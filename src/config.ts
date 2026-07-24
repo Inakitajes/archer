@@ -46,6 +46,8 @@ export type ConvoyConfig = {
 export type ConvoyDefaults = {
   model?: string
   maxAttempts?: number
+  /** Cap on agents running concurrently within a group; unset means the built-in default. */
+  maxConcurrentAgents?: number
   baseRef?: string
   pipeline?: string
   /** Model for the smart auto-accept judge; falls back to the run's model when unset. */
@@ -182,6 +184,7 @@ version: 1
 defaults:
   # model: openai/gpt-5.6-terra#xhigh # optional: uncomment to force every agent unless a step/agent overrides it
   # maxAttempts: 2
+  # maxConcurrentAgents: 8 # optional: cap agents running at once within a parallel group
   # baseRef: main # optional: when unset, convoy auto-detects (origin default branch, else main/master/develop/trunk, else current branch)
   # pipeline: implement
   # branchNameModel: anthropic/claude-haiku-4-5 # optional: model that names worktree branches
@@ -400,11 +403,12 @@ function mergeRoutingOverrides(global: ModelRoutingOverrides, project: ModelRout
 
 function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
   const record = v.record(raw, "defaults")
-  v.knownKeys(record, "defaults", ["model", "maxAttempts", "baseRef", "pipeline", "autoAcceptJudgeModel", "branchNameModel"])
+  v.knownKeys(record, "defaults", ["model", "maxAttempts", "maxConcurrentAgents", "baseRef", "pipeline", "autoAcceptJudgeModel", "branchNameModel"])
 
   const defaults: ConvoyDefaults = {}
   if (record.model !== undefined) defaults.model = v.model(record.model, "defaults.model")
   if (record.maxAttempts !== undefined) defaults.maxAttempts = v.positiveInt(record.maxAttempts, "defaults.maxAttempts")
+  if (record.maxConcurrentAgents !== undefined) defaults.maxConcurrentAgents = v.positiveInt(record.maxConcurrentAgents, "defaults.maxConcurrentAgents")
   if (record.baseRef !== undefined) defaults.baseRef = v.nonEmptyString(record.baseRef, "defaults.baseRef")
   if (record.pipeline !== undefined) defaults.pipeline = v.nonEmptyString(record.pipeline, "defaults.pipeline")
   if (record.autoAcceptJudgeModel !== undefined) defaults.autoAcceptJudgeModel = v.model(record.autoAcceptJudgeModel, "defaults.autoAcceptJudgeModel")

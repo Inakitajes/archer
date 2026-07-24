@@ -11,6 +11,7 @@ import { fileParts } from "./attachments"
 import { ensureClaudeAvailable, promptClaudePhase } from "./claude-code"
 import { addAllAndCommit, createCleanRepoSnapshot, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
+import { getSessionEventHub, payloadProperties } from "./event-hub"
 import { runHumanReviewGate } from "./human"
 import { log } from "./log"
 import { openRunMetadata, recordProgress, type RunMetadataStore } from "./metadata"
@@ -289,6 +290,33 @@ export function planBatches(steps: readonly Step[]): Step[][] {
   return batches
 }
 
+/** Default cap on how many agents run at once inside one concurrent group. */
+export const defaultMaxConcurrentAgents = 8
+
+/**
+ * Bounds how many jobs run at once. A group smaller than `limit` is never
+ * throttled; a larger fan-out queues the overflow so the run never holds more
+ * than `limit` live model sessions — each with its own event stream and poll
+ * timer — open at the same time.
+ */
+export function createConcurrencyLimiter(limit: number) {
+  let active = 0
+  const waiters: Array<() => void> = []
+  const release = () => {
+    active--
+    waiters.shift()?.()
+  }
+  return async <T>(job: () => Promise<T>): Promise<T> => {
+    if (active >= limit) await new Promise<void>((resolve) => waiters.push(resolve))
+    active++
+    try {
+      return await job()
+    } finally {
+      release()
+    }
+  }
+}
+
 /** Every group member runs to completion before the pipeline fails; this aggregates their failures into one error. */
 export class PhaseGroupError extends Error {
   readonly failures: { name: string; error: unknown }[]
@@ -470,6 +498,10 @@ export async function run(options: RunOptions) {
 
     const resuming = Boolean(options.resumeRunID)
     const gitLock = createGitLock()
+    // Caps concurrent agents within a group so a large `parallel:`/`models:`
+    // fan-out doesn't open dozens of live sessions (each an event stream + poll
+    // timer) at once; smaller groups are unaffected.
+    const limitAgents = createConcurrencyLimiter(Math.max(1, options.maxConcurrentAgents ?? defaultMaxConcurrentAgents))
     // Narrow once, outside any closure: opencode/metadata are `let`s assigned
     // above, and TS won't retain that narrowing inside the batch's nested
     // arrow functions, but a `const` alias captured here stays narrowed.
@@ -504,10 +536,12 @@ export async function run(options: RunOptions) {
             log.warn(`[${step.name}] skipped by flag`)
             return
           }
-          const restored = resuming && (await restorePhaseFromPreviousRun(workspace, runMetadata, step, progress))
-          if (!restored) {
-            await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions })
-          }
+          await limitAgents(async () => {
+            const restored = resuming && (await restorePhaseFromPreviousRun(workspace, runMetadata, step, progress))
+            if (!restored) {
+              await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions })
+            }
+          })
         }),
       )
 
@@ -1299,8 +1333,6 @@ type SessionSignal =
 
 const sessionPollMs = 30_000
 const maxConsecutivePollFailures = 10
-const reconnectBaseMs = 1_000
-const reconnectMaxMs = 15_000
 
 export function watchSession(
   client: OpencodeClient,
@@ -1329,10 +1361,9 @@ export function watchSession(
   })
   result.catch(() => {}) // the watcher may be stopped before anyone awaits the result
 
-  let resolveReady!: () => void
-  const ready = new Promise<void>((resolve) => {
-    resolveReady = resolve
-  })
+  // One directory-scoped subscription is shared across all phases; this watcher
+  // just registers for its own session's events (see event-hub).
+  const hub = getSessionEventHub(client, input.directory)
 
   const finish = (outcome: { value?: SessionResult; error?: unknown }) => {
     if (settled) return
@@ -1406,43 +1437,30 @@ export function watchSession(
     }
   }
 
-  const eventLoop = (async () => {
-    let reconnectDelay = reconnectBaseMs
-    while (!controller.signal.aborted && !settled) {
-      try {
-        const stream = await client.event.subscribe({ directory: input.directory }, { signal: controller.signal })
-        reconnectDelay = reconnectBaseMs
-        for await (const event of stream.stream) {
-          resolveReady() // any event (server.connected included) proves the stream is live
-          if (controller.signal.aborted || settled) return
-          const payload = eventPayload(event)
-          if (!payloadMatchesSession(payload, input.sessionID)) continue
-          state.lastServerEvent = Date.now()
-          const signal = describeSessionActivity(payload, state)
-          if (signal) {
-            if (signal.type !== "idle" && signal.type !== "error") sawWork = true
-            await handleSignal(signal)
-          }
-          if (settled) return
-          // The verbatim model stream for the session transcript, extracted
-          // separately so the summarized activity/status signals above are
-          // untouched. Appends only — the TUI repaints it on its own ticker.
-          const chunk = describeMessageChunk(payload, state)
-          if (chunk) {
-            sawWork = true
-            input.progress.phaseMessage(input.phaseName, chunk)
-          }
-        }
-      } catch (error) {
-        resolveReady()
-        if (controller.signal.aborted || settled) return
-        input.progress.phaseActivity(input.phaseName, `event stream dropped; reconnecting: ${formatSdkError(error)}`, "info")
-      }
-      if (controller.signal.aborted || settled) return
-      await sleep(reconnectDelay, controller.signal)
-      reconnectDelay = Math.min(reconnectDelay * 2, reconnectMaxMs)
+  // The hub delivers only this session's events (it filters by sessionID), so we
+  // describe them into the same activity/message signals the old per-session
+  // subscription produced — just without owning a subscription of our own.
+  const unsubscribe = hub.onSession(input.sessionID, (payload) => {
+    if (settled || controller.signal.aborted) return
+    state.lastServerEvent = Date.now()
+    const signal = describeSessionActivity(payload, state)
+    if (signal) {
+      if (signal.type !== "idle" && signal.type !== "error") sawWork = true
+      // handleSignal's only async work is completion verification, which is
+      // idempotent; fire-and-forget keeps the hub's dispatch non-blocking so one
+      // session's network round-trip can't stall the others'.
+      void handleSignal(signal).catch(() => {})
     }
-  })()
+    if (settled) return
+    // The verbatim model stream for the session transcript, extracted separately
+    // so the summarized activity/status signals above are untouched. Appends
+    // only — the TUI repaints it on its own ticker.
+    const chunk = describeMessageChunk(payload, state)
+    if (chunk) {
+      sawWork = true
+      input.progress.phaseMessage(input.phaseName, chunk)
+    }
+  })
 
   const pollLoop = (async () => {
     let failures = 0
@@ -1483,15 +1501,17 @@ export function watchSession(
 
   return {
     result,
-    ready,
+    // Readiness now means "the shared subscription is live"; the hub opens it
+    // once at run start, before any phase prompts, so early events aren't lost.
+    ready: hub.ready,
     async stop() {
       settled = true
-      resolveReady()
+      unsubscribe() // last listener to leave tears the shared subscription down
       controller.abort(new Error("session watcher stopped"))
       input.signal.removeEventListener("abort", onExternalAbort)
-      // Aborting tears the subscription down promptly; the race is a safety
-      // net so a misbehaving stream can never hold the whole run hostage.
-      await Promise.race([Promise.allSettled([eventLoop, pollLoop]), sleep(3_000)])
+      // The poll loop unwinds on abort; the race is a safety net so a stuck
+      // request can never hold the whole run hostage.
+      await Promise.race([pollLoop, sleep(3_000)])
     },
   }
 }
@@ -1521,31 +1541,12 @@ function sleep(ms: number, signal?: AbortSignal) {
   })
 }
 
-function eventPayload(event: unknown) {
-  if (event && typeof event === "object" && "payload" in event) return (event as { payload?: unknown }).payload
-  return event
-}
-
-function payloadProperties(payload: unknown) {
-  if (!payload || typeof payload !== "object") return undefined
-  const properties = (payload as { properties?: unknown }).properties
-  if (properties && typeof properties === "object") return properties as Record<string, unknown>
-  const data = (payload as { data?: unknown }).data
-  if (data && typeof data === "object") return data as Record<string, unknown>
-  return undefined
-}
-
 function payloadType(payload: unknown) {
   if (!payload || typeof payload !== "object") return ""
   const type = (payload as { type?: unknown }).type
   if (typeof type === "string") return type === "sync" ? String((payload as { name?: unknown }).name ?? "").replace(/\.1$/, "") : type
   const name = (payload as { name?: unknown }).name
   return typeof name === "string" ? name.replace(/\.1$/, "") : ""
-}
-
-function payloadMatchesSession(payload: unknown, sessionID: string) {
-  const properties = payloadProperties(payload)
-  return properties?.sessionID === sessionID
 }
 
 export function newActivityState(): ActivityState {

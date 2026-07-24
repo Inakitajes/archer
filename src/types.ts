@@ -19,6 +19,8 @@ export type RunOptions = {
   tui: boolean
   humanReview: boolean
   maxAttempts: number
+  /** Cap on agents running at once within a concurrent group (`parallel:` block or `models:` fan-out). Groups smaller than this are unaffected. Defaults to `defaultMaxConcurrentAgents` when unset. */
+  maxConcurrentAgents?: number
   baseRef: string
   targetDir: string
   includeDirty: boolean

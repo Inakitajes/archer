@@ -6,7 +6,7 @@ import { detectBaseRef } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
 import { defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
-import { parseModel, run } from "./runner"
+import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
 import { buildRunPlan } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
 import { isModelGateway, type ModelGateway } from "./model-routing"
@@ -37,6 +37,7 @@ export type ParsedArgs = {
   tui?: boolean
   humanReview?: boolean
   maxAttempts?: number
+  maxConcurrent?: number
   baseRef?: string
   /**
    * Repo to auto-detect the base ref in when it differs from targetDir. TUI
@@ -456,6 +457,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     tui: parsed.tui ?? Boolean(process.stdout.isTTY && process.stderr.isTTY),
     humanReview,
     maxAttempts: parsed.maxAttempts ?? defaults.maxAttempts ?? 2,
+    maxConcurrentAgents: parsed.maxConcurrent ?? defaults.maxConcurrentAgents ?? defaultMaxConcurrentAgents,
     baseRef: await resolveBaseRef(parsed, defaults),
     targetDir: parsed.targetDir,
     includeDirty: parsed.includeDirty ?? false,
@@ -602,6 +604,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
           throw new Error("--max-attempts must be a positive integer")
         }
         break
+      case "--max-concurrent":
+        parsed.maxConcurrent = parseInt(takeValue(), 10)
+        if (!Number.isInteger(parsed.maxConcurrent) || parsed.maxConcurrent < 1) {
+          throw new Error("--max-concurrent must be a positive integer")
+        }
+        break
       case "--base":
         parsed.baseRef = takeValue()
         break
@@ -680,6 +688,7 @@ Flags:
   --human-step             Enable human steps (alias: --human-review; default in interactive terminals)
   --no-human-step          Drop all human steps (alias: --no-human-review)
   --max-attempts <n>       Attempts per step before failing (default: 2)
+  --max-concurrent <n>     Max agents running at once within a parallel group (default: ${defaultMaxConcurrentAgents}); smaller groups are unaffected
   --base <ref>             Branch/base for calculating diffs (default: auto-detected — origin's default branch, else main/master/develop/trunk, else the current branch)
   --dir <path>             Target repo (default: cwd)
 

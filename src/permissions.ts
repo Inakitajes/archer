@@ -3,6 +3,7 @@ import { createInterface } from "node:readline/promises"
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
+import { getSessionEventHub } from "./event-hub"
 import { log } from "./log"
 import { noopProgress, type AutoAccept, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "./progress"
 import { judgeCommand } from "./safety-judge"
@@ -43,46 +44,28 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
   const handled = new Set<string>()
   const queue = serialQueue()
   let paused = false
-  let listenerDone: Promise<void> = Promise.resolve()
 
-  const loop = async () => {
-    // permission.asked is delivered on the directory-scoped event bus, so the
-    // subscription must be pinned to the directory the sessions run in.
-    while (!controller.signal.aborted) {
-      try {
-        const stream = await options.client.event.subscribe({ directory: options.directory }, { signal: controller.signal })
-        for await (const event of stream.stream) {
-          if (controller.signal.aborted) return
-          const payload = event && typeof event === "object" && "payload" in event ? (event as { payload?: unknown }).payload : event
-          if (!isPermissionAsked(payload)) continue
-          if (paused) continue
-          const request = payload.properties
-          if (handled.has(request.id)) continue
-          handled.add(request.id)
-          queue(() =>
-            handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal),
-          )
-        }
-      } catch (error) {
-        if (controller.signal.aborted) return
-        log.warn(`permission gate stream dropped; reconnecting: ${error instanceof Error ? error.message : String(error)}`)
-      }
-      if (controller.signal.aborted) return
-      await sleep(1_000)
-    }
-  }
-
-  listenerDone = loop()
+  // permission.asked is delivered on the directory-scoped event bus, so we share
+  // the run's single subscription for that directory (see event-hub) instead of
+  // opening a second one just for the gate. onAny sees every event regardless of
+  // session, which is what a permission request — not tied to one phase — needs.
+  const hub = getSessionEventHub(options.client, options.directory)
+  const unsubscribe = hub.onAny((payload) => {
+    if (controller.signal.aborted) return
+    if (!isPermissionAsked(payload)) return
+    if (paused) return
+    const request = payload.properties
+    if (handled.has(request.id)) return
+    handled.add(request.id)
+    queue(() =>
+      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal),
+    )
+  })
 
   return {
     async stop() {
+      unsubscribe()
       controller.abort(new Error("permission gate stopped"))
-      try {
-        // Aborting ends the subscription promptly; the race is a safety net.
-        await Promise.race([listenerDone, sleep(2_000)])
-      } catch {
-        // ignore
-      }
     },
     pause() {
       paused = true
@@ -244,8 +227,4 @@ function serialQueue() {
   return (job: () => Promise<unknown>) => {
     tail = tail.then(job, job)
   }
-}
-
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }

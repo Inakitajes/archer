@@ -15,6 +15,7 @@ import {
   UserAbortError,
   waitForInteractiveGate,
   commitRecoveredPhase,
+  createConcurrencyLimiter,
   createGitLock,
   describeMessageChunk,
   describeSessionActivity,
@@ -631,6 +632,60 @@ describe("createGitLock", () => {
     await expect(first).rejects.toThrow("boom")
     await second
     expect(order).toEqual(["first", "second"])
+  })
+})
+
+describe("createConcurrencyLimiter", () => {
+  test("never runs more than `limit` jobs at once and drains the rest", async () => {
+    const limit = createConcurrencyLimiter(2)
+    let active = 0
+    let peak = 0
+    let completed = 0
+    const job = () =>
+      limit(async () => {
+        active++
+        peak = Math.max(peak, active)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        active--
+        completed++
+      })
+
+    await Promise.all(Array.from({ length: 6 }, job))
+    expect(peak).toBe(2)
+    expect(completed).toBe(6)
+    expect(active).toBe(0)
+  })
+
+  test("a group at or below the limit runs fully in parallel (no throttling)", async () => {
+    const limit = createConcurrencyLimiter(8)
+    let active = 0
+    let peak = 0
+    const job = () =>
+      limit(async () => {
+        active++
+        peak = Math.max(peak, active)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        active--
+      })
+
+    await Promise.all(Array.from({ length: 6 }, job))
+    expect(peak).toBe(6)
+  })
+
+  test("releases its slot even when a job throws, so queued jobs still run", async () => {
+    const limit = createConcurrencyLimiter(1)
+    const order: string[] = []
+    const boom = limit(async () => {
+      order.push("boom")
+      throw new Error("boom")
+    })
+    const after = limit(async () => {
+      order.push("after")
+    })
+
+    await expect(boom).rejects.toThrow("boom")
+    await after
+    expect(order).toEqual(["boom", "after"])
   })
 })
 

@@ -300,6 +300,10 @@ export class TuiProgress implements ProgressUI {
   // via phaseMessage and repainted on the ticker, not per delta.
   private readonly transcripts = new Map<string, TranscriptBlock[]>()
   private readonly ticker: ReturnType<typeof setInterval>
+  // Set by scheduleRender(); drained once per opentui frame by flushRender.
+  // Collapses a burst of agent events (N parallel phases each streaming) into a
+  // single repaint per frame instead of one full rebuild per event.
+  private dirty = false
   // Subscription meters (GPT windows, OpenRouter credits) polled in the
   // background; the 250ms ticker just repaints whatever the last poll left.
   private readonly stopLimits: () => void
@@ -983,6 +987,9 @@ export class TuiProgress implements ProgressUI {
     renderer.on("theme_mode", this.handleThemeMode)
 
     this.ticker = setInterval(() => this.render(), 250)
+    // Coalesced repaints run here, once per frame, driven by scheduleRender's
+    // requestRender. The ticker still animates the spinner when nothing is dirty.
+    renderer.setFrameCallback(this.flushRender)
     this.stopLimits = startLimitsPoller((snapshot) => {
       this.limits = snapshot
     })
@@ -994,13 +1001,13 @@ export class TuiProgress implements ProgressUI {
     this.targetDir = targetDir
     this.runDir = runDir
     this.addEvent("convoy", "system", `run ${runID} started`)
-    this.render()
+    this.scheduleRender()
   }
 
   serverReady(url: string) {
     this.serverUrl = url
     this.addEvent("convoy", "system", `opencode server at ${url}`)
-    this.render()
+    this.scheduleRender()
   }
 
   phaseStarted(name: string, detail = "") {
@@ -1014,7 +1021,7 @@ export class TuiProgress implements ProgressUI {
     const phase = this.findPhase(name)
     if (phase) phase.now = { kind: "info", message: detail }
     this.addEvent(name, "info", detail)
-    this.render()
+    this.scheduleRender()
   }
 
   phaseAttempt(name: string, info: ProgressAttempt) {
@@ -1026,7 +1033,7 @@ export class TuiProgress implements ProgressUI {
     phase.updatedAt = Date.now()
     this.activePhase = name
     this.addEvent(name, "step", `attempt ${info.attempt}/${info.maxAttempts}${info.model ? ` · ${info.model}` : ""}`)
-    this.render()
+    this.scheduleRender()
   }
 
   phaseSession(name: string, sessionID: string) {
@@ -1039,7 +1046,7 @@ export class TuiProgress implements ProgressUI {
     phase.updatedAt = Date.now()
     this.activePhase = name
     this.addEvent(name, "system", `session ${shortID(sessionID)}`)
-    this.render()
+    this.scheduleRender()
   }
 
   phaseActivity(name: string, detail: string, kind: ActivityKind = "info", pulse = false) {
@@ -1050,7 +1057,7 @@ export class TuiProgress implements ProgressUI {
     this.activePhase = name
     if (pulse) this.lastActivityAt = Date.now()
     else this.addEvent(name, kind, detail)
-    this.render()
+    this.scheduleRender()
   }
 
   // Appends a raw slice of the model's stream to the phase's transcript.
@@ -1083,7 +1090,7 @@ export class TuiProgress implements ProgressUI {
     phase.lastStepModel = usage.model || phase.lastStepModel
     phase.updatedAt = Date.now()
     this.recalculateUsage(phase)
-    this.render()
+    this.scheduleRender()
   }
 
   phaseUsageTotal(name: string, usage: ProgressUsage) {
@@ -1094,7 +1101,7 @@ export class TuiProgress implements ProgressUI {
     if (usage.model) phase.lastStepModel = usage.model
     phase.updatedAt = Date.now()
     this.recalculateUsage(phase)
-    this.render()
+    this.scheduleRender()
   }
 
   phaseTodos(name: string, todos: ProgressTodo[]) {
@@ -1102,7 +1109,7 @@ export class TuiProgress implements ProgressUI {
     if (!phase) return
     phase.todos = todos
     phase.updatedAt = Date.now()
-    this.render()
+    this.scheduleRender()
   }
 
   phaseDiff(name: string, summary: ProgressDiffSummary) {
@@ -1110,7 +1117,7 @@ export class TuiProgress implements ProgressUI {
     if (!phase) return
     phase.diff = summary
     phase.updatedAt = Date.now()
-    this.render()
+    this.scheduleRender()
   }
 
   phaseCompleted(name: string, detail = "") {
@@ -1159,7 +1166,7 @@ export class TuiProgress implements ProgressUI {
       snapshot.sessionID ? `session ${shortID(snapshot.sessionID)}` : "",
     ].filter(Boolean)
     this.addEvent(name, "system", `restored from previous run${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`)
-    this.render()
+    this.scheduleRender()
   }
 
   askPermission(info: PermissionPromptInfo): Promise<PermissionReply> {
@@ -1433,6 +1440,7 @@ export class TuiProgress implements ProgressUI {
 
   stop() {
     clearInterval(this.ticker)
+    this.renderer.removeFrameCallback(this.flushRender)
     this.stopLimits()
     log.mute(false)
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
@@ -1732,7 +1740,7 @@ export class TuiProgress implements ProgressUI {
     phase.updatedAt = Date.now()
     this.activePhase = name
     this.lastActivityAt = Date.now()
-    this.render()
+    this.scheduleRender()
   }
 
   private findPhase(name: string) {
@@ -1763,7 +1771,30 @@ export class TuiProgress implements ProgressUI {
     phase.usageReported = totals.reported
   }
 
+  // Data events (agent activity, usage, todos, status changes) call this instead
+  // of render() directly. It only marks the screen dirty and asks opentui for a
+  // frame; flushRender does the one rebuild per frame. This decouples render
+  // frequency from event frequency, so N parallel phases streaming events no
+  // longer trigger N full-screen rebuilds each. Streamed token deltas already
+  // rely on the same idea via the 250ms ticker (see phaseMessage); this extends
+  // it to every data event. Input handlers still call render() directly for
+  // zero-latency feedback.
+  private scheduleRender() {
+    if (this.renderer.isDestroyed) return
+    this.dirty = true
+    this.renderer.requestRender()
+  }
+
+  // Runs once per opentui frame, before the native paint (see CliRenderer.loop).
+  // Rebuilds the screen only when a data event marked it dirty.
+  private readonly flushRender = async () => {
+    if (this.dirty) this.render()
+  }
+
   private render() {
+    // This repaint (frame flush, ticker, or immediate input render) satisfies any
+    // pending schedule.
+    this.dirty = false
     if (this.renderer.isDestroyed) return
     const now = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
