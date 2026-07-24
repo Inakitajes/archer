@@ -517,10 +517,14 @@ export class TuiProgress implements ProgressUI {
         else this.toggleInteractiveTakeover()
         return
       case "p":
-        if (!finished && !this.observer && this.onPauseToggle) {
-          consume()
-          this.onPauseToggle()
+        if (finished) return
+        consume()
+        if (this.observer) {
+          this.addEvent("convoy", "system", "pause isn't available while attached read-only")
+          this.render()
+          return
         }
+        if (this.onPauseToggle) this.onPauseToggle()
         return
     }
     // Digit keys jump straight to a content tab (1 session · 2 reports · 3 logs).
