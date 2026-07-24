@@ -3,24 +3,55 @@ import { describe, expect, test } from "bun:test"
 import { copyReportToClipboard, nativeClipboardCommand, writeClipboardOSC52 } from "../src/clipboard"
 
 describe("report clipboard", () => {
-  test("uses the native clipboard locally for large reports", async () => {
+  test("uses the native clipboard locally for 2 KiB and 64 KiB reports", async () => {
     const calls: string[][] = []
-    const result = await copyReportToClipboard("x".repeat(64 * 1024), () => false, {
-      platform: "darwin",
-      env: {},
-      which: () => "/usr/bin/pbcopy",
-      runNative: async (command) => {
-        calls.push(command)
-        return true
-      },
-    })
-    expect(result).toBe("copied-native")
-    expect(calls).toEqual([["pbcopy"]])
+    for (const size of [2 * 1024, 64 * 1024]) {
+      const result = await copyReportToClipboard("x".repeat(size), () => false, {
+        platform: "darwin",
+        env: {},
+        which: () => "/usr/bin/pbcopy",
+        runNative: async (command) => {
+          calls.push(command)
+          return true
+        },
+      })
+      expect(result).toBe("copied-native")
+    }
+    expect(calls).toEqual([["pbcopy"], ["pbcopy"]])
   })
 
   test("uses OSC52 remotely and reports its large-payload transport limit", async () => {
     expect(await copyReportToClipboard("remote", () => true, { env: { SSH_CONNECTION: "host" } })).toBe("copied-osc52")
     expect(await copyReportToClipboard("x".repeat(2 * 1024), () => false, { env: { MOSH_CONNECTION: "host" } })).toBe("transport-failed")
+  })
+
+  test("falls back to OSC52 after a local native-copy failure but never invokes native copy remotely", async () => {
+    let nativeCalls = 0
+    expect(
+      await copyReportToClipboard("local", () => true, {
+        platform: "darwin",
+        env: {},
+        which: () => "/usr/bin/pbcopy",
+        runNative: async () => {
+          nativeCalls++
+          return false
+        },
+      }),
+    ).toBe("copied-osc52")
+    expect(nativeCalls).toBe(1)
+
+    expect(
+      await copyReportToClipboard("remote", () => true, {
+        platform: "darwin",
+        env: { SSH_TTY: "/dev/pts/1" },
+        which: () => "/usr/bin/pbcopy",
+        runNative: async () => {
+          nativeCalls++
+          return true
+        },
+      }),
+    ).toBe("copied-osc52")
+    expect(nativeCalls).toBe(1)
   })
 
   test("distinguishes unsupported OSC52 and selects platform commands", async () => {

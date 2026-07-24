@@ -43,17 +43,20 @@ const quick: Pipeline = {
 
 describe("run metadata", () => {
   test("recordProgress preserves optional runner probes", () => {
+    const controlUpdates: string[] = []
     const progress = {
       ...noopProgress,
       isInteractiveTakeover: (name: string) => name === "implementer",
       keepRunDirRequested: () => true,
+      runControlState: (state: string, activePhases: number) => controlUpdates.push(`${state}:${activePhases}`),
     }
     const wrapped = recordProgress(progress, {} as RunMetadataStore)
 
     expect(wrapped.isInteractiveTakeover?.("implementer")).toBeTrue()
     expect(wrapped.isInteractiveTakeover?.("other")).toBeFalse()
     expect(wrapped.keepRunDirRequested?.()).toBeTrue()
-    expect(wrapped.runControlState).toBeUndefined()
+    wrapped.runControlState?.("pausing", 2)
+    expect(controlUpdates).toEqual(["pausing:2"])
   })
 
   test("the first open freezes the pipeline; later opens replay it", async () => {
@@ -271,5 +274,17 @@ describe("run metadata", () => {
 
     const adopted = await openRunMetadata(ws, "/repo", defaultPipeline())
     expect(adopted.pipeline.name).toBe("implement")
+  })
+
+  test("resuming a persisted paused run normalizes control to running", async () => {
+    const ws = await workspace()
+    const store = await openRunMetadata(ws, "/repo", quick)
+    await store.setControlState("paused")
+
+    const resumed = await openRunMetadata(ws, "/repo", quick)
+    expect(resumed.controlState()).toBe("running")
+    await resumed.flush()
+
+    expect((await readRunMetadata(join(ws.dir, "metadata.json")))?.control).toEqual({ state: "running" })
   })
 })

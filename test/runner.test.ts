@@ -27,6 +27,7 @@ import {
   parseModel,
   planBatches,
   progressPhases,
+  runPhaseWithRetries,
   restorePhaseFromPreviousRun,
   selectInterruptedPhase,
   shouldRetryAttempt,
@@ -367,6 +368,113 @@ describe("RunControl", () => {
     const checkpoint = control.checkpointAfterBatch(shutdown.signal)
     shutdown.abort(new UserAbortError("test shutdown"))
     await expect(checkpoint).rejects.toThrow("test shutdown")
+  })
+
+  test("pauses immediately when no batch is active", async () => {
+    let state = "running" as "running" | "pausing" | "paused"
+    const persisted: string[] = []
+    const control = new RunControl({
+      controlState: () => state,
+      setControlState: async (next: typeof state) => {
+        state = next
+        persisted.push(next)
+      },
+    } as unknown as RunMetadataStore)
+
+    await control.requestPause()
+
+    expect(state).toBe("paused")
+    expect(persisted).toEqual(["paused"])
+  })
+})
+
+describe("run phase retries", () => {
+  const prepared = {
+    attachments: [],
+    prompt: "test prompt",
+    model: { providerID: "openai", modelID: "gpt-5.5" },
+    maxAttempts: 2,
+  }
+  async function retryWorkspace(): Promise<Workspace> {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-retry-"))
+    recoveryDirs.push(dir)
+    await mkdir(join(dir, "logs"))
+    return { dir, runID: "20260724-110022-test" }
+  }
+
+  test("an armed takeover turns an OpenCode Esc cancellation into one gate without retrying or restoring", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      isInteractiveTakeover: () => true,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("continue")
+      },
+    }
+
+    const result = await runPhaseWithRetries(
+      {} as never,
+      workspace,
+      agentStep("implementer"),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          throw new SessionAbortedError({ name: "MessageAbortedError", data: { message: "stopped from OpenCode" } })
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    expect(result).toBe("")
+    expect(attempts).toEqual([1])
+    expect(restores).toBe(0)
+    expect(prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "interactive" }])
+  })
+
+  test("a non-abort agent failure restores the baseline and retries normally", async () => {
+    const attempts: number[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+
+    const result = await runPhaseWithRetries(
+      {} as never,
+      workspace,
+      agentStep("implementer"),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      noopProgress,
+      new RunShutdown(),
+      createGitLock(),
+      undefined,
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          if (attempt === 1) throw new Error("provider temporarily unavailable")
+          return "# report"
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    expect(result).toBe("# report")
+    expect(attempts).toEqual([1, 2])
+    expect(restores).toBe(1)
   })
 })
 

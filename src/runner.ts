@@ -833,7 +833,12 @@ async function projectContextFileParts(paths: string[], targetDir: string) {
   return out
 }
 
-async function runPhaseWithRetries(
+type PhaseRetryDeps = {
+  runPhaseAttempt: typeof runPhaseAttempt
+  restorePhaseBaseline: typeof restorePhaseBaseline
+}
+
+export async function runPhaseWithRetries(
   client: OpencodeClient,
   workspace: Workspace,
   phase: AgentStep,
@@ -844,6 +849,7 @@ async function runPhaseWithRetries(
   shutdown: RunShutdown,
   gitLock: GitLock,
   takeover?: TakeoverContext,
+  deps: PhaseRetryDeps = { runPhaseAttempt, restorePhaseBaseline },
 ) {
   if (!baseline && prepared.maxAttempts > 1) {
     throw new Error(`[${phase.name}] can't retry with dirty working tree; use --max-attempts 1 or clean the repo`)
@@ -859,7 +865,7 @@ async function runPhaseWithRetries(
     progress.phaseAttempt(phase.name, { attempt, maxAttempts: prepared.maxAttempts, model: formatModel(prepared.model) })
     log.info(`[${phase.name}] attempt ${attempt}/${prepared.maxAttempts} with ${formatModel(prepared.model)}`)
     try {
-      const assistantText = await runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef)
+      const assistantText = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef)
       if (armed()) {
         // Armed means "this step is mine": even a clean finish waits for the
         // user's decision before the step commits and the pipeline moves on.
@@ -887,12 +893,12 @@ async function runPhaseWithRetries(
       if (!(error instanceof LoggedAttemptError)) {
         await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
       }
-      if (shouldRetryAttempt(error, shutdown.signal, attempt, prepared.maxAttempts)) await gitLock(() => restorePhaseBaseline(phase, baseline, targetDir, error))
+      if (shouldRetryAttempt(error, shutdown.signal, attempt, prepared.maxAttempts)) await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, error))
     }
   }
 
   if (lastError) {
-    await gitLock(() => restorePhaseBaseline(phase, baseline, targetDir, lastError))
+    await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, lastError))
     throw lastError
   }
 

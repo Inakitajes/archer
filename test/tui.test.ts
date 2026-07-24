@@ -5,12 +5,15 @@ import type { Selection } from "@opentui/core"
 import { TuiProgress, autoFollowGroup, comparisonColumnCount, initialContentTab, iteratePrompt, phaseCapabilityBadges, phaseCapabilityLabel, pickBadge, pipelineSelectionTargets, type ContentTab } from "../src/tui"
 import { formatMoney, limitsRow } from "../src/tui-theme"
 
+import type { ClipboardResult } from "../src/clipboard"
 import type { LimitsSnapshot } from "../src/limits"
 import type { ProgressPhase } from "../src/progress"
 
 type DashboardInternals = {
   bodyBox: { primaryAxis: "row" | "column" }
   feedText: { x: number; y: number; plainText: string }
+  headerText: { plainText: string }
+  footerText: { plainText: string }
   pipelineBox: { width: number; height: number; x: number; y: number }
   pipelineScroll: number
   rightBox: { x: number; y: number }
@@ -18,6 +21,8 @@ type DashboardInternals = {
   contentTab: ContentTab
   fullscreen?: { phase: string; tab: ContentTab; scroll: number }
   fullscreenScrollbar: { visible: boolean; scrollSize: number; viewportSize: number; slider: { value: number } }
+  reportOverlay: { title: string }
+  feed: Array<{ message: string }>
   handleFullscreenKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
   handleNavKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
   handleFullscreenWheel(event: {
@@ -27,13 +32,18 @@ type DashboardInternals = {
   }): void
 }
 
-async function createDashboard(width = 120, height = 40, phases: ProgressPhase[] = [{ name: "implement", description: "" }]) {
+async function createDashboard(
+  width = 120,
+  height = 40,
+  phases: ProgressPhase[] = [{ name: "implement", description: "" }],
+  options: { observer?: boolean; onPauseToggle?: () => void; copyResult?: ClipboardResult } = {},
+) {
   const testRenderer = await createTestRenderer({ width, height })
   const copied: string[] = []
-  const dashboard = new TuiProgress(testRenderer.renderer, phases, undefined, undefined, false, false, "session", async (text) => {
+  const dashboard = new TuiProgress(testRenderer.renderer, phases, undefined, undefined, false, options.observer ?? false, "session", async (text) => {
     copied.push(text)
-    return "copied-native"
-  })
+    return options.copyResult ?? "copied-native"
+  }, options.onPauseToggle)
   testRenderer.renderer.copyToClipboardOSC52 = (text) => {
     copied.push(text)
     return true
@@ -132,6 +142,41 @@ describe("run dashboard defaults", () => {
 
     // A writable phase never grows a badge, however much room there is.
     expect(pickBadge(phaseCapabilityBadges({}), 40, false)).toBeUndefined()
+  })
+
+  test("p delegates pause control and renders pausing and paused states", async () => {
+    let toggles = 0
+    const { dashboard, mockInput, renderOnce } = await createDashboard(120, 40, [{ name: "implement", description: "" }], { onPauseToggle: () => toggles++ })
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      mockInput.pressKey("p")
+      expect(toggles).toBe(1)
+
+      dashboard.runControlState("pausing", 2)
+      await renderOnce()
+      expect(internals.headerText.plainText).toContain("pausing · 2 active")
+
+      dashboard.runControlState("paused", 0)
+      await renderOnce()
+      expect(internals.headerText.plainText).toContain("paused · p resume")
+      expect(internals.footerText.plainText).toContain("resume")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("p reports why pause is unavailable on an attached observer dashboard", async () => {
+    let toggles = 0
+    const { dashboard, mockInput } = await createDashboard(120, 40, [{ name: "implement", description: "" }], { observer: true, onPauseToggle: () => toggles++ })
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      mockInput.pressKey("p")
+
+      expect(toggles).toBe(0)
+      expect(internals.feed.map((entry) => entry.message)).toContain("pause isn't available while attached read-only")
+    } finally {
+      dashboard.stop()
+    }
   })
 })
 
@@ -258,6 +303,30 @@ describe("dashboard content selection", () => {
       expect(internals.fullscreen).toBeUndefined()
     } finally {
       dashboard.stop()
+    }
+  })
+
+  test("shows the specific report copy failure in the fullscreen reader", async () => {
+    for (const [result, label] of [
+      ["unsupported", "terminal clipboard (OSC52) unavailable"],
+      ["transport-failed", "couldn't copy report; report is too large for this terminal transport"],
+    ] as const) {
+      const { dashboard, mockInput, renderOnce } = await createDashboard(120, 40, [{ name: "implement", description: "" }], { copyResult: result })
+      try {
+        const internals = dashboard as unknown as DashboardInternals
+        dashboard.start("run", "/target", "/run")
+        internals.reports.set("implement", ["# Result"])
+        internals.contentTab = "reports"
+
+        mockInput.pressKey("v")
+        mockInput.pressKey("c")
+        await Bun.sleep(0)
+        await renderOnce()
+
+        expect(internals.reportOverlay.title).toContain(label)
+      } finally {
+        dashboard.stop()
+      }
     }
   })
 
