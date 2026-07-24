@@ -132,6 +132,8 @@ export type RunOutcome = {
   runDir: string
 }
 
+export type RunControlState = "running" | "pausing" | "paused"
+
 export type ProgressUI = {
   /** `runDir` is the run workspace (where phase reports land); passed early so the reports tab works during a live run, not just on the finish screen. */
   start(runID: string, targetDir: string, runDir?: string): void
@@ -164,6 +166,8 @@ export type ProgressUI = {
   runFinished?(outcome: RunOutcome): Promise<void>
   /** True when the finish screen handed the run dir to an iterate session ([i]), so cleanup must skip it. */
   keepRunDirRequested?(): boolean
+  /** Persistent cooperative pause state; pausing waits for the current atomic batch. */
+  runControlState?(state: RunControlState, activePhases: number): void
   message(message: string): void
   suspend(): void
   resume(): void
@@ -198,12 +202,13 @@ export async function createProgressUI(
   enabled: boolean,
   onAbort?: () => void,
   autoAccept?: AutoAccept,
+  onPauseToggle?: () => void,
 ): Promise<ProgressUI> {
   if (!enabled || !process.stdout.isTTY) return noopProgress
 
   try {
     const { createTuiProgress } = await import("./tui")
-    const progress = await createTuiProgress(phases, onAbort, autoAccept)
+    const progress = await createTuiProgress(phases, onAbort, autoAccept, { onPauseToggle })
     log.mute(true)
     return progress
   } catch (error) {

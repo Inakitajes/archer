@@ -29,8 +29,11 @@ type DashboardInternals = {
 
 async function createDashboard(width = 120, height = 40, phases: ProgressPhase[] = [{ name: "implement", description: "" }]) {
   const testRenderer = await createTestRenderer({ width, height })
-  const dashboard = new TuiProgress(testRenderer.renderer, phases)
   const copied: string[] = []
+  const dashboard = new TuiProgress(testRenderer.renderer, phases, undefined, undefined, false, false, "session", async (text) => {
+    copied.push(text)
+    return "copied-native"
+  })
   testRenderer.renderer.copyToClipboardOSC52 = (text) => {
     copied.push(text)
     return true
@@ -212,6 +215,7 @@ describe("dashboard content selection", () => {
       expect(internals.fullscreen).toMatchObject({ phase: "implement", tab: "reports" })
 
       mockInput.pressKey("c")
+      await Bun.sleep(0)
       expect(copied).toEqual([report.join("\n")])
 
       mockInput.pressKey("v")

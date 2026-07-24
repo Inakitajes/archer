@@ -4,8 +4,9 @@ import { join } from "node:path"
 
 import { afterAll, describe, expect, test } from "bun:test"
 
-import { openRunMetadata, readRunMetadata } from "../src/metadata"
+import { openRunMetadata, readRunMetadata, recordProgress, type RunMetadataStore } from "../src/metadata"
 import { defaultPipeline } from "../src/pipeline"
+import { noopProgress } from "../src/progress"
 import type { AgentStep, Pipeline } from "../src/types"
 import type { Workspace } from "../src/workspace"
 
@@ -41,6 +42,19 @@ const quick: Pipeline = {
 }
 
 describe("run metadata", () => {
+  test("recordProgress preserves optional runner probes", () => {
+    const progress = {
+      ...noopProgress,
+      isInteractiveTakeover: (name: string) => name === "implementer",
+      keepRunDirRequested: () => true,
+    }
+    const wrapped = recordProgress(progress, {} as RunMetadataStore)
+
+    expect(wrapped.isInteractiveTakeover?.("implementer")).toBeTrue()
+    expect(wrapped.isInteractiveTakeover?.("other")).toBeFalse()
+    expect(wrapped.keepRunDirRequested?.()).toBeTrue()
+  })
+
   test("the first open freezes the pipeline; later opens replay it", async () => {
     const ws = await workspace()
 
@@ -223,20 +237,35 @@ describe("run metadata", () => {
     expect(saved?.server).toBeUndefined()
   })
 
-  test("persists as schemaVersion 2 and still reads v1 metadata", async () => {
+  test("persists pause transitions immediately", async () => {
+    const ws = await workspace()
+    const store = await openRunMetadata(ws, "/repo", quick)
+
+    await store.setControlState("pausing")
+    let saved = await readRunMetadata(join(ws.dir, "metadata.json"))
+    expect(saved?.control.state).toBe("pausing")
+    expect(saved?.control.requestedAt).toBeNumber()
+
+    await store.setControlState("paused")
+    saved = await readRunMetadata(join(ws.dir, "metadata.json"))
+    expect(saved?.control.state).toBe("paused")
+    expect(saved?.control.pausedAt).toBeNumber()
+  })
+
+  test("persists as schemaVersion 3 and still reads v1 metadata", async () => {
     const ws = await workspace()
     const store = await openRunMetadata(ws, "/repo", quick)
     await store.flush()
 
     const path = join(ws.dir, "metadata.json")
     const persisted = JSON.parse(await readFile(path, "utf8"))
-    expect(persisted.schemaVersion).toBe(2)
+    expect(persisted.schemaVersion).toBe(3)
     expect(persisted.pipeline.name).toBe("quick")
 
     // v1 runs predate the frozen pipeline; they read fine without one.
     await Bun.write(path, JSON.stringify({ ...persisted, schemaVersion: 1, pipeline: undefined }))
     const v1 = await readRunMetadata(path)
-    expect(v1?.schemaVersion).toBe(2)
+    expect(v1?.schemaVersion).toBe(3)
     expect(v1?.pipeline).toBeUndefined()
 
     const adopted = await openRunMetadata(ws, "/repo", defaultPipeline())

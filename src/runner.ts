@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, open, readFile, rm, stat, unlink, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { stdin, stdout } from "node:process"
 import { createInterface } from "node:readline/promises"
@@ -152,6 +152,98 @@ export class RunShutdown {
   }
 }
 
+/** Cooperative pause controller: an in-flight parallel batch remains atomic. */
+export class RunControl {
+  private state: "running" | "pausing" | "paused"
+  private activePhases = 0
+  private waiters: Array<() => void> = []
+  private progress?: ProgressUI
+
+  constructor(private readonly metadata: RunMetadataStore) {
+    this.state = metadata.controlState()
+  }
+
+  bind(progress: ProgressUI) {
+    this.progress = progress
+    this.publish()
+  }
+
+  beginBatch(activePhases: number) {
+    this.activePhases = activePhases
+  }
+
+  async toggle() {
+    if (this.state === "running") await this.requestPause()
+    else await this.resume()
+  }
+
+  async requestPause() {
+    if (this.state !== "running") return
+    this.state = this.activePhases > 0 ? "pausing" : "paused"
+    await this.metadata.setControlState(this.state)
+    this.publish()
+  }
+
+  async resume() {
+    if (this.state === "running") return
+    this.state = "running"
+    await this.metadata.setControlState("running")
+    this.publish()
+    for (const resolve of this.waiters.splice(0)) resolve()
+  }
+
+  async awaitRunnable() {
+    if (this.state === "running") return
+    await new Promise<void>((resolve) => this.waiters.push(resolve))
+  }
+
+  async checkpointAfterBatch() {
+    this.activePhases = 0
+    if (this.state === "pausing") {
+      this.state = "paused"
+      await this.metadata.setControlState("paused")
+      this.publish()
+    }
+    await this.awaitRunnable()
+  }
+
+  private publish() {
+    this.progress?.runControlState?.(this.state, this.activePhases)
+  }
+}
+
+/** Exclusive per-run lease preventing two coordinators from mutating one pipeline. */
+export async function acquireRunLease(workspace: Workspace): Promise<() => Promise<void>> {
+  const path = join(workspace.dir, "coordinator.lock")
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const handle = await open(path, "wx")
+      await handle.writeFile(token)
+      await handle.close()
+      return async () => {
+        const current = await readFile(path, "utf8").catch(() => "")
+        if (current === token) await unlink(path).catch(() => undefined)
+      }
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error
+      const owner = Number((await readFile(path, "utf8").catch(() => "")).split(":", 1)[0])
+      if (owner > 0 && processIsAlive(owner)) throw new Error(`run ${workspace.runID} is already controlled by process ${owner}`)
+      await unlink(path).catch(() => undefined)
+    }
+  }
+  throw new Error(`couldn't acquire coordinator lease for run ${workspace.runID}`)
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return Boolean(error && typeof error === "object" && "code" in error && error.code === "EPERM")
+  }
+}
+
 /**
  * Groups the flat step list into batches the runner executes together: a
  * human gate is always its own batch, and consecutive agent steps sharing a
@@ -245,6 +337,8 @@ export async function run(options: RunOptions) {
   let progress: ProgressUI = noopProgress
   let permissions: PermissionGate | undefined
   let metadata: RunMetadataStore | undefined
+  let control: RunControl | undefined
+  let releaseLease: (() => Promise<void>) | undefined
   let hookSet = options.plan?.hooks ?? hooksForPipeline(options.hooks, options.pipeline.name)
   let pipelineNameForHooks = options.pipeline.name
   let postHooksStarted = false
@@ -257,6 +351,7 @@ export async function run(options: RunOptions) {
   const judgeModel = parseModel(splitModelVariant(options.smartJudgeModel).model)
 
   try {
+    releaseLease = await acquireRunLease(workspace)
     metadata = await openRunMetadata(workspace, options.targetDir, options.pipeline, {
       gateway: options.plan?.modelRouting.gateway ?? options.gateway ?? "configured",
       gatewayOverride: options.gatewayExplicit ?? false,
@@ -281,10 +376,14 @@ export async function run(options: RunOptions) {
     // offer to commit that work as the interrupted phase and continue. Runs here,
     // before the TUI grabs the terminal, so the readline prompt stays visible.
     await maybeRecoverDirtyTree(workspace, metadata, options)
+    control = new RunControl(metadata)
     progress = recordProgress(
-      await createProgressUI(progressPhases(pipeline, hookSet), options.tui, () => shutdown.request("Ctrl+C"), autoAccept),
+      await createProgressUI(progressPhases(pipeline, hookSet), options.tui, () => shutdown.request("Ctrl+C"), autoAccept, () => {
+        void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
+      }),
       metadata,
     )
+    control.bind(progress)
     progress.start(workspace.runID, options.targetDir, workspace.dir)
     log.info(`Run ${workspace.runID} - dir: ${workspace.dir}`)
     // Use the captured flag: options.modelOverride was already cleared when a
@@ -356,19 +455,24 @@ export async function run(options: RunOptions) {
 
     for (const batch of planBatches(pipeline.steps)) {
       shutdown.throwIfRequested()
+      await control.awaitRunnable()
       const [first] = batch
 
       if (batch.length === 1 && first?.type === "human") {
+        control.beginBatch(1)
         if (shouldSkip(first, options)) {
           progress.phaseSkipped(first.name)
           log.warn(`[${first.name}] skipped by flag`)
+          await control.checkpointAfterBatch()
           continue
         }
         await runHumanReviewGate(workspace, options, opencode.url, progress, permissions, first.name)
+        await control.checkpointAfterBatch()
         continue
       }
 
       const agentBatch = batch as AgentStep[]
+      control.beginBatch(agentBatch.filter((step) => !shouldSkip(step, options)).length)
       const results = await Promise.allSettled(
         agentBatch.map(async (step) => {
           if (shouldSkip(step, options)) {
@@ -390,6 +494,7 @@ export async function run(options: RunOptions) {
       const userAbort = results.find((result): result is PromiseRejectedResult => result.status === "rejected" && isUserAbortError(result.reason))
       if (userAbort) throw userAbort.reason
       const failures = results.flatMap((result, index) => (result.status === "rejected" ? [{ name: agentBatch[index]!.name, error: result.reason }] : []))
+      await control.checkpointAfterBatch()
       if (failures.length > 0) throw new PhaseGroupError(failures)
     }
 
@@ -437,6 +542,7 @@ export async function run(options: RunOptions) {
     // `convoy runs` stops offering to attach to a run that's shutting down.
     metadata?.serverStopped()
     await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
+    await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
     progress.stop()
     shutdown.dispose()
 
@@ -845,7 +951,10 @@ async function runPhaseAttempt(
     text: result.assistantText,
   })
 
-  if (result.error) throw new LoggedAttemptError(formatSdkError(result.error))
+  if (result.error) {
+    if (isMessageAbortedError(result.error)) throw new SessionAbortedError(result.error)
+    throw new LoggedAttemptError(formatSdkError(result.error), { cause: result.error })
+  }
   return result.assistantText
 }
 
@@ -1874,7 +1983,24 @@ export function modelOverrideNotice(pipeline: Pipeline, override: string): strin
   return `--model applies to OpenCode steps only; Claude Code steps keep their configured model: ${unaffected.join(", ")}`
 }
 
-class LoggedAttemptError extends Error {}
+class LoggedAttemptError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = "LoggedAttemptError"
+  }
+}
+
+/** Typed cancellation returned when Esc aborts an OpenCode message. */
+export class SessionAbortedError extends LoggedAttemptError {
+  constructor(error: { name: "MessageAbortedError"; data?: { message?: string } }) {
+    super(error.data?.message || "OpenCode session message aborted", { cause: error })
+    this.name = "SessionAbortedError"
+  }
+}
+
+export function isMessageAbortedError(error: unknown): error is { name: "MessageAbortedError"; data?: { message?: string } } {
+  return Boolean(error && typeof error === "object" && "name" in error && error.name === "MessageAbortedError")
+}
 
 function extractAssistantText(parts: Part[]) {
   return parts

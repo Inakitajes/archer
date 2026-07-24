@@ -11,6 +11,7 @@ import type {
   ProgressTokens,
   ProgressUI,
   ProgressUsage,
+  RunControlState,
 } from "./progress"
 import type { Pipeline } from "./types"
 import type { ModelGateway } from "./model-routing"
@@ -34,7 +35,7 @@ export type PhaseMetadata = {
 }
 
 export type RunMetadata = {
-  schemaVersion: 2
+  schemaVersion: 3
   runID: string
   targetDir: string
   createdAt: number
@@ -44,6 +45,7 @@ export type RunMetadata = {
   modelRouting?: { gateway: ModelGateway }
   /** The live opencode server for this run while it executes; cleared on shutdown, so a lingering entry means the run process died mid-flight. Lets `convoy runs` attach to a running run. */
   server?: { url: string; pid: number; startedAt: number }
+  control: { state: RunControlState; requestedAt?: number; pausedAt?: number }
   phases: Record<string, PhaseMetadata>
 }
 
@@ -62,6 +64,8 @@ export type RunMetadataStore = {
   repositoryBaseline(name: string): RepoSnapshot | undefined
   phaseRepositoryBaseline(name: string, baseline: RepoSnapshot): Promise<void>
   phaseEnded(name: string, status: "completed" | "skipped" | "failed"): void
+  controlState(): RunControlState
+  setControlState(state: RunControlState): Promise<void>
   flush(): Promise<void>
 }
 
@@ -86,6 +90,9 @@ export async function openRunMetadata(
   const gateway = options.gateway ?? "configured"
   const path = join(workspace.dir, "metadata.json")
   const data = (await loadMetadata(path, workspace.runID)) ?? newMetadata(workspace.runID, targetDir)
+  // Opening metadata means a new coordinator owns the run. It resumes from the
+  // next pending batch; pausing/running crashes still use normal phase recovery.
+  if (data.control.state !== "running") data.control = { state: "running" }
   // Step names are user-configurable safe identifiers and may still equal
   // Object.prototype keys such as "constructor" or "__proto__".
   data.phases = Object.assign(Object.create(null) as Record<string, PhaseMetadata>, data.phases)
@@ -232,6 +239,17 @@ export async function openRunMetadata(
       if (entry.startedAt !== undefined) entry.durationMs = entry.endedAt - entry.startedAt
       void persist()
     },
+    controlState() {
+      return data.control.state
+    },
+    async setControlState(state) {
+      data.control = {
+        state,
+        ...(state === "pausing" ? { requestedAt: Date.now() } : {}),
+        ...(state === "paused" ? { requestedAt: data.control.requestedAt ?? Date.now(), pausedAt: Date.now() } : {}),
+      }
+      await persist({ throwOnError: true })
+    },
     async flush() {
       await persist()
     },
@@ -305,6 +323,7 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
       progress.phaseFailed(name, detail)
     },
     phaseRestored: (name, snapshot) => progress.phaseRestored(name, snapshot),
+    runControlState: (state, activePhases) => progress.runControlState?.(state, activePhases),
     message: (message) => progress.message(message),
     suspend: () => progress.suspend(),
     resume: () => progress.resume(),
@@ -314,8 +333,10 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
   // probing for askPermission, so its presence must mirror the wrapped UI.
   if (progress.askPermission) recorder.askPermission = progress.askPermission.bind(progress)
   if (progress.askHumanReview) recorder.askHumanReview = progress.askHumanReview.bind(progress)
+  if (progress.isInteractiveTakeover) recorder.isInteractiveTakeover = progress.isInteractiveTakeover.bind(progress)
   // Same probing contract: the runner only holds the finish screen when the UI offers one.
   if (progress.runFinished) recorder.runFinished = progress.runFinished.bind(progress)
+  if (progress.keepRunDirRequested) recorder.keepRunDirRequested = progress.keepRunDirRequested.bind(progress)
   return recorder
 }
 
@@ -334,12 +355,14 @@ export async function readRunMetadata(path: string): Promise<RunMetadata | undef
   }
   try {
     const parsed = JSON.parse(body) as Partial<RunMetadata> & { schemaVersion?: number }
-    // v1 is v2 minus the frozen pipeline; openRunMetadata backfills it.
-    if (![1, 2].includes(parsed.schemaVersion ?? 0) || typeof parsed.phases !== "object" || !parsed.phases) {
+    // v1 predates the frozen pipeline; v1/v2 predate cooperative run control.
+    if (![1, 2, 3].includes(parsed.schemaVersion ?? 0) || typeof parsed.phases !== "object" || !parsed.phases) {
       log.warn(`ignoring run metadata with unknown shape at ${path}`)
       return undefined
     }
-    return { ...parsed, schemaVersion: 2, phases: parsed.phases } as RunMetadata
+    const state = parsed.control?.state
+    const control = state === "running" || state === "pausing" || state === "paused" ? parsed.control! : { state: "running" as const }
+    return { ...parsed, schemaVersion: 3, control, phases: parsed.phases } as RunMetadata
   } catch {
     log.warn(`ignoring corrupt run metadata at ${path}`)
     return undefined
@@ -348,5 +371,5 @@ export async function readRunMetadata(path: string): Promise<RunMetadata | undef
 
 function newMetadata(runID: string, targetDir: string): RunMetadata {
   const now = Date.now()
-  return { schemaVersion: 2, runID, targetDir, createdAt: now, updatedAt: now, phases: {} }
+  return { schemaVersion: 3, runID, targetDir, createdAt: now, updatedAt: now, control: { state: "running" }, phases: {} }
 }

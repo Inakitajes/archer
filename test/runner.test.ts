@@ -8,7 +8,10 @@ import { createCleanRepoSnapshot } from "../src/git"
 import { noopProgress, type HumanReviewAction, type HumanReviewPromptInfo, type ProgressPhaseSnapshot, type ProgressUI } from "../src/progress"
 import {
   assertPendingReadOnlyResumeBaselines,
+  acquireRunLease,
   RunShutdown,
+  RunControl,
+  SessionAbortedError,
   UserAbortError,
   waitForInteractiveGate,
   commitRecoveredPhase,
@@ -17,6 +20,7 @@ import {
   describeSessionActivity,
   finalizePhaseRepository,
   isIgnorableRejection,
+  isMessageAbortedError,
   isUserAbortError,
   newActivityState,
   modelOverrideNotice,
@@ -101,6 +105,15 @@ function assistantInfo(id: string, cost: number, input: number, output: number) 
 }
 
 describe("runner helpers", () => {
+  test("preserves OpenCode message aborts as typed session cancellations", () => {
+    const error = { name: "MessageAbortedError" as const, data: { message: "stopped" } }
+    expect(isMessageAbortedError(error)).toBeTrue()
+    const wrapped = new SessionAbortedError(error)
+    expect(wrapped.name).toBe("SessionAbortedError")
+    expect(wrapped.cause).toBe(error)
+    expect(shouldRetryAttempt(wrapped, new AbortController().signal, 1, 2)).toBeTrue()
+  })
+
   test("parses provider/model values", () => {
     expect(parseModel("anthropic/claude-sonnet-4-6")).toEqual({
       providerID: "anthropic",
@@ -308,6 +321,52 @@ describe("runner helpers", () => {
     expect(isIgnorableRejection(new TypeError("boom"))).toBe(false)
     expect(isIgnorableRejection("aborted")).toBe(false)
     expect(isIgnorableRejection(undefined)).toBe(false)
+  })
+})
+
+describe("RunControl", () => {
+  test("waits for an active batch before pausing and resumes its checkpoint", async () => {
+    let state = "running" as "running" | "pausing" | "paused"
+    const persisted: string[] = []
+    const metadata = {
+      controlState: () => state,
+      setControlState: async (next: typeof state) => {
+        state = next
+        persisted.push(next)
+      },
+    } as RunMetadataStore
+    const published: string[] = []
+    const control = new RunControl(metadata)
+    control.bind({ ...noopProgress, runControlState: (next, active) => published.push(`${next}:${active}`) })
+    control.beginBatch(2)
+
+    await control.requestPause()
+    expect(state).toBe("pausing")
+    let passed = false
+    const checkpoint = control.checkpointAfterBatch().then(() => { passed = true })
+    await Bun.sleep(0)
+    expect(state).toBe("paused")
+    expect(passed).toBeFalse()
+    await control.resume()
+    await checkpoint
+
+    expect(persisted).toEqual(["pausing", "paused", "running"])
+    expect(published).toContain("pausing:2")
+    expect(passed).toBeTrue()
+  })
+})
+
+describe("run coordinator lease", () => {
+  test("allows only one coordinator and releases ownership", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-lease-"))
+    recoveryDirs.push(dir)
+    const workspace = { dir, runID: "lease-test" }
+    const release = await acquireRunLease(workspace)
+
+    await expect(acquireRunLease(workspace)).rejects.toThrow("already controlled")
+    await release()
+    const releaseAgain = await acquireRunLease(workspace)
+    await releaseAgain()
   })
 })
 

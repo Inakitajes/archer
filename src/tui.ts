@@ -14,6 +14,7 @@ import {
 } from "@opentui/core"
 
 import { openClaudeSessionWindow } from "./claude-code"
+import { copyReportToClipboard, writeClipboardOSC52, type ClipboardResult } from "./clipboard"
 import { startLimitsPoller } from "./limits"
 import { log } from "./log"
 import { openIterateOpencodeWindow, openOpencodeSessionWindow, openStoredSessionWindow, type SessionWindowBackend } from "./opencode"
@@ -122,7 +123,14 @@ type FullscreenView = {
   phase: string
   tab: ContentTab
   scroll: number
-  copyStatus?: "copied" | "unavailable"
+  copyStatus?: ClipboardResult
+}
+
+function clipboardStatusLabel(status?: ClipboardResult): string {
+  if (status === "copied-native" || status === "copied-osc52") return " · copied"
+  if (status === "unsupported") return " · terminal clipboard (OSC52) unavailable"
+  if (status === "transport-failed") return " · couldn't copy report; report is too large for this terminal transport"
+  return ""
 }
 
 export type TuiDashboardMode = "historical" | "live"
@@ -233,7 +241,7 @@ export async function createTuiProgress(
   // offlineSessions: re-opened finished runs have no live server, so [o] opens
   // their stored sessions from disk instead of attaching. observer: read-only
   // attach to another process's run, where [i] takeover must be refused.
-  options?: { offlineSessions?: boolean; observer?: boolean; mode?: TuiDashboardMode },
+  options?: { offlineSessions?: boolean; observer?: boolean; mode?: TuiDashboardMode; onPauseToggle?: () => void },
 ): Promise<ProgressUI> {
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
@@ -253,6 +261,8 @@ export async function createTuiProgress(
     options?.offlineSessions ?? false,
     options?.observer ?? false,
     initialContentTab(options?.mode ?? "live"),
+    copyReportToClipboard,
+    options?.onPauseToggle,
   )
 }
 
@@ -339,6 +349,8 @@ export class TuiProgress implements ProgressUI {
   // a phase finishes so a report written mid-run is picked up on the next view.
   private readonly reports = new Map<string, string[] | "loading" | "missing">()
   private fullscreen?: FullscreenView
+  private controlState: "running" | "pausing" | "paused" = "running"
+  private controlActivePhases = 0
   // ScrollBarRenderable emits change events for programmatic state updates as
   // well as mouse drags. Ignore the former so a layout recalculation cannot
   // overwrite the reader's just-computed scroll position.
@@ -503,6 +515,12 @@ export class TuiProgress implements ProgressUI {
         if (this.finished) void this.openIterateWindow()
         else this.toggleInteractiveTakeover()
         return
+      case "p":
+        if (!finished && !this.observer && this.onPauseToggle) {
+          consume()
+          this.onPauseToggle()
+        }
+        return
     }
     // Digit keys jump straight to a content tab (1 session · 2 reports · 3 logs).
     const digitTab: Record<string, ContentTab> = { "1": "session", "2": "reports", "3": "logs" }
@@ -622,7 +640,15 @@ export class TuiProgress implements ProgressUI {
       case "c": {
         if (view.tab === "reports") {
           const report = this.reports.get(view.phase)
-          if (Array.isArray(report)) view.copyStatus = this.renderer.copyToClipboardOSC52(report.join("\n")) ? "copied" : "unavailable"
+          if (Array.isArray(report)) {
+            view.copyStatus = undefined
+            void this.copyReport(report.join("\n"), writeClipboardOSC52).then((result) => {
+              if (this.fullscreen === view) {
+                view.copyStatus = result
+                this.render()
+              }
+            })
+          }
         }
         break
       }
@@ -653,6 +679,8 @@ export class TuiProgress implements ProgressUI {
     // no runner reads this dashboard's takeover set.
     private readonly observer = false,
     initialTab: ContentTab = "session",
+    private readonly copyReport = copyReportToClipboard,
+    private readonly onPauseToggle?: () => void,
   ) {
     this.contentTab = initialTab
     this.phases = phases.map((phase) => ({
@@ -1196,6 +1224,16 @@ export class TuiProgress implements ProgressUI {
   // can still be reading files from the run directory.
   keepRunDirRequested(): boolean {
     return this.iterateRequested
+  }
+
+  runControlState(state: "running" | "pausing" | "paused", activePhases: number): void {
+    const previous = this.controlState
+    this.controlState = state
+    this.controlActivePhases = activePhases
+    if (previous === "running" && state === "running") return
+    const message = state === "pausing" ? `pausing · waiting for current batch (${activePhases} active)` : state === "paused" ? "paused · p resume" : "pipeline resumed"
+    this.addEvent("convoy", "system", message)
+    this.render()
   }
 
   // The focused phase, clamped to a valid index (the pipeline can be empty
@@ -1820,6 +1858,14 @@ export class TuiProgress implements ProgressUI {
       fg(theme.dim)(`↑${formatCount(usage.tokens.input)} ↓${formatCount(usage.tokens.output)} tokens`),
     ]
     const title: TextChunk[] = [bold(fg(theme.accent)("◆ convoy"))]
+    if (!this.finished && this.controlState !== "running") {
+      title.push(
+        fg(theme.faint)("  ·  "),
+        bold(fg(this.controlState === "paused" ? theme.yellow : theme.cyan)(
+          this.controlState === "paused" ? "paused · p resume" : `pausing · ${this.controlActivePhases} active`,
+        )),
+      )
+    }
     if (this.finished) {
       title.push(
         fg(theme.faint)("  ·  "),
@@ -2242,7 +2288,7 @@ export class TuiProgress implements ProgressUI {
     const maxScroll = Math.max(0, lines.length - visible)
     view.scroll = Math.max(0, Math.min(view.scroll, maxScroll))
     const position = scrollPosition(view.scroll, maxScroll) || "all"
-    const copy = view.copyStatus === "copied" ? " · copied" : view.copyStatus === "unavailable" ? " · clipboard unavailable" : ""
+    const copy = clipboardStatusLabel(view.copyStatus)
     const label = view.tab === "reports" ? "report" : view.tab
     const copyHint = view.tab === "reports" ? " · c copy" : ""
     this.reportOverlay.title = ` ${label} · ${view.phase} · ↑/↓ scroll${copyHint} · v/esc close · ${position}${copy} `
@@ -2597,7 +2643,9 @@ export class TuiProgress implements ProgressUI {
           fg(theme.accent)("o"),
           fg(theme.dim)("] session · ["),
           fg(theme.accent)("i"),
-          fg(theme.dim)("] interactive · "),
+          fg(theme.dim)("] interactive · ["),
+          fg(theme.accent)("p"),
+          fg(theme.dim)(this.controlState === "running" ? "] pause · " : "] resume · "),
           fg(theme.yellow)("ctrl+c"),
           fg(theme.dim)(" abort"),
         ]
