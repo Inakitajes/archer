@@ -39,11 +39,12 @@ export function nativeClipboardCommand(platform: NodeJS.Platform, which: (comman
 /** Dynamic OSC52 writer; unlike OpenTUI 0.3.0 it does not truncate at a 1 KiB native buffer. */
 export function writeClipboardOSC52(text: string, output: Pick<NodeJS.WriteStream, "write" | "isTTY"> = process.stdout): boolean {
   if (!output.isTTY) return false
-  try {
-    return output.write(`\u001b]52;c;${Buffer.from(text, "utf8").toString("base64")}\u0007`)
-  } catch {
-    return false
-  }
+  // A false return from write() is backpressure — the payload was accepted and
+  // still flushes — never a transport failure. Only a synchronous throw (which
+  // copyReportToClipboard maps to "transport-failed") means the terminal
+  // couldn't receive the sequence.
+  output.write(`\u001b]52;c;${Buffer.from(text, "utf8").toString("base64")}\u0007`)
+  return true
 }
 
 async function runNativeClipboard(command: string[], text: string): Promise<boolean> {

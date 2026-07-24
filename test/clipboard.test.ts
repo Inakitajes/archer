@@ -66,4 +66,14 @@ describe("report clipboard", () => {
     expect(writes[0]?.startsWith("\u001b]52;c;")).toBeTrue()
     expect(writes[0]?.endsWith("\u0007")).toBeTrue()
   })
+
+  test("treats OSC52 backpressure as accepted, a throwing stream as failed, and non-TTY as unsupported", async () => {
+    // write() === false signals backpressure: the payload was accepted and still
+    // flushes, so the copy must report success instead of a false failure.
+    expect(writeClipboardOSC52("x".repeat(64 * 1024), { isTTY: true, write: () => false })).toBeTrue()
+    expect(writeClipboardOSC52("report", { isTTY: false, write: () => true })).toBeFalse()
+    await expect(
+      copyReportToClipboard("report", (text) => writeClipboardOSC52(text, { isTTY: true, write: () => { throw new Error("EPIPE") } }), { env: { SSH_CONNECTION: "host" } }),
+    ).resolves.toBe("transport-failed")
+  })
 })
