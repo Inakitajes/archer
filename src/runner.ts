@@ -1,4 +1,5 @@
-import { mkdir, open, readFile, rm, stat, unlink, writeFile } from "node:fs/promises"
+import { link, mkdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
 import { stdin, stdout } from "node:process"
 import { createInterface } from "node:readline/promises"
@@ -193,19 +194,32 @@ export class RunControl {
     for (const resolve of this.waiters.splice(0)) resolve()
   }
 
-  async awaitRunnable() {
+  async awaitRunnable(signal?: AbortSignal) {
     if (this.state === "running") return
-    await new Promise<void>((resolve) => this.waiters.push(resolve))
+    if (signal?.aborted) throw signal.reason ?? new UserAbortError()
+    await new Promise<void>((resolve, reject) => {
+      const resume = () => {
+        signal?.removeEventListener("abort", abort)
+        resolve()
+      }
+      const abort = () => {
+        const index = this.waiters.indexOf(resume)
+        if (index >= 0) this.waiters.splice(index, 1)
+        reject(signal?.reason ?? new UserAbortError())
+      }
+      this.waiters.push(resume)
+      signal?.addEventListener("abort", abort, { once: true })
+    })
   }
 
-  async checkpointAfterBatch() {
+  async checkpointAfterBatch(signal?: AbortSignal) {
     this.activePhases = 0
     if (this.state === "pausing") {
       this.state = "paused"
       await this.metadata.setControlState("paused")
       this.publish()
     }
-    await this.awaitRunnable()
+    await this.awaitRunnable(signal)
   }
 
   private publish() {
@@ -216,24 +230,33 @@ export class RunControl {
 /** Exclusive per-run lease preventing two coordinators from mutating one pipeline. */
 export async function acquireRunLease(workspace: Workspace): Promise<() => Promise<void>> {
   const path = join(workspace.dir, "coordinator.lock")
-  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const handle = await open(path, "wx")
-      await handle.writeFile(token)
-      await handle.close()
-      return async () => {
-        const current = await readFile(path, "utf8").catch(() => "")
-        if (current === token) await unlink(path).catch(() => undefined)
-      }
-    } catch (error) {
-      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error
-      const owner = Number((await readFile(path, "utf8").catch(() => "")).split(":", 1)[0])
-      if (owner > 0 && processIsAlive(owner)) throw new Error(`run ${workspace.runID} is already controlled by process ${owner}`)
-      await unlink(path).catch(() => undefined)
-    }
+  const token = `${process.pid}:${Date.now()}:${randomUUID()}`
+  // Publish a complete owner record before atomically linking it into the lock
+  // pathname. `open(path, "wx")` exposes an empty lock between creation and
+  // write, letting another coordinator delete it and acquire the same run.
+  const candidate = `${path}.${randomUUID()}.candidate`
+  await writeFile(candidate, token, { encoding: "utf8", mode: 0o600, flag: "wx" })
+  try {
+    await link(candidate, path)
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error
+    const owner = Number((await readFile(path, "utf8").catch(() => "")).split(":", 1)[0])
+    if (owner > 0 && processIsAlive(owner)) throw new Error(`run ${workspace.runID} is already controlled by process ${owner}`)
+    // Never reclaim a lease with a read-then-unlink sequence: two resumptions
+    // can both observe a stale owner and one can remove the other's new lock.
+    // Failing closed preserves exclusive ownership; an operator can remove a
+    // stale lock after verifying no coordinator still owns the run.
+    throw new Error(`run ${workspace.runID} has a stale coordinator lease at ${path}; remove it only after confirming no Convoy coordinator is running`)
+  } finally {
+    await unlink(candidate).catch(() => undefined)
   }
-  throw new Error(`couldn't acquire coordinator lease for run ${workspace.runID}`)
+
+  return async () => {
+    // Cooperating coordinators cannot replace an extant lock, so checking the
+    // token before unlinking cannot race with a newly acquired lease.
+    const current = await readFile(path, "utf8").catch(() => "")
+    if (current === token) await unlink(path).catch(() => undefined)
+  }
 }
 
 function processIsAlive(pid: number): boolean {
@@ -456,7 +479,7 @@ export async function run(options: RunOptions) {
 
     for (const batch of planBatches(pipeline.steps)) {
       shutdown.throwIfRequested()
-      await control.awaitRunnable()
+      await control.awaitRunnable(shutdown.signal)
       const [first] = batch
 
       if (batch.length === 1 && first?.type === "human") {
@@ -464,11 +487,11 @@ export async function run(options: RunOptions) {
         if (shouldSkip(first, options)) {
           progress.phaseSkipped(first.name)
           log.warn(`[${first.name}] skipped by flag`)
-          await control.checkpointAfterBatch()
+          await control.checkpointAfterBatch(shutdown.signal)
           continue
         }
         await runHumanReviewGate(workspace, options, opencode.url, progress, permissions, first.name)
-        await control.checkpointAfterBatch()
+        await control.checkpointAfterBatch(shutdown.signal)
         continue
       }
 
@@ -495,7 +518,7 @@ export async function run(options: RunOptions) {
       const userAbort = results.find((result): result is PromiseRejectedResult => result.status === "rejected" && isUserAbortError(result.reason))
       if (userAbort) throw userAbort.reason
       const failures = results.flatMap((result, index) => (result.status === "rejected" ? [{ name: agentBatch[index]!.name, error: result.reason }] : []))
-      await control.checkpointAfterBatch()
+      await control.checkpointAfterBatch(shutdown.signal)
       if (failures.length > 0) throw new PhaseGroupError(failures)
     }
 

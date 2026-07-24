@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -334,7 +334,7 @@ describe("RunControl", () => {
         state = next
         persisted.push(next)
       },
-    } as RunMetadataStore
+    } as unknown as RunMetadataStore
     const published: string[] = []
     const control = new RunControl(metadata)
     control.bind({ ...noopProgress, runControlState: (next, active) => published.push(`${next}:${active}`) })
@@ -354,6 +354,20 @@ describe("RunControl", () => {
     expect(published).toContain("pausing:2")
     expect(passed).toBeTrue()
   })
+
+  test("unblocks a paused checkpoint when the run is aborted", async () => {
+    const metadata = {
+      controlState: () => "running" as const,
+      setControlState: async () => {},
+    } as unknown as RunMetadataStore
+    const control = new RunControl(metadata)
+    const shutdown = new AbortController()
+
+    await control.requestPause()
+    const checkpoint = control.checkpointAfterBatch(shutdown.signal)
+    shutdown.abort(new UserAbortError("test shutdown"))
+    await expect(checkpoint).rejects.toThrow("test shutdown")
+  })
 })
 
 describe("run coordinator lease", () => {
@@ -367,6 +381,30 @@ describe("run coordinator lease", () => {
     await release()
     const releaseAgain = await acquireRunLease(workspace)
     await releaseAgain()
+  })
+
+  test("fails closed for an incomplete or stale lease instead of deleting it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-lease-"))
+    recoveryDirs.push(dir)
+    const workspace = { dir, runID: "lease-test" }
+    const path = join(dir, "coordinator.lock")
+
+    await writeFile(path, "")
+    await expect(acquireRunLease(workspace)).rejects.toThrow("stale coordinator lease")
+    expect(await readFile(path, "utf8")).toBe("")
+  })
+
+  test("does not release another coordinator's lock", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-lease-"))
+    recoveryDirs.push(dir)
+    const workspace = { dir, runID: "lease-test" }
+    const path = join(dir, "coordinator.lock")
+    const release = await acquireRunLease(workspace)
+
+    await unlink(path)
+    await writeFile(path, "other-coordinator")
+    await release()
+    expect(await readFile(path, "utf8")).toBe("other-coordinator")
   })
 })
 
