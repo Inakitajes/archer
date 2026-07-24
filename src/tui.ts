@@ -68,6 +68,7 @@ import type {
   ProgressTokens,
   ProgressUI,
   ProgressUsage,
+  RunControlState,
   RunOutcome,
 } from "./progress"
 
@@ -349,7 +350,7 @@ export class TuiProgress implements ProgressUI {
   // a phase finishes so a report written mid-run is picked up on the next view.
   private readonly reports = new Map<string, string[] | "loading" | "missing">()
   private fullscreen?: FullscreenView
-  private controlState: "running" | "pausing" | "paused" = "running"
+  private controlState: RunControlState = "running"
   private controlActivePhases = 0
   // ScrollBarRenderable emits change events for programmatic state updates as
   // well as mouse drags. Ignore the former so a layout recalculation cannot
@@ -1226,7 +1227,7 @@ export class TuiProgress implements ProgressUI {
     return this.iterateRequested
   }
 
-  runControlState(state: "running" | "pausing" | "paused", activePhases: number): void {
+  runControlState(state: RunControlState, activePhases: number): void {
     const previous = this.controlState
     this.controlState = state
     this.controlActivePhases = activePhases

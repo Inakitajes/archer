@@ -323,7 +323,6 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
       progress.phaseFailed(name, detail)
     },
     phaseRestored: (name, snapshot) => progress.phaseRestored(name, snapshot),
-    runControlState: (state, activePhases) => progress.runControlState?.(state, activePhases),
     message: (message) => progress.message(message),
     suspend: () => progress.suspend(),
     resume: () => progress.resume(),
@@ -334,6 +333,7 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
   if (progress.askPermission) recorder.askPermission = progress.askPermission.bind(progress)
   if (progress.askHumanReview) recorder.askHumanReview = progress.askHumanReview.bind(progress)
   if (progress.isInteractiveTakeover) recorder.isInteractiveTakeover = progress.isInteractiveTakeover.bind(progress)
+  if (progress.runControlState) recorder.runControlState = progress.runControlState.bind(progress)
   // Same probing contract: the runner only holds the finish screen when the UI offers one.
   if (progress.runFinished) recorder.runFinished = progress.runFinished.bind(progress)
   if (progress.keepRunDirRequested) recorder.keepRunDirRequested = progress.keepRunDirRequested.bind(progress)

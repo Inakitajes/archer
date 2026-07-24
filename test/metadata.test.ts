@@ -53,6 +53,7 @@ describe("run metadata", () => {
     expect(wrapped.isInteractiveTakeover?.("implementer")).toBeTrue()
     expect(wrapped.isInteractiveTakeover?.("other")).toBeFalse()
     expect(wrapped.keepRunDirRequested?.()).toBeTrue()
+    expect(wrapped.runControlState).toBeUndefined()
   })
 
   test("the first open freezes the pipeline; later opens replay it", async () => {

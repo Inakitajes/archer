@@ -29,6 +29,7 @@ import {
   type ProgressTokens,
   type ProgressUI,
   type ProgressUsage,
+  type RunControlState,
   type RunOutcome,
 } from "./progress"
 import { discoverProjectContextFiles } from "./project-context"
@@ -154,7 +155,7 @@ export class RunShutdown {
 
 /** Cooperative pause controller: an in-flight parallel batch remains atomic. */
 export class RunControl {
-  private state: "running" | "pausing" | "paused"
+  private state: RunControlState
   private activePhases = 0
   private waiters: Array<() => void> = []
   private progress?: ProgressUI
