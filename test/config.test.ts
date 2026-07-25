@@ -25,8 +25,10 @@ import {
 import {
   builtInAgents,
   builtInPipelines,
+  defaultAdversarialModel,
   defaultGptModel,
   defaultGptVariant,
+  defaultImplementerModel,
   defaultImplementReviewModel,
   defaultOpusModel,
   isHumanStepSpec,
@@ -343,7 +345,7 @@ describe("agent registry", () => {
     const design = registry.find((agent) => agent.name === "design-polisher")
     expect(design).toMatchObject({ model: "openai/gpt-5.5#xhigh", temperature: 0.5, readOnly: true, builtIn: true })
     // The built-in preference survives underneath the override.
-    expect(design?.defaultModel).toBe("anthropic/claude-opus-4-8")
+    expect(design?.defaultModel).toBe("anthropic/claude-opus-5")
 
     const custom = registry.find((agent) => agent.name === "api-reviewer")
     expect(custom).toMatchObject({ description: "Reviews APIs", readOnly: true, builtIn: false })
@@ -369,6 +371,14 @@ describe("agent registry", () => {
       "implementation-final-review",
       "implementation-fixer",
       "implementation-validator",
+      "hunter-correctness",
+      "hunter-memory",
+      "hunter-performance",
+      "hunter-security",
+      "hunter-reliability",
+      "hunter-supply-chain",
+      "hunter-report",
+      "hunter-max-report",
     ])
   })
 })
@@ -382,7 +392,7 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: implement, implement-lite, quick, refine, review, review-lite, ultra-implement, ultra-refine)',
+      'unknown pipeline "ghost" (available: hunter, hunter-max, implement, implement-lite, quick, refine, review, review-cc, review-lite, ultra-implement, ultra-refine)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
   })
@@ -580,7 +590,7 @@ describe("serialization", () => {
     expect(template.defaults.model).toBe(`${defaultGptModel}#${defaultGptVariant}`)
     const steps = template.pipelines.implement!.steps
     expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "design")).toEqual({ agent: "design", model: defaultImplementReviewModel })
-    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "adversarial")).toEqual({ agent: "adversarial", model: defaultImplementReviewModel, reports: "all" })
+    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "adversarial")).toEqual({ agent: "adversarial", model: defaultAdversarialModel, reports: "all" })
     const reparsed = parse(serializeConvoyConfig(template))
     expect(reparsed.defaults).toEqual(template.defaults)
     expect(reparsed.pipelines).toEqual(template.pipelines)
@@ -653,12 +663,12 @@ describe("default config init", () => {
       expect(await readFile(join(dir, "agents", `${agent.name}.md`), "utf8")).toContain("#")
     }
     expect(config.pipelines.implement?.steps).toEqual([
-      { agent: "implementer", reports: "none" },
+      { agent: "implementer", model: defaultImplementerModel, reports: "none" },
       "patterns",
       "security",
       { agent: "design", model: defaultImplementReviewModel },
       { agent: "tests", reports: "none" },
-      { agent: "adversarial", model: defaultImplementReviewModel, reports: "all" },
+      { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
     ])
     expect(config.permissions).toEqual({ allow: [], deny: [] })
     expect(config.hooks).toEqual({ pre: [], post: [], pipelines: {} })

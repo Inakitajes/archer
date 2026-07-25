@@ -67,7 +67,7 @@ type StepNode = {
   /** Empty for human gates, which never run concurrently. */
   groupId: string
   kind: "agent" | "human"
-  /** Short model label (e.g. "claude-opus-4-8"); empty for human gates. */
+  /** Short model label (e.g. "claude-opus-5"); empty for human gates. */
   modelLabel: string
 }
 
@@ -230,7 +230,7 @@ export function launcherStepModelLabel(step: Pick<AgentStep, "model" | "variant"
   return runner.id === "opencode" ? shortModelLabel(step.model, step.variant) : runner.modelLabel(step.model)
 }
 
-/** Drops the provider path from a model id so the tree shows "claude-opus-4-8", not "anthropic/claude-opus-4-8#…". */
+/** Drops the provider path from a model id so the tree shows "claude-opus-5", not "anthropic/claude-opus-5#…". */
 function shortModelLabel(model: string, variant?: string): string {
   const base = model.slice(model.lastIndexOf("/") + 1)
   return variant ? `${base} ${variant}` : base

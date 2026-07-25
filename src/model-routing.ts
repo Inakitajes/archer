@@ -21,9 +21,11 @@ export type ResolvedModel = {
 }
 
 const gatewayProviders = new Set(["openrouter", "vercel"])
-const directAliases: Record<string, string> = { "z-ai": "zai" }
-const openRouterAliases: Record<string, string> = { zai: "z-ai" }
-const safelyRoutableProviders = new Set(["openai", "anthropic", "moonshotai", "zai"])
+// OpenRouter dashes some provider names that models.dev spells solid; map both ways so a
+// gateway-wrapped model recovers the same logical identity as its direct equivalent.
+const directAliases: Record<string, string> = { "z-ai": "zai", "x-ai": "xai" }
+const openRouterAliases: Record<string, string> = { zai: "z-ai", xai: "x-ai" }
+const safelyRoutableProviders = new Set(["openai", "anthropic", "moonshotai", "zai", "xai"])
 
 export function isModelGateway(value: unknown): value is ModelGateway {
   return typeof value === "string" && modelGateways.includes(value as ModelGateway)

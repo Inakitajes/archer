@@ -11,7 +11,10 @@ import {
   builtInPipelines,
   defaultGptModel,
   defaultGptVariant,
+  defaultAdversarialModel,
+  defaultImplementerModel,
   defaultImplementReviewModel,
+  defaultOpusModel,
   defaultPipelineName,
   humanStepType,
   humanReviewStep,
@@ -199,7 +202,7 @@ defaults:
 #     model: openai/gpt-5.6-terra#xhigh
 #   design-polisher:
 #     description: Polishes new UI following the repo's design system, without redesigning
-#     model: anthropic/claude-opus-4-8
+#     model: ${defaultOpusModel}
 #     temperature: 0.2
 #   api-reviewer:
 #     description: Reviews API consistency
@@ -213,12 +216,16 @@ defaults:
 #   ultra-refine         like refine, with every audit fanned out across two models
 #   review               report-only: parallel audits across two models plus one prioritized report (no changes)
 #   review-lite          like review, but swaps GPT 5.6 Terra xhigh for GLM 5.2 (scope + audit fan-out); report stays on Opus
+#   review-cc            like review, but pairs each audit with a Claude Code run (needs the \`claude\` CLI on PATH)
+#   hunter               report-only repo audit: six specialty tracks on two models each, then one consensus report
+#   hunter-max           like hunter, with every track fanned across all five models (30 audits — slow and expensive)
 # The default \`implement\` pipeline is inlined below as an editable starting point; redefining a name here overrides the built-in.
 pipelines:
   implement:
     description: Implementation, pattern/security audits, design polish, tests, and adversarial review
     steps:
       - agent: implementer
+        model: ${defaultImplementerModel}
         reports: none
       - patterns
       - security
@@ -227,7 +234,7 @@ pipelines:
       - agent: tests
         reports: none
       - agent: adversarial
-        model: ${defaultImplementReviewModel}
+        model: ${defaultAdversarialModel}
         reports: all
 
 # Optional shell hooks. Top-level hooks run for every pipeline; hooks under

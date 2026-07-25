@@ -3,6 +3,7 @@ import { expect, test } from "bun:test"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import { logicalModel } from "../src/model-routing"
 import { buildRunPlan, routePipeline } from "../src/run-plan"
+import { stepRunnerFor } from "../src/step-runners"
 import type { AgentStep, RunOptions } from "../src/types"
 
 test("the immutable plan filters and freezes exact routed targets", () => {
@@ -67,6 +68,13 @@ test("routing preserves every built-in pipeline's execution structure", () => {
       expect(routedAgents.map(shape)).toEqual(originalAgents.map(shape))
       for (const [index, step] of routedAgents.entries()) {
         const originalStep = originalAgents[index]!
+        // Non-OpenCode runners (review-cc's claude-code steps) carry a CLI alias
+        // like "opus" rather than provider/model, and routing passes them through.
+        if (stepRunnerFor(originalStep.runner).id !== "opencode") {
+          expect(step.model).toBe(originalStep.model)
+          expect(step.resolvedModel).toBeUndefined()
+          continue
+        }
         const configured = `${originalStep.model}${originalStep.variant ? `#${originalStep.variant}` : ""}`
         const recovered = logicalModel(configured)
         const logical = `${recovered.model}${recovered.variant ? `#${recovered.variant}` : ""}`
@@ -76,7 +84,7 @@ test("routing preserves every built-in pipeline's execution structure", () => {
             : gateway === "direct"
               ? logical
               : gateway === "openrouter"
-                ? `openrouter/${logical.replace(/^zai\//, "z-ai/")}`
+                ? `openrouter/${logical.replace(/^zai\//, "z-ai/").replace(/^xai\//, "x-ai/")}`
                 : `vercel/${logical}`
 
         expect(step.resolvedModel?.gateway).toBe(gateway)
