@@ -75,6 +75,11 @@ export class ConfigError extends Error {
   }
 }
 
+/** Canonical form for user-created pipeline names. */
+export function normalizePipelineName(value: string): string {
+  return value.trim().toLowerCase()
+}
+
 const configFileNames = ["config.yaml", "config.yml"]
 
 export async function loadConvoyConfig(targetDir: string): Promise<ConvoyConfig | undefined> {
@@ -105,9 +110,48 @@ export async function loadGlobalConvoyConfig(): Promise<ConvoyConfig | undefined
     } catch {
       continue
     }
-    return parseConvoyConfig(body, `~/.convoy/${fileName}`, convoyRoot())
+    const config = parseConvoyConfig(body, `~/.convoy/${fileName}`, convoyRoot())
+    if (normalizeGlobalPipelineNames(config)) await writeConvoyConfig(path, config, convoyRoot())
+    return config
   }
   return undefined
+}
+
+/**
+ * Migrates pipeline identifiers in the user-level config. Pipeline hooks and
+ * the configured default are references to those identifiers, so move them in
+ * the same transaction.
+ */
+function normalizeGlobalPipelineNames(config: ConvoyConfig): boolean {
+  const pipelines = normalizePipelineKeyRecord(config.pipelines, "pipelines")
+  const hooks = normalizePipelineKeyRecord(config.hooks.pipelines, "hooks.pipelines")
+  const defaultPipeline = config.defaults.pipeline === undefined ? undefined : normalizePipelineName(config.defaults.pipeline)
+  const defaultChanged = defaultPipeline !== config.defaults.pipeline
+
+  if (!pipelines.changed && !hooks.changed && !defaultChanged) return false
+
+  config.pipelines = pipelines.record
+  config.hooks = { ...config.hooks, pipelines: hooks.record }
+  if (defaultPipeline === undefined) delete config.defaults.pipeline
+  else config.defaults.pipeline = defaultPipeline
+  return true
+}
+
+function normalizePipelineKeyRecord<T>(record: Record<string, T>, section: string): { record: Record<string, T>; changed: boolean } {
+  const normalized: Record<string, T> = {}
+  const originalNames = new Map<string, string>()
+  let changed = false
+  for (const [name, value] of Object.entries(record)) {
+    const canonical = normalizePipelineName(name)
+    const original = originalNames.get(canonical)
+    if (original !== undefined) {
+      throw new ConfigError(`${section} contains names "${original}" and "${name}" that collide when lowercased to "${canonical}"`)
+    }
+    normalized[canonical] = value
+    originalNames.set(canonical, name)
+    changed ||= canonical !== name
+  }
+  return { record: normalized, changed }
 }
 
 /**

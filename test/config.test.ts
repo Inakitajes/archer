@@ -627,6 +627,42 @@ describe("global config", () => {
     expect(config?.agents["global-agent"]).toMatchObject({ model: "anthropic/claude-opus-4-7" })
   })
 
+  test("migrates existing global pipeline names and their references to lowercase", async () => {
+    const home = await globalHome()
+    await writeFile(
+      join(home, "config.yaml"),
+      [
+        "defaults:",
+        "  pipeline: Deploy-Prod",
+        "pipelines:",
+        "  Deploy-Prod:",
+        "    steps:",
+        "      - implementer",
+        "hooks:",
+        "  pipelines:",
+        "    Deploy-Prod:",
+        "      pre:",
+        "        - echo deploy",
+      ].join("\n"),
+    )
+
+    const config = await loadGlobalConvoyConfig()
+    expect(config?.defaults.pipeline).toBe("deploy-prod")
+    expect(config?.pipelines["deploy-prod"]?.steps).toEqual(["implementer"])
+    expect(config?.hooks.pipelines["deploy-prod"]?.pre).toEqual([{ command: "echo deploy" }])
+
+    const persisted = await readFile(join(home, "config.yaml"), "utf8")
+    expect(persisted).toContain("deploy-prod:")
+    expect(persisted).not.toContain("Deploy-Prod")
+  })
+
+  test("rejects global pipeline names that collide when lowercased", async () => {
+    const home = await globalHome()
+    await writeFile(join(home, "config.yaml"), "pipelines:\n  Deploy:\n    steps:\n      - implementer\n  deploy:\n    steps:\n      - tests\n")
+
+    await expect(loadGlobalConvoyConfig()).rejects.toThrow('pipelines contains names "Deploy" and "deploy" that collide when lowercased to "deploy"')
+  })
+
   test("merges global under project so the project wins", async () => {
     const home = await globalHome()
     await writeFile(join(home, "config.yaml"), "defaults:\n  model: openai/gpt-5.5#xhigh\n  maxAttempts: 9\n")

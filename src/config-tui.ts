@@ -11,6 +11,7 @@ import {
   loadGlobalConvoyConfig,
   materializePipelineSpec,
   mergeConvoyConfigs,
+  normalizePipelineName,
   writeConvoyConfig,
   type ConvoyConfig,
   type ConvoyDefaults,
@@ -1066,13 +1067,13 @@ export class ConfigEditor {
     if (!config) return
     this.openInput("new pipeline name", "", "lowercase name, e.g. quick", {
       validate: (value) => {
-        const name = value.trim()
+        const name = normalizePipelineName(value)
         if (!name) return "name can't be empty"
         if (config.pipelines[name]) return `pipeline "${name}" already exists`
         return undefined
       },
       commit: (value) => {
-        const name = value.trim()
+        const name = normalizePipelineName(value)
         config.pipelines[name] = { steps: ["implementer"] }
         this.expanded.add(this.expandKey(name))
         this.markDirty()
