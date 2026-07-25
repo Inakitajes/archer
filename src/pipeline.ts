@@ -3,8 +3,7 @@ import type { AgentSpec, AgentStep, HumanStep, Pipeline, Step, StepRunner } from
 
 export const defaultGptModel = "openai/gpt-5.6-terra"
 export const defaultGptVariant = "xhigh"
-export const defaultOpusModel = "anthropic/claude-opus-4-8"
-export const defaultImplementReviewModel = "openrouter/z-ai/glm-5.2"
+export const defaultOpusModel = "anthropic/claude-opus-5"
 
 const fallbackModel = `${defaultGptModel}#${defaultGptVariant}`
 
@@ -12,6 +11,23 @@ const fallbackModel = `${defaultGptModel}#${defaultGptVariant}`
 const sonnetModel = "openrouter/anthropic/claude-sonnet-5"
 /** Lower-cost replacement for the GPT xhigh phases in the lightweight pipelines. */
 const glmModel = "openrouter/z-ai/glm-5.2"
+/** Opus reached through OpenRouter, so the hunter fan-outs share one provider across every track. */
+const opusViaOpenRouter = "openrouter/anthropic/claude-opus-5"
+/** Remaining specialty models the hunter pipelines fan their audit tracks across. */
+const grokModel = "openrouter/x-ai/grok-4.5"
+const kimiModel = "openrouter/moonshotai/kimi-k3"
+/** GPT 5.6 Sol: the implementation workhorse, and at xhigh the consensus reporter for the review/hunter pipelines. */
+const solModel = "openai/gpt-5.6-sol"
+const solXhighModel = `${solModel}#xhigh`
+
+// Per-step models the built-in `implement` pipeline pins. Exported so `convoy init`'s
+// inlined copy of that pipeline stays in sync with the built-in it claims to mirror.
+export const defaultImplementerModel = solModel
+export const defaultImplementReviewModel = glmModel
+export const defaultAdversarialModel = kimiModel
+
+/** The six specialty audit tracks shared by `hunter` and `hunter-max`; each maps to a `hunter-<track>` agent. */
+const hunterTracks = ["correctness", "memory", "performance", "security", "reliability", "supply-chain"] as const
 
 /** Legacy reserved step keyword: pauses the pipeline for a manual human gate. */
 export const humanReviewStep = "human-review"
@@ -154,6 +170,71 @@ export const builtInAgents: readonly AgentSpec[] = [
     readOnly: true,
     builtIn: true,
   },
+  // hunter / hunter-max: six specialty audit tracks fanned across models, then one consensus report.
+  {
+    name: "hunter-correctness",
+    description: "Finds concrete functional, logic, state-management, and concurrency defects",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  {
+    name: "hunter-memory",
+    description: "Finds memory leaks, retained state, unbounded growth, and resource lifecycle defects",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  {
+    name: "hunter-performance",
+    description: "Finds concrete performance, latency, throughput, and scalability defects",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  {
+    name: "hunter-security",
+    description: "Finds exploitable application-security and privacy vulnerabilities",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  {
+    name: "hunter-reliability",
+    description: "Finds resilience, partial-failure, recovery, and data-integrity defects",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  {
+    name: "hunter-supply-chain",
+    description: "Finds dependency, build, CI/CD, infrastructure, and supply-chain security defects",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  {
+    name: "hunter-report",
+    description: "Validates, deduplicates, attributes, prioritizes, and counts every balanced Hunter finding",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  {
+    name: "hunter-max-report",
+    description: "Validates, deduplicates, attributes, prioritizes, and counts every five-model Hunter Max finding",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
 ]
 
 /** Short names accepted in pipeline steps for the built-in agents. */
@@ -216,16 +297,16 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   implement: {
     description: "Implementation, pattern/security audits, design polish, tests, and adversarial review",
     steps: [
-      { agent: "implementer", reports: "none" },
+      { agent: "implementer", model: defaultImplementerModel, reports: "none" },
       "patterns",
       "security",
       { agent: "design", model: defaultImplementReviewModel },
       { agent: "tests", reports: "none" },
-      { agent: "adversarial", model: defaultImplementReviewModel, reports: "all" },
+      { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
     ],
   },
   "implement-lite": {
-    description: "Like implement, but swaps GPT 5.6 Terra xhigh phases for GLM 5.2 to reduce cost",
+    description: "Like implement, but drops every code-writing phase to GLM 5.2 to reduce cost; design and adversarial run on Opus",
     steps: [
       { agent: "implementer", model: glmModel, reports: "none" },
       { agent: "patterns", model: glmModel },
@@ -313,6 +394,59 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "implementation-validator", name: "validator", model: defaultOpusModel, reports: "all" },
     ],
   },
+  "review-cc": {
+    description:
+      "Report-only PR review: Terra scope, parallel audits on Terra + Claude Code (subscription), then one prioritized findings report. Makes no changes.",
+    steps: [
+      { agent: "review-scope", name: "scope", model: fallbackModel, reports: "none", diff: true },
+      {
+        parallel: [
+          { agent: "clean-code-auditor", name: "clean-code", model: fallbackModel, reports: ["scope"] },
+          { agent: "clean-code-auditor", name: "clean-code-cc", model: "opus", runner: "claude-code", reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", model: fallbackModel, reports: ["scope"] },
+          { agent: "security-reviewer", name: "security-cc", model: "opus", runner: "claude-code", reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", model: fallbackModel, reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs-cc", model: "opus", runner: "claude-code", reports: ["scope"] },
+        ],
+      },
+      { agent: "review-report", name: "report", model: solXhighModel, reports: "all" },
+    ],
+  },
+  hunter: {
+    description:
+      "Balanced report-only audit: Terra plus one specialty model on each of six audit tracks, followed by a Sol xhigh consensus report. Makes no changes.",
+    steps: [
+      {
+        parallel: [
+          { agent: "hunter-correctness", models: [fallbackModel, opusViaOpenRouter], reports: "none", diff: true },
+          { agent: "hunter-memory", models: [fallbackModel, grokModel], reports: "none", diff: true },
+          { agent: "hunter-performance", models: [fallbackModel, grokModel], reports: "none", diff: true },
+          { agent: "hunter-security", models: [fallbackModel, kimiModel], reports: "none", diff: true },
+          { agent: "hunter-reliability", models: [fallbackModel, glmModel], reports: "none", diff: true },
+          { agent: "hunter-supply-chain", models: [fallbackModel, glmModel], reports: "none", diff: true },
+        ],
+      },
+      { agent: "hunter-report", model: solXhighModel, reports: "previous", diff: true },
+    ],
+  },
+  "hunter-max": {
+    description:
+      "Maximum-coverage report-only audit: all five API models on each of six audit tracks, followed by a Sol xhigh consensus report. Makes no changes.",
+    steps: [
+      { parallel: hunterMaxTracks() },
+      { agent: "hunter-max-report", model: solXhighModel, reports: "previous", diff: true },
+    ],
+  },
+}
+
+/** Every hunter-max track runs the same five-model fan-out, so build the six steps instead of repeating the list. */
+function hunterMaxTracks(): AgentStepSpec[] {
+  return hunterTracks.map((track) => ({
+    agent: `hunter-${track}`,
+    models: [fallbackModel, opusViaOpenRouter, glmModel, kimiModel, grokModel],
+    reports: "none",
+    diff: true,
+  }))
 }
 
 /** Splits the `provider/model#variant` shorthand used everywhere a model is configured. */
