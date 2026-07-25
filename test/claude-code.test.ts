@@ -120,7 +120,7 @@ describe("stream-json adapter", () => {
       { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello" } } },
       state,
     )
-    expect(signals[0]).toEqual({ type: "message", message: { channel: "response", text: "Hello" } })
+    expect(signals[0]).toEqual({ type: "message", message: { channel: "response", text: "Hello", partID: "block:0" } })
     expect(signals[1]).toMatchObject({ type: "activity", kind: "write", pulse: true })
     expect(state.textChars).toBe(5)
   })
@@ -131,8 +131,23 @@ describe("stream-json adapter", () => {
       { type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "hmm…" } } },
       state,
     )
-    expect(signals[0]).toEqual({ type: "message", message: { channel: "reasoning", text: "hmm…" } })
+    expect(signals[0]).toEqual({ type: "message", message: { channel: "reasoning", text: "hmm…", partID: "block:0" } })
     expect(signals[1]).toMatchObject({ type: "activity", kind: "think", pulse: true })
+  })
+
+  test("each content block gets its own transcript part so thoughts stay separate", () => {
+    const state = newClaudeStreamState()
+    const start = (type: string) => describeClaudeEvent({ type: "stream_event", event: { type: "content_block_start", content_block: { type } } }, state)
+    const delta = (thinking: string) =>
+      describeClaudeEvent({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking } } }, state)
+
+    start("thinking")
+    const first = delta("Planning the diff scope")
+    start("thinking")
+    const second = delta("Inspecting the rules")
+
+    expect(first[0]).toEqual({ type: "message", message: { channel: "reasoning", text: "Planning the diff scope", partID: "block:1" } })
+    expect(second[0]).toEqual({ type: "message", message: { channel: "reasoning", text: "Inspecting the rules", partID: "block:2" } })
   })
 
   test("assistant messages contribute one-line tool markers only (text already streamed)", () => {

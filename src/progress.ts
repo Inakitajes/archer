@@ -71,8 +71,12 @@ export type ProgressMessageChannel = "reasoning" | "response" | "tool" | "bash"
  * "reasoning"/"response" the `text` is an incremental delta appended to the
  * open block of that channel; for "tool"/"bash" it is one complete action
  * marker (a tool call or shell command) forming its own line.
+ *
+ * `partID` identifies the provider-side block the delta belongs to. A change of
+ * partID closes the open transcript block, so the separate reasoning summaries a
+ * model emits stay separate thoughts instead of concatenating into one paragraph.
  */
-export type ProgressMessage = { channel: ProgressMessageChannel; text: string }
+export type ProgressMessage = { channel: ProgressMessageChannel; text: string; partID?: string }
 
 export type ProgressDiffSummary = {
   files: number

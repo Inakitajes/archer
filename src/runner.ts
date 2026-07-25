@@ -1320,6 +1320,11 @@ type ActivityState = {
   lastServerEvent: number
   messageUsage: Map<string, { cost: number; tokens: ProgressTokens }>
   messagePartChannels: Map<string, "reasoning" | "response">
+  // Counters behind the synthetic part IDs for the session.next.* stream, which
+  // carries no part identity of its own: each reasoning/text burst gets its own
+  // transcript block instead of merging into the one before it.
+  reasoningPart: number
+  textPart: number
   usageSignature: string
 }
 
@@ -1560,6 +1565,8 @@ export function newActivityState(): ActivityState {
     lastServerEvent: Date.now(),
     messageUsage: new Map(),
     messagePartChannels: new Map(),
+    reasoningPart: 0,
+    textPart: 0,
     usageSignature: "",
   }
 }
@@ -1687,15 +1694,24 @@ export function describeMessageChunk(payload: unknown, state?: ActivityState): P
       const text = rawString(properties.delta)
       if (!text || properties.field !== "text") return undefined
       const partID = rawString(properties.partID)
-      return { channel: state?.messagePartChannels.get(partID) ?? "response", text }
+      return { channel: state?.messagePartChannels.get(partID) ?? "response", text, ...(partID ? { partID } : {}) }
     }
+    // The session.next.* stream has no part IDs, so each burst is numbered here:
+    // a model that emits several reasoning summaries in a row sends one
+    // started/delta…/ended cycle per summary, and the counter keeps them apart.
+    case "session.next.reasoning.started":
+      if (state) state.reasoningPart++
+      return undefined
+    case "session.next.text.started":
+      if (state) state.textPart++
+      return undefined
     case "session.next.reasoning.delta": {
       const text = rawString(properties.delta)
-      return text ? { channel: "reasoning", text } : undefined
+      return text ? { channel: "reasoning", text, partID: `reasoning:${state?.reasoningPart ?? 0}` } : undefined
     }
     case "session.next.text.delta": {
       const text = rawString(properties.delta)
-      return text ? { channel: "response", text } : undefined
+      return text ? { channel: "response", text, partID: `text:${state?.textPart ?? 0}` } : undefined
     }
     case "session.next.tool.called":
       return { channel: "tool", text: describeToolCall(properties) }

@@ -214,10 +214,12 @@ describe("runner helpers", () => {
     expect(describeMessageChunk({ type: "session.next.reasoning.delta", properties: props({ delta: "let me check " }) })).toEqual({
       channel: "reasoning",
       text: "let me check ",
+      partID: "reasoning:0",
     })
     expect(describeMessageChunk({ type: "session.next.text.delta", properties: props({ delta: long }) })).toEqual({
       channel: "response",
       text: long,
+      partID: "text:0",
     })
 
     // Tool calls and shell commands become one-line action markers.
@@ -237,6 +239,7 @@ describe("runner helpers", () => {
     expect(describeMessageChunk({ type: "message.part.delta", properties: props({ field: "text", partID: "part_1", delta: "hello" }) }, state)).toEqual({
       channel: "response",
       text: "hello",
+      partID: "part_1",
     })
 
     // message.part.updated teaches the transcript whether later deltas belong
@@ -245,6 +248,7 @@ describe("runner helpers", () => {
     expect(describeMessageChunk({ type: "message.part.delta", properties: props({ field: "text", partID: "part_2", delta: "thinking" }) }, state)).toEqual({
       channel: "reasoning",
       text: "thinking",
+      partID: "part_2",
     })
 
     // Empty deltas and everything else (usage, todos, heartbeats) are not
@@ -252,6 +256,30 @@ describe("runner helpers", () => {
     expect(describeMessageChunk({ type: "session.next.text.delta", properties: props({ delta: "" }) })).toBeUndefined()
     expect(describeMessageChunk({ type: "message.part.delta", properties: props({ field: "metadata", partID: "part_1", delta: "ignored" }) }, state)).toBeUndefined()
     expect(describeMessageChunk({ type: "session.status", properties: props({ status: { type: "busy" } }) })).toBeUndefined()
+  })
+
+  test("numbers each reasoning and response burst so summaries stay separate blocks", () => {
+    const props = (properties: Record<string, unknown>) => properties
+    const state = newActivityState()
+
+    // Successive reasoning summaries arrive as their own started/delta cycles;
+    // without distinct part IDs the transcript would glue them into one
+    // paragraph ("…scope inspectionInspecting rules…").
+    expect(describeMessageChunk({ type: "session.next.reasoning.started", properties: props({}) }, state)).toBeUndefined()
+    const first = describeMessageChunk({ type: "session.next.reasoning.delta", properties: props({ delta: "Planning diff scope" }) }, state)
+    describeMessageChunk({ type: "session.next.reasoning.started", properties: props({}) }, state)
+    const second = describeMessageChunk({ type: "session.next.reasoning.delta", properties: props({ delta: "Inspecting rules" }) }, state)
+
+    expect(first).toEqual({ channel: "reasoning", text: "Planning diff scope", partID: "reasoning:1" })
+    expect(second).toEqual({ channel: "reasoning", text: "Inspecting rules", partID: "reasoning:2" })
+
+    // Response bursts are numbered on their own counter.
+    describeMessageChunk({ type: "session.next.text.started", properties: props({}) }, state)
+    expect(describeMessageChunk({ type: "session.next.text.delta", properties: props({ delta: "answer" }) }, state)).toEqual({
+      channel: "response",
+      text: "answer",
+      partID: "text:1",
+    })
   })
 
   test("restores on resume only when the phase didn't fail", async () => {

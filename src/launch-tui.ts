@@ -163,11 +163,12 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
 
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
+  // No targetFps: it only applies while opentui's own loop runs, which convoy
+  // never starts — frames come on demand, paced by the ticker below.
   const renderer = await createCliRenderer({
     screenMode: "alternate-screen",
     consoleMode: "console-overlay",
     exitOnCtrlC: false,
-    targetFps: 12,
   })
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
@@ -266,6 +267,9 @@ class LaunchPicker {
   }
 
   private readonly ticker: ReturnType<typeof setInterval>
+  // When the screen was last rebuilt, so the ticker can hold its old 250ms pace
+  // while nothing is animating.
+  private lastRenderAt = 0
   private readonly stopLimits: () => void
   private limits?: LimitsSnapshot
   private readonly headerText: TextRenderable
@@ -489,7 +493,12 @@ class LaunchPicker {
     renderer.keyInput.on("paste", this.handlePaste)
     renderer.on("theme_mode", this.handleThemeMode)
 
-    this.ticker = setInterval(() => this.render(), 250)
+    // Faster than the spinner's 100ms step while a loading modal is up, so its
+    // rotation is painted frame by frame instead of sampled late; otherwise the
+    // old 250ms clock/meters cadence.
+    this.ticker = setInterval(() => {
+      if (this.modal?.kind === "loading" || Date.now() - this.lastRenderAt >= 250) this.render()
+    }, 80)
     this.stopLimits = startLimitsPoller((snapshot) => {
       this.limits = snapshot
     })
@@ -825,6 +834,7 @@ class LaunchPicker {
 
   private render() {
     if (this.renderer.isDestroyed) return
+    this.lastRenderAt = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const reviewing = this.mode === "review"
     // The Review step owns the whole screen: the pipeline list would only

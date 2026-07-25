@@ -41,11 +41,12 @@ const dateColumnWidth = 12 // "10 Jun 12:00"
 export async function browseRunsTui(runs: RunEntry[], initialIndex: number): Promise<RunsResolution> {
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
+  // No targetFps: it only applies while opentui's own loop runs, which convoy
+  // never starts — frames come on demand from requestRender.
   const renderer = await createCliRenderer({
     screenMode: "alternate-screen",
     consoleMode: "console-overlay",
     exitOnCtrlC: false,
-    targetFps: 12,
   })
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))

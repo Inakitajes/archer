@@ -23,6 +23,9 @@ type DashboardInternals = {
   fullscreenScrollbar: { visible: boolean; scrollSize: number; viewportSize: number; slider: { value: number } }
   reportOverlay: { title: string }
   feed: Array<{ message: string }>
+  dirty: boolean
+  lastRenderAt: number
+  animationTick(): void
   handleFullscreenKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
   handleNavKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
   handleFullscreenWheel(event: {
@@ -240,6 +243,89 @@ describe("dashboard content selection", () => {
       expect(internals.feedText.plainText).toContain("Report\n\n• result")
       expect(internals.feedText.plainText).not.toContain("## Report")
       expect(internals.feedText.plainText).not.toContain("`result`")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("the animation ticker repaints running spinners and idles otherwise", async () => {
+    const { dashboard } = await createDashboard()
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+
+      // Nothing started: no spinner on screen, so a tick right after a repaint
+      // does nothing (the 1 Hz clock fallback is the only other repaint).
+      internals.dirty = false
+      internals.lastRenderAt = Date.now()
+      internals.animationTick()
+      expect(Date.now() - internals.lastRenderAt).toBeLessThan(50)
+      const idleAt = internals.lastRenderAt
+
+      // A running phase animates a spinner, so every tick repaints it.
+      dashboard.phaseStarted("implement")
+      internals.dirty = false
+      internals.lastRenderAt = 0
+      internals.animationTick()
+      expect(internals.lastRenderAt).toBeGreaterThanOrEqual(idleAt)
+
+      // The finish screen is frozen: no spinners, no clock, no repaints. Its
+      // promise only settles when the reader quits, so it is not awaited here.
+      dashboard.phaseCompleted("implement")
+      void dashboard.runFinished?.({ status: "completed", runDir: "/run" })
+      await Bun.sleep(0)
+      internals.dirty = false
+      const frozenAt = internals.lastRenderAt - 10_000
+      internals.lastRenderAt = frozenAt
+      internals.animationTick()
+      expect(internals.lastRenderAt).toBe(frozenAt)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("separate reasoning summaries stay separate bullets under one label", async () => {
+    const { dashboard, renderOnce } = await createDashboard()
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      dashboard.phaseStarted("implement")
+      // Each summary is its own provider part; merging them would read as
+      // "…diff scope inspectionInspecting rules…".
+      dashboard.phaseMessage("implement", { channel: "reasoning", text: "Planning diff scope inspection", partID: "reasoning:1" })
+      dashboard.phaseMessage("implement", { channel: "reasoning", text: "Inspecting rules", partID: "reasoning:2" })
+      dashboard.phaseMessage("implement", { channel: "reasoning", text: " and loading skills", partID: "reasoning:2" })
+      dashboard.phaseMessage("implement", { channel: "response", text: "done", partID: "text:1" })
+      dashboard.phaseActivity("implement", "streamed")
+      await renderOnce()
+
+      const text = internals.feedText.plainText
+      expect(text).toContain("· Planning diff scope inspection")
+      // Deltas of the same part still concatenate into one bullet.
+      expect(text).toContain("· Inspecting rules and loading skills")
+      expect(text).not.toContain("inspectionInspecting")
+      // One label for the whole reasoning stretch, then the response block.
+      expect(text.match(/reasoning/g)).toHaveLength(1)
+      expect(text).toContain("response")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("re-wraps memoized transcript lines when the panel width changes", async () => {
+    const { dashboard, renderOnce, resize } = await createDashboard(200, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      dashboard.phaseStarted("implement")
+      dashboard.phaseMessage("implement", { channel: "reasoning", text: "wrap ".repeat(30).trim(), partID: "reasoning:1" })
+      dashboard.phaseActivity("implement", "streamed")
+      await renderOnce()
+      const wide = internals.feedText.plainText.split("\n").filter((line) => line.includes("wrap")).length
+
+      resize(90, 40)
+      dashboard.phaseActivity("implement", "still streaming")
+      await renderOnce()
+      const narrow = internals.feedText.plainText.split("\n").filter((line) => line.includes("wrap")).length
+
+      expect(narrow).toBeGreaterThan(wide)
     } finally {
       dashboard.stop()
     }

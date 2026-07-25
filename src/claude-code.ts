@@ -76,10 +76,14 @@ export type ClaudeSignal =
 export type ClaudeStreamState = {
   reasoningChars: number
   textChars: number
+  // Counts content blocks across the whole stream so each thinking/text block
+  // becomes its own transcript block: consecutive thinking blocks are separate
+  // thoughts, not one run-on paragraph.
+  block: number
 }
 
 export function newClaudeStreamState(): ClaudeStreamState {
-  return { reasoningChars: 0, textChars: 0 }
+  return { reasoningChars: 0, textChars: 0, block: 0 }
 }
 
 /**
@@ -97,19 +101,20 @@ export function describeClaudeEvent(event: unknown, state: ClaudeStreamState): C
   }
 
   if (record.type === "stream_event") {
+    if (eventType(record.event) === "content_block_start") state.block++
     const delta = deltaOf(record.event)
     if (!delta) return []
     if (delta.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
       state.textChars += delta.text.length
       return [
-        { type: "message", message: { channel: "response", text: delta.text } },
+        { type: "message", message: { channel: "response", text: delta.text, partID: `block:${state.block}` } },
         { type: "activity", message: `responding… (${formatCharCount(state.textChars)} chars)`, kind: "write", pulse: true },
       ]
     }
     if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking.length > 0) {
       state.reasoningChars += delta.thinking.length
       return [
-        { type: "message", message: { channel: "reasoning", text: delta.thinking } },
+        { type: "message", message: { channel: "reasoning", text: delta.thinking, partID: `block:${state.block}` } },
         { type: "activity", message: `thinking… (${formatCharCount(state.reasoningChars)} chars)`, kind: "think", pulse: true },
       ]
     }
@@ -144,6 +149,12 @@ export function describeClaudeEvent(event: unknown, state: ClaudeStreamState): C
   }
 
   return []
+}
+
+function eventType(event: unknown): string {
+  if (!event || typeof event !== "object") return ""
+  const type = (event as Record<string, unknown>).type
+  return typeof type === "string" ? type : ""
 }
 
 function deltaOf(event: unknown): Record<string, unknown> | undefined {

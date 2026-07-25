@@ -211,11 +211,26 @@ type FeedEntry = {
 
 // One contiguous span of a phase's live transcript. Reasoning/response blocks
 // grow as their verbatim deltas arrive; tool/bash blocks are single markers.
-type TranscriptBlock = { channel: ProgressMessageChannel; text: string }
+// `id` is the provider-side part the block came from: deltas only extend the
+// open block while the id matches, so two reasoning summaries never merge into
+// one paragraph. `lines` memoizes the block's wrapped output — every render
+// re-derives the whole transcript, and only the block still streaming changes.
+type TranscriptBlock = {
+  channel: ProgressMessageChannel
+  text: string
+  id?: string
+  lines?: { key: string; value: StyledText[] }
+}
 
 // Keep only the newest slice of a phase's stream in memory: reasoning can run
 // to tens of thousands of characters, and the session tab only ever tails it.
 const transcriptCap = 24_000
+
+// The animation ticker's period. Deliberately shorter than the spinner's 100ms
+// step (see spinnerFrame) so no frame of the rotation is ever skipped; the
+// repaint it drives is cheap because the transcript, report and feed panels
+// memoize their wrapped lines.
+const animationTickMs = 80
 
 type PendingPermission = {
   info: PermissionPromptInfo
@@ -246,11 +261,13 @@ export async function createTuiProgress(
 ): Promise<ProgressUI> {
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
+  // No targetFps: opentui only honours it while its own loop runs (start() /
+  // requestLive()), which convoy never starts — frames come on demand from
+  // requestRender instead, and the cadence is the animation ticker's.
   const renderer = await createCliRenderer({
     screenMode: "alternate-screen",
     consoleMode: "console-overlay",
     exitOnCtrlC: false,
-    targetFps: 12,
   })
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
@@ -297,15 +314,18 @@ export class TuiProgress implements ProgressUI {
   private readonly feed: FeedEntry[] = []
   // The live model transcript per phase (the session tab): verbatim reasoning
   // and response text, interleaved with tool/bash action markers. Streamed in
-  // via phaseMessage and repainted on the ticker, not per delta.
+  // via phaseMessage and repainted on the animation ticker, not per delta.
   private readonly transcripts = new Map<string, TranscriptBlock[]>()
   private readonly ticker: ReturnType<typeof setInterval>
   // Set by scheduleRender(); drained once per opentui frame by flushRender.
   // Collapses a burst of agent events (N parallel phases each streaming) into a
   // single repaint per frame instead of one full rebuild per event.
   private dirty = false
+  // When the screen was last rebuilt, so the animation ticker can idle instead
+  // of repainting a dashboard where nothing moves.
+  private lastRenderAt = 0
   // Subscription meters (GPT windows, OpenRouter credits) polled in the
-  // background; the 250ms ticker just repaints whatever the last poll left.
+  // background; the ticker just repaints whatever the last poll left.
   private readonly stopLimits: () => void
   private limits?: LimitsSnapshot
   private readonly dirText: TextRenderable
@@ -353,6 +373,14 @@ export class TuiProgress implements ProgressUI {
   // Phase reports read lazily from the run dir; the cache entry is dropped when
   // a phase finishes so a report written mid-run is picked up on the next view.
   private readonly reports = new Map<string, string[] | "loading" | "missing">()
+  // Wrapped output for the one report on screen (see wrappedReport) and for the
+  // focused phase's activity feed (see phaseFeedSourceLines). Only one of each
+  // is visible at a time, so a single-entry memo is enough to keep repaints off
+  // the markdown wrapper.
+  private reportLines?: { source: string[]; width: number; value: StyledText[] }
+  private feedLines?: { phase: string; width: number; revision: number; value: StyledText[] }
+  // Bumped by addEvent; keys the feed memo above.
+  private feedRevision = 0
   private fullscreen?: FullscreenView
   private controlState: RunControlState = "running"
   private controlActivePhases = 0
@@ -986,9 +1014,9 @@ export class TuiProgress implements ProgressUI {
     renderer.on("selection", this.handleSelection)
     renderer.on("theme_mode", this.handleThemeMode)
 
-    this.ticker = setInterval(() => this.render(), 250)
+    this.ticker = setInterval(this.animationTick, animationTickMs)
     // Coalesced repaints run here, once per frame, driven by scheduleRender's
-    // requestRender. The ticker still animates the spinner when nothing is dirty.
+    // requestRender. The ticker animates the spinner when nothing is dirty.
     renderer.setFrameCallback(this.flushRender)
     this.stopLimits = startLimitsPoller((snapshot) => {
       this.limits = snapshot
@@ -1062,8 +1090,8 @@ export class TuiProgress implements ProgressUI {
 
   // Appends a raw slice of the model's stream to the phase's transcript.
   // Deliberately does NOT render: text deltas arrive many-per-second, so the
-  // 250ms ticker repaints the session tab instead of paying a layout pass per
-  // delta. Bumping updatedAt keeps the "idle" detector honest between the
+  // animation ticker repaints the session tab instead of paying a layout pass
+  // per delta. Bumping updatedAt keeps the "idle" detector honest between the
   // (throttled) activity summaries.
   phaseMessage(name: string, message: ProgressMessage) {
     const phase = this.findPhase(name)
@@ -1075,10 +1103,15 @@ export class TuiProgress implements ProgressUI {
     }
     const streaming = message.channel === "reasoning" || message.channel === "response"
     const last = blocks[blocks.length - 1]
-    // Consecutive deltas of the same channel are one paragraph; anything else
-    // (a channel switch, or a tool/bash marker) starts a fresh block.
-    if (streaming && last && last.channel === message.channel) last.text += message.text
-    else blocks.push({ channel: message.channel, text: message.text })
+    // Consecutive deltas of the same channel *and* the same provider part are
+    // one paragraph; anything else (a channel switch, the next reasoning
+    // summary, or a tool/bash marker) starts a fresh block.
+    if (streaming && last && last.channel === message.channel && last.id === message.partID) {
+      last.text += message.text
+      last.lines = undefined
+    } else {
+      blocks.push({ channel: message.channel, text: message.text, id: message.partID })
+    }
     capTranscript(blocks)
     phase.updatedAt = Date.now()
   }
@@ -1749,6 +1782,7 @@ export class TuiProgress implements ProgressUI {
 
   private addEvent(phase: string, kind: ActivityKind, message: string) {
     this.lastActivityAt = Date.now()
+    this.feedRevision++
     const entry: FeedEntry = { time: this.lastActivityAt, phase, kind, message: truncate(message, 220) }
     const last = this.feed[this.feed.length - 1]
 
@@ -1776,9 +1810,9 @@ export class TuiProgress implements ProgressUI {
   // frame; flushRender does the one rebuild per frame. This decouples render
   // frequency from event frequency, so N parallel phases streaming events no
   // longer trigger N full-screen rebuilds each. Streamed token deltas already
-  // rely on the same idea via the 250ms ticker (see phaseMessage); this extends
-  // it to every data event. Input handlers still call render() directly for
-  // zero-latency feedback.
+  // rely on the same idea via the animation ticker (see phaseMessage); this
+  // extends it to every data event. Input handlers still call render() directly
+  // for zero-latency feedback.
   private scheduleRender() {
     if (this.renderer.isDestroyed) return
     this.dirty = true
@@ -1791,11 +1825,35 @@ export class TuiProgress implements ProgressUI {
     if (this.dirty) this.render()
   }
 
+  // The animation clock. Data events repaint through the frame callback above;
+  // this exists for what changes without an event — the spinners, the elapsed
+  // clocks, and the transcript text phaseMessage appends silently. It runs
+  // faster than the spinner's own step (see spinnerFrame) so every frame of the
+  // animation is painted once instead of being sampled two or three frames late,
+  // which is what made the spinners look slowed-down. Nothing running means
+  // nothing to animate, so an idle dashboard falls back to a 1 Hz clock tick and
+  // a finished one stops repainting altogether.
+  private readonly animationTick = () => {
+    if (this.renderer.isDestroyed) return
+    if (this.dirty || this.isAnimating()) {
+      this.render()
+      return
+    }
+    if (this.finished) return
+    if (Date.now() - this.lastRenderAt >= 1_000) this.render()
+  }
+
+  private isAnimating() {
+    if (this.finished) return false
+    return this.phases.some((phase) => phase.status === "running")
+  }
+
   private render() {
     // This repaint (frame flush, ticker, or immediate input render) satisfies any
     // pending schedule.
     this.dirty = false
     if (this.renderer.isDestroyed) return
+    this.lastRenderAt = Date.now()
     const now = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const compact = this.usesCompactLayout()
@@ -2309,7 +2367,17 @@ export class TuiProgress implements ProgressUI {
       return [t`${fg(theme.dim)(done ? "this step wrote no report" : "no report yet — it appears once the step finishes")}`]
     }
 
-    return markdownLines(report, Math.max(20, width))
+    return this.wrappedReport(report, Math.max(20, width))
+  }
+
+  // Reports are re-wrapped on every repaint and can run to thousands of lines,
+  // so the result is memoized against the loaded source array — `loadReport`
+  // swaps that reference whenever the file is re-read, invalidating the entry.
+  private wrappedReport(report: string[], width: number): StyledText[] {
+    if (this.reportLines?.source === report && this.reportLines.width === width) return this.reportLines.value
+    const value = markdownLines(report, width)
+    this.reportLines = { source: report, width, value }
+    return value
   }
 
   private renderFullscreenView() {
@@ -2371,6 +2439,14 @@ export class TuiProgress implements ProgressUI {
   }
 
   private phaseFeedSourceLines(phase: PhaseState, width: number): StyledText[] {
+    const memo = this.feedLines
+    if (memo && memo.phase === phase.name && memo.width === width && memo.revision === this.feedRevision) return memo.value
+    const value = this.buildPhaseFeedSourceLines(phase, width)
+    this.feedLines = { phase: phase.name, width, revision: this.feedRevision, value }
+    return value
+  }
+
+  private buildPhaseFeedSourceLines(phase: PhaseState, width: number): StyledText[] {
     const events = this.feed.filter((entry) => entry.phase === phase.name).reverse()
     if (events.length === 0) return [t`${fg(theme.dim)("no activity for this step yet…")}`]
 
@@ -2526,7 +2602,6 @@ export class TuiProgress implements ProgressUI {
   }
 
   private sessionSourceLines(phase: PhaseState, width: number): StyledText[] {
-
     const blocks = this.transcripts.get(phase.name) ?? []
     if (blocks.length === 0) {
       const hint =
@@ -2541,11 +2616,17 @@ export class TuiProgress implements ProgressUI {
     const running = phase.status === "running"
     const lines: StyledText[] = []
     blocks.forEach((block, index) => {
-      if (index > 0) lines.push(plain(""))
+      // A run of same-channel blocks is one stretch of thinking (or one answer)
+      // split into provider parts: it carries a single channel label, and the
+      // parts read as separate items under it.
+      const continues = index > 0 && blocks[index - 1]!.channel === block.channel
+      // Reasoning bullets stay tight under their label; everything else keeps a
+      // blank line between blocks.
+      if (index > 0 && !(continues && block.channel === "reasoning")) lines.push(plain(""))
       // A blinking-style cursor trails the final block only while it's still
       // being written, so you can see the stream is live.
       const live = running && index === blocks.length - 1
-      lines.push(...transcriptBlockLines(block, width, live))
+      lines.push(...transcriptBlockLines(block, width, live, !continues))
     })
     return lines
   }
@@ -2814,6 +2895,7 @@ function capTranscript(blocks: TranscriptBlock[]) {
     const excess = total - transcriptCap
     if (first.text.length > excess) {
       first.text = first.text.slice(excess)
+      first.lines = undefined
       total -= excess
     } else {
       total -= first.text.length
@@ -2823,10 +2905,23 @@ function capTranscript(blocks: TranscriptBlock[]) {
 }
 
 // Renders one transcript block. Tool/bash markers are a single labelled line;
-// reasoning/response are a channel label followed by the verbatim text,
-// wrapped under a two-space hang. Reasoning is dimmed so the model's actual
-// answer (response) stands out. `live` trails a cursor on the final line.
-function transcriptBlockLines(block: TranscriptBlock, width: number, live: boolean): StyledText[] {
+// reasoning/response are the verbatim text wrapped under a two-space hang,
+// headed by a channel label unless the previous block already carried it
+// (`labelled` is false for the second and later parts of one stretch).
+// Reasoning parts are bulleted — a model emits one summary per part, and run
+// together they read as a single garbled paragraph. Reasoning is dimmed so the
+// model's actual answer (response) stands out. `live` trails a cursor on the
+// final line. Results are memoized on the block: the transcript is re-derived on
+// every repaint, but only the block still streaming ever changes.
+function transcriptBlockLines(block: TranscriptBlock, width: number, live: boolean, labelled: boolean): StyledText[] {
+  const key = `${width}:${live ? 1 : 0}:${labelled ? 1 : 0}:${block.text.length}`
+  if (block.lines?.key === key) return block.lines.value
+  const value = buildTranscriptBlockLines(block, width, live, labelled)
+  block.lines = { key, value }
+  return value
+}
+
+function buildTranscriptBlockLines(block: TranscriptBlock, width: number, live: boolean, labelled: boolean): StyledText[] {
   const cursor: TextChunk[] = live ? [fg(theme.accent)("▌")] : []
 
   if (block.channel === "tool" || block.channel === "bash") {
@@ -2835,10 +2930,30 @@ function transcriptBlockLines(block: TranscriptBlock, width: number, live: boole
   }
 
   const isReasoning = block.channel === "reasoning"
-  const lines: StyledText[] = [
-    new StyledText([fg(isReasoning ? theme.magenta : theme.accent)(isReasoning ? "✻ " : "✎ "), fg(theme.faint)(isReasoning ? "reasoning" : "response")]),
-  ]
+  const lines: StyledText[] = labelled
+    ? [new StyledText([fg(isReasoning ? theme.magenta : theme.accent)(isReasoning ? "✻ " : "✎ "), fg(theme.faint)(isReasoning ? "reasoning" : "response")])]
+    : []
   const bodyColor = isReasoning ? theme.dim : theme.text
+
+  if (isReasoning) {
+    // A part can still hold several summaries when the provider separates them
+    // with blank lines instead of parts, so each paragraph gets its own bullet.
+    const paragraphs = block.text.split(/\n\s*\n/).map((paragraph) => paragraph.trim()).filter(Boolean)
+    if (paragraphs.length === 0) {
+      if (live) lines.push(new StyledText([raw("  "), ...cursor]))
+      return lines
+    }
+    paragraphs.forEach((paragraph, paragraphIndex) => {
+      const rendered = markdownLines(paragraph, Math.max(12, width - 4), bodyColor)
+      rendered.forEach((segment, index) => {
+        const chunks: TextChunk[] = [raw("  "), fg(theme.faint)(index === 0 ? "· " : "  "), ...segment.chunks]
+        if (live && paragraphIndex === paragraphs.length - 1 && index === rendered.length - 1) chunks.push(...cursor)
+        lines.push(new StyledText(chunks))
+      })
+    })
+    return lines
+  }
+
   const rendered = markdownLines(block.text, Math.max(12, width - 2), bodyColor)
   if (rendered.length === 0) {
     if (live) lines.push(new StyledText([raw("  "), ...cursor]))

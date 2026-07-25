@@ -156,6 +156,9 @@ export class ConfigEditor {
   private rows: Row[] = []
 
   private readonly ticker: ReturnType<typeof setInterval>
+  // When the screen was last rebuilt, so the ticker can hold its old 250ms pace
+  // while nothing is animating.
+  private lastRenderAt = 0
   private readonly headerText: TextRenderable
   private readonly listText: TextRenderable
   private readonly detailText: TextRenderable
@@ -284,7 +287,13 @@ export class ConfigEditor {
     renderer.keyInput.on("keypress", this.handleKeyPress)
     renderer.on("theme_mode", this.handleThemeMode)
 
-    this.ticker = setInterval(() => this.render(), 250)
+    // Faster than the spinner's 100ms step while the model list is loading, so
+    // its rotation is painted frame by frame instead of sampled late; otherwise
+    // the old 250ms cadence.
+    this.ticker = setInterval(() => {
+      const loading = this.modal?.kind === "model" || this.modal?.kind === "models" ? this.modal.loading : false
+      if (loading || Date.now() - this.lastRenderAt >= 250) this.render()
+    }, 80)
     this.render()
     this.selected = this.firstSelectable()
     this.render()
@@ -1334,6 +1343,7 @@ export class ConfigEditor {
 
   private render() {
     if (this.renderer.isDestroyed) return
+    this.lastRenderAt = Date.now()
     this.rows = this.buildRows()
     if (this.selected >= this.rows.length) this.selected = this.firstSelectable()
     if (!this.rows[this.selected]?.meta) this.selected = this.firstSelectable()
