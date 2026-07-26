@@ -16,7 +16,7 @@ import type { Pipeline, RunOptions } from "./types"
 import { isValidRunID, resumeWorkspace } from "./workspace"
 import { readRunMetadata } from "./metadata"
 import { preflightRunPlan } from "./preflight"
-import type { LaunchRunPreparation, LaunchRunSelection } from "./launch-tui"
+import type { LaunchBranchCheck, LaunchBranchProposal, LaunchRunPreparation, LaunchRunSelection } from "./launch-tui"
 
 /**
  * Flags as written: every scalar stays undefined until the user sets it, so
@@ -130,6 +130,8 @@ async function launchInteractiveRun(targetDir: string) {
   const selection = await launchRunTui({
     targetDir,
     prepareRun: (runSelection) => prepareInteractiveRun(targetDir, runSelection),
+    proposeBranchName: (input) => proposeInteractiveBranchName(targetDir, input),
+    checkBranchName: (name) => checkInteractiveBranchName(targetDir, name),
   })
   if (!selection) return
   if (selection.action === "runs") {
@@ -162,9 +164,9 @@ async function launchInteractiveRun(targetDir: string) {
   })
   if (runSelection.isolateWorktree) {
     const { createIsolatedWorktree } = await import("./worktree")
-    const namer = plan.branchNamer?.model.target
-    if (!namer) throw new Error("worktree plan is missing its branch-namer model")
-    const worktree = await createIsolatedWorktree({ targetDir, prompt: runSelection.prompt, model: namer })
+    const branch = plan.target.branch
+    if (!branch) throw new Error("worktree plan is missing its confirmed branch name")
+    const worktree = await createIsolatedWorktree({ targetDir, branch })
     options = { ...options, targetDir: worktree.dir, includeDirty: false }
     log.info(`running in isolated worktree (branch: ${worktree.branch})`)
     log.info(`  dir: ${worktree.dir}`)
@@ -188,21 +190,35 @@ async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSele
   if (selection.includeDirty) parsed.maxAttempts = 1
 
   let options = { ...(await resolveRunOptions(parsed)), prompt: selection.prompt }
-  // Resolve the branch namer before the review so the exact routed target is
-  // part of the confirmed plan; the AI naming call itself stays behind the
-  // confirmation gate.
-  let branchNameModel: string | undefined
-  if (selection.isolateWorktree) {
-    const { defaultBranchNameModel } = await import("./worktree")
-    const config = await loadMergedConvoyConfig(targetDir)
-    branchNameModel = config?.defaults.branchNameModel ?? defaultBranchNameModel
-  }
+  // The branch was named and confirmed in the launcher's branch step, so the
+  // plan the user reviews already names the branch the run will create.
   const plan = buildRunPlan({
     ...options,
     worktree: Boolean(selection.isolateWorktree),
-    ...(branchNameModel ? { branchNameModel } : {}),
+    ...(selection.branchName ? { branch: selection.branchName } : {}),
+    ...(selection.worktreeDir ? { worktreeDir: selection.worktreeDir } : {}),
   })
   return { options, plan }
+}
+
+/** Asks the configured naming model for a branch name for the launcher's branch step. */
+async function proposeInteractiveBranchName(targetDir: string, input: { prompt: string; guidance?: string }): Promise<LaunchBranchProposal> {
+  const { defaultBranchNameModel, proposeBranchName } = await import("./worktree")
+  const config = await loadMergedConvoyConfig(targetDir)
+  const model = config?.defaults.branchNameModel ?? defaultBranchNameModel
+  const proposal = await proposeBranchName({ ...input, targetDir, model })
+  return { ...proposal, model }
+}
+
+/** Sanitizes a candidate branch name and reports the free name it would take, plus its worktree path. */
+async function checkInteractiveBranchName(targetDir: string, name: string): Promise<LaunchBranchCheck> {
+  const { cleanBranchName, ensureFreeBranchName, worktreeDirFor } = await import("./worktree")
+  // A hand-written name keeps whatever prefix (or none) the user chose; only
+  // the model's proposals are held to the conventional `type/` shape.
+  const cleaned = cleanBranchName(name, { authored: true })
+  if (!cleaned) return { branch: "", dir: "" }
+  const free = await ensureFreeBranchName(cleaned, targetDir)
+  return { branch: free, dir: worktreeDirFor(free), ...(free === cleaned ? {} : { suffixed: true }) }
 }
 
 async function openRunsBrowser(initialRunID?: string) {

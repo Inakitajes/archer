@@ -107,7 +107,7 @@ This leaves `convoy` in `~/.local/bin/convoy` and creates `~/.convoy/config.yaml
 From the root of the target repo, ideally on a working branch:
 
 ```bash
-# interactive launcher: choose a pipeline, enter the prompt, set options, then review
+# interactive launcher: choose a pipeline, enter the prompt, set options, name the branch, then review
 convoy
 
 # inline prompt
@@ -253,7 +253,7 @@ defaults:
   baseRef: main                    # optional; auto-detected when unset (origin default branch, else main/master/develop/trunk, else current branch)
   pipeline: quick                  # pipeline used when -p/--pipeline is not given
   autoAcceptJudgeModel: anthropic/claude-haiku-4-5   # model for smart auto-accept (--smart); defaults to the run's model
-  branchNameModel: anthropic/claude-haiku-4-5        # model that names worktree branches (may look up referenced issues)
+  branchNameModel: anthropic/claude-haiku-4-5        # proposes worktree branch names (may look up referenced issues); you confirm the name
 
 # Project agents: the prompt lives at .convoy/agents/<name>.md (required).
 # Naming a built-in agent here overrides its model/temperature/readOnly instead.
@@ -501,3 +501,14 @@ modelRouting:
 Unknown model namespaces require an explicit override when rerouting; `configured` always remains literal. Authenticate Vercel through `opencode providers login` (choose Vercel AI Gateway) or set `AI_GATEWAY_API_KEY`; Convoy never stores gateway credentials.
 
 Every interactive manual run now displays its fully resolved plan before repository effects. The launcher has a native **Review** step after Options: use Enter or `s` to start, Escape to return to Options, `q` to cancel, arrow/page keys or the mouse wheel to scroll, and `p` to expand the complete prompt. `--plan` prints that plan and exits without creating a run, running hooks, or starting OpenCode. `--no-confirm` prints a compact plan and starts immediately. Non-TTY environments continue automatically after the compact summary.
+
+### Isolating a run in a worktree
+
+The **Isolate in a worktree** option runs Convoy on a new branch checked out under `~/.convoy/worktrees/<branch>`, leaving your current checkout untouched. The branch is always agreed with you first, in a **Branch** step between Options and Review:
+
+- `defaults.branchNameModel` (Haiku by default) reads your prompt and proposes a conventional name — `feat/runtime-guard-limits`, `fix/login-redirect` — always in English, even when the prompt is not. Prompts that only reference an issue (`#123`, `DEV-1339`, a URL) are looked up first, so the branch is named after what the issue is about.
+- The proposed name is shown in an editable field together with the worktree path it would take. Enter accepts it and moves on to Review; nothing is created until you confirm the run there.
+- `tab` moves to the **hint** box: describe how you want it named ("name it after the budget limits") and press Enter or `ctrl+R` to re-name it. This is also what you get when the prompt is too thin to name anything, or when the naming model is unavailable — the step still opens, with a name derived from the prompt, ready to be edited.
+- Names already taken by a branch or an existing worktree are suffixed (`-2`, `-3`) instead of failing `git worktree add` after the run has been confirmed.
+
+The new branch is created from `HEAD`, so it starts from whatever you have checked out.

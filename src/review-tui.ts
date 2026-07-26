@@ -44,15 +44,13 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
 
   rows.push(labelRow("target", [fg(theme.text)(truncate(displayPath(sanitizeReviewInline(plan.target.directory)), value))]))
   rows.push(continuation([fg(theme.dim)(`diff base ${sanitizeReviewInline(plan.target.baseRef)} · ${plan.target.dirty ? "dirty tree included" : "clean tree required"}`)]))
-  rows.push(continuation([fg(theme.dim)(plan.target.worktree ? "worktree and branch created after confirmation" : "runs in the current checkout")]))
-  if (plan.branchNamer) {
-    rows.push(
-      continuation([
-        fg(theme.faint)("branch named by "),
-        fg(theme.text)(truncate(sanitizeReviewInline(plan.branchNamer.model.target), Math.max(8, value - 34))),
-        fg(theme.faint)(" after confirmation"),
-      ]),
-    )
+  if (plan.target.worktree) {
+    rows.push(continuation([fg(theme.faint)("branch "), fg(theme.text)(truncate(sanitizeReviewInline(plan.target.branch ?? "?"), Math.max(8, value - 7)))]))
+    if (plan.target.worktreeDir) {
+      rows.push(continuation([fg(theme.faint)("worktree "), fg(theme.dim)(truncate(displayPath(sanitizeReviewInline(plan.target.worktreeDir)), Math.max(8, value - 9)))]))
+    }
+  } else {
+    rows.push(continuation([fg(theme.dim)("runs in the current checkout")]))
   }
   rows.push(plain(""))
 

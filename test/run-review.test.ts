@@ -49,7 +49,7 @@ test("run review renders untrusted plan fields without terminal or layout inject
 test("review renders the exact target, worktree intent, and routed smart judge", () => {
   const plan: RunPlan = {
     prompt: { source: "file", text: "Audit the checkout flow" },
-    target: { directory: "/repo", baseRef: "main", worktree: true, dirty: false },
+    target: { directory: "/repo", baseRef: "main", worktree: true, dirty: false, branch: "feat/audit-checkout-flow" },
     pipeline: {
       name: "audit",
       steps: [
@@ -96,7 +96,7 @@ test("review renders the exact target, worktree intent, and routed smart judge",
   const detailed = renderRunPlan(plan)
   const compact = renderRunPlan(plan, true)
 
-  expect(detailed).toContain("Worktree: yes (created after confirmation)")
+  expect(detailed).toContain("Worktree: yes · branch feat/audit-checkout-flow")
   expect(detailed).toContain("Logical: openai/gpt-5.6-sol")
   expect(detailed).toContain("Target:  vercel/openai/gpt-5.6-sol")
   expect(detailed).toContain("Judge: vercel/anthropic/claude-haiku-4.5")
@@ -105,22 +105,19 @@ test("review renders the exact target, worktree intent, and routed smart judge",
   expect(compact).not.toContain("Target:  vercel/openai/gpt-5.6-sol")
 })
 
-test("review marks a resume gateway override in every format and shows the routed branch namer", () => {
+test("review marks a resume gateway override in every format and shows the confirmed branch", () => {
   const plan: RunPlan = {
     prompt: { source: "resume", text: "continue the work" },
-    target: { directory: "/repo", baseRef: "main", worktree: true, dirty: false },
+    target: {
+      directory: "/repo",
+      baseRef: "main",
+      worktree: true,
+      dirty: false,
+      branch: "feat/runtime-guard-limits",
+      worktreeDir: "/home/dev/.convoy/worktrees/feat-runtime-guard-limits",
+    },
     pipeline: { name: "implement", steps: [] },
     modelRouting: { gateway: "openrouter" },
-    branchNamer: {
-      model: {
-        configured: "anthropic/claude-haiku-4-5",
-        logical: "anthropic/claude-haiku-4-5",
-        gateway: "openrouter",
-        providerID: "openrouter",
-        modelID: "anthropic/claude-haiku-4-5",
-        target: "openrouter/anthropic/claude-haiku-4-5",
-      },
-    },
     hooks: { pre: [], post: [] },
     attachments: [],
     permissions: "interactive",
@@ -137,8 +134,10 @@ test("review marks a resume gateway override in every format and shows the route
   expect(compact).toContain("Resume gateway override:")
   expect(compact).toContain("pending phases: OpenRouter")
 
-  expect(detailed).toContain("Branch naming: openrouter/anthropic/claude-haiku-4-5 (generated after confirmation)")
-  expect(compact).not.toContain("Branch naming:")
+  expect(detailed).toContain("Worktree: yes · branch feat/runtime-guard-limits")
+  expect(detailed).toContain("Worktree directory: /home/dev/.convoy/worktrees/feat-runtime-guard-limits")
+  expect(compact).toContain("Worktree: yes · branch feat/runtime-guard-limits")
+  expect(compact).not.toContain("Worktree directory:")
 })
 
 test("review can expand the complete sanitized prompt for the launcher", () => {

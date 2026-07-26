@@ -1,3 +1,4 @@
+import { homedir } from "node:os"
 import { basename } from "node:path"
 
 import { BoxRenderable, StyledText, TextRenderable, bg, bold, createCliRenderer, decodePasteBytes, fg, stripAnsiSequences, t } from "@opentui/core"
@@ -30,8 +31,32 @@ export type LaunchRunSelection = {
   gateway: ModelGateway
   /** Worktree creation is intentionally deferred until after plan confirmation. */
   isolateWorktree?: boolean
+  /** The branch confirmed in the branch step; the worktree is created with exactly this name. */
+  branchName?: string
+  /** Where that branch will be checked out. */
+  worktreeDir?: string
   /** Empty repositories are initialized only after the review is confirmed. */
   initializeGit?: boolean
+}
+
+/** A branch name suggested for the run, plus where it came from so the step can say so. */
+export type LaunchBranchProposal = {
+  branch: string
+  /** "model" when the namer answered, "prompt" when it was derived locally, "fallback" for the timestamp. */
+  source: "model" | "prompt" | "fallback"
+  /** Why the model call didn't produce the name; shown as a hint, never as a blocker. */
+  error?: string
+  /** The naming model that was asked, for attribution in the UI. */
+  model?: string
+}
+
+/** Whether a candidate branch name can still be created, and where it would live. */
+export type LaunchBranchCheck = {
+  /** The name after sanitizing plus any collision suffix; may differ from what was passed in. */
+  branch: string
+  dir: string
+  /** Set when the passed name was already taken and had to be suffixed. */
+  suffixed?: boolean
 }
 
 export type LaunchNavigationSelection =
@@ -55,6 +80,10 @@ export type LaunchRunTuiOptions = {
   targetDir: string
   /** Resolves the run without effects so Review and the runner share one frozen plan. */
   prepareRun(selection: LaunchRunSelection): Promise<LaunchRunPreparation>
+  /** Asks the naming model for a branch name. Injected so the launcher stays free of the worktree/opencode modules. */
+  proposeBranchName(input: { prompt: string; guidance?: string }): Promise<LaunchBranchProposal>
+  /** Sanitizes a candidate and reports where it would live, suffixing it when the name is taken. */
+  checkBranchName(name: string): Promise<LaunchBranchCheck>
 }
 
 // One resolved step, flattened for the preview: `groupId` ties concurrent
@@ -101,7 +130,10 @@ type ToggleSpec = {
   description: string
 }
 
-type Mode = "pipelines" | "prompt" | "options" | "review"
+type Mode = "pipelines" | "prompt" | "options" | "branch" | "review"
+
+/** The two editable fields of the branch step. */
+type BranchField = "name" | "guidance"
 
 type Modal =
   | { kind: "message"; title: string; message: string; footer?: string }
@@ -172,7 +204,7 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
   })
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", options.prepareRun).result
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", options).result
 }
 
 function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly AgentSpec[]): PipelineChoice[] {
@@ -256,6 +288,22 @@ class LaunchPicker {
   private reviewTotalLines = 0
   private reviewFullPrompt = false
 
+  // Branch step state. `branchDir` is the worktree path for the current name,
+  // and `branchEdited` flips as soon as the user types: a proposed name may be
+  // auto-suffixed on collision, a hand-written one never is.
+  private branchName = ""
+  /** The prompt the current name was proposed for, so editing the prompt re-names the branch. */
+  private branchPrompt = ""
+  private branchCursor = 0
+  private branchGuidance = ""
+  private branchGuidanceCursor = 0
+  private branchField: BranchField = "name"
+  private branchDir = ""
+  private branchSource: LaunchBranchProposal["source"] | "manual" = "manual"
+  private branchNote = ""
+  private branchError = ""
+  private branchChecking = false
+
   private readonly toggleState: Record<ToggleKey, boolean> = {
     smart: true,
     yolo: false,
@@ -293,11 +341,16 @@ class LaunchPicker {
   }
 
   private readonly handlePaste = (event: PasteEvent) => {
-    if (this.mode !== "prompt") return
+    if (this.mode !== "prompt" && this.mode !== "branch") return
     event.preventDefault()
     event.stopPropagation()
     const text = sanitizePaste(stripAnsiSequences(decodePasteBytes(event.bytes)))
     if (!text) return
+    if (this.mode === "branch") {
+      // Branch fields are single-line; a pasted newline would desync the cursor.
+      this.insertBranchText(text.replace(/\n+/g, " ").trim())
+      return
+    }
     this.insertPromptText(text)
     this.promptError = ""
     this.render()
@@ -342,6 +395,9 @@ class LaunchPicker {
       case "options":
         this.handleOptionsKey(key)
         break
+      case "branch":
+        this.handleBranchKey(key)
+        break
       case "review":
         this.handleReviewKey(key)
         break
@@ -353,7 +409,8 @@ class LaunchPicker {
     private readonly targetDir: string,
     private readonly choices: PipelineChoice[],
     private gateway: ModelGateway,
-    private readonly prepareRun: (selection: LaunchRunSelection) => Promise<LaunchRunPreparation>,
+    // Named `callbacks` rather than `hooks`: this file already uses "hooks" for the pipeline's shell hooks.
+    private readonly callbacks: Pick<LaunchRunTuiOptions, "prepareRun" | "proposeBranchName" | "checkBranchName">,
   ) {
     const defaultIndex = choices.findIndex((choice) => choice.isDefault)
     this.selected = defaultIndex >= 0 ? defaultIndex : 0
@@ -662,6 +719,97 @@ class LaunchPicker {
     }
   }
 
+  private handleBranchKey(key: KeyEvent) {
+    switch (branchActionForKey(key)) {
+      case "next-field":
+        this.branchField = this.branchField === "name" ? "guidance" : "name"
+        this.render()
+        return
+      case "previous-field":
+        this.branchField = this.branchField === "guidance" ? "name" : "guidance"
+        this.render()
+        return
+      case "regenerate":
+        void this.proposeBranch({ guidance: this.branchGuidance })
+        return
+      case "submit":
+        // Enter on the hint box means "name it with this", which is the whole
+        // point of the box when the prompt was too thin to name anything.
+        if (this.branchField === "guidance" && this.branchGuidance.trim()) void this.proposeBranch({ guidance: this.branchGuidance })
+        else void this.acceptBranch()
+        return
+      case "clear":
+        this.setBranchField("")
+        return
+      case "line-start":
+        this.setBranchCursor(0)
+        return
+      case "line-end":
+        this.setBranchCursor(this.branchFieldValue().length)
+        return
+      case "cursor-left":
+        this.setBranchCursor(this.branchFieldCursor() - 1)
+        return
+      case "cursor-right":
+        this.setBranchCursor(this.branchFieldCursor() + 1)
+        return
+      case "delete-back": {
+        const value = this.branchFieldValue()
+        const at = this.branchFieldCursor()
+        if (at > 0) this.setBranchField(value.slice(0, at - 1) + value.slice(at), at - 1)
+        else this.render()
+        return
+      }
+      case "back":
+        this.mode = "options"
+        this.branchError = ""
+        this.render()
+        return
+    }
+
+    const text = typedText(key)
+    if (text) this.insertBranchText(text)
+  }
+
+  private branchFieldValue() {
+    return this.branchField === "name" ? this.branchName : this.branchGuidance
+  }
+
+  private branchFieldCursor() {
+    return this.branchField === "name" ? this.branchCursor : this.branchGuidanceCursor
+  }
+
+  private setBranchField(value: string, cursor = value.length) {
+    if (this.branchField === "name") {
+      this.branchName = value
+      this.branchCursor = clamp(cursor, 0, value.length)
+      // The typed name owns the outcome from here: no silent collision suffix,
+      // and no conventional prefix forced onto it. The proposal's attribution
+      // and its checked path no longer describe what's in the field.
+      this.branchSource = "manual"
+      this.branchDir = ""
+      this.branchNote = ""
+      this.branchError = ""
+    } else {
+      this.branchGuidance = value
+      this.branchGuidanceCursor = clamp(cursor, 0, value.length)
+    }
+    this.render()
+  }
+
+  private setBranchCursor(cursor: number) {
+    const value = this.branchFieldValue()
+    if (this.branchField === "name") this.branchCursor = clamp(cursor, 0, value.length)
+    else this.branchGuidanceCursor = clamp(cursor, 0, value.length)
+    this.render()
+  }
+
+  private insertBranchText(text: string) {
+    const value = this.branchFieldValue()
+    const at = this.branchFieldCursor()
+    this.setBranchField(value.slice(0, at) + text + value.slice(at), at + text.length)
+  }
+
   private handleReviewKey(key: KeyEvent) {
     switch (reviewActionForKey(key)) {
       case "scroll-back":
@@ -694,7 +842,7 @@ class LaunchPicker {
         return
       case "back":
         this.prepared = undefined
-        this.mode = "options"
+        this.mode = this.toggleState.worktree ? "branch" : "options"
         this.reviewScroll = 0
         this.reviewTotalLines = 0
         this.render()
@@ -732,7 +880,95 @@ class LaunchPicker {
       this.render()
       return
     }
+    // Worktree runs stop to agree on a branch name first; everything else goes
+    // straight to the review as before.
+    if (this.toggleState.worktree) {
+      // A name already agreed for this exact prompt is kept; a rewritten prompt
+      // gets a fresh proposal rather than a stale name.
+      if (this.branchName && this.branchPrompt === this.prompt) {
+        this.mode = "branch"
+        this.render()
+        return
+      }
+      void this.proposeBranch({})
+      return
+    }
     void this.prepareReview(choice.name)
+  }
+
+  /**
+   * Asks for a name and lands on the branch step. A failure never blocks: the
+   * step opens with whatever could be derived (or empty), so the user can type
+   * the name or describe it and regenerate.
+   */
+  private async proposeBranch(input: { guidance?: string }) {
+    this.mode = "branch"
+    this.branchField = "name"
+    this.modal = { kind: "loading", title: "naming the branch", message: "Asking the namer for a branch name…" }
+    this.render()
+    try {
+      const proposal = await this.callbacks.proposeBranchName({ prompt: this.prompt, guidance: input.guidance?.trim() || undefined })
+      const checked = await this.callbacks.checkBranchName(proposal.branch)
+      if (!checked.branch) throw new Error("the proposed name had nothing usable in it")
+      this.branchPrompt = this.prompt
+      this.branchName = checked.branch
+      this.branchCursor = checked.branch.length
+      this.branchDir = checked.dir
+      this.branchSource = proposal.source
+      this.branchError = ""
+      this.branchNote = branchProposalNote(proposal, checked)
+    } catch (error) {
+      this.branchName = ""
+      this.branchCursor = 0
+      this.branchDir = ""
+      this.branchSource = "manual"
+      this.branchNote = ""
+      this.branchError = `Couldn't propose a name (${error instanceof Error ? error.message : String(error)}). Write one, or describe it below and press ctrl+R.`
+      this.branchField = "guidance"
+    } finally {
+      this.modal = undefined
+      this.render()
+    }
+  }
+
+  /** Validates the current name and moves on to the review with it frozen in. */
+  private async acceptBranch() {
+    const typed = this.branchName.trim()
+    if (!typed) {
+      this.branchError = "Write a branch name, or describe it below and press ctrl+R."
+      this.render()
+      return
+    }
+    if (this.branchChecking) return
+    this.branchChecking = true
+    try {
+      const checked = await this.callbacks.checkBranchName(typed)
+      if (!checked.branch) {
+        this.branchError = "That name has no usable characters for a git branch."
+        this.render()
+        return
+      }
+      // A hand-written name is never silently renamed: show the free name it
+      // would become and let the next Enter confirm it.
+      if (checked.suffixed && this.branchSource === "manual" && checked.branch !== typed) {
+        this.branchName = checked.branch
+        this.branchCursor = checked.branch.length
+        this.branchDir = checked.dir
+        this.branchError = `"${typed}" already exists — press enter again to use ${checked.branch}.`
+        this.render()
+        return
+      }
+      this.branchName = checked.branch
+      this.branchCursor = checked.branch.length
+      this.branchDir = checked.dir
+      this.branchError = ""
+      await this.prepareReview(this.currentChoice().name)
+    } catch (error) {
+      this.branchError = error instanceof Error ? error.message : String(error)
+      this.render()
+    } finally {
+      this.branchChecking = false
+    }
   }
 
   private async prepareReview(pipelineName: string) {
@@ -742,7 +978,7 @@ class LaunchPicker {
       const { repoBootstrapStatus } = await import("./git")
       const status = await repoBootstrapStatus(this.targetDir)
       const selection = this.runSelection(pipelineName, status !== "ready")
-      const preparation = await this.prepareRun(selection)
+      const preparation = await this.callbacks.prepareRun(selection)
       this.prepared = { action: "run", selection, ...preparation }
       this.mode = "review"
       this.reviewScroll = 0
@@ -770,6 +1006,7 @@ class LaunchPicker {
       smart: this.toggleState.smart,
       gateway: this.gateway,
       isolateWorktree: this.toggleState.worktree,
+      ...(this.toggleState.worktree && this.branchName ? { branchName: this.branchName, worktreeDir: this.branchDir } : {}),
       ...(initializeGit ? { initializeGit: true } : {}),
     }
   }
@@ -897,11 +1134,19 @@ class LaunchPicker {
   private headerContent(width: number) {
     const project = basename(this.targetDir) || this.targetDir
     const title: TextChunk[] = [fg(theme.faint)("target "), bold(fg(theme.text)(truncate(project, Math.max(12, width - 32))))]
+    // The branch step only exists for worktree runs, so the stage row grows and
+    // shrinks with the toggle instead of showing a step that can't be reached.
+    const steps: Array<{ label: string; mode: Mode }> = [
+      { label: "pipeline", mode: "pipelines" },
+      { label: "prompt", mode: "prompt" },
+      { label: "options", mode: "options" },
+      ...(this.toggleState.worktree ? [{ label: "branch", mode: "branch" as Mode }] : []),
+      { label: "review", mode: "review" },
+    ]
     const stage: TextChunk[] = []
-    for (const [index, step] of ["pipeline", "prompt", "options", "review"].entries()) {
+    for (const [index, step] of steps.entries()) {
       if (index > 0) stage.push(fg(theme.faint)(" → "))
-      const active = (this.mode === "pipelines" && index === 0) || (this.mode === "prompt" && index === 1) || (this.mode === "options" && index === 2) || (this.mode === "review" && index === 3)
-      stage.push(active ? bold(fg(theme.accent)(step)) : fg(theme.dim)(step))
+      stage.push(this.mode === step.mode ? bold(fg(theme.accent)(step.label)) : fg(theme.dim)(step.label))
     }
     const line1 = padBetween(title, stage, width)
     return joinLines([line1, limitsRow(this.limits, Date.now(), width)])
@@ -951,6 +1196,8 @@ class LaunchPicker {
         return this.promptDetail(width)
       case "options":
         return this.optionsDetail(width)
+      case "branch":
+        return this.branchDetail(width)
       case "review":
         return this.reviewDetail(width)
     }
@@ -1081,6 +1328,38 @@ class LaunchPicker {
     return joinLines(lines)
   }
 
+  private branchDetail(width: number) {
+    const lines: StyledText[] = []
+    lines.push(new StyledText([fg(theme.faint)("pipeline "), bold(fg(theme.text)(this.currentChoice().name))]))
+    lines.push(plain(""))
+    lines.push(t`${fg(theme.dim)("Name the branch and worktree for this run. Nothing is created until you confirm.")}`)
+    lines.push(plain(""))
+
+    const fieldWidth = Math.max(10, Math.min(width - 2, 60))
+    lines.push(new StyledText([fg(theme.faint)("branch")]))
+    lines.push(...textField(this.branchName, this.branchCursor, fieldWidth, this.branchField === "name", "feat/short-name"))
+
+    if (this.branchDir) {
+      lines.push(new StyledText([fg(theme.faint)("worktree "), fg(theme.dim)(truncate(displayHome(this.branchDir), Math.max(8, width - 9)))]))
+    } else if (this.branchName) {
+      lines.push(new StyledText([fg(theme.faint)("worktree "), fg(theme.dim)("checked when you press enter")]))
+    } else {
+      lines.push(plain(""))
+    }
+    if (this.branchNote) lines.push(new StyledText([fg(theme.faint)(truncate(this.branchNote, width))]))
+    else lines.push(plain(""))
+
+    lines.push(plain(""))
+    lines.push(new StyledText([fg(theme.faint)("hint "), fg(theme.dim)("optional — say how you want it named, then enter")]))
+    lines.push(...textField(this.branchGuidance, this.branchGuidanceCursor, fieldWidth, this.branchField === "guidance", "e.g. name it after the budget limits"))
+
+    if (this.branchError) {
+      lines.push(plain(""))
+      for (const line of wrapWords(this.branchError, width)) lines.push(t`${fg(theme.red)(line)}`)
+    }
+    return joinLines(lines)
+  }
+
   private reviewDetail(width: number) {
     const prepared = this.prepared
     if (!prepared) return joinLines([t`${fg(theme.red)("Unable to load the run review.")}`])
@@ -1122,6 +1401,22 @@ class LaunchPicker {
       return padBetween(
         [fg(theme.dim)("type/paste · "), fg(theme.accent)("shift+enter"), fg(theme.dim)(" newline · "), fg(theme.accent)("enter"), fg(theme.dim)(" options · "), fg(theme.accent)("esc"), fg(theme.dim)(" back")],
         [fg(theme.faint)(`${this.prompt.length} char${this.prompt.length === 1 ? "" : "s"}`)],
+        width,
+      )
+    }
+    if (this.mode === "branch") {
+      return padBetween(
+        [
+          fg(theme.accent)("enter"),
+          fg(theme.dim)(this.branchField === "guidance" ? " name it from the hint · " : " review · "),
+          fg(theme.accent)("tab"),
+          fg(theme.dim)(" field · "),
+          fg(theme.accent)("ctrl+R"),
+          fg(theme.dim)(" rename · "),
+          fg(theme.accent)("esc"),
+          fg(theme.dim)(" options"),
+        ],
+        [fg(theme.faint)(this.branchField === "name" ? "branch" : "hint")],
         width,
       )
     }
@@ -1168,6 +1463,113 @@ class LaunchPicker {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
+}
+
+/** A boxed single-line input, styled like the prompt editor's field. */
+function textField(value: string, cursor: number, width: number, focused: boolean, placeholder: string): StyledText[] {
+  const border = focused ? theme.accent : theme.faint
+  const inner = Math.max(1, width)
+  // Scroll the window so the cursor stays visible in a value longer than the box.
+  const start = Math.max(0, Math.min(cursor - inner + 1, Math.max(0, value.length - inner + 1)))
+  const visible = value.slice(start, start + inner)
+  const column = clamp(cursor - start, 0, inner - 1)
+
+  const chunks: TextChunk[] = [fg(border)("│")]
+  if (!value) {
+    const text = truncate(placeholder, Math.max(0, inner - 1))
+    if (focused) chunks.push(cursorChunk(" "), fg(theme.faint)(text), fg(theme.faint)(" ".repeat(Math.max(0, inner - 1 - text.length))))
+    else chunks.push(fg(theme.faint)(text), raw(" ".repeat(Math.max(0, inner - text.length))))
+  } else if (focused) {
+    const before = visible.slice(0, column)
+    const at = visible[column] ?? " "
+    const after = visible.slice(column + 1)
+    chunks.push(fg(theme.text)(before), cursorChunk(at), fg(theme.text)(after))
+    chunks.push(raw(" ".repeat(Math.max(0, inner - before.length - 1 - after.length))))
+  } else {
+    chunks.push(fg(theme.text)(visible), raw(" ".repeat(Math.max(0, inner - visible.length))))
+  }
+  chunks.push(fg(border)("│"))
+
+  return [
+    new StyledText([fg(border)("┌" + "─".repeat(inner) + "┐")]),
+    new StyledText(chunks),
+    new StyledText([fg(border)("└" + "─".repeat(inner) + "┘")]),
+  ]
+}
+
+/** Attribution line under the branch field: who proposed the name, and whether it had to move. */
+export function branchProposalNote(proposal: LaunchBranchProposal, check: LaunchBranchCheck): string {
+  const origin =
+    proposal.source === "model"
+      ? `proposed by ${proposal.model || "the naming model"}`
+      : proposal.source === "prompt"
+        ? "derived from your prompt (the naming model didn't answer)"
+        : "generic name (nothing to derive it from)"
+  return check.suffixed ? `${origin} · renamed, the original was taken` : origin
+}
+
+function displayHome(path: string): string {
+  const home = homedir()
+  if (path === home) return "~"
+  return path.startsWith(`${home}/`) ? `~/${path.slice(home.length + 1)}` : path
+}
+
+export type BranchAction =
+  | "next-field"
+  | "previous-field"
+  | "regenerate"
+  | "submit"
+  | "clear"
+  | "line-start"
+  | "line-end"
+  | "cursor-left"
+  | "cursor-right"
+  | "delete-back"
+  | "back"
+
+/**
+ * Keyboard contract for the branch step. Plain letters are never bound here —
+ * both fields are text inputs, so anything printable must reach them.
+ */
+export function branchActionForKey(key: Pick<KeyEvent, "name" | "ctrl" | "shift">): BranchAction | undefined {
+  if (key.ctrl) {
+    switch (key.name) {
+      case "r":
+        return "regenerate"
+      case "u":
+        return "clear"
+      case "a":
+        return "line-start"
+      case "e":
+        return "line-end"
+      case "h":
+        return "delete-back"
+    }
+    return undefined
+  }
+  switch (key.name) {
+    case "tab":
+      return key.shift ? "previous-field" : "next-field"
+    // Some terminals report shift+tab as its own key rather than a modifier.
+    case "backtab":
+      return "previous-field"
+    case "return":
+    case "linefeed":
+      return "submit"
+    case "home":
+      return "line-start"
+    case "end":
+      return "line-end"
+    case "left":
+      return "cursor-left"
+    case "right":
+      return "cursor-right"
+    case "backspace":
+      return "delete-back"
+    case "escape":
+      return "back"
+  }
+  return undefined
 }
 
 export type ReviewAction = "scroll-back" | "scroll-forward" | "page-back" | "page-forward" | "top" | "bottom" | "toggle-prompt" | "start" | "back" | "cancel"

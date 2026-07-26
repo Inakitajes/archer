@@ -174,13 +174,22 @@ test("the plan freezes the routed branch namer and marks an explicit resume gate
     hooks: { pre: [], post: [], pipelines: {} },
   }
 
-  const overridden = buildRunPlan({ ...options, promptSource: "resume", resumeGateway: "vercel", branchNameModel: "anthropic/claude-haiku-4-5" })
+  const overridden = buildRunPlan({
+    ...options,
+    promptSource: "resume",
+    resumeGateway: "vercel",
+    worktree: true,
+    branch: "feat/runtime-guard-limits",
+    worktreeDir: "/home/dev/.convoy/worktrees/feat-runtime-guard-limits",
+  })
   expect(overridden.resume).toEqual({ runID: "20260720-135802-5bbh", gatewayOverride: { original: "vercel", pending: "openrouter" } })
-  expect(overridden.branchNamer?.model).toMatchObject({ logical: "anthropic/claude-haiku-4-5", target: "openrouter/anthropic/claude-haiku-4-5" })
-  expect(Object.isFrozen(overridden.branchNamer)).toBe(true)
+  // The branch the user confirmed in the launcher is frozen into the plan.
+  expect(overridden.target.branch).toBe("feat/runtime-guard-limits")
+  expect(overridden.target.worktreeDir).toBe("/home/dev/.convoy/worktrees/feat-runtime-guard-limits")
+  expect(Object.isFrozen(overridden.target)).toBe(true)
 
   // Resuming with the frozen gateway (or no explicit override) leaves no banner.
   const unchanged = buildRunPlan({ ...options, gateway: "vercel", promptSource: "resume", resumeGateway: "vercel" })
   expect(unchanged.resume).toEqual({ runID: "20260720-135802-5bbh" })
-  expect(unchanged).not.toHaveProperty("branchNamer")
+  expect(unchanged.target).not.toHaveProperty("branch")
 })

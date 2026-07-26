@@ -23,7 +23,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     `Prompt: ${plan.prompt.source} · ${prompt.length} characters · ${prompt.split("\n").length} lines`,
     `Target: ${sanitizeInline(plan.target.directory)}`,
     `  Diff base: ${sanitizeInline(plan.target.baseRef)} · working tree: ${plan.target.dirty ? "include dirty" : "clean required"}`,
-    `  Worktree: ${plan.target.worktree ? "yes (created after confirmation)" : "no"}`,
+    `  Worktree: ${plan.target.worktree ? `yes · branch ${sanitizeInline(plan.target.branch ?? "?")}` : "no"}`,
     `Pipeline: ${sanitizeInline(plan.pipeline.name)} · ${plan.pipeline.steps.length} steps`,
     `Gateway: ${gatewayLabel(plan.modelRouting.gateway)}`,
   ]
@@ -41,7 +41,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     )
   }
   if (!compact) {
-    if (plan.branchNamer) lines.push(`Branch naming: ${sanitizeInline(plan.branchNamer.model.target)} (generated after confirmation)`)
+    if (plan.target.worktreeDir) lines.push(`Worktree directory: ${sanitizeInline(plan.target.worktreeDir)}`)
     plan.pipeline.steps.forEach((step, index) => {
       if (step.type === "human") lines.push(`  ${index + 1}. ${sanitizeInline(step.name)} · human gate`)
       else {
