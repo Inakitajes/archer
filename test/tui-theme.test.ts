@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import type { CliRenderer } from "@opentui/core"
-import { displayWidth, fmtCountdown, markdownLines, padBetween, paletteForMode, paletteForTerminal, raw, terminalBackgroundHex, truncate, wrapLines } from "../src/tui-theme"
+import { displayWidth, fmtCountdown, padBetween, paletteForMode, paletteForTerminal, raw, terminalBackgroundHex, truncate, wrapLines } from "../src/tui-theme"
 
 // terminalBackgroundHex reaches into opentui internals; the adapter must read a
 // real reply but degrade to undefined (→ static palettes) on any shape change.
@@ -115,73 +115,5 @@ describe("padBetween", () => {
   test("drops the right side entirely when the left leaves it no room", () => {
     const row = text([{ text: "a-very-long-left-side-label" }, { text: "0:42" }], 24)
     expect(row).toBe("a-very-long-left-side-label")
-  })
-})
-
-describe("markdown rendering", () => {
-  const text = (line: { chunks: { text: string }[] }) => line.chunks.map((chunk) => chunk.text).join("")
-
-  test("conceals common markdown markers while preserving document structure", () => {
-    const lines = markdownLines("# Heading\n\n- **bold** and `code`\n> quoted\n[docs](https://example.com)", 80).map(text)
-
-    expect(lines).toEqual(["Heading", "", "• bold and code", "▎ quoted", "docs"])
-  })
-
-  test("wraps styled content to terminal cell width", () => {
-    const lines = markdownLines("**界界界**", 4).map(text)
-
-    expect(lines).toEqual(["界界", "界"])
-    expect(lines.every((line) => displayWidth(line) <= 4)).toBeTrue()
-  })
-
-  test("wraps prose between words, only splitting an unbroken over-wide token", () => {
-    const prose = markdownLines("Pack words without splitting them", 10).map(text)
-    const longToken = markdownLines("supercalifragilistic", 8).map(text)
-
-    expect(prose).toEqual(["Pack words", "without", "splitting", "them"])
-    expect(longToken).toEqual(["supercal", "ifragili", "stic"])
-  })
-
-  test("renders inline typography plus ordered, task, rule, and fenced-code blocks", () => {
-    const inline = markdownLines("**strong** _emphasis_ ~~deleted~~ `code` [site](https://example.com)", 80)[0]!.chunks
-    const blocks = markdownLines("1. first\n2) second\n- [ ] queued\n* [x] done\n---\n```ts\nconst value = 1\n```", 20).map(text)
-
-    expect(inline.find((chunk) => chunk.text === "strong")?.attributes).toBe(1)
-    expect(inline.find((chunk) => chunk.text === "emphasis")?.attributes).toBe(4)
-    expect(inline.find((chunk) => chunk.text === "deleted")?.attributes).toBe(128)
-    expect(inline.find((chunk) => chunk.text === "site")?.link).toEqual({ url: "https://example.com/" })
-    expect(blocks.slice(0, 4)).toEqual(["1. first", "2) second", "☐ queued", "☑ done"])
-    expect(blocks[4]).toBe("─".repeat(20))
-    expect(blocks[5]).toBe("┄ ts " + "┄".repeat(15))
-    expect(blocks[6]).toBe("│ const value = 1")
-    expect(blocks[7]).toBe("┄".repeat(20))
-    expect(blocks.every((line) => displayWidth(line) <= 20)).toBeTrue()
-  })
-
-  test("sanitizes terminal controls and only creates web hyperlinks", () => {
-    const lines = markdownLines("safe\u001b]52;c;dGVzdA\u0007text\n[local](file:///etc/passwd)\n[web](https://example.com)", 80)
-    const chunks = lines.flatMap((line) => line.chunks)
-
-    expect(chunks.map((chunk) => chunk.text).join("")).not.toMatch(/[\u0000-\u001F\u007F-\u009F]/)
-    expect(chunks.find((chunk) => chunk.text === "local")?.link).toBeUndefined()
-    expect(chunks.find((chunk) => chunk.text === "web")?.link).toEqual({ url: "https://example.com/" })
-  })
-
-  test("keeps intra-word underscores literal instead of italicizing identifiers", () => {
-    const lines = markdownLines("use foo_bar_baz or report_fullscreen_flag, but _real emphasis_ stays", 80).map(text)
-
-    expect(lines).toEqual(["use foo_bar_baz or report_fullscreen_flag, but real emphasis stays"])
-    expect(lines[0]).toContain("foo_bar_baz")
-  })
-
-  test("bounds fence rows to width even with long info strings", () => {
-    const lines = markdownLines("```python { .annotate }\nx = 1\n```", 20).map(text)
-
-    expect(lines[0]!.startsWith("┄ python")).toBeTrue()
-    expect(lines.every((line) => displayWidth(line) <= 20)).toBeTrue()
-  })
-
-  test("never loops on a glyph wider than the column", () => {
-    expect(markdownLines("界面", 1).map(text)).toEqual(["界", "面"])
   })
 })

@@ -17,6 +17,7 @@ import { openClaudeSessionWindow } from "./claude-code"
 import { copyReportToClipboard, writeClipboardOSC52, type ClipboardResult } from "./clipboard"
 import { startLimitsPoller } from "./limits"
 import { log } from "./log"
+import { markdownInlineChunks, markdownLines, parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
 import { openIterateOpencodeWindow, openOpencodeSessionWindow, openStoredSessionWindow, type SessionWindowBackend } from "./opencode"
 import { stepRunnerFor, type StepRunnerId } from "./step-runners"
 import { PhaseUsage, addTokens, emptyTokens } from "./usage"
@@ -26,10 +27,11 @@ import {
   formatElapsed,
   formatMoney,
   formatTime,
+  clipChunks,
   displayWidth,
+  indentStyled,
   joinLines,
   limitsRow,
-  markdownLines,
   padBetween,
   paletteForTerminal,
   plain,
@@ -94,6 +96,10 @@ function kindStyle(kind: ActivityKind): { icon: string; color: string } {
 }
 
 const feedLimit = 100
+// A log message wraps rather than being cut off at one row, but one verbose
+// entry must not push every other event off screen (nor swallow a comparison
+// card's preview), so the tail past this many rows is elided.
+const maxFeedRowsPerEvent = 3
 const contentTabBarRows = 2
 // Side-by-side panels become too cramped around a conventional 80-column
 // terminal, so the dashboard switches to a stacked, single-column layout.
@@ -389,12 +395,15 @@ export class TuiProgress implements ProgressUI {
   // Phase reports read lazily from the run dir; the cache entry is dropped when
   // a phase finishes so a report written mid-run is picked up on the next view.
   private readonly reports = new Map<string, string[] | "loading" | "missing">()
-  // Wrapped output for the one report on screen (see wrappedReport) and for the
-  // focused phase's activity feed (see phaseFeedSourceLines). Only one of each
-  // is visible at a time, so a single-entry memo is enough to keep repaints off
-  // the markdown wrapper.
-  private reportLines?: { source: string[]; width: number; value: StyledText[] }
-  private feedLines?: { phase: string; width: number; revision: number; value: StyledText[] }
+  // Wrapped output for the reports on screen (see wrappedReport) and for each
+  // phase's activity feed (see phaseFeedSourceLines). Keyed rather than single
+  // slots because a selected group renders one card per member on every frame,
+  // and single slots would have the members evicting each other — a miss now
+  // costs a full re-lex, not just a re-wrap. The report memo is keyed on the
+  // source array's identity, which is what `loadReport` swaps to invalidate it,
+  // and holds the parsed document so a resize re-wraps without re-parsing.
+  private readonly reportLines = new WeakMap<string[], { doc: MarkdownDoc; width: number; value: StyledText[] }>()
+  private readonly feedLines = new Map<string, { width: number; revision: number; value: StyledText[] }>()
   // Bumped by addEvent; keys the feed memo above.
   private feedRevision = 0
   private fullscreen?: FullscreenView
@@ -2542,13 +2551,17 @@ export class TuiProgress implements ProgressUI {
     return this.wrappedReport(report, Math.max(20, width))
   }
 
-  // Reports are re-wrapped on every repaint and can run to thousands of lines,
+  // Reports are re-derived on every repaint and can run to thousands of lines,
   // so the result is memoized against the loaded source array — `loadReport`
   // swaps that reference whenever the file is re-read, invalidating the entry.
   private wrappedReport(report: string[], width: number): StyledText[] {
-    if (this.reportLines?.source === report && this.reportLines.width === width) return this.reportLines.value
-    const value = markdownLines(report, width)
-    this.reportLines = { source: report, width, value }
+    const memo = this.reportLines.get(report)
+    if (memo?.width === width) return memo.value
+    // A resize invalidates the wrapping but never the parse, and parsing is the
+    // expensive half, so a drag re-wraps the document it already lexed.
+    const doc = memo?.doc ?? parseMarkdown(report)
+    const value = renderMarkdownDoc(doc, width)
+    this.reportLines.set(report, { doc, width, value })
     return value
   }
 
@@ -2611,10 +2624,10 @@ export class TuiProgress implements ProgressUI {
   }
 
   private phaseFeedSourceLines(phase: PhaseState, width: number): StyledText[] {
-    const memo = this.feedLines
-    if (memo && memo.phase === phase.name && memo.width === width && memo.revision === this.feedRevision) return memo.value
+    const memo = this.feedLines.get(phase.name)
+    if (memo && memo.width === width && memo.revision === this.feedRevision) return memo.value
     const value = this.buildPhaseFeedSourceLines(phase, width)
-    this.feedLines = { phase: phase.name, width, revision: this.feedRevision, value }
+    this.feedLines.set(phase.name, { width, revision: this.feedRevision, value })
     return value
   }
 
@@ -2622,15 +2635,22 @@ export class TuiProgress implements ProgressUI {
     const events = this.feed.filter((entry) => entry.phase === phase.name).reverse()
     if (events.length === 0) return [t`${fg(theme.dim)("no activity for this step yet…")}`]
 
-    return events.map((entry) => {
+    return events.flatMap((entry) => {
       const style = kindStyle(entry.kind)
-      return new StyledText([
-        fg(theme.faint)(formatTime(entry.time)),
-        raw(" "),
-        fg(style.color)(style.icon),
-        raw(" "),
-        fg(entry.kind === "error" ? theme.red : theme.text)(truncate(entry.message, Math.max(20, width - 12))),
-      ])
+      const gutter: TextChunk[] = [fg(theme.faint)(formatTime(entry.time)), raw(" "), fg(style.color)(style.icon), raw(" ")]
+      // Inline markdown only: a message is one line of prose, not a document, so
+      // a message starting with "- " stays a message and not a bullet. The
+      // hanging indent lands continuation rows under the message column, which
+      // is measured from the gutter rather than assumed.
+      const body = markdownInlineChunks(entry.message, entry.kind === "error" ? theme.red : theme.text)
+      const rows = indentStyled(new StyledText(body), width, gutter)
+      if (rows.length <= maxFeedRowsPerEvent) return rows
+      const last = rows[maxFeedRowsPerEvent - 1]!
+      // clipChunks returns its input untouched when nothing had to be cut, so a
+      // final row that already fits needs the elision marker added here.
+      const clipped = clipChunks(last.chunks, Math.max(1, width - 1))
+      const elided = clipped === last.chunks ? [...clipped, fg(theme.faint)("…")] : clipped
+      return [...rows.slice(0, maxFeedRowsPerEvent - 1), new StyledText(elided)]
     })
   }
 

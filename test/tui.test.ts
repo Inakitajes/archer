@@ -263,11 +263,16 @@ describe("dashboard content selection", () => {
     try {
       const internals = dashboard as unknown as DashboardInternals
       dashboard.phaseStarted("implement")
-      dashboard.phaseMessage("implement", { channel: "response", text: "# Answer\n- **first**\n> quoted" })
+      // Blank lines between the blocks on purpose: without one, the quote is a
+      // lazy continuation *inside* the list item and the test would be pinning
+      // that nesting rather than the markdown structure it means to check.
+      dashboard.phaseMessage("implement", { channel: "response", text: "# Answer\n\n- **first**\n\n> quoted" })
       dashboard.phaseActivity("implement", "response received")
       await renderOnce()
 
-      expect(internals.feedText.plainText).toContain("Answer\n  • first\n  ▎ quoted")
+      expect(internals.feedText.plainText).toContain("Answer")
+      expect(internals.feedText.plainText).toContain("  • first")
+      expect(internals.feedText.plainText).toContain("  ▎ quoted")
       expect(internals.feedText.plainText).not.toContain("# Answer")
       expect(internals.feedText.plainText).not.toContain("**first**")
 
@@ -280,6 +285,62 @@ describe("dashboard content selection", () => {
       expect(internals.feedText.plainText).toContain("Report\n\n• result")
       expect(internals.feedText.plainText).not.toContain("## Report")
       expect(internals.feedText.plainText).not.toContain("`result`")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("wraps a long log message under the message column instead of cutting it", async () => {
+    const { dashboard, renderOnce } = await createDashboard(90, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      dashboard.phaseStarted("implement")
+      internals.contentTab = "logs"
+      dashboard.phaseActivity("implement", "wrapped ".repeat(20).trim())
+      await renderOnce()
+
+      const rendered = internals.feedText.plainText.split("\n").filter((line) => line.includes("wrapped"))
+      expect(rendered.length).toBeGreaterThan(1)
+      // Continuation rows hang under the message column rather than restarting
+      // at column 0, so the timestamp gutter stays a column.
+      const gutter = rendered[0]!.indexOf("wrapped")
+      expect(gutter).toBeGreaterThan(0)
+      expect(rendered[1]!.startsWith(" ".repeat(gutter))).toBeTrue()
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("renders log messages as prose, applying typography but not block markdown", async () => {
+    const { dashboard, renderOnce } = await createDashboard(90, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      dashboard.phaseStarted("implement")
+      internals.contentTab = "logs"
+      dashboard.phaseActivity("implement", "- ran `bun test` twice")
+      await renderOnce()
+
+      // A message starting with "- " is a message, not a bullet.
+      expect(internals.feedText.plainText).toContain("- ran bun test twice")
+      expect(internals.feedText.plainText).not.toContain("`bun test`")
+      expect(internals.feedText.plainText).not.toContain("• ran")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("elides a log message that would outgrow its row budget", async () => {
+    const { dashboard, renderOnce } = await createDashboard(60, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      dashboard.phaseStarted("implement")
+      internals.contentTab = "logs"
+      dashboard.phaseActivity("implement", "verbose ".repeat(40).trim())
+      await renderOnce()
+
+      const rendered = internals.feedText.plainText.split("\n").filter((line) => line.includes("verbose"))
+      expect(rendered.length).toBe(3)
+      expect(rendered[2]!.endsWith("…")).toBeTrue()
     } finally {
       dashboard.stop()
     }

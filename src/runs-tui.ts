@@ -3,13 +3,13 @@ import { stdout } from "node:process"
 import { BoxRenderable, StyledText, TextRenderable, bold, createCliRenderer, fg, t } from "@opentui/core"
 
 import { startLimitsPoller } from "./limits"
+import { parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
 import { loadRunSummary } from "./runs"
 import {
   formatElapsed,
   formatMoney,
   joinLines,
   limitsRow,
-  markdownLines,
   padBetween,
   paletteForTerminal,
   plain,
@@ -60,6 +60,7 @@ class RunsBrowser {
   private selected: number
   private scroll = 0
   private summary?: { runID: string; lines: string[]; scroll: number }
+  private summaryLines?: { source: string[]; doc: MarkdownDoc; width: number; value: StyledText[] }
   // A subshell owns the terminal while the renderer is suspended; ignore keys.
   private inSubshell = false
   private readonly ticker: ReturnType<typeof setInterval>
@@ -446,6 +447,23 @@ class RunsBrowser {
     return Math.max(4, this.renderer.height - 8)
   }
 
+  private summaryWidth() {
+    return this.modalWidth() - 6
+  }
+
+  // The modal body and its scroll indicator both need the rendered summary, so
+  // without a memo every frame parsed the same markdown twice. Keyed on the
+  // loaded line array, and holding the parsed document so a resize re-wraps
+  // without re-parsing.
+  private summaryRows(lines: string[], width: number): StyledText[] {
+    const memo = this.summaryLines
+    if (memo?.source === lines && memo.width === width) return memo.value
+    const doc = memo?.source === lines ? memo.doc : parseMarkdown(lines)
+    const value = renderMarkdownDoc(doc, width)
+    this.summaryLines = { source: lines, doc, width, value }
+    return value
+  }
+
   private render() {
     if (this.renderer.isDestroyed) return
     const now = Date.now()
@@ -560,7 +578,7 @@ class RunsBrowser {
   private footerContent(width: number) {
     if (this.summary) {
       const summary = this.summary
-      const rendered = markdownLines(summary.lines, Math.max(20, this.modalWidth() - 6))
+      const rendered = this.summaryRows(summary.lines, this.summaryWidth())
       const maxScroll = Math.max(0, rendered.length - this.summaryHeight())
       const position = maxScroll === 0 ? "all" : `${Math.min(100, Math.round((Math.min(summary.scroll, maxScroll) / maxScroll) * 100))}%`
       const left: TextChunk[] = [
@@ -600,9 +618,8 @@ class RunsBrowser {
     if (!summary) return
 
     const boxWidth = this.modalWidth()
-    const width = boxWidth - 6
     const visible = this.summaryHeight()
-    const rendered = markdownLines(summary.lines, width)
+    const rendered = this.summaryRows(summary.lines, this.summaryWidth())
     summary.scroll = Math.max(0, Math.min(summary.scroll, rendered.length - visible))
 
     const lines = rendered.slice(summary.scroll, summary.scroll + visible)

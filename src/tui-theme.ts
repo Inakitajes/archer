@@ -1,4 +1,4 @@
-import { StyledText, bold, fg, italic, link, strikethrough, stringToStyledText, t, underline } from "@opentui/core"
+import { StyledText, fg, stringToStyledText } from "@opentui/core"
 
 import type { CliRenderer, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
@@ -208,7 +208,7 @@ export function padBetween(left: TextChunk[], right: TextChunk[], width: number)
 
 // Keeps chunks from the start until `max` columns are filled; the chunk at the
 // cut keeps its own style and ends in the ellipsis.
-function clipChunks(chunks: TextChunk[], max: number): TextChunk[] {
+export function clipChunks(chunks: TextChunk[], max: number): TextChunk[] {
   if (chunksLength(chunks) <= max) return chunks
   if (max <= 0) return []
   const out: TextChunk[] = []
@@ -226,7 +226,7 @@ function clipChunks(chunks: TextChunk[], max: number): TextChunk[] {
   return out
 }
 
-function chunksLength(chunks: TextChunk[]) {
+export function chunksLength(chunks: readonly TextChunk[]) {
   return chunks.reduce((sum, chunk) => sum + displayWidth(chunk.text), 0)
 }
 
@@ -373,109 +373,7 @@ export function truncate(value: string, max: number) {
   return `${takeDisplayCells(singleLine, max - 1).head}…`
 }
 
-/**
- * Render the Markdown subset model messages commonly use into styled terminal
- * rows. Keeping this as StyledText (rather than a separate renderable) lets the
- * dashboard retain its existing paging, group previews, and text selection.
- */
-export function markdownLines(markdown: string | string[], width: number, baseColor = theme.text): StyledText[] {
-  // Model responses and reports are untrusted terminal content. OpenTUI keeps
-  // chunk text verbatim, so strip control bytes before it can reach the
-  // renderer and turn links into terminal OSC-8 sequences.
-  const source = (Array.isArray(markdown) ? markdown : markdown.replace(/\r\n/g, "\n").split("\n")).map(sanitizeMarkdownLine)
-  const out: StyledText[] = []
-  let fenced = false
-
-  for (const sourceLine of source) {
-    const fence = /^\s*```/.test(sourceLine)
-    if (fence) {
-      fenced = !fenced
-      const language = sourceLine.trim().slice(3).trim()
-      // Info strings can be arbitrarily long (```python { .annotate }); keep
-      // the fence row inside the panel width instead of overflowing it.
-      const prefix = takeDisplayCells(language ? `┄ ${language} ` : "┄", width).head
-      out.push(new StyledText([fg(theme.faint)(prefix), fg(theme.faint)("┄".repeat(Math.max(0, width - displayWidth(prefix))))]))
-      continue
-    }
-    if (fenced) {
-      out.push(...wrapStyled(new StyledText([fg(theme.faint)("│ "), fg(theme.yellow)(sourceLine)]), width))
-      continue
-    }
-
-    const heading = /^(#{1,6})\s+(.*)$/.exec(sourceLine)
-    if (heading) {
-      const color = heading[1]!.length <= 2 ? theme.accent : theme.magenta
-      out.push(...wrapStyled(new StyledText(inlineMarkdown(heading[2]!, color).map((chunk) => bold(chunk))), width))
-      continue
-    }
-    if (/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(sourceLine)) {
-      out.push(t`${fg(theme.faint)("─".repeat(Math.max(1, width)))}`)
-      continue
-    }
-
-    const quote = /^\s*>\s?(.*)$/.exec(sourceLine)
-    if (quote) {
-      out.push(...wrapStyled(new StyledText([fg(theme.teal)("▎ "), ...inlineMarkdown(quote[1]!, theme.dim).map((chunk) => italic(chunk))]), width))
-      continue
-    }
-
-    const list = /^(\s*)([-+*]|\d+[.)])\s+(?:\[([ xX])\]\s+)?(.*)$/.exec(sourceLine)
-    if (list) {
-      const marker = list[3] === undefined ? (list[2]!.startsWith("-") || list[2] === "+" || list[2] === "*" ? "•" : list[2]!) : list[3] === " " ? "☐" : "☑"
-      out.push(...wrapStyled(new StyledText([raw(list[1]!), fg(theme.teal)(`${marker} `), ...inlineMarkdown(list[4]!, baseColor)]), width))
-      continue
-    }
-
-    out.push(...wrapStyled(new StyledText(inlineMarkdown(sourceLine, baseColor)), width))
-  }
-  return out
-}
-
-function inlineMarkdown(text: string, color: string): TextChunk[] {
-  if (!text) return [fg(color)("")]
-  const chunks: TextChunk[] = []
-  // Underscore emphasis, like CommonMark, cannot open or close inside a word;
-  // otherwise snake_case identifiers would lose their underscores to italics.
-  const token = /(`[^`]+`|\*\*[^*]+\*\*|(?<![A-Za-z0-9_])__[^_]+__(?![A-Za-z0-9_])|~~[^~]+~~|\*[^*]+\*|(?<![A-Za-z0-9_])_[^_]+_(?![A-Za-z0-9_])|\[[^\]]+\]\([^)]+\))/g
-  let cursor = 0
-  for (const match of text.matchAll(token)) {
-    const index = match.index ?? 0
-    if (index > cursor) chunks.push(fg(color)(text.slice(cursor, index)))
-    const value = match[0]
-    if (value.startsWith("`")) chunks.push(fg(theme.yellow)(value.slice(1, -1)))
-    else if (value.startsWith("**") || value.startsWith("__")) chunks.push(bold(fg(color)(value.slice(2, -2))))
-    else if (value.startsWith("~~")) chunks.push(strikethrough(fg(theme.dim)(value.slice(2, -2))))
-    else if (value.startsWith("[")) {
-      const parsed = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(value)!
-      const label = underline(fg(theme.cyan)(parsed[1]!))
-      const url = safeHyperlinkUrl(parsed[2]!)
-      chunks.push(url ? link(url)(label) : label)
-    } else chunks.push(italic(fg(color)(value.slice(1, -1))))
-    cursor = index + value.length
-  }
-  if (cursor < text.length) chunks.push(fg(color)(text.slice(cursor)))
-  return chunks
-}
-
-function sanitizeMarkdownLine(line: string) {
-  // Preserve tabs as indentation without passing a tab control to the terminal.
-  return line.replace(/\t/g, "    ").replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "")
-}
-
-function safeHyperlinkUrl(value: string): string | undefined {
-  // Terminal link handlers can open arbitrary URI schemes. Markdown supplied by
-  // a model may only produce network links, and a bounded normalized URL also
-  // prevents OSC-8 control-sequence injection through the link target.
-  if (value.length > 2_048) return undefined
-  try {
-    const url = new URL(value)
-    return url.protocol === "https:" || url.protocol === "http:" ? url.href : undefined
-  } catch {
-    return undefined
-  }
-}
-
-function wrapStyled(styled: StyledText, width: number): StyledText[] {
+export function wrapStyled(styled: StyledText, width: number): StyledText[] {
   if (width <= 0) return [plain("")]
   const lines: StyledText[] = []
   let row: TextChunk[] = []
@@ -569,6 +467,78 @@ function wrapStyled(styled: StyledText, width: number): StyledText[] {
   return lines
 }
 
+/**
+ * Wraps `styled` inside a gutter: `first` heads the opening row and `rest` (by
+ * default blanks of the same width) heads every continuation. Blockquote bars,
+ * code gutters, list markers and the log feed's timestamp column are all this
+ * one shape, and because the prefix is applied *after* wrapping, nesting them
+ * composes without any level knowing about the others.
+ */
+export function indentStyled(styled: StyledText, width: number, first: TextChunk[], rest?: TextChunk[]): StyledText[] {
+  const gutter = chunksLength(first)
+  // Nothing readable survives a gutter as wide as the column it sits in, and an
+  // empty row is worse than a missing marker, so the content wins the tie.
+  if (width - gutter < 1) return wrapStyled(styled, Math.max(1, width))
+  return indentRows(wrapStyled(styled, width - gutter), first, rest)
+}
+
+/** The same gutter, for rows a caller already wrapped at the inner width. */
+export function indentRows(rows: StyledText[], first: TextChunk[], rest?: TextChunk[]): StyledText[] {
+  // Measured from `first` rather than assumed: the markers in use are not all
+  // ASCII, and a hardcoded pad would drift from the prefix that set the wrap
+  // budget, pushing continuation rows out of the panel by a cell or two.
+  const gutter = chunksLength(first)
+  const continuation = fitGutter(rest ?? [raw(" ".repeat(gutter))], gutter)
+  // A blank row keeps a *visible* gutter — an empty line inside a code block or
+  // a blockquote still belongs to it — but a blank list continuation must not
+  // emit trailing spaces, which would land in the terminal's selection buffer.
+  const visibleGutter = continuation.some((chunk) => chunk.text.trim() !== "")
+  const blankGutter = visibleGutter ? trimTrailing(continuation) : []
+  return rows.map((row, index) => {
+    if (index === 0) return new StyledText([...first, ...row.chunks])
+    if (row.chunks.every((chunk) => chunk.text.trim() === "")) {
+      return blankGutter.length > 0 ? new StyledText(blankGutter) : row
+    }
+    return new StyledText([...continuation, ...row.chunks])
+  })
+}
+
+/** Pads or clips a gutter to exactly `width` cells, without an ellipsis. */
+function fitGutter(chunks: TextChunk[], width: number): TextChunk[] {
+  const length = chunksLength(chunks)
+  if (length === width) return chunks
+  if (length < width) return [...chunks, raw(" ".repeat(width - length))]
+  const clipped: TextChunk[] = []
+  let budget = width
+  for (const chunk of chunks) {
+    if (budget <= 0) break
+    const part = takeDisplayCells(chunk.text, budget)
+    if (part.head) {
+      clipped.push({ ...chunk, text: part.head })
+      budget -= displayWidth(part.head)
+    }
+    if (part.tail) break
+  }
+  // A wide glyph straddling the budget leaves a cell unfilled; pad it so the
+  // caller's alignment maths still holds.
+  return budget > 0 ? [...clipped, raw(" ".repeat(budget))] : clipped
+}
+
+function trimTrailing(chunks: TextChunk[]): TextChunk[] {
+  const out = chunks.slice()
+  while (out.length > 0) {
+    const last = out[out.length - 1]!
+    const trimmed = last.text.replace(/\s+$/, "")
+    if (trimmed === last.text) break
+    out.pop()
+    if (trimmed) {
+      out.push({ ...last, text: trimmed })
+      break
+    }
+  }
+  return out
+}
+
 export function wrapLines(lines: string[], width: number): string[] {
   const wrapped: string[] = []
   for (const line of lines) {
@@ -601,7 +571,7 @@ export function wrapLines(lines: string[], width: number): string[] {
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
 
-function takeDisplayCells(text: string, max: number): { head: string; tail: string } {
+export function takeDisplayCells(text: string, max: number): { head: string; tail: string } {
   let head = ""
   let cells = 0
   let consumed = 0
