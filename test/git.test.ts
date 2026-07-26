@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { addWorktree, detectBaseRef, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
+import { addAllAndCommit, addWorktree, detectBaseRef, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
 
 describe("findSuspiciousStagedFiles", () => {
   test("flags common secret filenames", () => {
@@ -61,7 +61,7 @@ describe("ensureRepoReady", () => {
   })
 
   async function git(args: string[], cwd: string) {
-    const proc = Bun.spawn(["git", ...args], {
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
@@ -133,7 +133,7 @@ describe("detectBaseRef", () => {
   })
 
   async function git(args: string[], cwd: string) {
-    const proc = Bun.spawn(["git", ...args], {
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
@@ -230,7 +230,7 @@ describe("initializeRepoWithInitialCommit", () => {
   }
 
   async function gitOutput(args: string[], cwd: string) {
-    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", env: process.env })
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], { cwd, stdout: "pipe", stderr: "pipe", env: process.env })
     const stdout = await new Response(proc.stdout).text()
     const stderr = await new Response(proc.stderr).text()
     const exitCode = await proc.exited
@@ -292,6 +292,61 @@ describe("initializeRepoWithInitialCommit", () => {
   })
 })
 
+describe("unsigned commits", () => {
+  const dirs: string[] = []
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  async function git(args: string[], cwd: string) {
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], { cwd, stdout: "pipe", stderr: "pipe", env: process.env })
+    const stdout = await new Response(proc.stdout).text()
+    const stderr = await new Response(proc.stderr).text()
+    if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${stderr}`)
+    return stdout.trim()
+  }
+
+  /**
+   * A repo whose config demands a signature it can never produce: /usr/bin/false
+   * stands in for a 1Password/gpg-agent prompt nobody answers during an
+   * unattended run. Any commit Convoy makes without --no-gpg-sign dies here.
+   */
+  async function repoThatCannotSign(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-unsigned-"))
+    dirs.push(dir)
+    await git(["init", "-q", "-b", "main"], dir)
+    await git(["config", "commit.gpgsign", "true"], dir)
+    await git(["config", "gpg.format", "ssh"], dir)
+    await git(["config", "user.signingkey", join(dir, "nonexistent.pub")], dir)
+    await git(["config", "gpg.ssh.program", "/usr/bin/false"], dir)
+    return dir
+  }
+
+  test("initializeRepoWithInitialCommit commits when the repo config forces signing", async () => {
+    const dir = await repoThatCannotSign()
+    await writeFile(join(dir, "README.md"), "hello\n")
+
+    await initializeRepoWithInitialCommit(dir, { baseRef: "main" })
+
+    expect(await repoBootstrapStatus(dir)).toBe("ready")
+    expect(await git(["log", "-1", "--format=%s"], dir)).toBe("convoy: initial commit")
+  })
+
+  test("addAllAndCommit commits when the repo config forces signing", async () => {
+    const dir = await repoThatCannotSign()
+    await git(["commit", "-q", "--allow-empty", "-m", "base"], dir)
+    await writeFile(join(dir, "feature.ts"), "export const feature = true\n")
+
+    expect(await addAllAndCommit("convoy(implement): add feature", dir)).toBe(true)
+
+    expect(await git(["log", "-1", "--format=%s"], dir)).toBe("convoy(implement): add feature")
+    expect(await git(["log", "-1", "--format=%an <%ae>"], dir)).toBe("convoy <convoy@local>")
+    // %G? is "N" for an unsigned commit; anything else means we tried to sign.
+    expect(await git(["log", "-1", "--format=%G?"], dir)).toBe("N")
+    expect(await git(["status", "--porcelain"], dir)).toBe("")
+  })
+})
+
 describe("addWorktree", () => {
   const dirs: string[] = []
   afterAll(async () => {
@@ -299,7 +354,7 @@ describe("addWorktree", () => {
   })
 
   async function git(args: string[], cwd: string) {
-    const proc = Bun.spawn(["git", ...args], {
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
       cwd,
       stdout: "pipe",
       stderr: "pipe",

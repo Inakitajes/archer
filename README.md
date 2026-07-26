@@ -236,6 +236,8 @@ The judge model is `--smart-model <provider/model[#variant]>`, falling back to `
 
 Before each commit Convoy scans the staged files for common secret names (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*.p12`, `*.keystore`, ...). If any match, the commit is aborted, the index reset, and Convoy asks you to add them to `.gitignore` (or delete them) before re-running. Combined with `--include-dirty` this is the only line of defense against accidentally publishing a secret your working tree had lying around — review the resulting commits with `git show` before pushing.
 
+Convoy's commits are always unsigned (`--no-gpg-sign`) and authored by `convoy <convoy@local>`. They are machine commits: with a global `commit.gpgsign = true`, an unattended run would otherwise stall on an interactive signing prompt (1Password, gpg-agent) until it times out and takes the whole pipeline down — and the signature would not verify against that identity anyway. Committing is Convoy's job, so agents are denied `git commit` alongside `git push`. To sign the result, do it yourself once you are back: `git rebase --exec 'git commit --amend --no-edit -S' <base>`.
+
 During a human step, Convoy waits indefinitely for an explicit action: `c` continues the pipeline (committing any manual changes), `o` opens an OpenCode window attached to the run's server (resuming its latest session, so the iteration keeps the run's context), and `a` aborts the run.
 
 ## Project configuration (`.convoy/config.yaml`)

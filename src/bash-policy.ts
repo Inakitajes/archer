@@ -167,6 +167,11 @@ export const denyBashPatterns = [
     "git remote set-url*",
     "git remote rm*",
     "git remote remove*",
+    // committing - also always Convoy's job: one commit per phase, authored by
+    // convoy and never signed. An agent commit would swallow the phase's own
+    // commit and can hang the run on an interactive signing prompt.
+    "git commit*",
+    "git commit",
     // exact + spaced forms so ghc/ghq and similar tools aren't denied too
     "gh",
     "gh *",

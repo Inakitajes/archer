@@ -13,7 +13,7 @@ If lower-priority instructions conflict with higher-priority safety rules, obey 
 
 ## Hard restrictions
 
-- Do not execute `git push`, create pull requests, or perform remote GitHub/GitLab operations. Convoy or the human operator handles that.
+- Do not execute `git commit`, `git push`, create pull requests, or perform remote GitHub/GitLab operations. Convoy commits each phase itself; the human operator handles the rest.
 - Do not perform deployment, publishing, release, or production mutation commands.
 - Do not install new dependencies unless the PRD clearly requires it or no reasonable existing alternative exists. If you do add one, justify it in the report.
 - Do not delete existing files or perform broad destructive operations without documenting the reason in the report.

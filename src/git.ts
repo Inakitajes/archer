@@ -26,6 +26,13 @@ export type RepoBootstrapStatus = "ready" | "no-repo" | "no-commits"
 // checks and commits must see every untracked file, including nested ones.
 const statusArgs = ["status", "--porcelain=v1", "--untracked-files=all"]
 
+// Convoy's commits are always unsigned. They are machine commits authored by
+// convoy@local — an identity no user signing key matches — and inheriting a
+// global `commit.gpgsign = true` makes an unattended run block on an
+// interactive signing prompt (1Password/gpg-agent) that times out, fails the
+// commit, and takes the whole pipeline down with it.
+const commitArgs = ["commit", "--no-gpg-sign"]
+
 async function execFile(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
   const proc = Bun.spawn([command, ...args], {
     cwd: options.cwd,
@@ -158,8 +165,9 @@ export async function initializeRepoWithInitialCommit(cwd: string, options: { ba
     )
   }
 
-  const commitArgs = porcelain.stdout.trim() === "" ? ["commit", "--allow-empty", "-m", "convoy: initial commit"] : ["commit", "-m", "convoy: initial commit"]
-  await execFile("git", commitArgs, { cwd, env: convoyGitEnv })
+  const initialCommitArgs =
+    porcelain.stdout.trim() === "" ? [...commitArgs, "--allow-empty", "-m", "convoy: initial commit"] : [...commitArgs, "-m", "convoy: initial commit"]
+  await execFile("git", initialCommitArgs, { cwd, env: convoyGitEnv })
 }
 
 export async function statusPorcelain(cwd: string): Promise<string> {
@@ -259,7 +267,7 @@ export async function addAllAndCommit(message: string, cwd: string) {
     )
   }
 
-  await execFile("git", ["commit", "-m", message], {
+  await execFile("git", [...commitArgs, "-m", message], {
     cwd,
     env: convoyGitEnv,
   })

@@ -15,6 +15,9 @@ describe("bash policy", () => {
     expect(policy["bun test*"]).toBe("allow")
     expect(policy["tsc --noEmit*"]).toBe("allow")
     expect(policy["git push*"]).toBe("deny")
+    // committing is Convoy's job — an agent commit would swallow the phase commit
+    expect(policy["git commit*"]).toBe("deny")
+    expect(policy["git commit"]).toBe("deny")
     expect(policy["npm install*"]).toBe("deny")
     expect(policy["npm run deploy*"]).toBe("deny")
     expect(policy["*"]).toBe("ask")

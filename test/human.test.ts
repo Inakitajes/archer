@@ -16,7 +16,7 @@ afterAll(async () => {
 })
 
 async function git(args: string[], cwd: string) {
-  const proc = Bun.spawn(["git", ...args], {
+  const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
     cwd,
     stdout: "pipe",
     stderr: "pipe",
