@@ -233,6 +233,17 @@ export async function describeRepoSnapshotDifference(snapshot: RepoSnapshot, cwd
  * (a commit/ref in `cwd`'s repo). Used by the launcher's "isolate in a worktree"
  * flow so Convoy runs against a clean checkout on a new branch.
  */
+/**
+ * Whether `<name>` is already a local branch. Used before `git worktree add -b`
+ * so a name collision is caught (and suffixed) while the user can still see it,
+ * instead of failing the run after it has been confirmed.
+ */
+export async function branchExists(name: string, cwd: string): Promise<boolean> {
+  if (!name) return false
+  const result = await execFile("git", ["show-ref", "--verify", "--quiet", `refs/heads/${name}`], { cwd, allowFailure: true })
+  return result.exitCode === 0
+}
+
 export async function addWorktree(dir: string, branch: string, baseRef: string, cwd: string) {
   // `--` terminates option parsing so a `dir`/`baseRef` starting with `-`
   // (e.g. a caller-supplied ref like `--detach`) can't be misread as a flag.

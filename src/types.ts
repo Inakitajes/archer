@@ -141,12 +141,19 @@ export type Pipeline = {
 
 export type RunPlan = {
   prompt: { source: "inline" | "file" | "resume"; text: string }
-  target: { directory: string; baseRef: string; worktree: boolean; dirty: boolean }
+  target: {
+    directory: string
+    baseRef: string
+    worktree: boolean
+    dirty: boolean
+    /** Worktree runs only: the branch name the user confirmed in the launcher's branch step. */
+    branch?: string
+    /** Worktree runs only: where that branch will be checked out. */
+    worktreeDir?: string
+  }
   pipeline: Pipeline
   modelRouting: { gateway: ModelGateway }
   smartJudge?: { model: ResolvedModel }
-  /** Resolved branch-naming model for worktree runs: the AI naming call happens after confirmation with exactly this target. */
-  branchNamer?: { model: ResolvedModel }
   hooks: HookSet
   attachments: string[]
   permissions: "interactive" | "smart" | "yolo"

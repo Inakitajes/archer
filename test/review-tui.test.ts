@@ -82,12 +82,11 @@ describe("run review TUI", () => {
     expect(lines.some((line) => line.includes("claude-code/opus"))).toBe(true)
   })
 
-  test("renders hooks, runtime judge, worktree intent, branch namer, and resume overrides", () => {
+  test("renders hooks, runtime judge, the confirmed branch, and resume overrides", () => {
     const plan = planWith([], {
-      target: { directory: "/repo", baseRef: "develop", worktree: true, dirty: false },
+      target: { directory: "/repo", baseRef: "develop", worktree: true, dirty: false, branch: "feat/runtime-guard-limits", worktreeDir: "/home/dev/.convoy/worktrees/feat-runtime-guard-limits" },
       modelRouting: { gateway: "openrouter" },
       smartJudge: { model: resolved("openai/gpt-5.6-terra#xhigh", "openrouter/openai/gpt-5.6-terra#xhigh", "openrouter") },
-      branchNamer: { model: resolved("anthropic/claude-haiku-4-5", "openrouter/anthropic/claude-haiku-4-5", "openrouter") },
       hooks: { pre: [{ command: "pnpm lint" }], post: [{ command: "./notify.sh", when: "always" }] },
       attachments: ["a.md", "b.md"],
       permissions: "smart",
@@ -98,8 +97,8 @@ describe("run review TUI", () => {
 
     expect(lines.some((line) => line.includes("gateway  OpenRouter"))).toBe(true)
     expect(lines.some((line) => line.includes("resume override · original Vercel AI Gateway · pending phases OpenRouter"))).toBe(true)
-    expect(lines.some((line) => line.includes("worktree and branch created after confirmation"))).toBe(true)
-    expect(lines.some((line) => line.includes("branch named by openrouter/anthropic/claude-haiku-4-5 after confirmation"))).toBe(true)
+    expect(lines.some((line) => line.includes("branch feat/runtime-guard-limits"))).toBe(true)
+    expect(lines.some((line) => line.includes("worktree /home/dev/.convoy/worktrees/feat-runtime-guard-limits"))).toBe(true)
     expect(lines.some((line) => line.includes("hooks    pre   · pnpm lint"))).toBe(true)
     expect(lines.some((line) => line.includes("post  · ./notify.sh · always"))).toBe(true)
     expect(lines.some((line) => line.includes("runtime  smart permissions · 2 attachments · judge openrouter/openai/gpt-5.6-terra#xhigh"))).toBe(true)

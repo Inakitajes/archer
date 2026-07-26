@@ -11,7 +11,8 @@ export function preflightTargets(plan: RunPlan): ResolvedModel[] {
     step.type === "agent" && step.runner !== "claude-code" && step.resolvedModel ? [step.resolvedModel] : [],
   )
   if (plan.smartJudge) targets.push(plan.smartJudge.model)
-  if (plan.branchNamer) targets.push(plan.branchNamer.model)
+  // No branch namer here: naming happens in the launcher, before the plan is
+  // built, so nothing is left to call once the run is confirmed.
   return targets
 }
 

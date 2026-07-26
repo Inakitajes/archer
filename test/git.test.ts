@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { addAllAndCommit, addWorktree, detectBaseRef, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
+import { addAllAndCommit, addWorktree, branchExists, detectBaseRef, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
 
 describe("findSuspiciousStagedFiles", () => {
   test("flags common secret filenames", () => {
@@ -368,6 +368,21 @@ describe("addWorktree", () => {
     })
     if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(proc.stderr).text()}`)
   }
+
+  test("branchExists tells a taken branch name from a free one", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "convoy-branch-exists-"))
+    dirs.push(repo)
+
+    await git(["init", "-q"], repo)
+    await writeFile(join(repo, "README.md"), "base\n")
+    await git(["add", "README.md"], repo)
+    await git(["commit", "-q", "-m", "init"], repo)
+    await git(["branch", "feat/add-onboarding"], repo)
+
+    expect(await branchExists("feat/add-onboarding", repo)).toBe(true)
+    expect(await branchExists("feat/add-onboarding-2", repo)).toBe(false)
+    expect(await branchExists("", repo)).toBe(false)
+  })
 
   test("creates a branch checked out in a separate worktree", async () => {
     const repo = await mkdtemp(join(tmpdir(), "convoy-worktree-repo-"))

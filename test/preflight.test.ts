@@ -103,21 +103,13 @@ describe("OpenCode run-plan preflight", () => {
         target: "vercel/anthropic/claude-haiku-4.5",
       },
     }
-    reviewed.branchNamer = {
-      model: {
-        configured: "anthropic/claude-haiku-4-5",
-        logical: "anthropic/claude-haiku-4-5",
-        gateway: "vercel",
-        providerID: "vercel",
-        modelID: "anthropic/claude-haiku-4-5",
-        target: "vercel/anthropic/claude-haiku-4-5",
-      },
-    }
+    // A worktree run has nothing extra to preflight: the branch was named in
+    // the launcher, so no naming call is left once the plan is confirmed.
+    reviewed.target = { ...reviewed.target, worktree: true, branch: "feat/add-onboarding" }
 
     expect(preflightTargets(reviewed).map((target) => target.target)).toEqual([
       "vercel/openai/gpt-5.6-sol",
       "vercel/anthropic/claude-haiku-4.5",
-      "vercel/anthropic/claude-haiku-4-5",
     ])
   })
 

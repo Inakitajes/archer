@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { cursorPosition, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
+import { branchActionForKey, branchProposalNote, cursorPosition, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
 
 import type { KeyEvent } from "@opentui/core"
 
@@ -62,6 +62,39 @@ describe("launch TUI review", () => {
     expect(reviewActionForKey(key({ name: "pagedown" }))).toBe("page-forward")
     expect(reviewActionForKey(key({ name: "home" }))).toBe("top")
     expect(reviewActionForKey(key({ name: "end" }))).toBe("bottom")
+  })
+})
+
+describe("launch TUI branch step", () => {
+  test("maps branch controls to editing, regeneration, and navigation", () => {
+    expect(branchActionForKey(key({ name: "return" }))).toBe("submit")
+    expect(branchActionForKey(key({ name: "tab" }))).toBe("next-field")
+    expect(branchActionForKey(key({ name: "tab", shift: true }))).toBe("previous-field")
+    expect(branchActionForKey(key({ name: "backtab" }))).toBe("previous-field")
+    expect(branchActionForKey(key({ name: "r", ctrl: true }))).toBe("regenerate")
+    expect(branchActionForKey(key({ name: "u", ctrl: true }))).toBe("clear")
+    expect(branchActionForKey(key({ name: "backspace" }))).toBe("delete-back")
+    expect(branchActionForKey(key({ name: "left" }))).toBe("cursor-left")
+    expect(branchActionForKey(key({ name: "escape" }))).toBe("back")
+  })
+
+  test("leaves printable keys unbound so both fields stay typable", () => {
+    // "s", "q", "p" and "r" are review/options shortcuts; here they are just letters.
+    for (const name of ["s", "q", "p", "r", "j", "k", "space"]) {
+      expect(branchActionForKey(key({ name }))).toBeUndefined()
+    }
+  })
+
+  test("attributes the proposal and says when the name had to move", () => {
+    expect(branchProposalNote({ branch: "feat/x", source: "model", model: "anthropic/claude-haiku-4-5" }, { branch: "feat/x", dir: "/w/feat-x" })).toBe(
+      "proposed by anthropic/claude-haiku-4-5",
+    )
+    expect(branchProposalNote({ branch: "feat/x", source: "prompt" }, { branch: "feat/x-2", dir: "/w/feat-x-2", suffixed: true })).toBe(
+      "derived from your prompt (the naming model didn't answer) · renamed, the original was taken",
+    )
+    expect(branchProposalNote({ branch: "convoy-20260726-a4f2", source: "fallback" }, { branch: "convoy-20260726-a4f2", dir: "/w/c" })).toBe(
+      "generic name (nothing to derive it from)",
+    )
   })
 })
 
