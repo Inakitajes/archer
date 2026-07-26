@@ -8,6 +8,7 @@ import type { AssistantMessage, FilePartInput, OpencodeClient, Part } from "@ope
 
 import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
+import { Caffeinate } from "./caffeinate"
 import { ensureClaudeAvailable, promptClaudePhase } from "./claude-code"
 import { addAllAndCommit, createCleanRepoSnapshot, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
@@ -390,6 +391,7 @@ export async function run(options: RunOptions) {
   let permissions: PermissionGate | undefined
   let metadata: RunMetadataStore | undefined
   let control: RunControl | undefined
+  let caffeinate: Caffeinate | undefined
   let releaseLease: (() => Promise<void>) | undefined
   let hookSet = options.plan?.hooks ?? hooksForPipeline(options.hooks, options.pipeline.name)
   let pipelineNameForHooks = options.pipeline.name
@@ -429,13 +431,20 @@ export async function run(options: RunOptions) {
     // before the TUI grabs the terminal, so the readline prompt stays visible.
     await maybeRecoverDirtyTree(workspace, metadata, options)
     control = new RunControl(metadata)
+    caffeinate = new Caffeinate()
     progress = recordProgress(
-      await createProgressUI(progressPhases(pipeline, hookSet), options.tui, () => shutdown.request("Ctrl+C"), autoAccept, () => {
-        void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
+      await createProgressUI(progressPhases(pipeline, hookSet), options.tui, () => shutdown.request("Ctrl+C"), autoAccept, {
+        onPauseToggle: () => {
+          void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
+        },
+        onKeepAwakeToggle: () => {
+          void caffeinate?.toggle().catch((error) => log.warn(`couldn't toggle Caffeinate: ${formatSdkError(error)}`))
+        },
       }),
       metadata,
     )
     control.bind(progress)
+    caffeinate.bind(progress)
     progress.start(workspace.runID, options.targetDir, workspace.dir)
     log.info(`Run ${workspace.runID} - dir: ${workspace.dir}`)
     // Use the captured flag: options.modelOverride was already cleared when a
@@ -568,6 +577,7 @@ export async function run(options: RunOptions) {
       progress,
       signal: shutdown.signal,
     })
+    await caffeinate.stop()
     await holdFinishScreen(progress, shutdown, { status: "completed", runDir: workspace.dir })
   } catch (error) {
     let failure = error
@@ -589,12 +599,14 @@ export async function run(options: RunOptions) {
     }
     runErr = failure
     if (!isUserAbortError(failure)) {
+      await caffeinate?.stop()
       await holdFinishScreen(progress, shutdown, { status: "failed", error: formatSdkError(failure), runDir: workspace.dir })
     }
     throw failure
   } finally {
     removeSignalHandlers()
     if (shutdown.aborted) await shutdown.abortActiveSessions(progress)
+    await caffeinate?.stop()
     await permissions?.stop()
     // The server dies at the end of this block; clear its metadata entry now so
     // `convoy runs` stops offering to attach to a run that's shutting down.

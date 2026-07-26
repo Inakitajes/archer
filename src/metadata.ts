@@ -334,6 +334,9 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
   if (progress.askHumanReview) recorder.askHumanReview = progress.askHumanReview.bind(progress)
   if (progress.isInteractiveTakeover) recorder.isInteractiveTakeover = progress.isInteractiveTakeover.bind(progress)
   if (progress.runControlState) recorder.runControlState = progress.runControlState.bind(progress)
+  // Keep-awake is UI-only, but like run-control state its publisher binds to
+  // the wrapped progress object owned by the runner.
+  if (progress.keepAwakeState) recorder.keepAwakeState = progress.keepAwakeState.bind(progress)
   // Same probing contract: the runner only holds the finish screen when the UI offers one.
   if (progress.runFinished) recorder.runFinished = progress.runFinished.bind(progress)
   if (progress.keepRunDirRequested) recorder.keepRunDirRequested = progress.keepRunDirRequested.bind(progress)

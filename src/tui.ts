@@ -68,6 +68,7 @@ import type {
   ProgressTokens,
   ProgressUI,
   ProgressUsage,
+  KeepAwakeState,
   RunControlState,
   RunOutcome,
 } from "./progress"
@@ -125,6 +126,20 @@ type FullscreenView = {
   tab: ContentTab
   scroll: number
   copyStatus?: ClipboardResult
+}
+
+type CommandID = "keep-awake" | "pause" | "permissions" | "interactive" | "help"
+
+type CommandPalette = {
+  filter: string
+  index: number
+  view: "commands" | "help"
+}
+
+type CommandItem = {
+  id: CommandID
+  label: string
+  detail: string
 }
 
 function clipboardStatusLabel(status?: ClipboardResult): string {
@@ -257,7 +272,7 @@ export async function createTuiProgress(
   // offlineSessions: re-opened finished runs have no live server, so [o] opens
   // their stored sessions from disk instead of attaching. observer: read-only
   // attach to another process's run, where [i] takeover must be refused.
-  options?: { offlineSessions?: boolean; observer?: boolean; mode?: TuiDashboardMode; onPauseToggle?: () => void },
+  options?: { offlineSessions?: boolean; observer?: boolean; mode?: TuiDashboardMode; onPauseToggle?: () => void; onKeepAwakeToggle?: () => void },
 ): Promise<ProgressUI> {
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
@@ -281,6 +296,7 @@ export async function createTuiProgress(
     initialContentTab(options?.mode ?? "live"),
     copyReportToClipboard,
     options?.onPauseToggle,
+    options?.onKeepAwakeToggle,
   )
 }
 
@@ -384,6 +400,8 @@ export class TuiProgress implements ProgressUI {
   private fullscreen?: FullscreenView
   private controlState: RunControlState = "running"
   private controlActivePhases = 0
+  private keepAwake?: KeepAwakeState
+  private commandPalette?: CommandPalette
   // ScrollBarRenderable emits change events for programmatic state updates as
   // well as mouse drags. Ignore the former so a layout recalculation cannot
   // overwrite the reader's just-computed scroll position.
@@ -477,6 +495,27 @@ export class TuiProgress implements ProgressUI {
       return
     }
     if (this.humanReviewQueue.length > 0 && this.handleHumanReviewKey(key)) return
+    if (this.humanReviewQueue.length > 0) {
+      // A review gate must not be hidden behind the command palette, but keep
+      // the existing non-gate navigation (including [p] pause) available.
+      if (key.ctrl && key.name === "p") {
+        key.preventDefault()
+        key.stopPropagation()
+      } else {
+        this.handleNavKey(key)
+      }
+      return
+    }
+    if (this.commandPalette) {
+      this.handleCommandPaletteKey(key)
+      return
+    }
+    if (key.ctrl && key.name === "p") {
+      key.preventDefault()
+      key.stopPropagation()
+      this.openCommandPalette()
+      return
+    }
     // Everything else is navigation, shared by the live dashboard and the
     // finish screen: move the focused phase, switch the content tab, focus or
     // scroll the reading panel, or open the external session.
@@ -493,6 +532,9 @@ export class TuiProgress implements ProgressUI {
       key.preventDefault()
       key.stopPropagation()
     }
+    // Ctrl+P is handled above as the command palette. Other modified keystrokes
+    // must never accidentally trigger their unmodified dashboard shortcut.
+    if (key.ctrl || key.meta || key.option || key.super || key.hyper) return
     if (this.contentFocused && this.handleContentFocusedKey(key, consume)) return
     switch (key.name) {
       case "up":
@@ -718,6 +760,7 @@ export class TuiProgress implements ProgressUI {
     initialTab: ContentTab = "session",
     private readonly copyReport = copyReportToClipboard,
     private readonly onPauseToggle?: () => void,
+    private readonly onKeepAwakeToggle?: () => void,
   ) {
     this.contentTab = initialTab
     this.phases = phases.map((phase) => ({
@@ -1281,6 +1324,16 @@ export class TuiProgress implements ProgressUI {
     this.render()
   }
 
+  keepAwakeState(state: KeepAwakeState): void {
+    const previous = this.keepAwake
+    this.keepAwake = state
+    if (previous && (previous.status !== state.status || state.detail)) {
+      const message = state.detail ?? (state.status === "on" ? "Caffeinate on — preventing display and idle sleep" : "Caffeinate off")
+      this.addEvent("convoy", state.detail ? "error" : "system", message)
+    }
+    this.render()
+  }
+
   // The focused phase, clamped to a valid index (the pipeline can be empty
   // only in degenerate cases). Shared by rendering and [o].
   private focusedPhase(): PhaseState | undefined {
@@ -1536,6 +1589,122 @@ export class TuiProgress implements ProgressUI {
   // navigation automatically scrolls this window as selection moves.
   private compactPipelineHeight(bodyHeight: number) {
     return Math.max(5, Math.min(10, Math.floor(bodyHeight * 0.4)))
+  }
+
+  private openCommandPalette() {
+    this.commandPalette = { filter: "", index: 0, view: "commands" }
+    this.render()
+  }
+
+  private commandItems(): CommandItem[] {
+    const items: CommandItem[] = []
+    if (!this.finished && !this.observer) {
+      if (this.onKeepAwakeToggle && this.keepAwake?.status !== "unavailable") {
+        items.push({
+          id: "keep-awake",
+          label: "Keep Mac awake",
+          detail: this.keepAwake?.status === "on" ? "on · release Caffeinate" : "off · prevent screen sleep",
+        })
+      }
+      if (this.onPauseToggle) {
+        items.push({
+          id: "pause",
+          label: this.controlState === "running" ? "Pause pipeline" : "Resume pipeline",
+          detail: this.controlState === "running" ? "after the current batch" : "resume now",
+        })
+      }
+      if (this.autoAccept) {
+        items.push({ id: "permissions", label: "Permission policy", detail: `${autoAcceptModeLabel(this.autoAccept.mode)} · cycle` })
+      }
+      items.push({
+        id: "interactive",
+        label: "Interactive takeover",
+        detail: this.interactiveTakeover.has(this.focusedPhase()?.name ?? "") ? "armed for selected step" : "selected running step",
+      })
+    }
+    items.push({ id: "help", label: "Keyboard shortcuts", detail: "show all controls" })
+    return items
+  }
+
+  private filteredCommandItems() {
+    const palette = this.commandPalette
+    if (!palette || palette.view !== "commands") return []
+    const query = palette.filter.trim().toLowerCase()
+    const items = this.commandItems().filter((item) => !query || `${item.label} ${item.detail}`.toLowerCase().includes(query))
+    palette.index = Math.max(0, Math.min(items.length - 1, palette.index))
+    return items
+  }
+
+  private handleCommandPaletteKey(key: KeyEvent) {
+    const palette = this.commandPalette
+    if (!palette) return
+    key.preventDefault()
+    key.stopPropagation()
+
+    if (palette.view === "help") {
+      if (key.name === "escape") this.commandPalette = undefined
+      else if (key.name === "return" || key.name === "linefeed" || key.name === "backspace") palette.view = "commands"
+      this.render()
+      return
+    }
+
+    const items = this.filteredCommandItems()
+    switch (key.name) {
+      case "escape":
+        this.commandPalette = undefined
+        this.render()
+        return
+      case "up":
+      case "k":
+        palette.index = Math.max(0, palette.index - 1)
+        break
+      case "down":
+      case "j":
+        palette.index = Math.min(Math.max(0, items.length - 1), palette.index + 1)
+        break
+      case "backspace":
+        palette.filter = palette.filter.slice(0, -1)
+        palette.index = 0
+        break
+      case "return":
+      case "linefeed": {
+        const item = items[palette.index]
+        if (item) this.runCommand(item)
+        return
+      }
+      default: {
+        const char = typedCharacter(key)
+        if (char !== undefined) {
+          palette.filter += char
+          palette.index = 0
+        }
+      }
+    }
+    this.render()
+  }
+
+  private runCommand(item: CommandItem) {
+    switch (item.id) {
+      case "keep-awake":
+        this.commandPalette = undefined
+        this.onKeepAwakeToggle?.()
+        break
+      case "pause":
+        this.commandPalette = undefined
+        this.onPauseToggle?.()
+        break
+      case "permissions":
+        this.cycleAutoAccept()
+        return
+      case "interactive":
+        this.commandPalette = undefined
+        this.toggleInteractiveTakeover()
+        return
+      case "help":
+        if (this.commandPalette) this.commandPalette.view = "help"
+        break
+    }
+    this.render()
   }
 
   private handlePermissionKey(key: KeyEvent) {
@@ -1931,7 +2100,7 @@ export class TuiProgress implements ProgressUI {
 
     this.footerText.content = this.footerContent(now, innerWidth)
     this.renderFullscreenView()
-    this.renderPermissionModal()
+    this.renderModal()
     this.renderer.requestRender()
   }
 
@@ -1959,6 +2128,9 @@ export class TuiProgress implements ProgressUI {
           this.controlState === "paused" ? "paused · p resume" : `pausing · ${this.controlActivePhases} active`,
         )),
       )
+    }
+    if (!this.finished && this.keepAwake?.status === "on") {
+      title.push(fg(theme.faint)("  ·  "), bold(fg(theme.cyan)("☕ awake")))
     }
     if (this.finished) {
       title.push(
@@ -2734,6 +2906,8 @@ export class TuiProgress implements ProgressUI {
           fg(theme.dim)("] page · ["),
           fg(theme.accent)("esc"),
           fg(theme.dim)("] pipeline · "),
+          fg(theme.accent)("ctrl+p"),
+          fg(theme.dim)(" commands · "),
           fg(theme.yellow)("ctrl+c"),
           fg(theme.dim)(" abort"),
         ]
@@ -2746,6 +2920,8 @@ export class TuiProgress implements ProgressUI {
             fg(theme.dim)("] read · ["),
             fg(theme.accent)("←→"),
             fg(theme.dim)("] tab · select a child for OpenCode · "),
+            fg(theme.accent)("ctrl+p"),
+            fg(theme.dim)(" commands · "),
             fg(theme.yellow)("ctrl+c"),
             fg(theme.dim)(" abort"),
           ]
@@ -2759,10 +2935,8 @@ export class TuiProgress implements ProgressUI {
           fg(theme.dim)("] tab · ["),
           fg(theme.accent)("o"),
           fg(theme.dim)("] session · ["),
-          fg(theme.accent)("i"),
-          fg(theme.dim)("] interactive · ["),
-          fg(theme.accent)("p"),
-          fg(theme.dim)(this.controlState === "running" ? "] pause · " : "] resume · "),
+          fg(theme.accent)("ctrl+p"),
+          fg(theme.dim)("] commands · "),
           fg(theme.yellow)("ctrl+c"),
           fg(theme.dim)(" abort"),
         ]
@@ -2782,10 +2956,22 @@ export class TuiProgress implements ProgressUI {
     return padBetween(left, right, width)
   }
 
-  private renderPermissionModal() {
+  private renderModal() {
     const pending = this.permissionQueue[0]
-    this.overlay.visible = Boolean(pending)
-    if (!pending) return
+    if (pending) {
+      this.renderPermissionModal(pending)
+      return
+    }
+    if (this.commandPalette) {
+      this.renderCommandPalette()
+      return
+    }
+    this.overlay.visible = false
+  }
+
+  private renderPermissionModal(pending: PendingPermission) {
+    this.overlay.visible = true
+    this.modal.title = " ⚿ permission required "
 
     const boxWidth = Math.max(44, Math.min(68, this.renderer.width - 8))
     const width = boxWidth - 6
@@ -2818,6 +3004,63 @@ export class TuiProgress implements ProgressUI {
     this.modal.height = lines.length + 4
     this.modalText.content = joinLines(lines)
   }
+
+  private renderCommandPalette() {
+    const palette = this.commandPalette
+    if (!palette) return
+    this.overlay.visible = true
+    this.modal.title = palette.view === "help" ? " ? keyboard shortcuts " : " ⌘ commands "
+
+    const boxWidth = Math.max(46, Math.min(72, this.renderer.width - 8))
+    const width = boxWidth - 6
+    const lines: StyledText[] = []
+
+    if (palette.view === "help") {
+      lines.push(t`${bold(fg(theme.text)("Run dashboard"))}`)
+      lines.push(plain(""))
+      lines.push(t`${fg(theme.accent)("↑↓ / j k")} ${fg(theme.dim)("select a step")}`)
+      lines.push(t`${fg(theme.accent)("enter / esc")} ${fg(theme.dim)("focus / leave the reader")}`)
+      lines.push(t`${fg(theme.accent)("←→ / tab / 1 2 3")} ${fg(theme.dim)("switch content tab")}`)
+      lines.push(t`${fg(theme.accent)("o")} ${fg(theme.dim)("open the selected session")}`)
+      lines.push(t`${fg(theme.accent)("i")} ${fg(theme.dim)("toggle interactive takeover")}`)
+      lines.push(t`${fg(theme.accent)("p")} ${fg(theme.dim)("pause or resume the pipeline")}`)
+      lines.push(t`${fg(theme.accent)("shift+tab")} ${fg(theme.dim)("cycle permission policy")}`)
+      lines.push(t`${fg(theme.accent)("ctrl+p")} ${fg(theme.dim)("open commands")}`)
+      lines.push(t`${fg(theme.yellow)("ctrl+c")} ${fg(theme.dim)("abort the run")}`)
+      lines.push(plain(""))
+      lines.push(t`${fg(theme.faint)("esc closes · enter returns to commands")}`)
+    } else {
+      lines.push(t`${fg(theme.faint)("type to filter · ↑↓ select · enter run · esc close")}`)
+      if (palette.filter) lines.push(t`${fg(theme.dim)("filter ")}${fg(theme.text)(palette.filter)}`)
+      lines.push(plain(""))
+      const items = this.filteredCommandItems()
+      if (items.length === 0) {
+        lines.push(t`${fg(theme.dim)("no matching commands")}`)
+      } else {
+        items.forEach((item, index) => {
+          const selected = index === palette.index
+          const left: TextChunk[] = [fg(selected ? theme.accent : theme.faint)(selected ? "› " : "  "), selected ? bold(fg(theme.text)(item.label)) : fg(theme.dim)(item.label)]
+          lines.push(padBetween(left, [fg(selected ? theme.accent : theme.faint)(item.detail)], width))
+        })
+      }
+    }
+
+    this.modal.width = boxWidth
+    this.modal.height = lines.length + 4
+    this.modalText.content = joinLines(lines)
+  }
+}
+
+function autoAcceptModeLabel(mode: AutoAcceptMode): string {
+  if (mode === "all") return "allow all"
+  if (mode === "smart") return "smart"
+  return "ask every time"
+}
+
+function typedCharacter(key: KeyEvent): string | undefined {
+  if (key.ctrl || key.meta || key.option || key.super || key.hyper) return undefined
+  const raw = key.raw ?? ""
+  return [...raw].length === 1 && raw >= " " && raw !== "\u007f" ? raw : undefined
 }
 
 function fullscreenHint(tab: ContentTab): TextChunk[] {

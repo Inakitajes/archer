@@ -138,6 +138,12 @@ export type RunOutcome = {
 
 export type RunControlState = "running" | "pausing" | "paused"
 
+/** Host-local screen/idle sleep assertion, intentionally never persisted with a run. */
+export type KeepAwakeState = {
+  status: "off" | "on" | "unavailable"
+  detail?: string
+}
+
 export type ProgressUI = {
   /** `runDir` is the run workspace (where phase reports land); passed early so the reports tab works during a live run, not just on the finish screen. */
   start(runID: string, targetDir: string, runDir?: string): void
@@ -172,6 +178,8 @@ export type ProgressUI = {
   keepRunDirRequested?(): boolean
   /** Persistent cooperative pause state; pausing waits for the current atomic batch. */
   runControlState?(state: RunControlState, activePhases: number): void
+  /** Host-local keep-awake state, driven by the optional macOS Caffeinate process. */
+  keepAwakeState?(state: KeepAwakeState): void
   message(message: string): void
   suspend(): void
   resume(): void
@@ -206,13 +214,13 @@ export async function createProgressUI(
   enabled: boolean,
   onAbort?: () => void,
   autoAccept?: AutoAccept,
-  onPauseToggle?: () => void,
+  controls?: { onPauseToggle?: () => void; onKeepAwakeToggle?: () => void },
 ): Promise<ProgressUI> {
   if (!enabled || !process.stdout.isTTY) return noopProgress
 
   try {
     const { createTuiProgress } = await import("./tui")
-    const progress = await createTuiProgress(phases, onAbort, autoAccept, { onPauseToggle })
+    const progress = await createTuiProgress(phases, onAbort, autoAccept, controls)
     log.mute(true)
     return progress
   } catch (error) {

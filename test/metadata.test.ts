@@ -7,6 +7,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 import { openRunMetadata, readRunMetadata, recordProgress, type RunMetadataStore } from "../src/metadata"
 import { defaultPipeline } from "../src/pipeline"
 import { noopProgress } from "../src/progress"
+import type { KeepAwakeState } from "../src/progress"
 import type { AgentStep, Pipeline } from "../src/types"
 import type { Workspace } from "../src/workspace"
 
@@ -44,11 +45,13 @@ const quick: Pipeline = {
 describe("run metadata", () => {
   test("recordProgress preserves optional runner probes", () => {
     const controlUpdates: string[] = []
+    const keepAwakeUpdates: string[] = []
     const progress = {
       ...noopProgress,
       isInteractiveTakeover: (name: string) => name === "implementer",
       keepRunDirRequested: () => true,
       runControlState: (state: string, activePhases: number) => controlUpdates.push(`${state}:${activePhases}`),
+      keepAwakeState: (state: KeepAwakeState) => keepAwakeUpdates.push(state.status),
     }
     const wrapped = recordProgress(progress, {} as RunMetadataStore)
 
@@ -56,7 +59,9 @@ describe("run metadata", () => {
     expect(wrapped.isInteractiveTakeover?.("other")).toBeFalse()
     expect(wrapped.keepRunDirRequested?.()).toBeTrue()
     wrapped.runControlState?.("pausing", 2)
+    wrapped.keepAwakeState?.({ status: "on" })
     expect(controlUpdates).toEqual(["pausing:2"])
+    expect(keepAwakeUpdates).toEqual(["on"])
   })
 
   test("the first open freezes the pipeline; later opens replay it", async () => {

@@ -39,14 +39,14 @@ async function createDashboard(
   width = 120,
   height = 40,
   phases: ProgressPhase[] = [{ name: "implement", description: "" }],
-  options: { observer?: boolean; onPauseToggle?: () => void; copyResult?: ClipboardResult } = {},
+  options: { observer?: boolean; onPauseToggle?: () => void; onKeepAwakeToggle?: () => void; copyResult?: ClipboardResult } = {},
 ) {
   const testRenderer = await createTestRenderer({ width, height })
   const copied: string[] = []
   const dashboard = new TuiProgress(testRenderer.renderer, phases, undefined, undefined, false, options.observer ?? false, "session", async (text) => {
     copied.push(text)
     return options.copyResult ?? "copied-native"
-  }, options.onPauseToggle)
+  }, options.onPauseToggle, options.onKeepAwakeToggle)
   testRenderer.renderer.copyToClipboardOSC52 = (text) => {
     copied.push(text)
     return true
@@ -162,7 +162,7 @@ describe("run dashboard defaults", () => {
       dashboard.runControlState("paused", 0)
       await renderOnce()
       expect(internals.headerText.plainText).toContain("paused · p resume")
-      expect(internals.footerText.plainText).toContain("resume")
+      expect(internals.footerText.plainText).toContain("ctrl+p")
     } finally {
       dashboard.stop()
     }
@@ -177,6 +177,43 @@ describe("run dashboard defaults", () => {
 
       expect(toggles).toBe(0)
       expect(internals.feed.map((entry) => entry.message)).toContain("pause isn't available while attached read-only")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("ctrl+p opens commands without triggering pause, while p still pauses", async () => {
+    let pauses = 0
+    const { dashboard, mockInput, renderOnce } = await createDashboard(120, 40, [{ name: "implement", description: "" }], { onPauseToggle: () => pauses++ })
+    try {
+      const internals = dashboard as unknown as DashboardInternals & { commandPalette?: { view: string } }
+      await renderOnce()
+      expect(internals.footerText.plainText).toContain("ctrl+p")
+
+      mockInput.pressKey("p", { ctrl: true })
+      expect(internals.commandPalette?.view).toBe("commands")
+      expect(pauses).toBe(0)
+
+      mockInput.pressEscape()
+      // An isolated Escape needs a beat to settle before the next printable key;
+      // otherwise terminal parsers legitimately read the pair as Meta+P.
+      await Bun.sleep(20)
+      mockInput.pressKey("p")
+      expect(pauses).toBe(1)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("the command palette toggles keep-awake through its callback", async () => {
+    let toggles = 0
+    const { dashboard, mockInput } = await createDashboard(120, 40, [{ name: "implement", description: "" }], { onKeepAwakeToggle: () => toggles++ })
+    try {
+      mockInput.pressKey("p", { ctrl: true })
+      // Keep Mac awake is the first live-run command.
+      mockInput.pressEnter()
+
+      expect(toggles).toBe(1)
     } finally {
       dashboard.stop()
     }
