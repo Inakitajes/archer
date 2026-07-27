@@ -6,6 +6,7 @@ import {
   defaultAdversarialModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
+  defaultOpusModel,
   defaultPipeline,
   resolvePipeline,
   slugifyModel,
@@ -143,13 +144,47 @@ describe("built-in implement-lite pipeline", () => {
     expect(byName.adversarial).toMatchObject({ model: "anthropic/claude-opus-5" })
   })
 
-  test("keeps GLM 5.2 scoped to the implementation, lite, refine, and hunter pipelines", () => {
+  test("keeps GLM 5.2 scoped to the implementation, lite, advised, refine, and hunter pipelines", () => {
     const glmPipelines = Object.entries(builtInPipelines)
       .filter(([, spec]) => JSON.stringify(spec).includes("openrouter/z-ai/glm-5.2"))
       .map(([name]) => name)
 
     // The hunter pipelines use GLM as one specialty voice in their fan-out, not as a cost downgrade.
-    expect(glmPipelines).toEqual(["implement", "implement-lite", "review-lite", "refine", "hunter", "hunter-max"])
+    // implement-advised uses it as the executor precisely because an advisor backs it.
+    expect(glmPipelines).toEqual(["implement", "implement-lite", "implement-advised", "review-lite", "refine", "hunter", "hunter-max"])
+  })
+})
+
+describe("built-in implement-advised pipeline", () => {
+  const advised = () =>
+    resolvePipeline({ name: "implement-advised", spec: builtInPipelines["implement-advised"]!, agents: builtInAgents }).steps.filter(
+      (step): step is AgentStep => step.type === "agent",
+    )
+
+  test("puts a cheap executor in every writing phase with Opus advising it", () => {
+    const steps = advised()
+    const writing = steps.filter((step) => step.name !== "adversarial")
+
+    expect(writing.length).toBeGreaterThan(0)
+    for (const step of writing) {
+      expect(step.advisor).toBe(defaultOpusModel)
+      expect(step.model).not.toBe(defaultOpusModel)
+    }
+  })
+
+  test("leaves the adversarial pass owning its own loop on Opus, with no advisor", () => {
+    const adversarial = advised().find((step) => step.name === "adversarial")
+
+    expect(adversarial?.model).toBe(defaultOpusModel)
+    expect(adversarial?.advisor).toBeUndefined()
+  })
+
+  test("mirrors implement's step names, so the two are directly comparable", () => {
+    expect(advised().map((step) => step.name)).toEqual(
+      resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents })
+        .steps.filter((step): step is AgentStep => step.type === "agent")
+        .map((step) => step.name),
+    )
   })
 })
 

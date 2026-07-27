@@ -324,6 +324,23 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "adversarial", model: defaultOpusModel, reports: "all" },
     ],
   },
+  // The advisor←executor pattern as a runnable default: cheap models own the
+  // loops, Opus is consulted at their decision points. Deliberately a separate
+  // pipeline rather than a change to `implement`, so the cost profile of the
+  // existing built-ins is untouched and the two can be compared directly.
+  "implement-advised": {
+    description: "Like implement-lite, but every writing phase consults Opus 5 as an advisor at its decision points instead of running on it",
+    steps: [
+      { agent: "implementer", model: sonnetModel, advisor: defaultOpusModel, reports: "none" },
+      { agent: "patterns", model: glmModel, advisor: defaultOpusModel },
+      { agent: "security", model: glmModel, advisor: defaultOpusModel },
+      { agent: "design", model: glmModel, advisor: defaultOpusModel },
+      { agent: "tests", model: glmModel, advisor: defaultOpusModel, reports: "none" },
+      // The adversarial pass is the one place the expensive model should own the
+      // loop: its whole job is the judgement an advisor would otherwise supply.
+      { agent: "adversarial", model: defaultOpusModel, advisor: false, reports: "all" },
+    ],
+  },
   review: {
     description:
       "Report-only PR review: scope, then parallel bug/clean-code/security audits across two models, then one prioritized findings report. Makes no changes.",

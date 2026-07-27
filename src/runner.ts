@@ -8,6 +8,7 @@ import type { AssistantMessage, FilePartInput, OpencodeClient, Part } from "@ope
 
 import { advisorNeedsOf, type AdvisorUsage } from "./advisor"
 import { advisorTokenEnv, advisorUrlEnv, installAdvisorTool, startAdvisorBridge, type AdvisorBridge } from "./advisor-bridge"
+import { readAdvisorSplit, renderAdvisorSplit } from "./advisor-report"
 import { createAdvisorRuntime, totalAdvisorUsage, type AdvisorPhaseHandle, type AdvisorRuntime } from "./advisor-runtime"
 import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
@@ -599,7 +600,12 @@ export async function run(options: RunOptions) {
     }
 
     progress.message("writing run summary")
-    await writeSummary(workspace, pipeline.steps.map((step) => step.name))
+    const advisorSection = advisorNeeds.agents.size > 0 ? renderAdvisorSplit(await readAdvisorSplit(workspace.dir)) : undefined
+    await writeSummary(
+      workspace,
+      pipeline.steps.map((step) => step.name),
+      advisorSection ? [advisorSection] : [],
+    )
     postHooksStarted = true
     await runHooks("post", hookSet.post, {
       workspace,

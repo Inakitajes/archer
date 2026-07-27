@@ -37,8 +37,10 @@ export async function cleanupWorkspace(workspace: Workspace) {
   await rm(workspace.dir, { recursive: true, force: true })
 }
 
-export async function writeSummary(workspace: Workspace, phaseNames: string[]) {
+export async function writeSummary(workspace: Workspace, phaseNames: string[], extraSections: readonly string[] = []) {
   const chunks: string[] = [`# convoy run ${workspace.runID} - summary`, ""]
+
+  for (const section of extraSections) chunks.push(section, "")
 
   for (const name of phaseNames) {
     chunks.push(`## ${name}`, "")
