@@ -7,6 +7,7 @@ import { createInterface } from "node:readline/promises"
 import type { AssistantMessage, FilePartInput, OpencodeClient, Part } from "@opencode-ai/sdk/v2"
 
 import { advisorNeedsOf, type AdvisorUsage } from "./advisor"
+import { advisorTokenEnv, advisorUrlEnv, installAdvisorTool, startAdvisorBridge, type AdvisorBridge } from "./advisor-bridge"
 import { createAdvisorRuntime, totalAdvisorUsage, type AdvisorPhaseHandle, type AdvisorRuntime } from "./advisor-runtime"
 import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
@@ -41,7 +42,7 @@ import { discoverProjectContextFiles } from "./project-context"
 import { createStepRunnerImpl, stepRunnerFor, stepRunnerModel, type StepRunnerId, type StepRunnerImpl } from "./step-runners"
 import type { AgentSpec, AgentStep, HookSet, HookSpec, Pipeline, RunOptions, Step } from "./types"
 import { addTokens, emptyTokens, tokensFromValue } from "./usage"
-import { cleanupWorkspace, createWorkspace, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
+import { cleanupWorkspace, createWorkspace, opencodeConfigDir, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
 
 export type ActiveSession = {
   client: OpencodeClient
@@ -391,6 +392,7 @@ export async function run(options: RunOptions) {
   let opencode: Awaited<ReturnType<typeof startOpencode>> | undefined
   let progress: ProgressUI = noopProgress
   let permissions: PermissionGate | undefined
+  let advisorBridge: AdvisorBridge | undefined
   let metadata: RunMetadataStore | undefined
   let control: RunControl | undefined
   let caffeinate: Caffeinate | undefined
@@ -493,6 +495,19 @@ export async function run(options: RunOptions) {
     // Derived from the frozen pipeline, so a resume rebuilds the same advisor
     // machinery the run started with.
     const advisorNeeds = advisorNeedsOf(pipeline.steps)
+    // Everything the on-demand tool needs must exist before the server spawns:
+    // the SDK hands opencode Convoy's environment at spawn time, and the tool
+    // file is discovered from OPENCODE_CONFIG_DIR at startup. The runtime the
+    // bridge serves is created after, once there is a client — hence the
+    // deferred lookup.
+    let advisors: AdvisorRuntime | undefined
+    if (advisorNeeds.agents.size > 0) {
+      await installAdvisorTool()
+      process.env.OPENCODE_CONFIG_DIR = opencodeConfigDir()
+      advisorBridge = await startAdvisorBridge({ advisors: () => advisors })
+      process.env[advisorUrlEnv] = advisorBridge.url
+      process.env[advisorTokenEnv] = advisorBridge.token
+    }
     try {
       opencode = await startOpencode(
         opencodeConfig(workspace.dir, options.targetDir, agents, options.permissions, {
@@ -507,7 +522,7 @@ export async function run(options: RunOptions) {
     progress.serverReady(opencode.url)
     log.info(`opencode SDK ready at ${opencode.url}`)
 
-    const advisors = createAdvisorRuntime({
+    advisors = createAdvisorRuntime({
       client: opencode.client,
       directory: options.targetDir,
       signal: shutdown.signal,
@@ -626,6 +641,9 @@ export async function run(options: RunOptions) {
     if (shutdown.aborted) await shutdown.abortActiveSessions(progress)
     await caffeinate?.stop()
     await permissions?.stop()
+    // Before the server: a tool call still in flight would otherwise hang on a
+    // socket nobody is going to answer.
+    advisorBridge?.close()
     // The server dies at the end of this block; clear its metadata entry now so
     // `convoy runs` stops offering to attach to a run that's shutting down.
     metadata?.serverStopped()

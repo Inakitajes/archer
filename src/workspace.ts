@@ -87,6 +87,22 @@ export function globalAgentsDir() {
   return join(convoyHome(), "agents")
 }
 
+/**
+ * A Convoy-owned OpenCode config directory, passed to the server as
+ * OPENCODE_CONFIG_DIR so `tools/advisor.ts` is discovered.
+ *
+ * Convoy-owned rather than the repo's `.opencode/` (which would show up in git
+ * status and in the read-only baseline checks) or the user's
+ * `~/.config/opencode/` (which would leak the tool into their own sessions).
+ * Verified against opencode 1.18.5: the variable is additive, so the user's
+ * global config, plugins and MCP servers keep loading exactly as before.
+ * Persistent, so the dependency install OpenCode kicks off in such a directory
+ * happens once rather than per run.
+ */
+export function opencodeConfigDir() {
+  return join(convoyHome(), "opencode")
+}
+
 export function isValidRunID(runID: string) {
   return runIDPattern.test(runID)
 }
