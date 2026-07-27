@@ -7,6 +7,13 @@ export type StepRunnerCapabilities = {
   writeSteps: boolean
   modelFanout: boolean
   globalModelOverride: boolean
+  /**
+   * Whether the engine can consult an advising model at the step's decision
+   * points. Convoy emulates the pattern through OpenCode's own session and
+   * permission APIs, so it is OpenCode-only: the `claude` CLI owns its loop and
+   * exposes no equivalent hook (its own `--advisor` flag does not exist yet).
+   */
+  advisor: boolean
 }
 
 export type StepRunnerDefinition = {
@@ -44,6 +51,7 @@ const definitions: Record<StepRunnerId, StepRunnerDefinition> = {
       writeSteps: true,
       modelFanout: true,
       globalModelOverride: true,
+      advisor: true,
     },
     modelLabel: (model, variant) => `${model}${variant ? `#${variant}` : ""}`,
   },
@@ -57,6 +65,7 @@ const definitions: Record<StepRunnerId, StepRunnerDefinition> = {
       writeSteps: false,
       modelFanout: false,
       globalModelOverride: false,
+      advisor: false,
     },
     modelLabel: (model) => `claude-code/${model || "default"}`,
   },

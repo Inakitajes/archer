@@ -260,6 +260,14 @@ export type AgentStepSpec = {
   models?: string[]
   /** Execution engine. Default is OpenCode; "claude-code" spawns the local `claude` CLI (read-only audit steps only). */
   runner?: "opencode" | StepRunner
+  /**
+   * Advising model consulted at this step's decision points, or `false` to run
+   * without one even when a broader default sets it. Absent inherits the
+   * agent's advisor, then defaults.advisor; absent everywhere means no advisor.
+   */
+  advisor?: string | false
+  /** Cap on advisor consultations per phase attempt. */
+  advisorMaxCalls?: number
   maxAttempts?: number
   /** Which previous step reports to attach: the nearest group (default), all of them, none, or an explicit list of step names. */
   reports?: "previous" | "all" | "none" | string[]
@@ -314,6 +322,23 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "design", model: defaultOpusModel },
       { agent: "tests", model: glmModel, reports: "none" },
       { agent: "adversarial", model: defaultOpusModel, reports: "all" },
+    ],
+  },
+  // The advisor←executor pattern as a runnable default: cheap models own the
+  // loops, Opus is consulted at their decision points. Deliberately a separate
+  // pipeline rather than a change to `implement`, so the cost profile of the
+  // existing built-ins is untouched and the two can be compared directly.
+  "implement-advised": {
+    description: "Like implement-lite, but every writing phase consults Opus 5 as an advisor at its decision points instead of running on it",
+    steps: [
+      { agent: "implementer", model: sonnetModel, advisor: defaultOpusModel, reports: "none" },
+      { agent: "patterns", model: glmModel, advisor: defaultOpusModel },
+      { agent: "security", model: glmModel, advisor: defaultOpusModel },
+      { agent: "design", model: glmModel, advisor: defaultOpusModel },
+      { agent: "tests", model: glmModel, advisor: defaultOpusModel, reports: "none" },
+      // The adversarial pass is the one place the expensive model should own the
+      // loop: its whole job is the judgement an advisor would otherwise supply.
+      { agent: "adversarial", model: defaultOpusModel, advisor: false, reports: "all" },
     ],
   },
   review: {
@@ -465,13 +490,19 @@ export type ResolvePipelineInput = {
   agents: readonly AgentSpec[]
   /** Project-wide defaults.model; beats built-in agent preferences, loses to step/agent models. */
   defaultModel?: string
+  /** Project-wide defaults.advisor; loses to step/agent advisors. Absent everywhere means no advisor. */
+  defaultAdvisor?: string
+  /** Project-wide defaults.advisorMaxCalls; loses to the step's own. */
+  defaultAdvisorMaxCalls?: number
 }
 
 /**
  * Turns a pipeline spec into concrete steps: resolves agent aliases, derives
  * step names and report paths, applies the model precedence chain
- * (step > agent > defaults.model > built-in preference > gpt default), and
- * wires each step's inputs (prd + previous reports + diff) by convention.
+ * (step > agent > defaults.model > built-in preference > gpt default) and the
+ * parallel advisor chain (step > agent > defaults.advisor, with no built-in
+ * fallback so the advisor stays opt-in), and wires each step's inputs
+ * (prd + previous reports + diff) by convention.
  *
  * Steps inside the same `parallel:` block, or produced by fanning one step
  * out across `models:`, share a `groupId` and are always forced read-only —
@@ -652,6 +683,29 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
     )
   }
 
+  // The advisor chain mirrors the model chain, with two differences: there is no
+  // built-in fallback (absent everywhere means no advisor, so cost never changes
+  // for a config that doesn't ask for one), and `false` cuts the chain so a step
+  // can opt out of a broader default.
+  const advisorConfigured = spec.advisor === false ? undefined : (spec.advisor ?? agent.advisor ?? ctx.input.defaultAdvisor)
+  // An advisor named ON the step is a hard error against a runner that can't do
+  // it; one merely inherited from the agent or defaults is dropped, so a global
+  // default stays usable in pipelines that mix runners.
+  if (advisorConfigured && !runnerDefinition.capabilities.advisor) {
+    if (spec.advisor !== undefined) {
+      throw new Error(
+        `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") sets an advisor, which runner: ${runnerDefinition.id} does not support; remove it or drop the runner`,
+      )
+    }
+  }
+  const advisor = runnerDefinition.capabilities.advisor ? advisorConfigured : undefined
+  const advisorMaxCalls = advisor ? (spec.advisorMaxCalls ?? ctx.input.defaultAdvisorMaxCalls) : undefined
+  if (spec.advisorMaxCalls !== undefined && !advisor) {
+    throw new Error(
+      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") sets advisorMaxCalls without an advisor; add advisor: <model> or remove the cap`,
+    )
+  }
+
   const models = spec.models
   const forced = ctx.forcedReadOnly || Boolean(models)
   // Runners without global override support own their model namespace and use
@@ -666,6 +720,7 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
     ctx.claimName(name, models ? `${ctx.position}[${variantIndex + 1}]` : ctx.position)
 
     const { model, variant } = runner ? { model: modelValue, variant: undefined } : splitModelVariant(modelValue)
+    const advisorParts = advisor ? splitModelVariant(advisor) : undefined
     const step: AgentStep = {
       type: "agent",
       name,
@@ -675,6 +730,9 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
       description: agent.description,
       model,
       ...(variant ? { variant } : {}),
+      ...(advisorParts ? { advisor: advisorParts.model } : {}),
+      ...(advisorParts?.variant ? { advisorVariant: advisorParts.variant } : {}),
+      ...(advisorMaxCalls !== undefined ? { advisorMaxCalls } : {}),
       ...(runner ? { runner } : {}),
       inputFiles: ["prd.md", ...reportInputs(ctx.input.name, name, spec.reports ?? "previous", ctx.priorSteps)],
       inputDiff: spec.diff ?? ctx.priorSteps.length > 0,

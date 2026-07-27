@@ -19,6 +19,7 @@ describe("step runner registry", () => {
       writeSteps: true,
       modelFanout: true,
       globalModelOverride: true,
+      advisor: true,
     })
   })
 
@@ -29,6 +30,7 @@ describe("step runner registry", () => {
       writeSteps: false,
       modelFanout: false,
       globalModelOverride: false,
+      advisor: false,
     })
   })
 

@@ -1,4 +1,6 @@
 import adversarialReviewer from "../prompts/adversarial-reviewer.md" with { type: "text" }
+import advisorSystem from "../prompts/advisor-system.md" with { type: "text" }
+import advisorTiming from "../prompts/advisor-timing.md" with { type: "text" }
 import bugAuditor from "../prompts/bug-auditor.md" with { type: "text" }
 import cleanCodeAuditor from "../prompts/clean-code-auditor.md" with { type: "text" }
 import designPolisher from "../prompts/design-polisher.md" with { type: "text" }
@@ -34,6 +36,8 @@ import testEngineer from "../prompts/test-engineer.md" with { type: "text" }
  */
 export const builtInPrompts: Record<string, string> = {
   "adversarial-reviewer": adversarialReviewer,
+  "advisor-system": advisorSystem,
+  "advisor-timing": advisorTiming,
   "bug-auditor": bugAuditor,
   "clean-code-auditor": cleanCodeAuditor,
   "design-polisher": designPolisher,

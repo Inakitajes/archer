@@ -9,6 +9,10 @@ export type RunOptions = {
   resumeRunID: string
   keepRunDir: boolean
   modelOverride: string
+  /** --advisor: forces this advising model on every advisor-capable step. Empty means "leave config alone". */
+  advisorOverride: string
+  /** --no-advisor: strips the advisor from every step, whatever config resolved. */
+  advisorDisabled: boolean
   gateway?: ModelGateway
   gatewayExplicit?: boolean
   modelRoutingOverrides?: ModelRoutingOverrides
@@ -89,6 +93,8 @@ export type AgentSpec = {
   temperature?: number
   /** When true, Convoy disables write/edit/bash tools for this agent. */
   readOnly?: boolean
+  /** Advising model for steps using this agent; beats defaults.advisor, loses to the step's own. */
+  advisor?: string
   builtIn: boolean
 }
 
@@ -110,6 +116,17 @@ export type AgentStep = {
   variant?: string
   /** Frozen logical and physical OpenCode model. Absent only on legacy metadata and Claude Code steps. */
   resolvedModel?: ResolvedModel
+  /**
+   * Configured advising model (`provider/model[#variant]`) consulted at this
+   * step's decision points. Absent means the step runs with no advisor, which
+   * is the default: the advisor is opt-in per step.
+   */
+  advisor?: string
+  advisorVariant?: string
+  /** Frozen logical and physical advising model, routed through the run's gateway like `resolvedModel`. */
+  resolvedAdvisor?: ResolvedModel
+  /** Cap on advisor consultations per phase attempt; falls back to the built-in default when absent. */
+  advisorMaxCalls?: number
   /** Absent for OpenCode (the default engine). */
   runner?: StepRunner
   inputFiles: readonly string[]

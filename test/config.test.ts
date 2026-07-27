@@ -392,7 +392,7 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: hunter, hunter-max, implement, implement-lite, quick, refine, review, review-cc, review-lite, ultra-implement, ultra-refine)',
+      'unknown pipeline "ghost" (available: hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ultra-implement, ultra-refine)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
   })
@@ -888,5 +888,97 @@ describe("materializing built-in pipelines", () => {
       "not an earlier agent step",
     )
     expect(checkPipelineResolves("x", { steps: ["patterns"] }, undefined)).toBeUndefined()
+  })
+})
+
+describe("advisor config", () => {
+  const parseAdvisor = (body: string) => parseConvoyConfig(body, ".convoy/config.yaml", "/tmp/non-existent-convoy-target")
+
+  test("accepts an advisor at all three levels", () => {
+    const config = parseAdvisor(`version: 1
+defaults:
+  advisor: anthropic/claude-opus-5
+  advisorMaxCalls: 2
+agents:
+  implementer:
+    advisor: anthropic/claude-opus-4-8
+pipelines:
+  advised:
+    steps:
+      - agent: implementer
+        advisor: anthropic/claude-opus-5#high
+        advisorMaxCalls: 1
+`)
+
+    expect(config.defaults.advisor).toBe("anthropic/claude-opus-5")
+    expect(config.defaults.advisorMaxCalls).toBe(2)
+    expect(config.agents.implementer?.advisor).toBe("anthropic/claude-opus-4-8")
+    expect(config.pipelines.advised?.steps[0]).toMatchObject({ advisor: "anthropic/claude-opus-5#high", advisorMaxCalls: 1 })
+  })
+
+  test("keeps advisor: false as an explicit opt-out rather than dropping it", () => {
+    const config = parseAdvisor(`version: 1
+pipelines:
+  advised:
+    steps:
+      - agent: implementer
+        advisor: false
+`)
+
+    expect(config.pipelines.advised?.steps[0]).toMatchObject({ advisor: false })
+  })
+
+  test("rejects malformed advisors, advisor: true, and caps without an advisor", () => {
+    const step = (body: string) => `version: 1\npipelines:\n  p:\n    steps:\n      - agent: implementer\n${body}`
+
+    expect(() => parseAdvisor(step("        advisor: not-a-model\n"))).toThrow(/advisor/)
+    expect(() => parseAdvisor(step("        advisor: true\n"))).toThrow(/true is not a model/)
+    expect(() => parseAdvisor(step("        advisor: false\n        advisorMaxCalls: 2\n"))).toThrow(/meaningless with advisor: false/)
+    expect(() => parseAdvisor(step("        advisorMaxCalls: 0\n"))).toThrow(/advisorMaxCalls/)
+    expect(() => parseAdvisor(`version: 1\ndefaults:\n  advisor: nope\n`)).toThrow(/defaults.advisor/)
+  })
+
+  test("rejects an advisor on a claude-code step", () => {
+    expect(() =>
+      parseAdvisor(`version: 1
+pipelines:
+  p:
+    steps:
+      - agent: bug-auditor
+        runner: claude-code
+        advisor: anthropic/claude-opus-5
+`),
+    ).toThrow(/does not support an advisor/)
+  })
+
+  test("buildAgentRegistry carries the advisor onto built-in and project agents", () => {
+    const config = parseAdvisor(`version: 1
+agents:
+  implementer:
+    advisor: anthropic/claude-opus-5
+`)
+    const registry = buildAgentRegistry(config)
+
+    expect(registry.find((agent) => agent.name === "implementer")?.advisor).toBe("anthropic/claude-opus-5")
+  })
+
+  test("survives a serialize/re-parse round trip", () => {
+    const config = parseAdvisor(`version: 1
+defaults:
+  advisor: anthropic/claude-opus-5
+pipelines:
+  advised:
+    steps:
+      - agent: implementer
+        advisor: false
+      - agent: tests
+        advisor: anthropic/claude-opus-5#high
+        advisorMaxCalls: 3
+`)
+    const reparsed = parseAdvisor(serializeConvoyConfig(config))
+
+    expect(reparsed.defaults.advisor).toBe("anthropic/claude-opus-5")
+    expect(reparsed.pipelines.advised?.steps[0]).toMatchObject({ advisor: false })
+    expect(reparsed.pipelines.advised?.steps[1]).toMatchObject({ advisor: "anthropic/claude-opus-5#high", advisorMaxCalls: 3 })
   })
 })

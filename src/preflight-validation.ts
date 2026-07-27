@@ -10,6 +10,12 @@ export function preflightTargets(plan: RunPlan): ResolvedModel[] {
   const targets = plan.pipeline.steps.flatMap((step) =>
     step.type === "agent" && step.runner !== "claude-code" && step.resolvedModel ? [step.resolvedModel] : [],
   )
+  // Advising models are validated as themselves, not as the synthetic capped
+  // alias the advisor is actually invoked with: the alias only exists inside the
+  // run's own OpenCode config, so a clean discovery server would never see it.
+  for (const step of plan.pipeline.steps) {
+    if (step.type === "agent" && step.resolvedAdvisor) targets.push(step.resolvedAdvisor)
+  }
   if (plan.smartJudge) targets.push(plan.smartJudge.model)
   // No branch namer here: naming happens in the launcher, before the plan is
   // built, so nothing is left to call once the run is confirmed.

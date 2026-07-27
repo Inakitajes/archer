@@ -33,6 +33,7 @@ import {
   selectInterruptedPhase,
   shouldRetryAttempt,
   shouldSkip,
+  watchSession,
   withReadOnlyRepositoryBoundary,
   type ActiveSession,
 } from "../src/runner"
@@ -1049,3 +1050,112 @@ describe("waitForInteractiveGate", () => {
     expect(events).toEqual([])
   })
 })
+
+/**
+ * The advisor's completion checkpoint gives a finished phase a second turn in
+ * the SAME session, so two watchers observe one message list. A result that
+ * described the whole session instead of its own turn would make the caller
+ * double-count usage and concatenate the first turn's report onto the second's.
+ */
+describe("watchSession turn scoping", () => {
+  const assistantMessage = (id: string, cost: number, text: string) => ({
+    info: {
+      id,
+      sessionID: "ses_1",
+      role: "assistant" as const,
+      time: { created: 1, completed: 2 },
+      parentID: "p",
+      modelID: "gpt-5.6-sol",
+      providerID: "openai",
+      mode: "primary",
+      agent: "implementer",
+      path: { cwd: "/repo", root: "/repo" },
+      cost,
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+    parts: [{ id: `${id}_p`, sessionID: "ses_1", messageID: id, type: "text" as const, text }],
+  })
+
+  function idleClient(messages: unknown[]) {
+    let release!: () => void
+    const idled = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    async function* stream() {
+      // One idle event, then hold the stream open the way a live server does.
+      yield { type: "session.idle", properties: { sessionID: "ses_1" } }
+      await idled
+    }
+    return {
+      close: release,
+      client: {
+        event: { subscribe: async () => ({ stream: stream() }) },
+        session: {
+          messages: async () => ({ data: messages }),
+          status: async () => ({ data: {} }),
+        },
+      } as never,
+    }
+  }
+
+  const watch = async (messages: unknown[], sinceMessageID?: string) => {
+    const { client, close } = idleClient(messages)
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress: noopProgress,
+      signal: new AbortController().signal,
+      ...(sinceMessageID ? { sinceMessageID } : {}),
+    })
+    try {
+      return await watcher.result
+    } finally {
+      close()
+      await watcher.stop()
+    }
+  }
+
+  const twoTurns = () => [assistantMessage("msg_1", 0.1, "first report"), assistantMessage("msg_2", 0.02, "NO CHANGES")]
+
+  test("an anchored watcher reports only the messages after its anchor", async () => {
+    const result = await watch(twoTurns(), "msg_1")
+
+    expect(result.assistantInfos.map((info) => info.id)).toEqual(["msg_2"])
+    expect(result.parts).toHaveLength(1)
+    // The sentinel is unreachable if the first turn's report is still in front of it.
+    expect((result.parts[0] as { text: string }).text).toBe("NO CHANGES")
+    expect(result.info.id).toBe("msg_2")
+  })
+
+  test("an unanchored watcher still reports the whole session", async () => {
+    const result = await watch(twoTurns())
+
+    expect(result.assistantInfos.map((info) => info.id)).toEqual(["msg_1", "msg_2"])
+    expect(result.parts).toHaveLength(2)
+  })
+
+  test("waits for the follow-up turn instead of resolving on the previous one", async () => {
+    // Only the first turn exists: the anchored watcher has nothing of its own
+    // yet, and resolving here would report an empty turn as a finished one.
+    const { client, close } = idleClient([assistantMessage("msg_1", 0.1, "first report")])
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress: noopProgress,
+      signal: new AbortController().signal,
+      sinceMessageID: "msg_1",
+    })
+
+    const settled = await Promise.race([watcher.result.then(() => "settled"), sleep(50).then(() => "pending")])
+
+    expect(settled).toBe("pending")
+    close()
+    await watcher.stop()
+  })
+})
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}

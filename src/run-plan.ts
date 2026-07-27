@@ -18,7 +18,10 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
   const gateway = input.gateway ?? "configured"
   const overrides = input.modelRoutingOverrides ?? {}
   // The immutable plan must never recursively freeze caller-owned config.
-  const pipeline = routePipeline(filterPipeline(structuredClone(input.pipeline), input.onlySteps, input.skipSteps), gateway, overrides, input.modelOverride)
+  const pipeline = routePipeline(filterPipeline(structuredClone(input.pipeline), input.onlySteps, input.skipSteps), gateway, overrides, input.modelOverride, {
+    advisorOverride: input.advisorOverride,
+    advisorDisabled: input.advisorDisabled,
+  })
   const judge = input.smart
     ? resolveModel(input.smartJudgeModel, gateway, overrides)
     : undefined
@@ -53,7 +56,20 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
   })
 }
 
-export function routePipeline(pipeline: Pipeline, gateway: ModelGateway, overrides: ModelRoutingOverrides, modelOverride = ""): Pipeline {
+export type AdvisorPlanOverrides = {
+  /** Forces this advising model on every advisor-capable step. Empty leaves each step's own resolution alone. */
+  advisorOverride?: string
+  /** Strips the advisor from every step; wins over advisorOverride. */
+  advisorDisabled?: boolean
+}
+
+export function routePipeline(
+  pipeline: Pipeline,
+  gateway: ModelGateway,
+  overrides: ModelRoutingOverrides,
+  modelOverride = "",
+  advisor: AdvisorPlanOverrides = {},
+): Pipeline {
   return {
     ...pipeline,
     steps: pipeline.steps.map((step): Step => {
@@ -65,8 +81,34 @@ export function routePipeline(pipeline: Pipeline, gateway: ModelGateway, overrid
         model: `${resolvedModel.providerID}/${resolvedModel.modelID}`,
         ...(resolvedModel.variant ? { variant: resolvedModel.variant } : { variant: undefined }),
         resolvedModel,
+        ...routeAdvisor(step, gateway, overrides, advisor),
       }
     }),
+  }
+}
+
+/**
+ * The advisor is routed through the run's gateway exactly like the executor's
+ * model, so a `--gateway openrouter` run doesn't consult the advisor direct.
+ * Returns the full set of advisor fields (explicitly undefined when off) so the
+ * spread always overwrites whatever the step carried in.
+ */
+function routeAdvisor(
+  step: AgentStep,
+  gateway: ModelGateway,
+  overrides: ModelRoutingOverrides,
+  { advisorOverride = "", advisorDisabled = false }: AdvisorPlanOverrides,
+): Pick<AgentStep, "advisor" | "advisorVariant" | "resolvedAdvisor"> {
+  const off = { advisor: undefined, advisorVariant: undefined, resolvedAdvisor: undefined }
+  if (advisorDisabled) return off
+  const configured = advisorOverride || (step.advisor ? `${step.advisor}${step.advisorVariant ? `#${step.advisorVariant}` : ""}` : "")
+  if (!configured) return off
+
+  const resolvedAdvisor = resolveModel(configured, gateway, overrides)
+  return {
+    advisor: `${resolvedAdvisor.providerID}/${resolvedAdvisor.modelID}`,
+    advisorVariant: resolvedAdvisor.variant,
+    resolvedAdvisor,
   }
 }
 
@@ -98,4 +140,10 @@ function deepFreeze<T>(value: T): T {
 export function plannedStepModel(step: AgentStep): string {
   if (step.runner === "claude-code") return `claude-code/${step.model || "default"}`
   return step.resolvedModel?.target ?? `${step.model}${step.variant ? `#${step.variant}` : ""}`
+}
+
+/** The step's advising model as the reviewed plan shows it, or undefined when the step runs without one. */
+export function plannedStepAdvisor(step: AgentStep): string | undefined {
+  if (!step.advisor) return undefined
+  return step.resolvedAdvisor?.target ?? `${step.advisor}${step.advisorVariant ? `#${step.advisorVariant}` : ""}`
 }

@@ -60,6 +60,23 @@ describe("cli parsing", () => {
     expect(() => parseArgs(["--no-confirm=yes", "prompt"])).toThrow("--no-confirm does not take a value")
   })
 
+  test("parses the advisor flags, letting the last one win so the eval configs stay unambiguous", () => {
+    expect(parseArgs(["--advisor", "anthropic/claude-opus-5", "prompt"])).toMatchObject({
+      advisorOverride: "anthropic/claude-opus-5",
+      advisorDisabled: false,
+    })
+    expect(parseArgs(["--no-advisor", "prompt"])).toMatchObject({ advisorDisabled: true, advisorOverride: undefined })
+    expect(parseArgs(["--advisor", "anthropic/claude-opus-5", "--no-advisor", "prompt"])).toMatchObject({
+      advisorDisabled: true,
+      advisorOverride: undefined,
+    })
+    expect(parseArgs(["--no-advisor", "--advisor", "anthropic/claude-opus-5", "prompt"])).toMatchObject({
+      advisorDisabled: false,
+      advisorOverride: "anthropic/claude-opus-5",
+    })
+    expect(() => parseArgs(["--no-advisor=yes", "prompt"])).toThrow("--no-advisor does not take a value")
+  })
+
   test("returns help as a command", async () => {
     const command = await parseCommand(["--help"])
 
@@ -260,7 +277,7 @@ describe("config precedence", () => {
   test("an unknown pipeline lists what exists", async () => {
     const dir = await projectWithConfig()
     await expect(parseCommand(["--dir", dir, "--pipeline", "ghost", "prompt"])).rejects.toThrow(
-      'unknown pipeline "ghost" (available: hunter, hunter-max, implement, implement-lite, quick, refine, review, review-cc, review-lite, ultra-implement, ultra-refine)',
+      'unknown pipeline "ghost" (available: hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ultra-implement, ultra-refine)',
     )
   })
 })

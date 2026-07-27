@@ -6,6 +6,7 @@ import {
   defaultAdversarialModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
+  defaultOpusModel,
   defaultPipeline,
   resolvePipeline,
   slugifyModel,
@@ -143,13 +144,47 @@ describe("built-in implement-lite pipeline", () => {
     expect(byName.adversarial).toMatchObject({ model: "anthropic/claude-opus-5" })
   })
 
-  test("keeps GLM 5.2 scoped to the implementation, lite, refine, and hunter pipelines", () => {
+  test("keeps GLM 5.2 scoped to the implementation, lite, advised, refine, and hunter pipelines", () => {
     const glmPipelines = Object.entries(builtInPipelines)
       .filter(([, spec]) => JSON.stringify(spec).includes("openrouter/z-ai/glm-5.2"))
       .map(([name]) => name)
 
     // The hunter pipelines use GLM as one specialty voice in their fan-out, not as a cost downgrade.
-    expect(glmPipelines).toEqual(["implement", "implement-lite", "review-lite", "refine", "hunter", "hunter-max"])
+    // implement-advised uses it as the executor precisely because an advisor backs it.
+    expect(glmPipelines).toEqual(["implement", "implement-lite", "implement-advised", "review-lite", "refine", "hunter", "hunter-max"])
+  })
+})
+
+describe("built-in implement-advised pipeline", () => {
+  const advised = () =>
+    resolvePipeline({ name: "implement-advised", spec: builtInPipelines["implement-advised"]!, agents: builtInAgents }).steps.filter(
+      (step): step is AgentStep => step.type === "agent",
+    )
+
+  test("puts a cheap executor in every writing phase with Opus advising it", () => {
+    const steps = advised()
+    const writing = steps.filter((step) => step.name !== "adversarial")
+
+    expect(writing.length).toBeGreaterThan(0)
+    for (const step of writing) {
+      expect(step.advisor).toBe(defaultOpusModel)
+      expect(step.model).not.toBe(defaultOpusModel)
+    }
+  })
+
+  test("leaves the adversarial pass owning its own loop on Opus, with no advisor", () => {
+    const adversarial = advised().find((step) => step.name === "adversarial")
+
+    expect(adversarial?.model).toBe(defaultOpusModel)
+    expect(adversarial?.advisor).toBeUndefined()
+  })
+
+  test("mirrors implement's step names, so the two are directly comparable", () => {
+    expect(advised().map((step) => step.name)).toEqual(
+      resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents })
+        .steps.filter((step): step is AgentStep => step.type === "agent")
+        .map((step) => step.name),
+    )
   })
 })
 
@@ -727,5 +762,93 @@ describe("claude-code runner steps", () => {
         steps: [{ agent: "bug-auditor", runner: "claude-code", models: ["openai/gpt-5.5#xhigh", "anthropic/claude-opus-4-8"] }],
       }),
     ).toThrow(/models/)
+  })
+})
+
+describe("advisor resolution", () => {
+  const withAdvisor = (spec: PipelineSpec, advisor?: string, maxCalls?: number) =>
+    resolvePipeline({
+      name: "test",
+      spec,
+      agents: builtInAgents,
+      defaultAdvisor: advisor,
+      defaultAdvisorMaxCalls: maxCalls,
+    }).steps.filter((step): step is AgentStep => step.type === "agent")
+
+  test("absent everywhere means no advisor, so an untouched config costs the same as before", () => {
+    const [step] = agentSteps({ steps: ["implementer"] })
+
+    expect(step?.advisor).toBeUndefined()
+    expect(step?.advisorVariant).toBeUndefined()
+    expect(step?.advisorMaxCalls).toBeUndefined()
+  })
+
+  test("splits the advisor's variant like any other model", () => {
+    const [step] = agentSteps({ steps: [{ agent: "implementer", advisor: "anthropic/claude-opus-5#high" }] })
+
+    expect(step?.advisor).toBe("anthropic/claude-opus-5")
+    expect(step?.advisorVariant).toBe("high")
+  })
+
+  test("precedence runs step > agent > defaults", () => {
+    const agents = builtInAgents.map((agent) => (agent.name === "implementer" ? { ...agent, advisor: "anthropic/claude-opus-4-8" } : agent))
+    const steps = resolvePipeline({
+      name: "test",
+      spec: {
+        steps: [
+          { agent: "implementer", name: "from-step", advisor: "anthropic/claude-opus-5" },
+          { agent: "implementer", name: "from-agent" },
+          { agent: "tests", name: "from-defaults" },
+        ],
+      },
+      agents,
+      defaultAdvisor: "openai/gpt-5.6-sol",
+    }).steps.filter((step): step is AgentStep => step.type === "agent")
+
+    expect(steps.find((step) => step.name === "from-step")?.advisor).toBe("anthropic/claude-opus-5")
+    expect(steps.find((step) => step.name === "from-agent")?.advisor).toBe("anthropic/claude-opus-4-8")
+    expect(steps.find((step) => step.name === "from-defaults")?.advisor).toBe("openai/gpt-5.6-sol")
+  })
+
+  test("advisor: false cuts the chain so one step can opt out of a broader default", () => {
+    const steps = withAdvisor(
+      { steps: [{ agent: "implementer", name: "advised" }, { agent: "tests", name: "solo", advisor: false }] },
+      "anthropic/claude-opus-5",
+    )
+
+    expect(steps.find((step) => step.name === "advised")?.advisor).toBe("anthropic/claude-opus-5")
+    expect(steps.find((step) => step.name === "solo")?.advisor).toBeUndefined()
+  })
+
+  test("advisorMaxCalls comes from the step, else defaults, and only with an advisor", () => {
+    const steps = withAdvisor(
+      { steps: [{ agent: "implementer", name: "capped", advisorMaxCalls: 1 }, { agent: "tests", name: "inherited" }] },
+      "anthropic/claude-opus-5",
+      4,
+    )
+
+    expect(steps.find((step) => step.name === "capped")?.advisorMaxCalls).toBe(1)
+    expect(steps.find((step) => step.name === "inherited")?.advisorMaxCalls).toBe(4)
+    expect(() => agentSteps({ steps: [{ agent: "implementer", advisorMaxCalls: 2 }] })).toThrow("advisorMaxCalls without an advisor")
+  })
+
+  test("an advisor named on a claude-code step is an error; an inherited one is dropped", () => {
+    expect(() =>
+      agentSteps({ steps: [{ agent: "bug-auditor", runner: "claude-code", advisor: "anthropic/claude-opus-5", reports: "none" }] }),
+    ).toThrow(/runner: claude-code does not support/)
+
+    const steps = withAdvisor({ steps: [{ agent: "bug-auditor", runner: "claude-code", reports: "none" }] }, "anthropic/claude-opus-5")
+    expect(steps[0]?.runner).toBe("claude-code")
+    expect(steps[0]?.advisor).toBeUndefined()
+  })
+
+  test("every variant of a models: fan-out inherits the same advisor", () => {
+    const steps = withAdvisor(
+      { steps: [{ agent: "bug-auditor", name: "bugs", models: ["openai/gpt-5.6-sol", "anthropic/claude-opus-5"], reports: "none" }] },
+      "anthropic/claude-opus-5",
+    )
+
+    expect(steps).toHaveLength(2)
+    for (const step of steps) expect(step.advisor).toBe("anthropic/claude-opus-5")
   })
 })

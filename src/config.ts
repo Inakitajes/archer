@@ -57,6 +57,10 @@ export type ConvoyDefaults = {
   autoAcceptJudgeModel?: string
   /** Model that names worktree branches; falls back to the built-in cheap default when unset. */
   branchNameModel?: string
+  /** Advising model for every step that doesn't set its own; unset means no advisor anywhere. */
+  advisor?: string
+  /** Cap on advisor consultations per phase attempt, for steps that don't set their own. */
+  advisorMaxCalls?: number
 }
 
 /** A project agent definition, or model/temperature/readOnly overrides for a built-in one. */
@@ -66,6 +70,8 @@ export type ConfigAgent = {
   temperature?: number
   /** Disable write/edit/bash tools for this agent. */
   readOnly?: boolean
+  /** Advising model for steps using this agent; beats defaults.advisor. */
+  advisor?: string
 }
 
 export class ConfigError extends Error {
@@ -454,7 +460,17 @@ function mergeRoutingOverrides(global: ModelRoutingOverrides, project: ModelRout
 
 function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
   const record = v.record(raw, "defaults")
-  v.knownKeys(record, "defaults", ["model", "maxAttempts", "maxConcurrentAgents", "baseRef", "pipeline", "autoAcceptJudgeModel", "branchNameModel"])
+  v.knownKeys(record, "defaults", [
+    "model",
+    "maxAttempts",
+    "maxConcurrentAgents",
+    "baseRef",
+    "pipeline",
+    "autoAcceptJudgeModel",
+    "branchNameModel",
+    "advisor",
+    "advisorMaxCalls",
+  ])
 
   const defaults: ConvoyDefaults = {}
   if (record.model !== undefined) defaults.model = v.model(record.model, "defaults.model")
@@ -464,6 +480,8 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
   if (record.pipeline !== undefined) defaults.pipeline = v.nonEmptyString(record.pipeline, "defaults.pipeline")
   if (record.autoAcceptJudgeModel !== undefined) defaults.autoAcceptJudgeModel = v.model(record.autoAcceptJudgeModel, "defaults.autoAcceptJudgeModel")
   if (record.branchNameModel !== undefined) defaults.branchNameModel = v.model(record.branchNameModel, "defaults.branchNameModel")
+  if (record.advisor !== undefined) defaults.advisor = v.model(record.advisor, "defaults.advisor")
+  if (record.advisorMaxCalls !== undefined) defaults.advisorMaxCalls = v.positiveInt(record.advisorMaxCalls, "defaults.advisorMaxCalls")
   return defaults
 }
 
@@ -479,13 +497,14 @@ function validateAgents(v: Validator, raw: unknown, targetDir: string): Record<s
     if (name.endsWith(readOnlyAgentSuffix)) v.fail(path, `agent names can't end in "${readOnlyAgentSuffix}"; that suffix is reserved for convoy's forced-read-only variants`)
 
     const entry = v.record(value, path)
-    v.knownKeys(entry, path, ["description", "model", "temperature", "readOnly"])
+    v.knownKeys(entry, path, ["description", "model", "temperature", "readOnly", "advisor"])
 
     const agent: ConfigAgent = {}
     if (entry.description !== undefined) agent.description = v.nonEmptyString(entry.description, `${path}.description`)
     if (entry.model !== undefined) agent.model = v.model(entry.model, `${path}.model`)
     if (entry.temperature !== undefined) agent.temperature = v.temperature(entry.temperature, `${path}.temperature`)
     if (entry.readOnly !== undefined) agent.readOnly = v.boolean(entry.readOnly, `${path}.readOnly`)
+    if (entry.advisor !== undefined) agent.advisor = v.model(entry.advisor, `${path}.advisor`)
 
     // Project agents bring their own prompt; built-in overrides keep theirs
     // (optionally replaced via the same path). Fail at load, not mid-run.
@@ -547,7 +566,7 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
     return step
   }
 
-  v.knownKeys(record, path, ["agent", "name", "model", "models", "runner", "maxAttempts", "reports", "diff"])
+  v.knownKeys(record, path, ["agent", "name", "model", "models", "runner", "advisor", "advisorMaxCalls", "maxAttempts", "reports", "diff"])
 
   const agent = validateStepName(v, record.agent, `${path}.agent`)
   if (context.insideParallel && agent === humanReviewStep) v.fail(path, `"${humanReviewStep}" can't run inside a parallel block`)
@@ -556,6 +575,14 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
   const runner = record.runner !== undefined ? validateRunner(v, record.runner, `${path}.runner`) : undefined
   if (!stepRunnerFor(runner).capabilities.modelFanout && record.models !== undefined) {
     v.fail(path, `can't combine runner: ${runner} with "models"; give the step a single model (or none for the CLI default)`)
+  }
+  if (!stepRunnerFor(runner).capabilities.advisor && record.advisor !== undefined && record.advisor !== false) {
+    v.fail(`${path}.advisor`, `runner: ${runner} does not support an advisor; remove it or drop the runner`)
+  }
+
+  const advisor = record.advisor === undefined ? undefined : validateStepAdvisor(v, record.advisor, `${path}.advisor`)
+  if (record.advisorMaxCalls !== undefined && advisor === false) {
+    v.fail(`${path}.advisorMaxCalls`, `is meaningless with advisor: false; remove one of them`)
   }
 
   let models: string[] | undefined
@@ -576,6 +603,8 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
     ...(model !== undefined ? { model } : {}),
     ...(models !== undefined ? { models } : {}),
     ...(runner !== undefined ? { runner } : {}),
+    ...(advisor !== undefined ? { advisor } : {}),
+    ...(record.advisorMaxCalls !== undefined ? { advisorMaxCalls: v.positiveInt(record.advisorMaxCalls, `${path}.advisorMaxCalls`) } : {}),
     ...(record.maxAttempts !== undefined ? { maxAttempts: v.positiveInt(record.maxAttempts, `${path}.maxAttempts`) } : {}),
     ...(record.reports !== undefined ? { reports: validateReports(v, record.reports, `${path}.reports`) } : {}),
     ...(record.diff !== undefined ? { diff: v.boolean(record.diff, `${path}.diff`) } : {}),
@@ -591,6 +620,18 @@ function validateStepName(v: Validator, raw: unknown, path: string): string {
 function validateRunner(v: Validator, raw: unknown, path: string): StepRunnerId {
   if (isStepRunnerId(raw)) return raw
   return v.fail(path, `must be "opencode" or "claude-code"`)
+}
+
+/**
+ * A step's advisor is either a model or the literal `false`, which opts the step
+ * out of an advisor inherited from its agent or from defaults. Unlike `model`,
+ * the advisor always names an OpenCode model: it is consulted through the
+ * OpenCode session API regardless of which engine runs the step.
+ */
+function validateStepAdvisor(v: Validator, raw: unknown, path: string): string | false {
+  if (raw === false) return false
+  if (raw === true) v.fail(path, `must be a model like "anthropic/claude-opus-5", or false to disable; true is not a model`)
+  return v.model(raw, path)
 }
 
 function validateStepRunnerModel(v: Validator, runner: StepRunnerId, raw: unknown, path: string): string {
@@ -690,6 +731,7 @@ export function buildAgentRegistry(config?: ConvoyConfig): AgentSpec[] {
       if (agent.model !== undefined) existing.model = agent.model
       if (agent.temperature !== undefined) existing.temperature = agent.temperature
       if (agent.readOnly !== undefined) existing.readOnly = agent.readOnly
+      if (agent.advisor !== undefined) existing.advisor = agent.advisor
       continue
     }
     registry.push({
@@ -698,6 +740,7 @@ export function buildAgentRegistry(config?: ConvoyConfig): AgentSpec[] {
       ...(agent.model !== undefined ? { model: agent.model } : {}),
       ...(agent.temperature !== undefined ? { temperature: agent.temperature } : {}),
       ...(agent.readOnly !== undefined ? { readOnly: agent.readOnly } : {}),
+      ...(agent.advisor !== undefined ? { advisor: agent.advisor } : {}),
       builtIn: false,
     })
   }
@@ -831,7 +874,14 @@ function materializeAgentStep(step: AgentStepSpec, effectiveDefaultModel: string
  */
 export function checkPipelineResolves(name: string, spec: PipelineSpec, config: ConvoyConfig | undefined): string | undefined {
   try {
-    resolvePipeline({ name, spec, agents: buildAgentRegistry(config), defaultModel: config?.defaults.model })
+    resolvePipeline({
+      name,
+      spec,
+      agents: buildAgentRegistry(config),
+      defaultModel: config?.defaults.model,
+      defaultAdvisor: config?.defaults.advisor,
+      defaultAdvisorMaxCalls: config?.defaults.advisorMaxCalls,
+    })
     return undefined
   } catch (error) {
     return error instanceof Error ? error.message : String(error)

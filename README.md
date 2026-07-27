@@ -22,7 +22,7 @@ Typical uses:
 
 Use it as a **CLI** or as a **TUI**, interchangeably: every run can be launched with plain flags and prompt files (`--no-tui` gives you plain logs for pipes and CI), or driven entirely from the TUI — `convoy` with no arguments opens the interactive launcher, every run gets a live dashboard, `convoy runs` browses past runs, and `convoy config` edits global and project config in place.
 
-**Pipelines are data, not code.** Convoy ships a family of built-in pipelines (`implement` — the default — plus `implement-lite`, `ultra-implement`, `refine`, `ultra-refine`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
+**Pipelines are data, not code.** Convoy ships a family of built-in pipelines (`implement` — the default — plus `implement-lite`, `implement-advised`, `ultra-implement`, `refine`, `ultra-refine`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
 
 Beyond sequencing agents, Convoy owns the operational layer around OpenCode: repo context attachment, runtime guard rails, a live permission gate, commit safety, phase reports, diff tracking, and a TUI that shows cost, tokens, and provider limits while the run is live.
 
@@ -56,6 +56,7 @@ Convoy ships these pipelines; select one with `-p/--pipeline` (no config needed)
 |---|---|---|
 | `implement` | yes | **The default** (runs with no `-p`). Implement a PRD, then audit, polish, test, and adversarial review (the table above). |
 | `implement-lite` | yes | Same workflow and agents as `implement`, but the code-writing phases (`implementer`, `patterns`, `security`, `tests`) all drop to `openrouter/z-ai/glm-5.2` for a lower-cost run, and `design`/`adversarial` run on Opus. |
+| `implement-advised` | yes | Same workflow and step names as `implement`, but every writing phase runs on a cheap executor that **consults Opus 5 as an advisor** at its decision points instead of running on it. The adversarial pass keeps Opus owning its own loop, since supplying that judgement is its entire job. Directly comparable with `implement-lite` — same executors, one has an advisor. |
 | `ultra-implement` | yes | Like `implement`, but the pattern/security/adversarial reviews of the initial diff run in parallel across two models feeding a triage step, and the run ends with an audit-only final review, a fixer that applies only blocking findings, and a final validator. |
 | `refine` | yes | Audit the current diff (scope → bugs → clean-code → security), triage the findings adversarially, apply the accepted fixes, then validate them. |
 | `ultra-refine` | yes | Like `refine`, but every read-only audit is fanned out across two models before triage, fixes, and validation. |
@@ -254,6 +255,8 @@ defaults:
   pipeline: quick                  # pipeline used when -p/--pipeline is not given
   autoAcceptJudgeModel: anthropic/claude-haiku-4-5   # model for smart auto-accept (--smart); defaults to the run's model
   branchNameModel: anthropic/claude-haiku-4-5        # proposes worktree branch names (may look up referenced issues); you confirm the name
+  advisor: anthropic/claude-opus-5   # optional; a stronger model consulted at every step's decision points
+  advisorMaxCalls: 3                 # optional; consultations allowed per phase attempt (default 3)
 
 # Project agents: the prompt lives at .convoy/agents/<name>.md (required).
 # Naming a built-in agent here overrides its model/temperature/readOnly instead.
@@ -263,6 +266,7 @@ agents:
     model: anthropic/claude-opus-5
     temperature: 0.1
     readOnly: true               # disables write/edit/bash tools for this agent
+    advisor: anthropic/claude-opus-5   # optional; beats defaults.advisor for steps using this agent
 
 pipelines:
   quick:
@@ -331,6 +335,7 @@ The rules:
 - **Aliases**: the built-in agents answer to their short names in steps — `patterns`, `security`, `design`, `tests`, `adversarial` — as well as their full names.
 - **Read-only agents**: set `agents.<name>.readOnly: true` to enforce audit-only behavior. Convoy disables the agent's write/edit/bash tools, denies edit/bash/task permissions, saves the phase report from the assistant response if the agent cannot write it directly, and checks the clean Git baseline before finalizing. If Git-visible files, HEAD, or the active branch change during the step, Convoy fails without committing or deleting anything; the changes stay intact for the user to inspect and resolve.
 - **Human steps**: use `type: human` with optional `name` and `description` to insert an interactive gate. The old `human-review` string still works as a legacy shorthand, but named `type: human` steps are preferred for planning, QA, approval, or any other human checkpoint.
+- **Advisor steps**: set `advisor: <provider/model[#variant]>` on a step to give its executor a stronger reviewing model, consulted at decision points without ever running tools or producing the deliverable. The point is that the cheap model keeps the loop and the whole transcript — the advisor reads that transcript verbatim, so nothing is re-serialized across a handoff and no intent is lost, which is the failure mode of plan-then-execute pipelines. It is consulted at three moments: **before the phase's first write** (Convoy holds that edit, consults, and hands back the advice mid-turn), **before the phase is accepted as done** (the advisor reviews the finished work and can send the phase one more turn in the same session), and **on demand** through an `advisor` tool the executor calls when it is stuck or about to commit to an approach. Precedence mirrors models: step `advisor` > agent `advisor` > `defaults.advisor`, with `advisor: false` opting one step out of a broader default and no built-in fallback, so a config that doesn't ask for an advisor costs exactly what it costs today. `--advisor <model>` and `--no-advisor` force either end for a whole run, which is how you compare executor-only, executor+advisor, and advisor-only over one unmodified pipeline. Advisor output is capped (a synthetic `convoy-advisor-*` model alias overrides only `limit.output`, inheriting real credentials and pricing from the model it names) and its spend is reported separately in `SUMMARY.md` as an executor/advisor token split — if the advisor's share of output is not small, the pattern is wired backwards. Every failure degrades rather than failing the phase: an unavailable advisor returns guidance saying so and the executor carries on. Not available on `runner: claude-code` steps, which own their own loop.
 - **Claude Code steps**: set `runner: claude-code` on an audit step to execute it with the locally installed [`claude` CLI](https://code.claude.com) instead of an OpenCode session, authenticated by whatever that install already uses — a Claude subscription login or an API key. This is how subscription users get genuine cross-vendor diversity in review pipelines without paying per token. The optional `model` accepts `opus`, `sonnet`, `haiku`, a `claude-*` ID, or the equivalent `anthropic/claude-*` form; omit it to use the CLI default. Convoy launches Claude with `--safe-mode`, disabling repository/user customizations such as `CLAUDE.md`, skills, plugins, hooks, and MCP servers, and exposes only the built-in read/search tools within the target and attached directories. Git-visible file, commit, or branch changes still fail the step but are left intact rather than deleted. Claude Code steps can't fan out across `models:` and stream their thinking/output/tool calls into the dashboard like any other step; their private raw event stream is written incrementally to `logs/<step>.<attempt>.claude.jsonl`, including failed attempts. Once a step finishes, `[o]` reopens its session interactively via `claude --resume --safe-mode` with the same tool envelope and full context. Claude Code is an **optional dependency**: only a pipeline that actually contains such a step requires the CLI, checked fail-fast at launch.
 - **Parallel steps and model fan-out**: wrap steps in `parallel: [...]` to run them concurrently, and/or give one step a `models: [...]` list (instead of `model:`) to run it once per model. Both are always forced read-only, regardless of the underlying agent's own `readOnly` setting. Convoy restricts built-in write tools and verifies the Git baseline before finalizing, so any Git-visible mutation fails the step and remains untouched for manual resolution — there's no per-step way to opt out. A `models:` step's variants get disambiguated names (`<step>__<model-slug>`) and reports; `reports: previous` after a parallel block attaches every member's report, and `reports: [<step-name>]` on a fanned-out step's un-suffixed name attaches every one of its model variants. `parallel:` can't nest and can't contain human steps.
 - **Project pipelines shadow built-ins**: defining `pipelines.implement` replaces the built-in default pipeline.
@@ -456,6 +461,10 @@ convoy/
 │   ├── project-context.ts # automatic .convoy/rules.md, AGENTS.md, CLAUDE.md discovery
 │   ├── permissions.ts   # live permission gate for tool calls that fall outside the allowlist
 │   ├── safety-judge.ts  # external AI judge for smart auto-accept (tool-less, fail-closed)
+│   ├── advisor.ts       # the advisor consultation: tool-less, over the executor's transcript, output-capped
+│   ├── advisor-runtime.ts # per-run advisor policy: session→phase, budget, first-write checkpoint
+│   ├── advisor-bridge.ts  # loopback endpoint + the custom `advisor` tool the executor calls on demand
+│   ├── advisor-report.ts  # executor/advisor token split read back from the attempt logs
 │   ├── attachments.ts   # FilePartInput for --file and internal attachments
 │   ├── git.ts           # diff, commit, and pre-commit secret scan
 │   ├── workspace.ts     # run dir, ~/.convoy home (CONVOY_HOME), global config/agents paths

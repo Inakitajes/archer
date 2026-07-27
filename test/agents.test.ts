@@ -125,3 +125,59 @@ describe("opencode config", () => {
     }
   })
 })
+
+describe("advisor wiring in the opencode config", () => {
+  const agents = [
+    { name: "implementer", description: "writes", builtIn: true },
+    { name: "bug-auditor", description: "audits", readOnly: true, builtIn: true },
+  ]
+
+  test("leaves every agent untouched when no step has an advisor", () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", agents)
+
+    expect(config.agent?.implementer?.tools?.advisor).toBe(false)
+    expect(config.agent?.implementer?.permission).toMatchObject({ edit: "allow" })
+    expect(config.agent?.implementer?.prompt).not.toContain("You have an `advisor` tool")
+    expect(Object.keys(config.provider?.anthropic?.models ?? {})).toEqual([])
+  })
+
+  test("gives an advised agent the tool, the timing block, and a gated first write", () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", agents, undefined, {
+      advisorAgents: new Set(["implementer"]),
+    })
+
+    expect(config.agent?.implementer?.tools?.advisor).toBe(true)
+    // "ask" is what routes the first edit through the permission gate.
+    expect(config.agent?.implementer?.permission).toMatchObject({ edit: "ask" })
+    expect(config.agent?.implementer?.prompt).toContain("You have an `advisor` tool")
+    // Timing lands before the agent's own instructions.
+    expect(config.agent?.implementer?.prompt?.indexOf("advisor")).toBeLessThan(config.agent!.implementer!.prompt!.indexOf("Convoy Runtime Safety"))
+
+    // An unadvised agent in the same run is unaffected.
+    expect(config.agent?.["bug-auditor"]?.tools?.advisor).toBe(false)
+    expect(config.agent?.["bug-auditor"]?.prompt).not.toContain("You have an `advisor` tool")
+  })
+
+  test("a read-only advised agent gets the tool without gaining any write path", () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", agents, undefined, {
+      advisorAgents: new Set(["bug-auditor"]),
+    })
+
+    expect(config.agent?.["bug-auditor"]?.tools?.advisor).toBe(true)
+    expect(config.agent?.["bug-auditor"]?.tools).toMatchObject({ write: false, edit: false, bash: false })
+    expect(config.agent?.["bug-auditor"]?.permission).toMatchObject({ edit: "deny", bash: "deny" })
+  })
+
+  test("declares capped advisor aliases alongside the provider timeout options", () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", agents, undefined, {
+      advisorModels: [{ providerID: "anthropic", modelID: "claude-opus-5" }],
+    })
+
+    // The alias is added without losing the provider-level timeout settings.
+    expect(config.provider?.anthropic?.options?.timeout).toBe(false)
+    expect(config.provider?.anthropic?.models?.["convoy-advisor-claude-opus-5"]).toMatchObject({
+      id: "claude-opus-5",
+      limit: { output: 2048 },
+    })
+  })
+})
