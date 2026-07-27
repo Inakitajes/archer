@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 
 import type { AgentConfig, Config } from "@opencode-ai/sdk/v2"
+import { advisorProviderOverride, type ModelSelection } from "./advisor"
 import { bashPolicy, noAdditions } from "./bash-policy"
 import { builtInPrompts } from "./built-in-prompts"
 import { builtInAgents, readOnlyAgentSuffix } from "./pipeline"
@@ -9,36 +10,89 @@ import type { AgentSpec, PermissionAdditions } from "./types"
 import { globalAgentsDir } from "./workspace"
 
 const runtimeSafetyPrompt = "runtime-safety"
+const advisorTimingPrompt = "advisor-timing"
+
+/** Name of the custom tool the executor calls to consult its advisor on demand. */
+export const advisorToolName = "advisor"
+
+export type OpencodeConfigOptions = {
+  /**
+   * Agents that at least one step consults an advisor from. They get the
+   * advisor tool plus the timing block in their prompt, and their `edit`
+   * permission becomes "ask" so the gate can enforce the first-write checkpoint.
+   *
+   * Agent-level rather than step-level on purpose: OpenCode's agent registry is
+   * built once per run, while the advisor is per step. Which advising model gets
+   * consulted is resolved at call time from the session's phase, so the only
+   * thing this set decides is whether the machinery is present at all.
+   */
+  advisorAgents?: ReadonlySet<string>
+  /** Advising models used anywhere in the run; declared as output-capped aliases. */
+  advisorModels?: readonly ModelSelection[]
+  /** Output cap for those aliases. */
+  advisorMaxTokens?: number
+}
 
 export function opencodeConfig(
   runDir: string,
   targetDir = process.cwd(),
   agents: readonly AgentSpec[] = builtInAgents,
   permissions: PermissionAdditions = noAdditions,
+  options: OpencodeConfigOptions = {},
 ): Config {
+  const advisorAgents = options.advisorAgents ?? new Set<string>()
   const agent: Record<string, AgentConfig> = {}
   for (const spec of agents) {
     // Synthesized forced-read-only variants (name suffixed "__ro", see
     // synthesizeReadOnlyAgents in pipeline.ts) have no prompt file of their
     // own; they share the base agent's prompt under its real name.
     const promptName = spec.name.endsWith(readOnlyAgentSuffix) ? spec.name.slice(0, -readOnlyAgentSuffix.length) : spec.name
-    agent[spec.name] = agentConfig(spec.description, spec.temperature, spec.readOnly, loadAgentPrompt(promptName, targetDir), runDir, targetDir, false, permissions)
+    const advised = advisorAgents.has(spec.name)
+    agent[spec.name] = agentConfig(
+      spec.description,
+      spec.temperature,
+      spec.readOnly,
+      loadAgentPrompt(promptName, targetDir, { advisor: advised }),
+      runDir,
+      targetDir,
+      false,
+      permissions,
+      advised,
+    )
   }
 
   return {
     agent,
-    provider: providerTimeouts(),
+    provider: mergeProviders(providerTimeouts(), advisorProviderOverride(options.advisorModels ?? [], options.advisorMaxTokens)),
     permission: {
       question: "deny",
     },
   }
 }
 
-export function loadAgentPrompt(agentName: string, targetDir = process.cwd()) {
+/** Advisor aliases carry no options of their own; the timeout entries own the provider-level settings. */
+function mergeProviders(timeouts: Config["provider"], advisors: Config["provider"]): Config["provider"] {
+  const merged: NonNullable<Config["provider"]> = { ...timeouts }
+  for (const [providerID, entry] of Object.entries(advisors ?? {})) {
+    merged[providerID] = { ...merged[providerID], ...entry, models: { ...merged[providerID]?.models, ...entry.models } }
+  }
+  return merged
+}
+
+export type LoadAgentPromptOptions = {
+  /** Prepend the advisor timing block, which the reference pattern places before anything else that mentions the advisor. */
+  advisor?: boolean
+}
+
+export function loadAgentPrompt(agentName: string, targetDir = process.cwd(), options: LoadAgentPromptOptions = {}) {
   // Precedence mirrors config merge: project override > global override > built-in.
   const agentPrompt = readProjectAgentPrompt(agentName, targetDir) ?? readGlobalAgentPrompt(agentName) ?? readBuiltInPrompt(agentName)
   const safetyPrompt = readBuiltInPrompt(runtimeSafetyPrompt)
-  return [agentPrompt.trimEnd(), "", "---", "", safetyPrompt.trim()].join("\n")
+  // Timing first, then the agent's own instructions, then the non-replaceable
+  // guard rails: the advisor block is about *when* to stop and ask, which has to
+  // land before the phase instructions it interrupts.
+  const advisorPrompt = options.advisor ? [readBuiltInPrompt(advisorTimingPrompt).trim(), "", "---", ""] : []
+  return [...advisorPrompt, agentPrompt.trimEnd(), "", "---", "", safetyPrompt.trim()].join("\n")
 }
 
 export function projectAgentPromptPath(agentName: string, targetDir: string) {
@@ -100,6 +154,7 @@ function agentConfig(
   targetDir: string,
   webfetch: boolean,
   permissions: PermissionAdditions,
+  advisor = false,
 ): AgentConfig {
   if (readOnly) {
     return {
@@ -117,6 +172,7 @@ function agentConfig(
         task: false,
         webfetch,
         websearch: false,
+        [advisorToolName]: advisor,
       },
       permission: {
         read: "allow",
@@ -148,9 +204,14 @@ function agentConfig(
       edit: true,
       bash: true,
       webfetch,
+      [advisorToolName]: advisor,
     },
     permission: {
-      edit: "allow",
+      // Advised steps route edits through the gate so it can enforce the
+      // first-write checkpoint: the first edit of a phase that hasn't consulted
+      // yet is answered with the advice itself. Every other edit is allowed
+      // immediately, so no new human prompt appears.
+      edit: advisor ? "ask" : "allow",
       question: "deny",
       bash: bashPolicy(targetDir, permissions),
       external_directory: {

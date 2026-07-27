@@ -6,6 +6,7 @@ import { createInterface } from "node:readline/promises"
 
 import type { AssistantMessage, FilePartInput, OpencodeClient, Part } from "@opencode-ai/sdk/v2"
 
+import { advisorNeedsOf } from "./advisor"
 import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
@@ -489,7 +490,16 @@ export async function run(options: RunOptions) {
     const abortBoot = () => boot.abort(shutdown.signal.reason)
     shutdown.signal.addEventListener("abort", abortBoot, { once: true })
     try {
-      opencode = await startOpencode(opencodeConfig(workspace.dir, options.targetDir, agents, options.permissions), boot.signal)
+      // Derived from the frozen pipeline, so a resume rebuilds the same advisor
+      // machinery the run started with.
+      const advisorNeeds = advisorNeedsOf(pipeline.steps)
+      opencode = await startOpencode(
+        opencodeConfig(workspace.dir, options.targetDir, agents, options.permissions, {
+          advisorAgents: advisorNeeds.agents,
+          advisorModels: advisorNeeds.models,
+        }),
+        boot.signal,
+      )
     } finally {
       shutdown.signal.removeEventListener("abort", abortBoot)
     }
