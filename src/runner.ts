@@ -6,7 +6,8 @@ import { createInterface } from "node:readline/promises"
 
 import type { AssistantMessage, FilePartInput, OpencodeClient, Part } from "@opencode-ai/sdk/v2"
 
-import { advisorNeedsOf } from "./advisor"
+import { advisorNeedsOf, type AdvisorUsage } from "./advisor"
+import { createAdvisorRuntime, totalAdvisorUsage, type AdvisorPhaseHandle, type AdvisorRuntime } from "./advisor-runtime"
 import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
@@ -489,10 +490,10 @@ export async function run(options: RunOptions) {
     const boot = new AbortController()
     const abortBoot = () => boot.abort(shutdown.signal.reason)
     shutdown.signal.addEventListener("abort", abortBoot, { once: true })
+    // Derived from the frozen pipeline, so a resume rebuilds the same advisor
+    // machinery the run started with.
+    const advisorNeeds = advisorNeedsOf(pipeline.steps)
     try {
-      // Derived from the frozen pipeline, so a resume rebuilds the same advisor
-      // machinery the run started with.
-      const advisorNeeds = advisorNeedsOf(pipeline.steps)
       opencode = await startOpencode(
         opencodeConfig(workspace.dir, options.targetDir, agents, options.permissions, {
           advisorAgents: advisorNeeds.agents,
@@ -506,6 +507,12 @@ export async function run(options: RunOptions) {
     progress.serverReady(opencode.url)
     log.info(`opencode SDK ready at ${opencode.url}`)
 
+    const advisors = createAdvisorRuntime({
+      client: opencode.client,
+      directory: options.targetDir,
+      signal: shutdown.signal,
+    })
+
     permissions = startPermissionGate({
       client: opencode.client,
       progress,
@@ -513,6 +520,7 @@ export async function run(options: RunOptions) {
       directory: options.targetDir,
       autoAccept,
       judgeModel,
+      ...(advisorNeeds.agents.size > 0 ? { advisorCheckpoint: advisors.checkpoint } : {}),
     })
 
     const resuming = Boolean(options.resumeRunID)
@@ -558,7 +566,7 @@ export async function run(options: RunOptions) {
           await limitAgents(async () => {
             const restored = resuming && (await restorePhaseFromPreviousRun(workspace, runMetadata, step, progress))
             if (!restored) {
-              await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions })
+              await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions }, advisors)
             }
           })
         }),
@@ -817,6 +825,7 @@ async function runPhase(
   shutdown: RunShutdown,
   gitLock: GitLock,
   takeover?: TakeoverContext,
+  advisors?: AdvisorRuntime,
 ) {
   progress.phaseStarted(phase.name, phase.description)
   log.section(`${phase.name} - ${phase.description}`)
@@ -835,7 +844,7 @@ async function runPhase(
     })
     if (phase.readOnly && baseline) await metadata.phaseRepositoryBaseline(phase.name, baseline)
     const reportAbs = await withReadOnlyRepositoryBoundary(phase, options.targetDir, baseline, gitLock, async () => {
-      const assistantText = await runPhaseWithRetries(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover)
+      const assistantText = await runPhaseWithRetries(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors)
       return persistPhaseReport(workspace, phase, assistantText)
     })
     await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline))
@@ -906,6 +915,7 @@ export async function runPhaseWithRetries(
   gitLock: GitLock,
   takeover?: TakeoverContext,
   deps: PhaseRetryDeps = { runPhaseAttempt, restorePhaseBaseline },
+  advisors?: AdvisorRuntime,
 ) {
   if (!baseline && prepared.maxAttempts > 1) {
     throw new Error(`[${phase.name}] can't retry with dirty working tree; use --max-attempts 1 or clean the repo`)
@@ -921,7 +931,7 @@ export async function runPhaseWithRetries(
     progress.phaseAttempt(phase.name, { attempt, maxAttempts: prepared.maxAttempts, model: formatModel(prepared.model) })
     log.info(`[${phase.name}] attempt ${attempt}/${prepared.maxAttempts} with ${formatModel(prepared.model)}`)
     try {
-      const assistantText = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef)
+      const assistantText = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors)
       if (armed()) {
         // Armed means "this step is mine": even a clean finish waits for the
         // user's decision before the step commits and the pipeline moves on.
@@ -1020,8 +1030,9 @@ async function runPhaseAttempt(
   progress: ProgressUI,
   shutdown: RunShutdown,
   sessionRef?: SessionRef,
+  advisors?: AdvisorRuntime,
 ) {
-  const input = { client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef }
+  const input = { client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors }
   const runner = phaseAttemptRunners[stepRunnerFor(phase.runner).id]
   const result = await runner.executeAttempt(input)
 
@@ -1034,6 +1045,9 @@ async function runPhaseAttempt(
     cost: result.cost,
     tokens: result.tokens,
     error: result.error,
+    // Logged as its own line, never folded into the executor's totals: the whole
+    // economic claim of the pattern is that this stays a small fraction.
+    ...(result.advisorUsage ? { advisor: totalAdvisorUsage(result.advisorUsage) } : {}),
     text: result.assistantText,
   })
 
@@ -1054,6 +1068,8 @@ type PhaseAttemptInput = {
   progress: ProgressUI
   shutdown: RunShutdown
   sessionRef?: SessionRef
+  /** Absent when no step in the run has an advisor. */
+  advisors?: AdvisorRuntime
 }
 
 type PhaseAttemptResult = {
@@ -1064,6 +1080,7 @@ type PhaseAttemptResult = {
   cost?: number
   tokens?: unknown
   error?: unknown
+  advisorUsage?: readonly AdvisorUsage[]
 }
 
 const phaseAttemptRunners: Record<StepRunnerId, StepRunnerImpl<PhaseAttemptInput, PhaseAttemptResult>> = {
@@ -1082,6 +1099,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     progress: input.progress,
     shutdown: input.shutdown,
     sessionRef: input.sessionRef,
+    ...(input.advisors ? { advisors: input.advisors } : {}),
   })
   const assistantText = extractAssistantText(result.parts)
   return {
@@ -1092,6 +1110,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     cost: result.info.cost,
     tokens: result.info.tokens,
     error: result.info.error,
+    ...(result.advisorUsage && result.advisorUsage.length > 0 ? { advisorUsage: result.advisorUsage } : {}),
   }
 }
 
@@ -1257,6 +1276,7 @@ async function promptPhase(
     progress: ProgressUI
     shutdown: RunShutdown
     sessionRef?: SessionRef
+    advisors?: AdvisorRuntime
   },
 ): Promise<SessionResult> {
   input.shutdown.throwIfRequested()
@@ -1269,6 +1289,9 @@ async function promptPhase(
   if (!session.data?.id) throw new Error("opencode didn't return session id")
 
   if (input.sessionRef) input.sessionRef.id = session.data.id
+  // Registered here and not earlier: the permission gate and the on-demand tool
+  // both find a phase by its live session, which only exists now.
+  const advisor = input.advisors?.begin(session.data.id, input.phase)
   input.progress.phaseSession(input.phase.name, session.data.id)
   input.shutdown.setActiveSession({ client, sessionID: session.data.id, directory: input.targetDir, phaseName: input.phase.name })
   log.info(`[${input.phase.name}] session: ${session.data.id}`)
@@ -1299,21 +1322,28 @@ async function promptPhase(
       parts: [...input.attachments, { type: "text", text: input.prompt }],
     }, { signal: input.shutdown.signal })
     if (accepted.error) throw new Error(formatSdkError(accepted.error))
-    const result = await watcher.result
+    const first = await watcher.result
     input.shutdown.throwIfRequested()
 
-    const usage = combinedAssistantUsage(result.assistantInfos, session.data.id)
+    // The deliverable is durable by now — the phase wrote its report or edited
+    // the repo before going idle — which is what makes this the right place for
+    // the "is it actually done?" consultation: a session that dies during the
+    // call loses nothing.
+    const reviewed = advisor ? await applyCompletionCheckpoint(client, { ...input, sessionID: session.data.id }, first, advisor) : first
+
+    const usage = combinedAssistantUsage(reviewed.assistantInfos, session.data.id)
     if (usage) {
       input.progress.phaseUsageTotal(input.phase.name, usage)
       log.info(`[${input.phase.name}] usage: ${formatUsageForLog(usage)}`)
     }
-    return result
+    return { ...reviewed, ...(advisor && advisor.usage.length > 0 ? { advisorUsage: [...advisor.usage] } : {}) }
   } catch (error) {
     if (!input.shutdown.aborted && !isUserAbortError(error)) {
       await abortSessionQuietly(client, session.data.id, input.targetDir, input.phase.name)
     }
     throw error
   } finally {
+    advisor?.end()
     if (input.shutdown.aborted) await input.shutdown.abortActiveSessions(input.progress)
     input.shutdown.clearActiveSession(input.phase.name, session.data.id)
     await watcher.stop()
@@ -1324,6 +1354,104 @@ type SessionResult = {
   info: AssistantMessage
   parts: Part[]
   assistantInfos: AssistantMessage[]
+  /** Present only when this attempt consulted an advisor; kept apart from executor usage so the split stays visible. */
+  advisorUsage?: readonly AdvisorUsage[]
+}
+
+/** Sentinel the closing checkpoint asks a read-only phase to reply with when the advice changes nothing. */
+export const noChangesReply = "NO CHANGES"
+
+/**
+ * Consults the advisor once the phase believes it is finished, and gives it one
+ * more turn in the SAME session when there is something to act on. Same session
+ * on purpose: nothing is re-serialized, so the phase keeps every bit of context
+ * it built up.
+ *
+ * Read-only phases need the sentinel protocol. Their visible output *is* the
+ * report — Convoy persists the assistant text verbatim — so a chatty extra turn
+ * would corrupt it. They are asked to either re-emit the whole report or reply
+ * with the sentinel, and the sentinel case keeps the original text.
+ */
+async function applyCompletionCheckpoint(
+  client: OpencodeClient,
+  input: {
+    phase: AgentStep
+    targetDir: string
+    model: ModelSelection
+    progress: ProgressUI
+    shutdown: RunShutdown
+    sessionID: string
+  },
+  first: SessionResult,
+  advisor: AdvisorPhaseHandle,
+): Promise<SessionResult> {
+  const advice = await advisor.consult("completion", completionQuestion(input.phase))
+  if (!advice.ok) return first
+  input.shutdown.throwIfRequested()
+
+  input.progress.message(`${input.phase.name}: advisor reviewed the finished phase`)
+
+  const watcher = watchSession(client, {
+    directory: input.targetDir,
+    phaseName: input.phase.name,
+    sessionID: input.sessionID,
+    progress: input.progress,
+    signal: input.shutdown.signal,
+  })
+  try {
+    await Promise.race([watcher.ready, sleep(3_000)])
+    const accepted = await client.session.promptAsync({
+      sessionID: input.sessionID,
+      directory: input.targetDir,
+      agent: input.phase.agentName,
+      model: { providerID: input.model.providerID, modelID: input.model.modelID },
+      variant: input.model.variant,
+      parts: [{ type: "text", text: completionFollowUp(input.phase, advice.text) }],
+    }, { signal: input.shutdown.signal })
+    if (accepted.error) throw new Error(formatSdkError(accepted.error))
+
+    const second = await watcher.result
+    const secondText = extractAssistantText(second.parts).trim()
+    const unchanged = secondText.length === 0 || secondText.toUpperCase().startsWith(noChangesReply)
+
+    return {
+      info: second.info,
+      // A read-only phase replaces its report or keeps it; a writing phase's text
+      // is only a fallback report, so both turns are kept.
+      parts: input.phase.readOnly ? (unchanged ? first.parts : second.parts) : [...first.parts, ...second.parts],
+      assistantInfos: [...first.assistantInfos, ...second.assistantInfos],
+    }
+  } catch (error) {
+    // The phase already produced a durable deliverable; a failed review turn
+    // must not discard it.
+    if (input.shutdown.aborted || isUserAbortError(error)) throw error
+    log.warn(`[${input.phase.name}] advisor review turn failed, keeping the completed phase: ${error instanceof Error ? error.message : String(error)}`)
+    return first
+  } finally {
+    await watcher.stop()
+  }
+}
+
+function completionQuestion(phase: AgentStep): string {
+  return phase.readOnly
+    ? `I believe this audit phase is complete and the report above is my final answer. Is anything missing, wrong, or unsupported by what I actually examined?`
+    : `I believe this phase is complete. Is it? If not, what specifically is missing or wrong?`
+}
+
+function completionFollowUp(phase: AgentStep, advice: string): string {
+  const protocol = phase.readOnly
+    ? `If this changes your findings, reply with your COMPLETE corrected report and nothing else — it replaces what you just produced. If it changes nothing, reply with exactly \`${noChangesReply}\`.`
+    : `If this identifies real work, do it now and then say what you changed. If it changes nothing, say so briefly and stop.`
+
+  return [
+    "Before this phase is accepted, a reviewing model read your full transcript. Its guidance:",
+    "",
+    advice,
+    "",
+    protocol,
+    "",
+    "Weigh it seriously, but you have first-hand evidence it lacks: if something it claims is contradicted by what you actually read or ran, say so instead of complying.",
+  ].join("\n")
 }
 
 export type SessionWatcher = {

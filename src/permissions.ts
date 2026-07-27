@@ -27,6 +27,21 @@ export type PermissionGate = {
   resume(): void
 }
 
+/**
+ * What the advisor checkpoint wants done with an `edit` request.
+ *
+ * - `advise`: this is the phase's first write and it hasn't consulted yet.
+ *   Reject carrying the advice, which the executor reads mid-turn and retries on.
+ * - `allow`: an advised phase that already consulted. Allowed immediately, never
+ *   escalated — advised agents run with `edit: "ask"` purely so this hook can
+ *   see the first write, so without this branch every later edit would start
+ *   prompting a human that today is never asked.
+ * - `defer`: not the checkpoint's business; handle as normal.
+ */
+export type AdvisorGateDecision = { action: "advise"; message: string } | { action: "allow" } | { action: "defer" }
+
+export type AdvisorCheckpoint = (request: { sessionID: string; permission: string; summary: string }) => Promise<AdvisorGateDecision>
+
 export type StartGateOptions = {
   client: OpencodeClient
   progress?: ProgressUI
@@ -36,6 +51,13 @@ export type StartGateOptions = {
   autoAccept?: AutoAccept
   /** Model used by the smart auto-accept judge; required for "smart" mode to do anything. */
   judgeModel?: { providerID: string; modelID: string }
+  /**
+   * Consulted for `edit` requests before anything else, including --yolo. It is
+   * not a safety decision, so auto-accept must not skip it: the point of the
+   * checkpoint is that the first write of a phase is preceded by a consultation,
+   * which is what makes the advisor reliable rather than a matter of judgement.
+   */
+  advisorCheckpoint?: AdvisorCheckpoint
 }
 
 export function startPermissionGate(options: StartGateOptions): PermissionGate {
@@ -58,7 +80,7 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
     if (handled.has(request.id)) return
     handled.add(request.id)
     queue(() =>
-      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal),
+      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal, options.advisorCheckpoint),
     )
   })
 
@@ -93,8 +115,27 @@ async function handleRequest(
   autoAccept?: AutoAccept,
   judgeModel?: { providerID: string; modelID: string },
   signal?: AbortSignal,
+  advisorCheckpoint?: AdvisorCheckpoint,
 ) {
   const summary = describeRequest(request)
+
+  // Before every other branch, including --yolo: the checkpoint is structural,
+  // not a safety judgement, and skipping it would turn "the first write is
+  // preceded by a consultation" back into something the model decides.
+  if (advisorCheckpoint && request.permission === "edit") {
+    const decision = await advisorCheckpoint({ sessionID: request.sessionID, permission: request.permission, summary })
+    if (decision.action === "advise") {
+      log.info(`[permission] advisor checkpoint held the first write: ${summary}`)
+      progress.message(`advisor consulted before first write: ${summary}`)
+      await reply(client, request.id, directory, "reject", decision.message)
+      return
+    }
+    if (decision.action === "allow") {
+      await reply(client, request.id, directory, "once")
+      return
+    }
+  }
+
   // Read at handling time, not subscription time: the TUI flips this live.
   // Opencode's denylist already rejected anything hard-denied, so whatever
   // reaches here is exactly the "ask" bucket auto-accept is meant to cover.
