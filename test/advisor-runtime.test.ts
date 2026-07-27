@@ -172,10 +172,24 @@ describe("first-write checkpoint", () => {
     expect((await advisors.checkpoint({ sessionID: "ses_1", permission: "edit", summary: "edit src/a.ts" })).action).toBe("allow")
   })
 
-  test("defers for a session it does not own", async () => {
+  test("allows for a session it does not own", async () => {
     const { runtime: advisors } = runtime()
 
-    expect((await advisors.checkpoint({ sessionID: "ses_unknown", permission: "edit", summary: "edit src/a.ts" })).action).toBe("defer")
+    expect((await advisors.checkpoint({ sessionID: "ses_unknown", permission: "edit", summary: "edit src/a.ts" })).action).toBe("allow")
+  })
+
+  test("allows an unadvised step that shares an advised step's agent", async () => {
+    const { runtime: advisors, calls } = runtime()
+    // `edit: "ask"` is set per agent, so this step's writes reach the checkpoint
+    // even though it opted out. Deferring would leave them to the gate's normal
+    // handling: a human prompt per edit interactively, a rejection in CI.
+    advisors.begin("ses_advised", step())
+    advisors.begin("ses_optout", step({ name: "audit", advisor: undefined, resolvedAdvisor: undefined }))
+
+    const decision = await advisors.checkpoint({ sessionID: "ses_optout", permission: "edit", summary: "edit src/a.ts" })
+
+    expect(decision.action).toBe("allow")
+    expect(calls).toHaveLength(0)
   })
 
   test("allows an already-consulted phase after a budget of one", async () => {

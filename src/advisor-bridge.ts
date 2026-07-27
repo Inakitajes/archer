@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
 import { join } from "node:path"
 
-import { advisorFallbackText } from "./advisor"
+import { advisorFallbackText, advisorToolName } from "./advisor"
 import type { AdvisorRuntime } from "./advisor-runtime"
 import { log } from "./log"
 import { opencodeConfigDir } from "./workspace"
@@ -161,7 +161,9 @@ export default {
 export async function installAdvisorTool(dir = opencodeConfigDir()): Promise<string> {
   const toolsDir = join(dir, "tools")
   await mkdir(toolsDir, { recursive: true, mode: 0o700 })
-  const path = join(toolsDir, "advisor.ts")
+  // OpenCode names a custom tool after its file, so this is the same constant
+  // the agent config and the advisor's own tool blocklist are built from.
+  const path = join(toolsDir, `${advisorToolName}.ts`)
   // Rewrite only on change: OpenCode watches these directories, and a touched
   // file on every run would churn its tool registry for nothing.
   const existing = await readFile(path, "utf8").catch(() => undefined)

@@ -6,7 +6,7 @@ import { createInterface } from "node:readline/promises"
 
 import type { AssistantMessage, FilePartInput, OpencodeClient, Part } from "@opencode-ai/sdk/v2"
 
-import { advisorNeedsOf, type AdvisorUsage } from "./advisor"
+import { advisorNeedsOf, completionQuestion, type AdvisorUsage, type ModelSelection } from "./advisor"
 import { advisorTokenEnv, advisorUrlEnv, installAdvisorTool, startAdvisorBridge, type AdvisorBridge } from "./advisor-bridge"
 import { readAdvisorSplit, renderAdvisorSplit } from "./advisor-report"
 import { createAdvisorRuntime, totalAdvisorUsage, type AdvisorPhaseHandle, type AdvisorRuntime } from "./advisor-runtime"
@@ -648,8 +648,12 @@ export async function run(options: RunOptions) {
     await caffeinate?.stop()
     await permissions?.stop()
     // Before the server: a tool call still in flight would otherwise hang on a
-    // socket nobody is going to answer.
+    // socket nobody is going to answer. The credentials go with it — they are
+    // inherited by every subprocess Convoy spawns after this, hooks included,
+    // and they would point at a bridge that no longer exists.
     advisorBridge?.close()
+    delete process.env[advisorUrlEnv]
+    delete process.env[advisorTokenEnv]
     // The server dies at the end of this block; clear its metadata entry now so
     // `convoy runs` stops offering to attach to a run that's shutting down.
     metadata?.serverStopped()
@@ -885,8 +889,6 @@ type PreparedPhaseRun = {
   model: ModelSelection
   maxAttempts: number
 }
-
-type ModelSelection = { providerID: string; modelID: string; variant?: string }
 
 async function preparePhaseRun(
   workspace: Workspace,
@@ -1126,13 +1128,18 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     ...(input.advisors ? { advisors: input.advisors } : {}),
   })
   const assistantText = extractAssistantText(result.parts)
+  // Totals for the whole attempt, not the final message: the attempt log's
+  // executor figures are what the advisor split is measured against, and a
+  // headline ratio computed from one message of a many-message phase would
+  // understate the executor by however much it happened to do first.
+  const usage = combinedAssistantUsage(result.assistantInfos, result.info.sessionID)
   return {
     assistantText,
     sessionID: result.info.sessionID,
     model: input.prepared.model,
     finish: result.info.finish,
-    cost: result.info.cost,
-    tokens: result.info.tokens,
+    cost: usage?.cost ?? result.info.cost,
+    tokens: usage?.tokens ?? result.info.tokens,
     error: result.info.error,
     ...(result.advisorUsage && result.advisorUsage.length > 0 ? { advisorUsage: result.advisorUsage } : {}),
   }
@@ -1409,7 +1416,7 @@ async function applyCompletionCheckpoint(
   first: SessionResult,
   advisor: AdvisorPhaseHandle,
 ): Promise<SessionResult> {
-  const advice = await advisor.consult("completion", completionQuestion(input.phase))
+  const advice = await advisor.consult("completion", completionQuestion(Boolean(input.phase.readOnly)))
   if (!advice.ok) return first
   input.shutdown.throwIfRequested()
 
@@ -1421,6 +1428,9 @@ async function applyCompletionCheckpoint(
     sessionID: input.sessionID,
     progress: input.progress,
     signal: input.shutdown.signal,
+    // Second turn of a session that already has one: anchored so the result is
+    // this turn alone, which is what the composition below assumes.
+    sinceMessageID: first.info.id,
   })
   try {
     await Promise.race([watcher.ready, sleep(3_000)])
@@ -1435,6 +1445,11 @@ async function applyCompletionCheckpoint(
     if (accepted.error) throw new Error(formatSdkError(accepted.error))
 
     const second = await watcher.result
+    // The watcher resolves on a terminal error as readily as on a completion, so
+    // the review turn's failure surfaces here and not only in the catch below.
+    // Propagating it would fail the attempt and roll the finished phase back.
+    if (second.info.error) return keepCompletedPhase(input.phase.name, first, formatSdkError(second.info.error))
+
     const secondText = extractAssistantText(second.parts).trim()
     const unchanged = secondText.length === 0 || secondText.toUpperCase().startsWith(noChangesReply)
 
@@ -1446,20 +1461,17 @@ async function applyCompletionCheckpoint(
       assistantInfos: [...first.assistantInfos, ...second.assistantInfos],
     }
   } catch (error) {
-    // The phase already produced a durable deliverable; a failed review turn
-    // must not discard it.
     if (input.shutdown.aborted || isUserAbortError(error)) throw error
-    log.warn(`[${input.phase.name}] advisor review turn failed, keeping the completed phase: ${error instanceof Error ? error.message : String(error)}`)
-    return first
+    return keepCompletedPhase(input.phase.name, first, error instanceof Error ? error.message : String(error))
   } finally {
     await watcher.stop()
   }
 }
 
-function completionQuestion(phase: AgentStep): string {
-  return phase.readOnly
-    ? `I believe this audit phase is complete and the report above is my final answer. Is anything missing, wrong, or unsupported by what I actually examined?`
-    : `I believe this phase is complete. Is it? If not, what specifically is missing or wrong?`
+/** The phase already produced a durable deliverable; a failed review turn must not discard it. */
+function keepCompletedPhase(phaseName: string, first: SessionResult, reason: string): SessionResult {
+  log.warn(`[${phaseName}] advisor review turn failed, keeping the completed phase: ${reason}`)
+  return first
 }
 
 function completionFollowUp(phase: AgentStep, advice: string): string {
@@ -1521,6 +1533,13 @@ export function watchSession(
     sessionID: string
     progress: ProgressUI
     signal: AbortSignal
+    /**
+     * Anchor for a watcher that covers a follow-up turn in an already-used
+     * session: everything up to and including this assistant message belongs to
+     * the previous turn and is excluded from the result. Omitted, the result
+     * covers the whole session — which is the same thing for a fresh one.
+     */
+    sinceMessageID?: string
   },
 ): SessionWatcher {
   const controller = new AbortController()
@@ -1567,13 +1586,19 @@ export function watchSession(
         const assistant = response.data.filter(
           (message): message is { info: AssistantMessage; parts: Part[] } => message.info.role === "assistant",
         )
-        const last = assistant[assistant.length - 1]
+        // A result describes ONE turn. The server hands back the whole session,
+        // so a follow-up watcher drops everything through its anchor: a caller
+        // that composes two turns would otherwise double-count their usage and
+        // concatenate the first turn's report onto the second's.
+        const anchor = input.sinceMessageID ? assistant.findIndex((message) => message.info.id === input.sinceMessageID) : -1
+        const turn = anchor === -1 ? assistant : assistant.slice(anchor + 1)
+        const last = turn[turn.length - 1]
         if (!last || (!last.info.time.completed && !last.info.error)) return false
         finish({
           value: {
             info: last.info,
-            parts: assistant.flatMap((message) => message.parts),
-            assistantInfos: assistant.map((message) => message.info),
+            parts: turn.flatMap((message) => message.parts),
+            assistantInfos: turn.map((message) => message.info),
           },
         })
         return true

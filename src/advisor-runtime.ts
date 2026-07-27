@@ -131,11 +131,12 @@ export function createAdvisorRuntime(options: AdvisorRuntimeOptions): AdvisorRun
 
     async checkpoint({ sessionID }): Promise<AdvisorGateDecision> {
       const state = phases.get(sessionID)
-      // Unknown session, or a phase whose agent is advised in some *other* step:
-      // allowing rather than deferring is what keeps `edit: "ask"` from
-      // surfacing a human prompt that never existed before.
-      if (!state) return { action: "defer" }
-      if (!state.step.resolvedAdvisor) return { action: "allow" }
+      // Unknown session — including a phase whose agent is advised in some
+      // *other* step, since `begin` registers advised phases only. Allowing
+      // rather than deferring is what keeps the `edit: "ask"` this feature puts
+      // on the agent from reaching the gate's normal handling, which would mean
+      // a human prompt on every edit interactively and a rejected edit in CI.
+      if (!state) return { action: "allow" }
       if (state.calls > 0) return { action: "allow" }
 
       const advice = await consultFor(sessionID, state, "first-write")

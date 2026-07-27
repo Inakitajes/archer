@@ -8,6 +8,7 @@ import {
   advisorNeedsOf,
   advisorProviderOverride,
   advisorSelectionFor,
+  advisorToolName,
   buildAdvisorPrompt,
   clampMiddle,
   consultAdvisor,
@@ -223,6 +224,11 @@ describe("consultAdvisor", () => {
     const tools = body?.tools as Record<string, boolean>
     expect(Object.keys(tools).length).toBeGreaterThan(8)
     expect(Object.values(tools).every((enabled) => enabled === false)).toBe(true)
+    // An enumerated denylist only ever covers the built-ins; the wildcard is what
+    // holds for MCP servers and anything else the config directory contributes.
+    expect(tools["*"]).toBe(false)
+    // Convoy's own tool included, or the advisor can consult an advisor.
+    expect(tools[advisorToolName]).toBe(false)
     expect(body?.system).toContain("You are advising an agent")
   })
 

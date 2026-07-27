@@ -2,7 +2,7 @@ import { readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 
 import type { AgentConfig, Config } from "@opencode-ai/sdk/v2"
-import { advisorProviderOverride, type ModelSelection } from "./advisor"
+import { advisorProviderOverride, advisorToolName, type ModelSelection } from "./advisor"
 import { bashPolicy, noAdditions } from "./bash-policy"
 import { builtInPrompts } from "./built-in-prompts"
 import { builtInAgents, readOnlyAgentSuffix } from "./pipeline"
@@ -11,9 +11,6 @@ import { globalAgentsDir } from "./workspace"
 
 const runtimeSafetyPrompt = "runtime-safety"
 const advisorTimingPrompt = "advisor-timing"
-
-/** Name of the custom tool the executor calls to consult its advisor on demand. */
-export const advisorToolName = "advisor"
 
 export type OpencodeConfigOptions = {
   /**

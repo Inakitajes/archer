@@ -27,6 +27,16 @@ import { log } from "./log"
 export const defaultAdvisorMaxCalls = 3
 
 /**
+ * Name of the custom tool the executor calls to consult its advisor on demand.
+ *
+ * Lives here rather than beside the agent config or the bridge because all three
+ * have to agree on it: OpenCode derives a custom tool's name from its filename,
+ * so the file the bridge writes, the agent's tool map, and the advisor session's
+ * own tool blocklist are the same string or the feature silently half-works.
+ */
+export const advisorToolName = "advisor"
+
+/**
  * Hard cap on advisor output tokens. OpenCode's prompt API takes no per-call
  * limit, but its effective cap is `min(model.limit.output, OUTPUT_TOKEN_MAX)`,
  * and `limit.output` is declarable per model in the config Convoy already
@@ -111,22 +121,7 @@ export async function consultAdvisor(input: ConsultAdvisorInput): Promise<Adviso
         model: { providerID: input.model.providerID, modelID: input.model.modelID },
         ...(input.model.variant ? { variant: input.model.variant } : {}),
         system: builtInPrompts["advisor-system"],
-        // Every tool off: the advisor advises, it never acts.
-        tools: {
-          read: false,
-          write: false,
-          edit: false,
-          bash: false,
-          glob: false,
-          grep: false,
-          list: false,
-          task: false,
-          webfetch: false,
-          websearch: false,
-          todoread: false,
-          todowrite: false,
-          skill: false,
-        },
+        tools: advisorTools(),
         parts: [{ type: "text", text: buildAdvisorPrompt(transcript, input) }],
       },
       { signal: controller.signal },
@@ -152,6 +147,36 @@ export async function consultAdvisor(input: ConsultAdvisorInput): Promise<Adviso
         // Throwaway session in an ephemeral workspace; deletion is best effort.
       }
     }
+  }
+}
+
+/**
+ * Every tool off: the advisor advises, it never acts.
+ *
+ * The leading wildcard is what makes this hold for tools Convoy doesn't know
+ * about — Convoy's own `advisor` tool (a recursive consultation), and anything
+ * an MCP server or the user's OpenCode config dir contributes. An enumerated
+ * denylist can only ever cover the built-ins, and an advisor that quietly gains
+ * a tool inverts the pattern's whole cost argument. Older servers that ignore the
+ * wildcard still get the explicit entries below it.
+ */
+export function advisorTools(): Record<string, boolean> {
+  return {
+    "*": false,
+    read: false,
+    write: false,
+    edit: false,
+    bash: false,
+    glob: false,
+    grep: false,
+    list: false,
+    task: false,
+    webfetch: false,
+    websearch: false,
+    todoread: false,
+    todowrite: false,
+    skill: false,
+    [advisorToolName]: false,
   }
 }
 
@@ -262,8 +287,20 @@ export function clampMiddle(value: string, max: number): string {
 
 const reasonQuestions: Record<AdvisorReason, string> = {
   "first-write": "I am about to make my first change to the repository. Is this the right change to make, and is this the right way to make it?",
-  completion: "I believe this phase is complete. Is it? If not, what specifically is missing or wrong?",
+  completion: completionQuestion(false),
   "on-demand": "What should I do next?",
+}
+
+/**
+ * What the closing checkpoint asks. A read-only phase gets a different question
+ * because its deliverable is the report itself: "is the phase done" and "is the
+ * report right" are the same question there, and asking the generic one invites
+ * advice about work a phase that cannot write was never going to do.
+ */
+export function completionQuestion(readOnly: boolean): string {
+  return readOnly
+    ? "I believe this audit phase is complete and the report above is my final answer. Is anything missing, wrong, or unsupported by what I actually examined?"
+    : "I believe this phase is complete. Is it? If not, what specifically is missing or wrong?"
 }
 
 export function buildAdvisorPrompt(transcript: string, input: Pick<ConsultAdvisorInput, "reason" | "question" | "brevityWords">): string {
