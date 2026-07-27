@@ -3,7 +3,7 @@ import { homedir } from "node:os"
 import { StyledText, fg } from "@opentui/core"
 
 import { gatewayLabel } from "./model-routing"
-import { plannedStepModel } from "./run-plan"
+import { plannedStepAdvisor, plannedStepModel } from "./run-plan"
 import { sanitizeReviewInline, sanitizeReviewText } from "./run-review"
 import { stepRunnerFor } from "./step-runners"
 import { plain, raw, theme, truncate } from "./tui-theme"
@@ -145,6 +145,10 @@ function pushAgentStep(rows: StyledText[], step: AgentStep, plan: RunPlan, width
 }
 
 function modelRows(step: AgentStep, indent: number, width: number): StyledText[] {
+  return [...executorModelRows(step, indent, width), ...advisorRows(step, indent, width)]
+}
+
+function executorModelRows(step: AgentStep, indent: number, width: number): StyledText[] {
   const available = Math.max(8, width - indent)
   const resolved = step.resolvedModel
   if (!resolved) return [continuation([fg(theme.dim)(truncate(sanitizeReviewInline(plannedStepModel(step)), available))], indent)]
@@ -158,6 +162,15 @@ function modelRows(step: AgentStep, indent: number, width: number): StyledText[]
     continuation([fg(theme.dim)(truncate(logical, available))], indent),
     continuation([fg(theme.teal)("→ "), fg(theme.text)(truncate(target, Math.max(8, available - 2)))], indent),
   ]
+}
+
+/** One extra dim row naming the advising model, only for steps that have one. */
+function advisorRows(step: AgentStep, indent: number, width: number): StyledText[] {
+  const advisor = plannedStepAdvisor(step)
+  if (!advisor) return []
+  const prefix = "advisor "
+  const available = Math.max(8, width - indent - prefix.length)
+  return [continuation([fg(theme.faint)(prefix), fg(theme.dim)(truncate(sanitizeReviewInline(advisor), available))], indent)]
 }
 
 function hookChunks(stage: "pre" | "post", hook: HookSpec, value: number): TextChunk[] {

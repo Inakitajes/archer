@@ -729,3 +729,91 @@ describe("claude-code runner steps", () => {
     ).toThrow(/models/)
   })
 })
+
+describe("advisor resolution", () => {
+  const withAdvisor = (spec: PipelineSpec, advisor?: string, maxCalls?: number) =>
+    resolvePipeline({
+      name: "test",
+      spec,
+      agents: builtInAgents,
+      defaultAdvisor: advisor,
+      defaultAdvisorMaxCalls: maxCalls,
+    }).steps.filter((step): step is AgentStep => step.type === "agent")
+
+  test("absent everywhere means no advisor, so an untouched config costs the same as before", () => {
+    const [step] = agentSteps({ steps: ["implementer"] })
+
+    expect(step?.advisor).toBeUndefined()
+    expect(step?.advisorVariant).toBeUndefined()
+    expect(step?.advisorMaxCalls).toBeUndefined()
+  })
+
+  test("splits the advisor's variant like any other model", () => {
+    const [step] = agentSteps({ steps: [{ agent: "implementer", advisor: "anthropic/claude-opus-5#high" }] })
+
+    expect(step?.advisor).toBe("anthropic/claude-opus-5")
+    expect(step?.advisorVariant).toBe("high")
+  })
+
+  test("precedence runs step > agent > defaults", () => {
+    const agents = builtInAgents.map((agent) => (agent.name === "implementer" ? { ...agent, advisor: "anthropic/claude-opus-4-8" } : agent))
+    const steps = resolvePipeline({
+      name: "test",
+      spec: {
+        steps: [
+          { agent: "implementer", name: "from-step", advisor: "anthropic/claude-opus-5" },
+          { agent: "implementer", name: "from-agent" },
+          { agent: "tests", name: "from-defaults" },
+        ],
+      },
+      agents,
+      defaultAdvisor: "openai/gpt-5.6-sol",
+    }).steps.filter((step): step is AgentStep => step.type === "agent")
+
+    expect(steps.find((step) => step.name === "from-step")?.advisor).toBe("anthropic/claude-opus-5")
+    expect(steps.find((step) => step.name === "from-agent")?.advisor).toBe("anthropic/claude-opus-4-8")
+    expect(steps.find((step) => step.name === "from-defaults")?.advisor).toBe("openai/gpt-5.6-sol")
+  })
+
+  test("advisor: false cuts the chain so one step can opt out of a broader default", () => {
+    const steps = withAdvisor(
+      { steps: [{ agent: "implementer", name: "advised" }, { agent: "tests", name: "solo", advisor: false }] },
+      "anthropic/claude-opus-5",
+    )
+
+    expect(steps.find((step) => step.name === "advised")?.advisor).toBe("anthropic/claude-opus-5")
+    expect(steps.find((step) => step.name === "solo")?.advisor).toBeUndefined()
+  })
+
+  test("advisorMaxCalls comes from the step, else defaults, and only with an advisor", () => {
+    const steps = withAdvisor(
+      { steps: [{ agent: "implementer", name: "capped", advisorMaxCalls: 1 }, { agent: "tests", name: "inherited" }] },
+      "anthropic/claude-opus-5",
+      4,
+    )
+
+    expect(steps.find((step) => step.name === "capped")?.advisorMaxCalls).toBe(1)
+    expect(steps.find((step) => step.name === "inherited")?.advisorMaxCalls).toBe(4)
+    expect(() => agentSteps({ steps: [{ agent: "implementer", advisorMaxCalls: 2 }] })).toThrow("advisorMaxCalls without an advisor")
+  })
+
+  test("an advisor named on a claude-code step is an error; an inherited one is dropped", () => {
+    expect(() =>
+      agentSteps({ steps: [{ agent: "bug-auditor", runner: "claude-code", advisor: "anthropic/claude-opus-5", reports: "none" }] }),
+    ).toThrow(/runner: claude-code does not support/)
+
+    const steps = withAdvisor({ steps: [{ agent: "bug-auditor", runner: "claude-code", reports: "none" }] }, "anthropic/claude-opus-5")
+    expect(steps[0]?.runner).toBe("claude-code")
+    expect(steps[0]?.advisor).toBeUndefined()
+  })
+
+  test("every variant of a models: fan-out inherits the same advisor", () => {
+    const steps = withAdvisor(
+      { steps: [{ agent: "bug-auditor", name: "bugs", models: ["openai/gpt-5.6-sol", "anthropic/claude-opus-5"], reports: "none" }] },
+      "anthropic/claude-opus-5",
+    )
+
+    expect(steps).toHaveLength(2)
+    for (const step of steps) expect(step.advisor).toBe("anthropic/claude-opus-5")
+  })
+})

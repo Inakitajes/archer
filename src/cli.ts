@@ -34,6 +34,10 @@ export type ParsedArgs = {
   resumeRunID?: string
   keepRunDir?: boolean
   modelOverride?: string
+  /** --advisor: force an advising model on every eligible step, whatever config says. */
+  advisorOverride?: string
+  /** --no-advisor: run every step without an advisor, whatever config says. */
+  advisorDisabled?: boolean
   tui?: boolean
   humanReview?: boolean
   maxAttempts?: number
@@ -445,7 +449,14 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
   const pipelineName = parsed.pipeline ?? defaults.pipeline ?? defaultPipelineName
   let pipeline: Pipeline
   try {
-    pipeline = resolvePipeline({ name: pipelineName, spec: selectPipelineSpec(config, pipelineName), agents, defaultModel: defaults.model })
+    pipeline = resolvePipeline({
+      name: pipelineName,
+      spec: selectPipelineSpec(config, pipelineName),
+      agents,
+      defaultModel: defaults.model,
+      defaultAdvisor: defaults.advisor,
+      defaultAdvisorMaxCalls: defaults.advisorMaxCalls,
+    })
   } catch (error) {
     // A resumed run replays the pipeline frozen in its metadata; a config
     // that has since broken must not block it. New runs surface the error.
@@ -457,6 +468,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
   if (!humanReview) pipeline = { ...pipeline, steps: pipeline.steps.filter((step) => step.type !== "human") }
 
   if (parsed.modelOverride) parseModel(splitModelVariant(parsed.modelOverride).model)
+  if (parsed.advisorOverride) parseModel(splitModelVariant(parsed.advisorOverride).model)
   if (parsed.smartModel) parseModel(splitModelVariant(parsed.smartModel).model)
   // Smart auto-accept always needs a concrete judge model; resolve the fallback
   // chain here so the runner can stay oblivious to config and built-in defaults.
@@ -470,6 +482,8 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     resumeRunID: parsed.resumeRunID ?? "",
     keepRunDir: parsed.keepRunDir ?? true,
     modelOverride: parsed.modelOverride ?? "",
+    advisorOverride: parsed.advisorOverride ?? "",
+    advisorDisabled: parsed.advisorDisabled ?? false,
     tui: parsed.tui ?? Boolean(process.stdout.isTTY && process.stderr.isTTY),
     humanReview,
     maxAttempts: parsed.maxAttempts ?? defaults.maxAttempts ?? 2,
@@ -586,6 +600,15 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "--model":
         parsed.modelOverride = takeValue()
         break
+      case "--advisor":
+        parsed.advisorOverride = takeValue()
+        parsed.advisorDisabled = false
+        break
+      case "--no-advisor":
+        if (value !== undefined) throw new Error("--no-advisor does not take a value")
+        parsed.advisorDisabled = true
+        parsed.advisorOverride = undefined
+        break
       case "--gateway": {
         const gateway = takeValue()
         if (!isModelGateway(gateway)) throw new Error('--gateway must be "configured", "direct", "openrouter", or "vercel"')
@@ -696,6 +719,10 @@ Flags:
   --smart-model <provider/model[#variant]> Model for the smart auto-accept judge (default: defaults.autoAcceptJudgeModel, else the run's model)
   --include-dirty          Include existing changes in the first commit (requires --max-attempts 1)
   --model <provider/model[#variant]> Force a model for OpenCode steps (Claude Code steps keep their CLI model)
+  --advisor <provider/model[#variant]> Force an advising model on every OpenCode step: a stronger model
+                           consulted at decision points (before the first write, before declaring done,
+                           and on demand) that reads the step's transcript but never runs tools
+  --no-advisor             Run every step without an advisor, whatever the config sets
   --gateway <configured|direct|openrouter|vercel> Route all OpenCode models through the selected gateway
   --plan                   Print the complete resolved plan without creating or running anything
   --no-confirm             Show a compact plan and start without the interactive confirmation

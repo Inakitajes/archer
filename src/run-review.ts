@@ -2,7 +2,7 @@ import { createInterface } from "node:readline/promises"
 import { stdin, stdout } from "node:process"
 
 import { gatewayLabel } from "./model-routing"
-import { plannedStepModel } from "./run-plan"
+import { plannedStepAdvisor, plannedStepModel } from "./run-plan"
 import { stepRunnerFor } from "./step-runners"
 import type { RunPlan } from "./types"
 
@@ -48,6 +48,8 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
         lines.push(`  ${index + 1}. ${sanitizeInline(step.name)} · ${stepRunnerFor(step.runner).displayName} · ${step.readOnly ? "read-only" : "writable"} · ${step.maxAttempts ?? plan.maxAttempts} attempts`)
         if (step.resolvedModel) lines.push(`     Logical: ${sanitizeInline(step.resolvedModel.logical)}`, `     Target:  ${sanitizeInline(step.resolvedModel.target)}`)
         else lines.push(`     Model: ${sanitizeInline(plannedStepModel(step))}`)
+        const advisor = plannedStepAdvisor(step)
+        if (advisor) lines.push(`     Advisor: ${sanitizeInline(advisor)}`)
       }
     })
     if (plan.hooks.pre.length || plan.hooks.post.length) {

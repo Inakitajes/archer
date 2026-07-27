@@ -229,4 +229,11 @@ describe("reports helpers", () => {
       "a/b · name scope · reports scope · diff off · attempts 3",
     )
   })
+
+  test("stepValueSummary distinguishes an advisor, an explicit opt-out, and inheriting", () => {
+    expect(stepValueSummary({ agent: "x", model: "a/b", advisor: "c/d" })).toBe("a/b · advisor c/d")
+    expect(stepValueSummary({ agent: "x", model: "a/b", advisor: false })).toBe("a/b · no advisor")
+    expect(stepValueSummary({ agent: "x", model: "a/b" })).toBe("a/b")
+    expect(stepValueSummary({ agent: "x", model: "a/b", advisor: "c/d", advisorMaxCalls: 2 })).toBe("a/b · advisor c/d · advisor×2")
+  })
 })

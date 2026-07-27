@@ -132,6 +132,12 @@ const modalListHeight = 12
 /** Synthetic top entry in the model picker; its empty value means "inherit / clear the override". */
 const clearOption: ModelChoice = { value: "", label: "inherit — clear override", providerID: "" }
 
+/**
+ * Second synthetic entry, advisor picker only: writes `advisor: false`. No model
+ * string can collide with it, since every model contains a "/".
+ */
+const advisorOffOption: ModelChoice = { value: "off", label: "off — run this step without an advisor", providerID: "" }
+
 export function claudeModelPickerState(current: string | undefined): { options: ModelChoice[]; index: number } {
   const options: ModelChoice[] = [
     clearOption,
@@ -365,7 +371,8 @@ export class ConfigEditor {
         this.deleteUnderCursor()
         return
       case "a":
-        this.addUnderCursor()
+        if (key.shift) this.editStepAdvisor()
+        else this.addUnderCursor()
         return
     }
   }
@@ -702,6 +709,38 @@ export class ConfigEditor {
       setSpecAt(steps, index, member, collapseStep(next))
       this.markDirty()
     })
+  }
+
+  /**
+   * The advisor is tri-state, unlike every other step field: a model, `false`
+   * (run without one even though a broader default sets one), or absent
+   * (inherit). The picker gets an explicit "off" entry for the middle case.
+   */
+  private editStepAdvisor() {
+    const at = this.agentStepUnderCursor()
+    if (!at) return
+    const obj = asStepObject(at.spec)
+    if (!stepRunnerFor(obj.runner).capabilities.advisor) {
+      this.message("Advisor unavailable", "Claude Code owns its own loop and exposes no advisor hook. Switch to OpenCode with Shift+R first.")
+      return
+    }
+    const { pipeline, index, member } = at.meta
+    const current = obj.advisor === false ? advisorOffOption.value : obj.advisor
+    this.openModelPicker(
+      `${stepLabel(pipeline, index, member)}.advisor`,
+      current,
+      (value) => {
+        const next = { ...obj }
+        if (value === undefined) delete next.advisor
+        else if (value === advisorOffOption.value) next.advisor = false
+        else next.advisor = value
+        // A cap is meaningless without an advisor, and config validation rejects the pair.
+        if (next.advisor === undefined || next.advisor === false) delete next.advisorMaxCalls
+        setSpecAt(at.steps, index, member, collapseStep(next))
+        this.markDirty()
+      },
+      [advisorOffOption],
+    )
   }
 
   private editStepModels() {
@@ -1149,8 +1188,9 @@ export class ConfigEditor {
     this.render()
   }
 
-  private openModelPicker(title: string, current: string | undefined, commit: (value: string | undefined) => void) {
-    const modal: Modal = { kind: "model", title, filter: "", loading: true, options: [clearOption], index: 0, commit }
+  private openModelPicker(title: string, current: string | undefined, commit: (value: string | undefined) => void, extraOptions: readonly ModelChoice[] = []) {
+    const leading = [clearOption, ...extraOptions]
+    const modal: Modal = { kind: "model", title, filter: "", loading: true, options: [...leading], index: 0, commit }
     this.modal = modal
     this.render()
     // Model edits target the project repo for provider resolution; the global tab has none of its own.
@@ -1158,7 +1198,7 @@ export class ConfigEditor {
     listModels(dir)
       .then((choices) => {
         if (this.modal !== modal) return
-        modal.options = [clearOption, ...choices]
+        modal.options = [...leading, ...choices]
         modal.loading = false
         if (current) {
           const at = modal.options.findIndex((choice) => choice.value === current)
@@ -1460,6 +1500,7 @@ export class ConfigEditor {
           fg(theme.dim)(runner.capabilities.modelFanout ? " multi-model" : " unavailable"),
         ])
         push([fg(theme.accent)("m"), fg(theme.dim)(" max-attempts   "), fg(theme.accent)("n"), fg(theme.dim)(" name")])
+        push([fg(theme.accent)("A"), fg(theme.dim)(runner.capabilities.advisor ? " advisor" : " advisor unavailable")])
         push([fg(theme.accent)("r"), fg(theme.dim)(" reports   "), fg(theme.accent)("R"), fg(theme.dim)(" runner   "), fg(theme.accent)("x"), fg(theme.dim)(" diff")])
         push([fg(theme.accent)("d"), fg(theme.dim)(" delete   "), fg(theme.accent)("g"), fg(theme.dim)(meta.member === undefined ? " make parallel   " : " eject from group   ")])
         push([fg(theme.accent)("shift+↑/↓"), fg(theme.dim)(" reorder")])
@@ -1878,6 +1919,9 @@ export function stepValueSummary(spec: string | AgentStepSpec): string {
   if (spec.reports !== undefined) parts.push(`reports ${Array.isArray(spec.reports) ? spec.reports.join(",") : spec.reports}`)
   if (spec.diff !== undefined) parts.push(`diff ${spec.diff ? "on" : "off"}`)
   if (spec.maxAttempts !== undefined) parts.push(`attempts ${spec.maxAttempts}`)
+  if (spec.advisor === false) parts.push("no advisor")
+  else if (spec.advisor !== undefined) parts.push(`advisor ${spec.advisor}`)
+  if (spec.advisorMaxCalls !== undefined) parts.push(`advisor×${spec.advisorMaxCalls}`)
   return parts.join(" · ")
 }
 

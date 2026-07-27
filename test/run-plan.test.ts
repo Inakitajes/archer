@@ -1,8 +1,8 @@
-import { expect, test } from "bun:test"
+import { describe, expect, test } from "bun:test"
 
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import { logicalModel } from "../src/model-routing"
-import { buildRunPlan, routePipeline } from "../src/run-plan"
+import { buildRunPlan, plannedStepAdvisor, routePipeline } from "../src/run-plan"
 import { stepRunnerFor } from "../src/step-runners"
 import type { AgentStep, RunOptions } from "../src/types"
 
@@ -15,6 +15,8 @@ test("the immutable plan filters and freezes exact routed targets", () => {
     resumeRunID: "",
     keepRunDir: true,
     modelOverride: "anthropic/claude-opus-4.8",
+    advisorOverride: "",
+    advisorDisabled: false,
     gateway: "vercel",
     tui: false,
     humanReview: false,
@@ -103,6 +105,8 @@ test("the plan routes fan-out and the smart judge while leaving Claude Code unto
     resumeRunID: "20260720-135802-5bbh",
     keepRunDir: true,
     modelOverride: "",
+    advisorOverride: "",
+    advisorDisabled: false,
     gateway: "vercel",
     modelRoutingOverrides: {},
     tui: false,
@@ -152,6 +156,8 @@ test("the plan freezes the routed branch namer and marks an explicit resume gate
     resumeRunID: "20260720-135802-5bbh",
     keepRunDir: true,
     modelOverride: "",
+    advisorOverride: "",
+    advisorDisabled: false,
     gateway: "openrouter",
     modelRoutingOverrides: {},
     tui: false,
@@ -192,4 +198,66 @@ test("the plan freezes the routed branch namer and marks an explicit resume gate
   const unchanged = buildRunPlan({ ...options, gateway: "vercel", promptSource: "resume", resumeGateway: "vercel" })
   expect(unchanged.resume).toEqual({ runID: "20260720-135802-5bbh" })
   expect(unchanged.target).not.toHaveProperty("branch")
+})
+
+describe("advisor routing", () => {
+  const step = (extra: Partial<AgentStep> = {}): AgentStep => ({
+    type: "agent",
+    name: "build",
+    stepName: "build",
+    groupId: "g1",
+    agentName: "implementer",
+    description: "Implement",
+    model: "openai/gpt-5.6-sol",
+    inputFiles: ["prd.md"],
+    inputDiff: false,
+    reportPath: "reports/build.md",
+    ...extra,
+  })
+
+  const route = (agentStep: AgentStep, gateway: Parameters<typeof routePipeline>[1] = "configured", advisor: Parameters<typeof routePipeline>[4] = {}) =>
+    routePipeline({ name: "p", steps: [agentStep] }, gateway, {}, "", advisor).steps[0] as AgentStep
+
+  test("routes the advisor through the run's gateway, like the executor's model", () => {
+    const routed = route(step({ advisor: "anthropic/claude-opus-5", advisorVariant: "high" }), "openrouter")
+
+    expect(routed.resolvedAdvisor).toMatchObject({
+      logical: "anthropic/claude-opus-5#high",
+      target: "openrouter/anthropic/claude-opus-5#high",
+      providerID: "openrouter",
+    })
+    expect(routed.advisor).toBe("openrouter/anthropic/claude-opus-5")
+    expect(routed.advisorVariant).toBe("high")
+  })
+
+  test("leaves a step with no advisor alone", () => {
+    const routed = route(step())
+
+    expect(routed.advisor).toBeUndefined()
+    expect(routed.resolvedAdvisor).toBeUndefined()
+  })
+
+  test("--advisor forces one onto every step and --no-advisor strips them all", () => {
+    const forced = route(step(), "configured", { advisorOverride: "anthropic/claude-opus-5" })
+    expect(forced.resolvedAdvisor?.target).toBe("anthropic/claude-opus-5")
+
+    const stripped = route(step({ advisor: "anthropic/claude-opus-5" }), "configured", { advisorDisabled: true })
+    expect(stripped.advisor).toBeUndefined()
+    expect(stripped.resolvedAdvisor).toBeUndefined()
+
+    // Disabling wins over an override, so the eval protocol's three configs stay distinct.
+    const both = route(step(), "configured", { advisorOverride: "anthropic/claude-opus-5", advisorDisabled: true })
+    expect(both.advisor).toBeUndefined()
+  })
+
+  test("plannedStepAdvisor shows the routed target, or nothing when the step has no advisor", () => {
+    expect(plannedStepAdvisor(route(step({ advisor: "anthropic/claude-opus-5" }), "openrouter"))).toBe("openrouter/anthropic/claude-opus-5")
+    expect(plannedStepAdvisor(route(step()))).toBeUndefined()
+  })
+
+  test("claude-code steps are never given an advisor by the global override", () => {
+    const routed = route(step({ runner: "claude-code", model: "opus", readOnly: true }), "configured", { advisorOverride: "anthropic/claude-opus-5" })
+
+    expect(routed.advisor).toBeUndefined()
+  })
 })

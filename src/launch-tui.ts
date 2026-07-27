@@ -219,7 +219,14 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
     const source: PipelineChoice["source"] = configured[name] ? "configured" : "built-in"
     const hooks = hookNodes(hooksForPipeline(hooksConfig, name))
     try {
-      const pipeline = resolvePipeline({ name, spec, agents, defaultModel: config?.defaults.model })
+      const pipeline = resolvePipeline({
+        name,
+        spec,
+        agents,
+        defaultModel: config?.defaults.model,
+        defaultAdvisor: config?.defaults.advisor,
+        defaultAdvisorMaxCalls: config?.defaults.advisorMaxCalls,
+      })
       return {
         name,
         description: spec.description ?? "No description",
