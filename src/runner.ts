@@ -437,6 +437,9 @@ export async function run(options: RunOptions) {
     await maybeRecoverDirtyTree(workspace, metadata, options)
     control = new RunControl(metadata)
     caffeinate = new Caffeinate()
+    // Imported lazily: finish pulls in the commit-message writer (and through it
+    // opencode), which a run that never reaches its finish screen shouldn't pay for.
+    const { createFinishSeam } = await import("./finish")
     progress = recordProgress(
       await createProgressUI(progressPhases(pipeline, hookSet), options.tui, () => shutdown.request("Ctrl+C"), autoAccept, {
         onPauseToggle: () => {
@@ -445,6 +448,7 @@ export async function run(options: RunOptions) {
         onKeepAwakeToggle: () => {
           void caffeinate?.toggle().catch((error) => log.warn(`couldn't toggle Caffeinate: ${formatSdkError(error)}`))
         },
+        finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: workspace.dir }),
       }),
       metadata,
     )

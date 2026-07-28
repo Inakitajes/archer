@@ -50,6 +50,9 @@ export async function openRunDashboard(runID: string): Promise<void> {
   const detached = new Promise<void>((resolve) => {
     resolveDetached = resolve
   })
+  // [f] is offered only for a stopped run: squashing the branch out from under a
+  // process that is still running steps in it would rewrite history mid-run.
+  const { createFinishSeam } = await import("./finish")
   const tui = await createTuiProgress(
     phases,
     () => {
@@ -57,7 +60,12 @@ export async function openRunDashboard(runID: string): Promise<void> {
       resolveDetached()
     },
     undefined,
-    { offlineSessions: !server, observer: true, mode: server ? "live" : "historical" },
+    {
+      offlineSessions: !server,
+      observer: true,
+      mode: server ? "live" : "historical",
+      ...(server ? {} : { finish: createFinishSeam({ cwd: targetDir, runDir: dir }) }),
+    },
   )
   tui.start(runID, targetDir, dir)
 

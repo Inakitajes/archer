@@ -138,6 +138,45 @@ export type RunOutcome = {
 
 export type RunControlState = "running" | "pausing" | "paused"
 
+/** The proposed squash, as the finish screen shows it. */
+export type FinishProposal = {
+  branch: string
+  /** How many convoy commits would be replaced. */
+  commitCount: number
+  subject: string
+  body: string[]
+  /** Caveats worth showing above the editor: a user commit the walk stopped at, a fallback message. */
+  notes: string[]
+}
+
+export type FinishOutcome = {
+  sha: string
+  branch: string
+  /** Ref holding the pre-squash tip, so the user can undo. */
+  backupRef: string
+  replaced: number
+}
+
+/**
+ * Lets the finish screen offer [f] without importing git or opencode: the host
+ * (runner.ts for a live run, attach.ts for a reopened one) supplies both halves,
+ * exactly as the launcher receives its branch-naming callbacks.
+ */
+export type FinishSeam = {
+  /** Gathers the commits to replace plus a proposed message, or explains why it can't. */
+  prepare(): Promise<{ ok: true; proposal: FinishProposal } | { ok: false; message: string }>
+  /** Rewrites the branch. Called with the TUI suspended, so signing can prompt on the terminal. */
+  apply(message: { subject: string; body: string[] }): Promise<FinishOutcome>
+  /** Opens the user's editor on the full message, returning the edited text. TUI suspended. */
+  edit(message: { subject: string; body: string[] }): Promise<{ subject: string; body: string[] } | undefined>
+  /** Pushes the finished branch and sets its upstream. TUI suspended, for credential prompts. */
+  push(branch: string): Promise<void>
+  /** Whether `gh` is installed, so the finish screen only offers a PR when one can be opened. */
+  canOpenPullRequest(): boolean
+  /** Opens a pull request with the squashed message as title and body. TUI suspended. */
+  openPullRequest(message: { subject: string; body: string[] }): Promise<void>
+}
+
 /** Host-local screen/idle sleep assertion, intentionally never persisted with a run. */
 export type KeepAwakeState = {
   status: "off" | "on" | "unavailable"
@@ -214,7 +253,7 @@ export async function createProgressUI(
   enabled: boolean,
   onAbort?: () => void,
   autoAccept?: AutoAccept,
-  controls?: { onPauseToggle?: () => void; onKeepAwakeToggle?: () => void },
+  controls?: { onPauseToggle?: () => void; onKeepAwakeToggle?: () => void; finish?: FinishSeam },
 ): Promise<ProgressUI> {
   if (!enabled || !process.stdout.isTTY) return noopProgress
 

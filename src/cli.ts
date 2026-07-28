@@ -17,6 +17,7 @@ import { isValidRunID, resumeWorkspace } from "./workspace"
 import { readRunMetadata } from "./metadata"
 import { preflightRunPlan } from "./preflight"
 import type { LaunchBranchCheck, LaunchBranchProposal, LaunchRunPreparation, LaunchRunSelection } from "./launch-tui"
+import type { FinishOptions } from "./finish-command"
 
 /**
  * Flags as written: every scalar stays undefined until the user sets it, so
@@ -43,6 +44,10 @@ export type ParsedArgs = {
   maxAttempts?: number
   maxConcurrent?: number
   baseRef?: string
+  /** --worktree / --no-worktree: isolate the run on a fresh branch in its own worktree. */
+  worktree?: boolean
+  /** --branch: pin the worktree branch name instead of asking the naming model for one. */
+  branch?: string
   /**
    * Repo to auto-detect the base ref in when it differs from targetDir. TUI
    * worktree runs point targetDir at the fresh worktree, whose checked-out
@@ -73,6 +78,7 @@ export type CliCommand =
   | { type: "runs"; runID?: string }
   | { type: "config"; targetDir: string }
   | { type: "init"; options: InitOptions }
+  | { type: "finish"; options: FinishOptions }
   | { type: "auth"; provider: "openrouter"; action: "set" | "remove" | "status" }
 
 export async function parseAndRun(argv: string[]) {
@@ -96,6 +102,11 @@ export async function parseAndRun(argv: string[]) {
   }
   if (command.type === "auth") {
     await runAuthCommand(command.action)
+    return
+  }
+  if (command.type === "finish") {
+    const { runFinishCommand } = await import("./finish-command")
+    await runFinishCommand(command.options)
     return
   }
   if (command.type === "init") {
@@ -124,7 +135,36 @@ export async function parseAndRun(argv: string[]) {
     process.stdout.write(renderRunPlan(plan, true))
   }
   await preflightRunPlan(plan)
-  await run({ ...command.options, plan })
+  // Nothing has touched the repo yet; the worktree is the first effect, and only
+  // once the plan has been accepted.
+  let options = command.options
+  if (options.worktree) {
+    const { ensureRepoReady } = await import("./git")
+    await ensureRepoReady(options.targetDir, { baseRef: options.baseRef, allowDirty: true })
+    options = await prepareWorktreeForRun(options.targetDir, options)
+  }
+  await run({ ...options, plan })
+}
+
+/**
+ * Creates the run's isolated worktree and repoints the options at it. Shared by
+ * the launcher, where the branch was already confirmed in the branch step, and
+ * the headless path, where it is either pinned with --branch or proposed by the
+ * naming model.
+ */
+async function prepareWorktreeForRun(sourceDir: string, options: RunOptions): Promise<RunOptions> {
+  const { createIsolatedWorktree } = await import("./worktree")
+  // A pinned name is sanitized the same way the launcher sanitizes a typed one;
+  // an unusable one is a flag error, not something to silently rename around.
+  const branch = options.branch
+    ? (await checkInteractiveBranchName(sourceDir, options.branch)).branch
+    : (await proposeInteractiveBranchName(sourceDir, { prompt: options.prompt })).branch
+  if (!branch) throw new Error(`--branch "${options.branch}" isn't usable as a git branch name`)
+  const worktree = await createIsolatedWorktree({ targetDir: sourceDir, branch })
+  log.info(`running in isolated worktree (branch: ${worktree.branch})`)
+  log.info(`  dir: ${worktree.dir}`)
+  // A fresh worktree starts clean, so there is nothing dirty left to include.
+  return { ...options, targetDir: worktree.dir, branch: worktree.branch, includeDirty: false }
 }
 
 async function launchInteractiveRun(targetDir: string) {
@@ -164,16 +204,11 @@ async function launchInteractiveRun(targetDir: string) {
     maxAttempts: options.maxAttempts,
     // A fresh worktree starts clean, so source changes are intentionally left
     // untouched and don't need to be included in this run.
-    allowDirty: Boolean(runSelection.isolateWorktree),
+    allowDirty: options.worktree,
   })
-  if (runSelection.isolateWorktree) {
-    const { createIsolatedWorktree } = await import("./worktree")
-    const branch = plan.target.branch
-    if (!branch) throw new Error("worktree plan is missing its confirmed branch name")
-    const worktree = await createIsolatedWorktree({ targetDir, branch })
-    options = { ...options, targetDir: worktree.dir, includeDirty: false }
-    log.info(`running in isolated worktree (branch: ${worktree.branch})`)
-    log.info(`  dir: ${worktree.dir}`)
+  if (options.worktree) {
+    if (!options.branch) throw new Error("worktree plan is missing its confirmed branch name")
+    options = await prepareWorktreeForRun(targetDir, options)
   }
   await run({ ...options, plan, noConfirm: true })
 }
@@ -191,15 +226,15 @@ async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSele
   parsed.yolo = selection.yolo
   parsed.smart = selection.smart
   parsed.gateway = selection.gateway
+  parsed.worktree = Boolean(selection.isolateWorktree)
+  if (selection.branchName) parsed.branch = selection.branchName
   if (selection.includeDirty) parsed.maxAttempts = 1
 
-  let options = { ...(await resolveRunOptions(parsed)), prompt: selection.prompt }
+  const options = { ...(await resolveRunOptions(parsed)), prompt: selection.prompt }
   // The branch was named and confirmed in the launcher's branch step, so the
   // plan the user reviews already names the branch the run will create.
   const plan = buildRunPlan({
     ...options,
-    worktree: Boolean(selection.isolateWorktree),
-    ...(selection.branchName ? { branch: selection.branchName } : {}),
     ...(selection.worktreeDir ? { worktreeDir: selection.worktreeDir } : {}),
   })
   return { options, plan }
@@ -334,6 +369,12 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     const parsed = parseInitArgs(argv.slice(1))
     if (parsed.help) return { type: "help", text: initHelp() }
     return { type: "init", options: parsed }
+  }
+  if (argv[0] === "finish") {
+    const { finishHelp, parseFinishArgs } = await import("./finish-command")
+    const parsed = parseFinishArgs(argv.slice(1))
+    if (parsed.help) return { type: "help", text: finishHelp() }
+    return { type: "finish", options: parsed }
   }
 
   const parsed = parseArgs(argv)
@@ -490,6 +531,11 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     maxConcurrentAgents: parsed.maxConcurrent ?? defaults.maxConcurrentAgents ?? defaultMaxConcurrentAgents,
     baseRef: await resolveBaseRef(parsed, defaults),
     targetDir: parsed.targetDir,
+    // A resumed run continues in the directory its metadata recorded — which is
+    // already the worktree, when the original run made one — so it never creates
+    // another.
+    worktree: parsed.resumeRunID ? false : (parsed.worktree ?? defaults.worktree ?? true),
+    ...(parsed.branch ? { branch: parsed.branch } : {}),
     includeDirty: parsed.includeDirty ?? false,
     yolo: parsed.yolo ?? false,
     smart: parsed.smart ?? false,
@@ -649,6 +695,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
           throw new Error("--max-concurrent must be a positive integer")
         }
         break
+      case "--worktree":
+        if (value !== undefined) throw new Error("--worktree does not take a value")
+        parsed.worktree = true
+        break
+      case "--no-worktree":
+        if (value !== undefined) throw new Error("--no-worktree does not take a value")
+        parsed.worktree = false
+        break
+      case "--branch":
+        parsed.branch = takeValue()
+        break
       case "--base":
         parsed.baseRef = takeValue()
         break
@@ -688,6 +745,7 @@ Usage:
   convoy --prompt-file prd.md --file lib/onboarding --file test/onboarding_test.dart
   convoy --pipeline bug-fix --prompt-file bug.md
   convoy init
+  convoy finish
   convoy runs [run-id]
   convoy config
   convoy auth openrouter
@@ -697,6 +755,9 @@ Commands:
                            enter a prompt, and toggle run options
   init                     Create .convoy/config.yaml and .convoy/agents/*.md in the target repo
   init --global            Create ~/.convoy/config.yaml and ~/.convoy/agents/*.md
+  finish                   Squash this branch's convoy commits into one conventional commit
+                           created with your own git identity, so it lands signed and attributed
+                           ("convoy finish --help" for options; [f] on the run dashboard does the same)
   runs [run-id]            Browse run history: resume a run, read its summary/reports,
                            or open a subshell in its run dir (under ~/.convoy/runs)
   config                   View and edit the global (~/.convoy) and current project config in a TUI
@@ -733,6 +794,9 @@ Flags:
   --max-attempts <n>       Attempts per step before failing (default: 2)
   --max-concurrent <n>     Max agents running at once within a parallel group (default: ${defaultMaxConcurrentAgents}); smaller groups are unaffected
   --base <ref>             Branch/base for calculating diffs (default: auto-detected — origin's default branch, else main/master/develop/trunk, else the current branch)
+  --worktree               Run on a fresh branch in its own worktree under ~/.convoy/worktrees (default)
+  --no-worktree            Run in the current working tree instead
+  --branch <name>          Name for the worktree branch, instead of asking the naming model
   --dir <path>             Target repo (default: cwd)
 
 Config files:
@@ -741,7 +805,8 @@ Config files:
   agents/*.md              Markdown prompts loaded by matching the agent name
 
 Config keys:
-  defaults:                model, maxAttempts, baseRef, pipeline, autoAcceptJudgeModel, branchNameModel
+  defaults:                model, maxAttempts, baseRef, pipeline, worktree, autoAcceptJudgeModel,
+                           branchNameModel, commitMessageModel
   modelRouting:            gateway and explicit per-logical-model overrides
   agents:                  project agents or built-in overrides; prompts live at agents/<name>.md
   pipelines:               named step lists mixing agents and human gates

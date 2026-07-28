@@ -23,7 +23,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     `Prompt: ${plan.prompt.source} · ${prompt.length} characters · ${prompt.split("\n").length} lines`,
     `Target: ${sanitizeInline(plan.target.directory)}`,
     `  Diff base: ${sanitizeInline(plan.target.baseRef)} · working tree: ${plan.target.dirty ? "include dirty" : "clean required"}`,
-    `  Worktree: ${plan.target.worktree ? `yes · branch ${sanitizeInline(plan.target.branch ?? "?")}` : "no"}`,
+    `  Worktree: ${plan.target.worktree ? `yes · branch ${plan.target.branch ? sanitizeInline(plan.target.branch) : "named at start"}` : "no"}`,
     `Pipeline: ${sanitizeInline(plan.pipeline.name)} · ${plan.pipeline.steps.length} steps`,
     `Gateway: ${gatewayLabel(plan.modelRouting.gateway)}`,
   ]

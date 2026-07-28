@@ -46,6 +46,7 @@ import {
   terminalBackgroundHex,
   theme,
   truncate,
+  wrapLines,
 } from "./tui-theme"
 
 import type { BoxOptions, CliRenderer, KeyEvent, Selection, TextChunk } from "@opentui/core"
@@ -55,6 +56,9 @@ import type {
   ActivityKind,
   AutoAccept,
   AutoAcceptMode,
+  FinishOutcome,
+  FinishProposal,
+  FinishSeam,
   PermissionPromptInfo,
   PermissionReply,
   ProgressAttempt,
@@ -147,6 +151,18 @@ type CommandItem = {
   label: string
   detail: string
 }
+
+/**
+ * The [f] flow on the finish screen. "working" covers both halves that take the
+ * terminal away (the model writing a message, and the commit itself); while it
+ * is up every key is swallowed, so a stray keystroke can't start a second
+ * rewrite of the same branch.
+ */
+type FinishModal =
+  | { kind: "working"; message: string }
+  | { kind: "blocked"; message: string }
+  | { kind: "edit"; proposal: FinishProposal; subject: string; cursor: number }
+  | { kind: "done"; outcome: FinishOutcome; message: { subject: string; body: string[] }; pushed: boolean; note?: string }
 
 function clipboardStatusLabel(status?: ClipboardResult): string {
   if (status === "copied-native" || status === "copied-osc52") return " · copied"
@@ -278,7 +294,14 @@ export async function createTuiProgress(
   // offlineSessions: re-opened finished runs have no live server, so [o] opens
   // their stored sessions from disk instead of attaching. observer: read-only
   // attach to another process's run, where [i] takeover must be refused.
-  options?: { offlineSessions?: boolean; observer?: boolean; mode?: TuiDashboardMode; onPauseToggle?: () => void; onKeepAwakeToggle?: () => void },
+  options?: {
+    offlineSessions?: boolean
+    observer?: boolean
+    mode?: TuiDashboardMode
+    onPauseToggle?: () => void
+    onKeepAwakeToggle?: () => void
+    finish?: FinishSeam
+  },
 ): Promise<ProgressUI> {
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
@@ -303,6 +326,7 @@ export async function createTuiProgress(
     copyReportToClipboard,
     options?.onPauseToggle,
     options?.onKeepAwakeToggle,
+    options?.finish,
   )
 }
 
@@ -411,6 +435,7 @@ export class TuiProgress implements ProgressUI {
   private controlActivePhases = 0
   private keepAwake?: KeepAwakeState
   private commandPalette?: CommandPalette
+  private finishModal?: FinishModal
   // ScrollBarRenderable emits change events for programmatic state updates as
   // well as mouse drags. Ignore the former so a layout recalculation cannot
   // overwrite the reader's just-computed scroll position.
@@ -513,6 +538,12 @@ export class TuiProgress implements ProgressUI {
       } else {
         this.handleNavKey(key)
       }
+      return
+    }
+    // Above the palette: [f] is a branch rewrite, and it must not be possible to
+    // stack another modal (or a second [f]) on top of one in flight.
+    if (this.finishModal) {
+      this.handleFinishKey(key)
       return
     }
     if (this.commandPalette) {
@@ -622,6 +653,9 @@ export class TuiProgress implements ProgressUI {
       if (key.name === "g") {
         consume()
         void this.openGitSubshell()
+      } else if (key.name === "f" && this.finishSeam) {
+        consume()
+        void this.openFinishModal()
       } else if (key.name === "q" || key.name === "escape") {
         consume()
         finished.resolve()
@@ -770,6 +804,7 @@ export class TuiProgress implements ProgressUI {
     private readonly copyReport = copyReportToClipboard,
     private readonly onPauseToggle?: () => void,
     private readonly onKeepAwakeToggle?: () => void,
+    private readonly finishSeam?: FinishSeam,
   ) {
     this.contentTab = initialTab
     this.phases = phases.map((phase) => ({
@@ -1716,6 +1751,196 @@ export class TuiProgress implements ProgressUI {
     this.render()
   }
 
+  /**
+   * [f] on the finish screen: collapse the run's convoy commits into one
+   * conventional commit made with the user's own git identity, so the branch
+   * lands signed and attributed instead of as a stack of machine commits.
+   */
+  private async openFinishModal() {
+    const seam = this.finishSeam
+    if (!seam || this.finishModal) return
+    this.finishModal = { kind: "working", message: "reading the branch and writing a commit message…" }
+    this.render()
+
+    try {
+      const prepared = await seam.prepare()
+      this.finishModal = prepared.ok
+        ? { kind: "edit", proposal: prepared.proposal, subject: prepared.proposal.subject, cursor: prepared.proposal.subject.length }
+        : { kind: "blocked", message: prepared.message }
+    } catch (error) {
+      this.finishModal = { kind: "blocked", message: error instanceof Error ? error.message : String(error) }
+    }
+    this.render()
+  }
+
+  private handleFinishKey(key: KeyEvent) {
+    const modal = this.finishModal
+    if (!modal) return
+    key.preventDefault()
+    key.stopPropagation()
+    // Both halves that take the terminal away swallow input rather than queueing
+    // it: whatever is typed here would otherwise land in the editor or the
+    // signing prompt that owns the screen.
+    if (modal.kind === "working") return
+
+    if (modal.kind === "blocked") {
+      this.finishModal = undefined
+      this.render()
+      return
+    }
+
+    if (modal.kind === "done") {
+      // The commit is already made; these only offer what comes after it, and
+      // anything else closes the modal.
+      if (key.name === "p" && !modal.pushed) void this.runFinishFollowUp(modal, "push")
+      else if (key.name === "r" && modal.pushed && this.finishSeam?.canOpenPullRequest()) void this.runFinishFollowUp(modal, "pr")
+      else this.finishModal = undefined
+      this.render()
+      return
+    }
+
+    switch (key.name) {
+      case "escape":
+        this.finishModal = undefined
+        break
+      case "return":
+      case "linefeed":
+        if (modal.subject.trim()) void this.applyFinish(modal.proposal, modal.subject.trim())
+        break
+      case "left":
+        modal.cursor = Math.max(0, modal.cursor - 1)
+        break
+      case "right":
+        modal.cursor = Math.min(modal.subject.length, modal.cursor + 1)
+        break
+      case "home":
+        modal.cursor = 0
+        break
+      case "end":
+        modal.cursor = modal.subject.length
+        break
+      case "backspace":
+        if (modal.cursor > 0) {
+          modal.subject = modal.subject.slice(0, modal.cursor - 1) + modal.subject.slice(modal.cursor)
+          modal.cursor--
+        }
+        break
+      case "delete":
+        modal.subject = modal.subject.slice(0, modal.cursor) + modal.subject.slice(modal.cursor + 1)
+        break
+      default: {
+        if (key.ctrl && key.name === "a") {
+          modal.cursor = 0
+          break
+        }
+        if (key.ctrl && key.name === "e") {
+          // A multi-line body can't be edited in a one-line field, so ctrl+E
+          // hands the whole message to the user's editor instead.
+          void this.editFinishMessage(modal)
+          break
+        }
+        if (key.ctrl && key.name === "u") {
+          modal.subject = modal.subject.slice(modal.cursor)
+          modal.cursor = 0
+          break
+        }
+        const char = typedCharacter(key)
+        if (char !== undefined) {
+          modal.subject = modal.subject.slice(0, modal.cursor) + char + modal.subject.slice(modal.cursor)
+          modal.cursor += char.length
+        }
+      }
+    }
+    this.render()
+  }
+
+  private async editFinishMessage(modal: Extract<FinishModal, { kind: "edit" }>) {
+    const seam = this.finishSeam
+    if (!seam || this.inSubshell) return
+    const current = { subject: modal.subject.trim(), body: modal.proposal.body }
+    this.finishModal = { kind: "working", message: "waiting for your editor…" }
+    this.render()
+
+    this.inSubshell = true
+    this.suspend()
+    let edited: { subject: string; body: string[] } | undefined
+    try {
+      edited = await seam.edit(current)
+    } catch (error) {
+      this.addEvent("convoy", "error", `couldn't open the editor: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      this.inSubshell = false
+      this.resume()
+    }
+
+    const next = edited ?? current
+    const proposal = { ...modal.proposal, body: next.body }
+    this.finishModal = { kind: "edit", proposal, subject: next.subject, cursor: next.subject.length }
+    this.render()
+  }
+
+  private async applyFinish(proposal: FinishProposal, subject: string) {
+    const seam = this.finishSeam
+    if (!seam || this.inSubshell) return
+    this.finishModal = { kind: "working", message: "committing — your signing key may prompt…" }
+    this.render()
+
+    // Suspended with the terminal handed back: the signer (1Password/gpg-agent)
+    // and any commit hook write to, and may prompt on, the real terminal.
+    this.inSubshell = true
+    this.suspend()
+    try {
+      const message = { subject, body: proposal.body }
+      const outcome = await seam.apply(message)
+      this.finishModal = { kind: "done", outcome, message, pushed: false }
+      this.addEvent("convoy", "system", `finished ${outcome.branch} as ${outcome.sha.slice(0, 8)} (${outcome.replaced} commits squashed)`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.finishModal = { kind: "blocked", message: `${message}\n\nthe branch was left exactly as it was.` }
+      this.addEvent("convoy", "error", `finish failed: ${message}`)
+    } finally {
+      this.inSubshell = false
+      this.resume()
+    }
+    this.render()
+  }
+
+  /**
+   * Push and pull request, each asked for explicitly after the commit exists.
+   * Neither ever runs as part of [f] itself: the squash is local and undoable,
+   * while these leave the machine.
+   */
+  private async runFinishFollowUp(modal: Extract<FinishModal, { kind: "done" }>, action: "push" | "pr") {
+    const seam = this.finishSeam
+    if (!seam || this.inSubshell) return
+    this.finishModal = { kind: "working", message: action === "push" ? `pushing ${modal.outcome.branch}…` : "opening a pull request…" }
+    this.render()
+
+    this.inSubshell = true
+    this.suspend()
+    let note: string | undefined
+    let pushed = modal.pushed
+    try {
+      if (action === "push") {
+        await seam.push(modal.outcome.branch)
+        pushed = true
+        note = `pushed to origin/${modal.outcome.branch}`
+      } else {
+        await seam.openPullRequest(modal.message)
+        note = "pull request opened"
+      }
+    } catch (error) {
+      note = `${action === "push" ? "push" : "gh pr create"} failed: ${error instanceof Error ? error.message : String(error)}`
+    } finally {
+      this.inSubshell = false
+      this.resume()
+    }
+
+    if (note) this.addEvent("convoy", "system", note)
+    this.finishModal = { ...modal, pushed, ...(note ? { note } : {}) }
+    this.render()
+  }
+
   private handlePermissionKey(key: KeyEvent) {
     key.preventDefault()
     key.stopPropagation()
@@ -2022,6 +2247,9 @@ export class TuiProgress implements ProgressUI {
   }
 
   private isAnimating() {
+    // The finish modal is the one thing on a finished run that still animates:
+    // its spinner covers the message-writing call and the signing commit.
+    if (this.finishModal?.kind === "working") return true
     if (this.finished) return false
     return this.phases.some((phase) => phase.status === "running")
   }
@@ -2854,6 +3082,7 @@ export class TuiProgress implements ProgressUI {
             fg(theme.dim)("] iterate · ["),
             fg(theme.accent)("g"),
             fg(theme.dim)("] lazygit · ["),
+            ...(this.finishSeam ? [fg(theme.accent)("f"), fg(theme.dim)("] finish · [")] : []),
             fg(theme.accent)("q"),
             fg(theme.dim)("] close"),
           ]
@@ -2871,6 +3100,7 @@ export class TuiProgress implements ProgressUI {
             fg(theme.dim)("] iterate · ["),
             fg(theme.accent)("g"),
             fg(theme.dim)("] lazygit · ["),
+            ...(this.finishSeam ? [fg(theme.accent)("f"), fg(theme.dim)("] finish · [")] : []),
             fg(theme.accent)("q"),
             fg(theme.dim)("] close"),
           ]
@@ -2982,11 +3212,79 @@ export class TuiProgress implements ProgressUI {
       this.renderPermissionModal(pending)
       return
     }
+    if (this.finishModal) {
+      this.renderFinishModal(this.finishModal)
+      return
+    }
     if (this.commandPalette) {
       this.renderCommandPalette()
       return
     }
     this.overlay.visible = false
+  }
+
+  private renderFinishModal(modal: FinishModal) {
+    this.overlay.visible = true
+    this.modal.title = " ⑂ finish run "
+
+    const boxWidth = Math.max(48, Math.min(76, this.renderer.width - 8))
+    const width = boxWidth - 6
+    const lines: StyledText[] = []
+
+    if (modal.kind === "working") {
+      lines.push(new StyledText([fg(theme.accent)(spinnerFrame(Date.now())), fg(theme.text)(` ${modal.message}`)]))
+    } else if (modal.kind === "blocked") {
+      for (const line of wrapLines(modal.message.split("\n"), width)) lines.push(t`${fg(theme.yellow)(line)}`)
+      lines.push(plain(""))
+      lines.push(t`${fg(theme.faint)("press any key to dismiss")}`)
+    } else if (modal.kind === "done") {
+      const { outcome } = modal
+      lines.push(new StyledText([fg(theme.green)("✓ "), fg(theme.text)(`${outcome.sha.slice(0, 8)} on ${truncate(outcome.branch, width - 14)}`)]))
+      lines.push(t`${fg(theme.dim)(`${outcome.replaced} convoy commit${outcome.replaced === 1 ? "" : "s"} replaced by one commit of your own`)}`)
+      if (modal.note) {
+        for (const line of wrapLines([modal.note], width)) lines.push(t`${fg(theme.dim)(line)}`)
+      }
+      lines.push(plain(""))
+      lines.push(t`${fg(theme.faint)("undo  ")}${fg(theme.dim)(truncate(`git reset --hard ${outcome.backupRef}`, width - 6))}`)
+      lines.push(plain(""))
+
+      const actions: TextChunk[] = []
+      if (!modal.pushed) actions.push(fg(theme.accent)("p"), fg(theme.dim)(" push · "))
+      else if (this.finishSeam?.canOpenPullRequest()) actions.push(fg(theme.accent)("r"), fg(theme.dim)(" pull request · "))
+      actions.push(fg(theme.faint)("any other key closes"))
+      lines.push(new StyledText(actions))
+    } else {
+      const { proposal } = modal
+      lines.push(t`${fg(theme.dim)(`${proposal.commitCount} convoy commit${proposal.commitCount === 1 ? "" : "s"} on `)}${fg(theme.text)(truncate(proposal.branch, Math.max(8, width - 28)))}${fg(theme.dim)(" → 1")}`)
+      for (const note of proposal.notes) {
+        for (const line of wrapLines([note], width - 2)) lines.push(new StyledText([fg(theme.yellow)("⚠ "), fg(theme.yellow)(line)]))
+      }
+      lines.push(plain(""))
+      lines.push(t`${fg(theme.faint)("subject")}`)
+      lines.push(...textInput(modal.subject, modal.cursor, width))
+      if (proposal.body.length > 0) {
+        lines.push(plain(""))
+        lines.push(t`${fg(theme.faint)("body")}`)
+        for (const entry of proposal.body) {
+          for (const line of wrapLines([`- ${entry}`], width)) lines.push(t`${fg(theme.dim)(line)}`)
+        }
+      }
+      lines.push(plain(""))
+      lines.push(
+        new StyledText([
+          fg(theme.accent)("enter"),
+          fg(theme.dim)(" commit · "),
+          fg(theme.accent)("ctrl+e"),
+          fg(theme.dim)(" editor · "),
+          fg(theme.accent)("esc"),
+          fg(theme.dim)(" cancel"),
+        ]),
+      )
+    }
+
+    this.modal.width = boxWidth
+    this.modal.height = lines.length + 4
+    this.modalText.content = joinLines(lines)
   }
 
   private renderPermissionModal(pending: PendingPermission) {
@@ -3044,6 +3342,8 @@ export class TuiProgress implements ProgressUI {
       lines.push(t`${fg(theme.accent)("o")} ${fg(theme.dim)("open the selected session")}`)
       lines.push(t`${fg(theme.accent)("i")} ${fg(theme.dim)("toggle interactive takeover")}`)
       lines.push(t`${fg(theme.accent)("p")} ${fg(theme.dim)("pause or resume the pipeline")}`)
+      lines.push(t`${fg(theme.accent)("f")} ${fg(theme.dim)("when finished: squash the run into one signed commit")}`)
+      lines.push(t`${fg(theme.accent)("g")} ${fg(theme.dim)("when finished: open lazygit")}`)
       lines.push(t`${fg(theme.accent)("shift+tab")} ${fg(theme.dim)("cycle permission policy")}`)
       lines.push(t`${fg(theme.accent)("ctrl+p")} ${fg(theme.dim)("open commands")}`)
       lines.push(t`${fg(theme.yellow)("ctrl+c")} ${fg(theme.dim)("abort the run")}`)
@@ -3075,6 +3375,27 @@ function autoAcceptModeLabel(mode: AutoAcceptMode): string {
   if (mode === "all") return "allow all"
   if (mode === "smart") return "smart"
   return "ask every time"
+}
+
+/**
+ * One-line editable field with a block cursor, for the finish modal's subject.
+ * The window scrolls so the cursor stays visible in a value longer than the box,
+ * matching the launcher's branch-name field.
+ */
+function textInput(value: string, cursor: number, width: number): StyledText[] {
+  const inner = Math.max(1, width - 2)
+  const start = Math.max(0, Math.min(cursor - inner + 1, Math.max(0, value.length - inner + 1)))
+  const visible = value.slice(start, start + inner)
+  const column = Math.max(0, Math.min(cursor - start, inner - 1))
+
+  const chunks: TextChunk[] = [fg(theme.accent)("│")]
+  const before = visible.slice(0, column)
+  const at = visible[column] ?? " "
+  const after = visible.slice(column + 1)
+  chunks.push(fg(theme.text)(before), bg(theme.accent)(fg(theme.chipText)(at)), fg(theme.text)(after))
+  chunks.push(raw(" ".repeat(Math.max(0, inner - before.length - 1 - after.length))))
+  chunks.push(fg(theme.accent)("│"))
+  return [new StyledText(chunks)]
 }
 
 function typedCharacter(key: KeyEvent): string | undefined {

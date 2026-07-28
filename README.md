@@ -237,7 +237,22 @@ The judge model is `--smart-model <provider/model[#variant]>`, falling back to `
 
 Before each commit Convoy scans the staged files for common secret names (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*.p12`, `*.keystore`, ...). If any match, the commit is aborted, the index reset, and Convoy asks you to add them to `.gitignore` (or delete them) before re-running. Combined with `--include-dirty` this is the only line of defense against accidentally publishing a secret your working tree had lying around — review the resulting commits with `git show` before pushing.
 
-Convoy's commits are always unsigned (`--no-gpg-sign`) and authored by `convoy <convoy@local>`. They are machine commits: with a global `commit.gpgsign = true`, an unattended run would otherwise stall on an interactive signing prompt (1Password, gpg-agent) until it times out and takes the whole pipeline down — and the signature would not verify against that identity anyway. Committing is Convoy's job, so agents are denied `git commit` alongside `git push`. To sign the result, do it yourself once you are back: `git rebase --exec 'git commit --amend --no-edit -S' <base>`.
+Convoy's commits are always unsigned (`--no-gpg-sign`) and authored by `convoy <convoy@local>`. They are machine commits: with a global `commit.gpgsign = true`, an unattended run would otherwise stall on an interactive signing prompt (1Password, gpg-agent) until it times out and takes the whole pipeline down — and the signature would not verify against that identity anyway. Committing is Convoy's job, so agents are denied `git commit` alongside `git push`. Turn them into one signed commit of your own with [`convoy finish`](#finishing-a-run) when the run is done.
+
+### Finishing a run
+
+A finished run leaves a stack of `convoy(<step>): …` commits: accurate, but not a story, and none of them yours. **`convoy finish`** — or **`f`** on the dashboard's finish screen — collapses them into a single conventional commit created with your own git identity, so your normal config applies and an SSH/GPG signature happens exactly as it would for a commit you typed yourself.
+
+```bash
+convoy finish                      # in the run's worktree
+convoy finish --branch feat/thing  # from the main repo, for an older run's worktree
+convoy finish --dry-run            # print what would happen and exit
+```
+
+- **What it replaces.** Only commits authored by `convoy@local`, walking back from `HEAD` and stopping at the first commit you wrote yourself — your own commits are never rewritten. The walk is floored at the merge base with the run's base ref, so a repo Convoy bootstrapped keeps its root commit. Commits already on the branch's upstream are refused outright rather than requiring a force-push.
+- **The message.** `defaults.commitMessageModel` (Haiku by default) reads the run's reports, the PRD, the step commits, and the diffstat, and proposes a conventional commit — subject plus a short bullet body. It is editable before anything is written: inline on the dashboard, `ctrl+E` for the full message in `$EDITOR`, or `e` at the CLI prompt. A model failure degrades to a message derived from the branch name and step commits; it never blocks the commit.
+- **Undo.** The pre-squash tip is kept at `refs/convoy/finish/<branch>`, so `git reset --hard refs/convoy/finish/<branch>` restores the original history. A commit that fails — declined signature, rejected hook — restores the branch instead of leaving it half-reset.
+- **After the commit.** Pushing, opening a PR with `gh`, and removing the worktree are each offered separately and never happen on their own; declining leaves you with the commit and nothing else done.
 
 During a human step, Convoy waits indefinitely for an explicit action: `c` continues the pipeline (committing any manual changes), `o` opens an OpenCode window attached to the run's server (resuming its latest session, so the iteration keeps the run's context), and `a` aborts the run.
 
@@ -255,6 +270,8 @@ defaults:
   pipeline: quick                  # pipeline used when -p/--pipeline is not given
   autoAcceptJudgeModel: anthropic/claude-haiku-4-5   # model for smart auto-accept (--smart); defaults to the run's model
   branchNameModel: anthropic/claude-haiku-4-5        # proposes worktree branch names (may look up referenced issues); you confirm the name
+  commitMessageModel: anthropic/claude-haiku-4-5     # writes the conventional commit `convoy finish` squashes a run into; you edit it before it lands
+  worktree: true                   # run each job on a new branch in its own worktree (default); false runs in the current tree
   advisor: anthropic/claude-opus-5   # optional; a stronger model consulted at every step's decision points
   advisorMaxCalls: 3                 # optional; consultations allowed per phase attempt (default 3)
 
@@ -437,7 +454,7 @@ Each invocation creates `~/.convoy/runs/<run-id>/`:
 
 The run dir is kept after the run by default (browse it with `convoy runs`); pass `--no-keep-run-dir` to delete it on successful completion. If the run fails, it's always preserved for inspecting reports, diffs, and logs.
 
-The target repo only sees commits with prefix `convoy(<phase>): ...`, made on the current branch. Normal runs leave no CLI files in the project; `convoy init` intentionally creates `.convoy/config.yaml` when you want project-local configuration.
+The target repo only sees commits with prefix `convoy(<phase>): ...`, made on the run's branch — by default a new one in its own worktree, so your checkout is untouched until you merge. `convoy finish` replaces that stack with one signed commit of your own. Normal runs leave no CLI files in the project; `convoy init` intentionally creates `.convoy/config.yaml` when you want project-local configuration.
 
 ## Development
 
@@ -467,6 +484,9 @@ convoy/
 │   ├── advisor-report.ts  # executor/advisor token split read back from the attempt logs
 │   ├── attachments.ts   # FilePartInput for --file and internal attachments
 │   ├── git.ts           # diff, commit, and pre-commit secret scan
+│   ├── finish.ts        # squashing a run's convoy commits into one commit of the user's own
+│   ├── finish-command.ts # convoy finish: confirmation, then the push/PR/worktree offers
+│   ├── commit-message.ts # writes the conventional commit message finish proposes
 │   ├── workspace.ts     # run dir, ~/.convoy home (CONVOY_HOME), global config/agents paths
 │   ├── runs.ts          # interactive run-history browser (convoy runs)
 │   ├── runs-tui.ts      # OpenTUI run-history browser rendering
@@ -513,11 +533,13 @@ Every interactive manual run now displays its fully resolved plan before reposit
 
 ### Isolating a run in a worktree
 
-The **Isolate in a worktree** option runs Convoy on a new branch checked out under `~/.convoy/worktrees/<branch>`, leaving your current checkout untouched. The branch is always agreed with you first, in a **Branch** step between Options and Review:
+**This is the default.** Every run gets a new branch checked out under `~/.convoy/worktrees/<branch>`, leaving your current checkout untouched — which is what makes the branch safely rewritable by [`convoy finish`](#finishing-a-run) afterwards. Opt out per run with `--no-worktree`, or permanently with `defaults.worktree: false`. `--branch <name>` pins the name instead of asking the naming model, which is what an unattended or scripted run should use.
+
+The branch is always agreed with you first, in a **Branch** step between Options and Review:
 
 - `defaults.branchNameModel` (Haiku by default) reads your prompt and proposes a conventional name — `feat/runtime-guard-limits`, `fix/login-redirect` — always in English, even when the prompt is not. Prompts that only reference an issue (`#123`, `DEV-1339`, a URL) are looked up first, so the branch is named after what the issue is about.
 - The proposed name is shown in an editable field together with the worktree path it would take. Enter accepts it and moves on to Review; nothing is created until you confirm the run there.
 - `tab` moves to the **hint** box: describe how you want it named ("name it after the budget limits") and press Enter or `ctrl+R` to re-name it. This is also what you get when the prompt is too thin to name anything, or when the naming model is unavailable — the step still opens, with a name derived from the prompt, ready to be edited.
 - Names already taken by a branch or an existing worktree are suffixed (`-2`, `-3`) instead of failing `git worktree add` after the run has been confirmed.
 
-The new branch is created from `HEAD`, so it starts from whatever you have checked out.
+The new branch is created from `HEAD`, so it starts from whatever you have checked out. When the run ends, [`convoy finish`](#finishing-a-run) squashes it into one signed commit.

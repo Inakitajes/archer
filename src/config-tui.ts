@@ -111,7 +111,7 @@ type RowMeta =
   | { t: "add-pipeline" }
   | { t: "builtin"; name: string }
 
-type DefaultField = { key: keyof ConvoyDefaults; type: "model" | "number" | "string" }
+type DefaultField = { key: keyof ConvoyDefaults; type: "model" | "number" | "string" | "boolean" }
 
 type Row = {
   chunks: (selected: boolean, width: number) => TextChunk[]
@@ -122,6 +122,8 @@ const defaultFields: DefaultField[] = [
   { key: "model", type: "model" },
   { key: "autoAcceptJudgeModel", type: "model" },
   { key: "branchNameModel", type: "model" },
+  { key: "commitMessageModel", type: "model" },
+  { key: "worktree", type: "boolean" },
   { key: "maxAttempts", type: "number" },
   { key: "baseRef", type: "string" },
   { key: "pipeline", type: "string" },
@@ -598,6 +600,15 @@ export class ConfigEditor {
         setDefault(config.defaults, field.key, value)
         this.markDirty()
       })
+      return
+    }
+    if (field.type === "boolean") {
+      // A tri-state (unset → true → false → unset) rather than a plain toggle:
+      // "unset" and "explicitly the default value" are different things to a
+      // project config that has to override a global one.
+      const next = current === undefined ? true : current === true ? false : undefined
+      setDefault(config.defaults, field.key, next)
+      this.markDirty()
       return
     }
     if (field.type === "number") {
@@ -1447,7 +1458,10 @@ export class ConfigEditor {
         push([fg(theme.text)(`defaults.${meta.field.key}`)])
         push([fg(theme.faint)(describeDefault(meta.field.key))])
         lines.push(plain(""))
-        push([fg(theme.accent)("enter"), fg(theme.dim)(meta.field.type === "model" ? " pick a model" : " edit value")])
+        push([
+          fg(theme.accent)("enter"),
+          fg(theme.dim)(meta.field.type === "model" ? " pick a model" : meta.field.type === "boolean" ? " cycle unset / true / false" : " edit value"),
+        ])
         break
       case "gateway":
         push([fg(theme.text)("modelRouting.gateway")])
@@ -1724,7 +1738,7 @@ function memberRow(pipeline: string, index: number, member: number, spec: string
 
 // ---- pure helpers ----------------------------------------------------------
 
-function setDefault(defaults: ConvoyDefaults, key: keyof ConvoyDefaults, value: string | number | undefined) {
+function setDefault(defaults: ConvoyDefaults, key: keyof ConvoyDefaults, value: string | number | boolean | undefined) {
   const record = defaults as Record<string, unknown>
   if (value === undefined) delete record[key]
   else record[key] = value
@@ -1992,6 +2006,10 @@ function describeDefault(key: keyof ConvoyDefaults): string {
       return "Model the smart auto-accept judge uses (falls back to the run's model)."
     case "branchNameModel":
       return "Model that names worktree branches (default: anthropic/claude-haiku-4-5)."
+    case "commitMessageModel":
+      return "Model that writes the squashed commit message for finish (default: anthropic/claude-haiku-4-5)."
+    case "worktree":
+      return "Run each job on a fresh branch in its own worktree (on when unset)."
     case "maxAttempts":
       return "Attempts per step before failing."
     case "baseRef":

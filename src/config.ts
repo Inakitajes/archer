@@ -57,6 +57,10 @@ export type ConvoyDefaults = {
   autoAcceptJudgeModel?: string
   /** Model that names worktree branches; falls back to the built-in cheap default when unset. */
   branchNameModel?: string
+  /** Model that writes the squashed commit message for `convoy finish`; falls back to the built-in cheap default. */
+  commitMessageModel?: string
+  /** Run each job on a fresh branch in its own worktree. On by default; set false to run in place. */
+  worktree?: boolean
   /** Advising model for every step that doesn't set its own; unset means no advisor anywhere. */
   advisor?: string
   /** Cap on advisor consultations per phase attempt, for steps that don't set their own. */
@@ -241,6 +245,8 @@ defaults:
   # baseRef: main # optional: when unset, convoy auto-detects (origin default branch, else main/master/develop/trunk, else current branch)
   # pipeline: implement
   # branchNameModel: anthropic/claude-haiku-4-5 # optional: model that names worktree branches
+  # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
+  # worktree: true # optional: run each job on a fresh branch in its own worktree (default); false runs in the current tree
 
 # Agents are matched by name with Markdown prompts next to this config:
 #   agents/<name>.md
@@ -468,6 +474,8 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
     "pipeline",
     "autoAcceptJudgeModel",
     "branchNameModel",
+    "commitMessageModel",
+    "worktree",
     "advisor",
     "advisorMaxCalls",
   ])
@@ -480,6 +488,8 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
   if (record.pipeline !== undefined) defaults.pipeline = v.nonEmptyString(record.pipeline, "defaults.pipeline")
   if (record.autoAcceptJudgeModel !== undefined) defaults.autoAcceptJudgeModel = v.model(record.autoAcceptJudgeModel, "defaults.autoAcceptJudgeModel")
   if (record.branchNameModel !== undefined) defaults.branchNameModel = v.model(record.branchNameModel, "defaults.branchNameModel")
+  if (record.commitMessageModel !== undefined) defaults.commitMessageModel = v.model(record.commitMessageModel, "defaults.commitMessageModel")
+  if (record.worktree !== undefined) defaults.worktree = v.boolean(record.worktree, "defaults.worktree")
   if (record.advisor !== undefined) defaults.advisor = v.model(record.advisor, "defaults.advisor")
   if (record.advisorMaxCalls !== undefined) defaults.advisorMaxCalls = v.positiveInt(record.advisorMaxCalls, "defaults.advisorMaxCalls")
   return defaults

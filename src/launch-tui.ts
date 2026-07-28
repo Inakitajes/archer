@@ -180,8 +180,9 @@ const toggles: readonly ToggleSpec[] = [
   {
     key: "worktree",
     label: "Isolate in a worktree",
-    flag: "--worktree",
-    description: "Create a new branch + git worktree (named from your prompt) and run Convoy there, leaving the current branch untouched.",
+    flag: "--worktree / --no-worktree",
+    description:
+      "Create a new branch + git worktree (named from your prompt) and run Convoy there, leaving the current branch untouched. Finish the run with [f] to squash its commits into one signed conventional commit.",
   },
 ]
 
@@ -204,7 +205,7 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
   })
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", options).result
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", config?.defaults.worktree ?? true, options).result
 }
 
 function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly AgentSpec[]): PipelineChoice[] {
@@ -318,7 +319,8 @@ class LaunchPicker {
     includeDirty: false,
     keepRunDir: true,
     tui: Boolean(process.stdout.isTTY && process.stderr.isTTY),
-    worktree: false,
+    // Overwritten from defaults.worktree in the constructor; on unless turned off.
+    worktree: true,
   }
 
   private readonly ticker: ReturnType<typeof setInterval>
@@ -416,9 +418,11 @@ class LaunchPicker {
     private readonly targetDir: string,
     private readonly choices: PipelineChoice[],
     private gateway: ModelGateway,
+    worktreeDefault: boolean,
     // Named `callbacks` rather than `hooks`: this file already uses "hooks" for the pipeline's shell hooks.
     private readonly callbacks: Pick<LaunchRunTuiOptions, "prepareRun" | "proposeBranchName" | "checkBranchName">,
   ) {
+    this.toggleState.worktree = worktreeDefault
     const defaultIndex = choices.findIndex((choice) => choice.isDefault)
     this.selected = defaultIndex >= 0 ? defaultIndex : 0
     this.result = new Promise((resolve) => {
@@ -1391,7 +1395,7 @@ class LaunchPicker {
     if (this.toggleState.includeDirty) flags.push("--include-dirty", "--max-attempts 1")
     if (!this.toggleState.keepRunDir) flags.push("--no-keep-run-dir")
     flags.push(this.toggleState.tui ? "--tui" : "--no-tui")
-    if (this.toggleState.worktree) flags.push("--worktree")
+    flags.push(this.toggleState.worktree ? "--worktree" : "--no-worktree")
     return flags
   }
 

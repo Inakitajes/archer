@@ -31,6 +31,11 @@ const statusArgs = ["status", "--porcelain=v1", "--untracked-files=all"]
 // global `commit.gpgsign = true` makes an unattended run block on an
 // interactive signing prompt (1Password/gpg-agent) that times out, fails the
 // commit, and takes the whole pipeline down with it.
+//
+// `commitAsUser` below is the deliberate exception, and the asymmetry is the
+// point: step commits are machine commits and stay unsigned, while the single
+// squashed commit `convoy finish` creates belongs to the user and inherits
+// their entire git config, signature included.
 const commitArgs = ["commit", "--no-gpg-sign"]
 
 async function execFile(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
@@ -290,6 +295,142 @@ const convoyGitEnv = {
   GIT_AUTHOR_EMAIL: "convoy@local",
   GIT_COMMITTER_NAME: "convoy",
   GIT_COMMITTER_EMAIL: "convoy@local",
+}
+
+/** The identity every convoy step commit carries; `convoy finish` finds its own commits by it. */
+export const convoyAuthorEmail = convoyGitEnv.GIT_AUTHOR_EMAIL
+
+/**
+ * Runs git with the terminal attached, for the few commands that legitimately
+ * talk to the user: signing (1Password/gpg-agent), commit hooks, an editor,
+ * push credentials. Nothing is captured, so git's own output is the error
+ * report; callers driving a TUI must suspend it first.
+ */
+async function execFileInherited(args: string[], cwd: string): Promise<number> {
+  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "inherit", stdout: "inherit", stderr: "inherit", env: process.env })
+  return await proc.exited
+}
+
+export type CommitAsUserOptions = {
+  /** Forces `-S` for users who sign deliberately rather than via `commit.gpgsign`. */
+  sign?: boolean
+  /** Opens the user's editor on the message before committing. */
+  edit?: boolean
+  /** Skips pre-commit/commit-msg hooks, which already ran on every step commit being replaced. */
+  noVerify?: boolean
+}
+
+/**
+ * Commits whatever is already staged **as the user**: no convoyGitEnv, no
+ * `--no-gpg-sign`, and deliberately no `git add -A`. This is the one commit
+ * convoy makes on the user's behalf (`convoy finish`), so it must inherit their
+ * whole git config — user.name, commit.gpgsign, gpg.format, hooks — and land in
+ * history signed and attributed exactly like a hand-written commit.
+ *
+ * Throws on a non-zero exit (signature declined, hook rejection, empty editor):
+ * the caller is mid-rewrite and has to restore the branch.
+ */
+export async function commitAsUser(message: string, cwd: string, options: CommitAsUserOptions = {}) {
+  const args = ["commit", "-m", message]
+  if (options.sign) args.push("-S")
+  if (options.edit) args.push("--edit")
+  if (options.noVerify) args.push("--no-verify")
+
+  const exitCode = await execFileInherited(args, cwd)
+  if (exitCode !== 0) throw new Error(`git commit exited with code ${exitCode}; the commit was not created`)
+}
+
+/** Pushes `<branch>` and sets its upstream, with the terminal attached for credential prompts. */
+export async function pushBranch(branch: string, remote: string, cwd: string) {
+  const exitCode = await execFileInherited(["push", "-u", remote, branch], cwd)
+  if (exitCode !== 0) throw new Error(`git push exited with code ${exitCode}`)
+}
+
+export async function removeWorktree(dir: string, cwd: string) {
+  await execFile("git", ["worktree", "remove", "--", dir], { cwd })
+}
+
+/** The checked-out branch, or undefined when HEAD is detached. */
+export async function currentBranch(cwd: string): Promise<string | undefined> {
+  const result = await execFile("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return undefined
+  return result.stdout.trim() || undefined
+}
+
+/** Resolves `<ref>` to a commit sha, or undefined when it doesn't name one. */
+export async function resolveCommit(ref: string, cwd: string): Promise<string | undefined> {
+  const result = await execFile("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return undefined
+  return result.stdout.trim() || undefined
+}
+
+/** The best common ancestor of two refs, or undefined when their histories are unrelated. */
+export async function mergeBase(refA: string, refB: string, cwd: string): Promise<string | undefined> {
+  const result = await execFile("git", ["merge-base", refA, refB], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return undefined
+  return result.stdout.trim() || undefined
+}
+
+export type CommitInfo = {
+  sha: string
+  authorEmail: string
+  subject: string
+}
+
+/**
+ * Commits reachable from `head` but not from `base`, newest first; an empty
+ * `base` walks the whole history. The unit separator keeps subjects containing
+ * anything (including tabs) parseable.
+ */
+export async function commitsBetween(base: string, head: string, cwd: string): Promise<CommitInfo[]> {
+  const range = base ? `${base}..${head}` : head
+  const result = await execFile("git", ["log", "--format=%H%x1f%ae%x1f%s", range], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return []
+  return result.stdout
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [sha = "", authorEmail = "", ...rest] = line.split("\x1f")
+      return { sha, authorEmail, subject: rest.join("\x1f") }
+    })
+    .filter((commit) => commit.sha !== "")
+}
+
+/** Whether `ancestor` is reachable from `descendant`; false when either ref is missing. */
+export async function isAncestor(ancestor: string, descendant: string, cwd: string): Promise<boolean> {
+  const result = await execFile("git", ["merge-base", "--is-ancestor", ancestor, descendant], { cwd, allowFailure: true })
+  return result.exitCode === 0
+}
+
+/** The upstream of the current branch (e.g. "origin/feat/x"), or undefined when it has none. */
+export async function upstreamRef(cwd: string): Promise<string | undefined> {
+  const result = await execFile("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return undefined
+  return result.stdout.trim() || undefined
+}
+
+export async function diffStat(base: string, head: string, cwd: string): Promise<string> {
+  const result = await execFile("git", ["diff", "--stat", `${base}..${head}`], { cwd, allowFailure: true })
+  return result.exitCode === 0 ? result.stdout : ""
+}
+
+/** Points `<ref>` at `<sha>`. Used to stash a pre-rewrite HEAD under refs/convoy/. */
+export async function updateRef(ref: string, sha: string, cwd: string) {
+  await execFile("git", ["update-ref", ref, sha], { cwd })
+}
+
+/** Moves the branch to `<sha>` keeping index and working tree, so the tree survives a squash. */
+export async function resetSoft(sha: string, cwd: string) {
+  await execFile("git", ["reset", "--soft", sha], { cwd })
+}
+
+/** The repo the worktree at `cwd` belongs to (its main checkout), for worktree bookkeeping. */
+export async function mainWorktreeDir(cwd: string): Promise<string | undefined> {
+  const result = await execFile("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return undefined
+  const gitDir = result.stdout.trim()
+  if (!gitDir.endsWith("/.git")) return undefined
+  return gitDir.slice(0, -"/.git".length)
 }
 
 const secretPatterns: RegExp[] = [

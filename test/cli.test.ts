@@ -149,6 +149,32 @@ describe("cli parsing", () => {
     expect(parseArgs(["--no-human-step", "prompt"]).humanReview).toBe(false)
   })
 
+  test("parses worktree flags", () => {
+    expect(parseArgs(["prompt"]).worktree).toBeUndefined()
+    expect(parseArgs(["--worktree", "prompt"]).worktree).toBe(true)
+    expect(parseArgs(["--no-worktree", "prompt"]).worktree).toBe(false)
+    expect(parseArgs(["--branch", "feat/thing", "prompt"]).branch).toBe("feat/thing")
+    expect(() => parseArgs(["--worktree=yes", "prompt"])).toThrow("--worktree does not take a value")
+    expect(() => parseArgs(["--no-worktree=yes", "prompt"])).toThrow("--no-worktree does not take a value")
+  })
+
+  test("worktrees are on by default and --no-worktree opts out", async () => {
+    const byDefault = await parseCommand(["prompt"])
+    if (byDefault.type === "run") expect(byDefault.options.worktree).toBe(true)
+
+    const off = await parseCommand(["--no-worktree", "prompt"])
+    if (off.type === "run") expect(off.options.worktree).toBe(false)
+  })
+
+  test("a resumed run never creates a second worktree, even with --worktree", async () => {
+    // It continues in the directory its metadata recorded, which already is the
+    // worktree when the original run made one.
+    const parsed = parseArgs(["--worktree"])
+    parsed.resumeRunID = "20260519-103045-x7q2"
+
+    expect((await resolveRunOptions(parsed)).worktree).toBe(false)
+  })
+
   test("yolo is opt-in", async () => {
     const plain = await parseCommand(["prompt"])
     if (plain.type === "run") expect(plain.options.yolo).toBe(false)

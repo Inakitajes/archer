@@ -27,6 +27,15 @@ export type RunOptions = {
   maxConcurrentAgents?: number
   baseRef: string
   targetDir: string
+  /**
+   * Run on a fresh branch in its own worktree instead of the current tree. On by
+   * default. Consumed before `run()` — the runner only ever sees the resulting
+   * `targetDir` — so a resumed run, which continues in its recorded directory,
+   * always resolves this to false.
+   */
+  worktree: boolean
+  /** Pins the worktree branch name (`--branch`, or the name confirmed in the launcher) instead of asking the naming model. */
+  branch?: string
   includeDirty: boolean
   /** Start with auto-accept enabled: ask-level permissions are allowed without prompting (denylist still applies). */
   yolo: boolean
