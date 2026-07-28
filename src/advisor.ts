@@ -35,6 +35,8 @@ export const defaultAdvisorMaxCalls = 3
  * own tool blocklist are the same string or the feature silently half-works.
  */
 export const advisorToolName = "advisor"
+/** Tool used by the executor to explicitly record what it did with delivered advice. */
+export const advisorFeedbackToolName = "advisor_feedback"
 
 /**
  * Hard cap on advisor output tokens. OpenCode's prompt API takes no per-call
@@ -87,6 +89,8 @@ export type ConsultAdvisorInput = {
   brevityWords?: number
   signal?: AbortSignal
   timeoutMs?: number
+  /** Observability seam: receives the exact bounded transcript sent to the advisor. */
+  onTranscript?: (transcript: string) => void
 }
 
 /**
@@ -106,6 +110,7 @@ export async function consultAdvisor(input: ConsultAdvisorInput): Promise<Adviso
   let advisorSessionID: string | undefined
   try {
     const transcript = await readTranscript(input.client, input.sessionID, input.directory, controller.signal)
+    input.onTranscript?.(transcript)
 
     const session = await input.client.session.create(
       { directory: input.directory, title: `convoy advisor (${input.reason})` },
@@ -135,8 +140,12 @@ export async function consultAdvisor(input: ConsultAdvisorInput): Promise<Adviso
     return { kind: "advice", text, usage: usageOf(response.data.info) }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    log.warn(`[advisor] consultation failed (${input.reason}), continuing without advice: ${message}`)
-    return { kind: "error", code: errorCodeFor(message), message }
+    const code = errorCodeFor(message)
+    // Provider errors can include request/response details. Keep diagnostics in
+    // the private audit event (under its configured retention policy), not the
+    // process log that may be collected or shared separately.
+    log.warn(`[advisor] consultation failed (${input.reason}, ${code}), continuing without advice`)
+    return { kind: "error", code, message }
   } finally {
     clearTimeout(timeout)
     input.signal?.removeEventListener("abort", onParentAbort)
@@ -177,6 +186,7 @@ export function advisorTools(): Record<string, boolean> {
     todowrite: false,
     skill: false,
     [advisorToolName]: false,
+    [advisorFeedbackToolName]: false,
   }
 }
 

@@ -3,6 +3,7 @@ import { basename } from "node:path"
 
 import { BoxRenderable, StyledText, TextRenderable, bg, bold, createCliRenderer, decodePasteBytes, fg, stripAnsiSequences, t } from "@opentui/core"
 
+import { defaultAdvisorMaxCalls } from "./advisor"
 import { buildAgentRegistry, emptyHooksConfig, loadMergedConvoyConfig } from "./config"
 import { hooksForPipeline } from "./hooks"
 import { startLimitsPoller } from "./limits"
@@ -98,6 +99,7 @@ type StepNode = {
   kind: "agent" | "human"
   /** Short model label (e.g. "claude-opus-5"); empty for human gates. */
   modelLabel: string
+  advisorLabel?: string
 }
 
 // One shell hook that would run around the selected pipeline, flattened for
@@ -118,6 +120,7 @@ type PipelineChoice = {
   steps: StepNode[]
   hooks: HookNode[]
   valid: boolean
+  advisedSteps: number
   error?: string
 }
 
@@ -236,6 +239,7 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
         steps: pipeline.steps.map(stepNode),
         hooks,
         valid: true,
+        advisedSteps: pipeline.steps.filter((step) => step.type === "agent" && Boolean(step.resolvedAdvisor ?? step.advisor)).length,
       }
     } catch (error) {
       return {
@@ -246,6 +250,7 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
         steps: [],
         hooks,
         valid: false,
+        advisedSteps: 0,
         error: error instanceof Error ? error.message : String(error),
       }
     }
@@ -262,8 +267,16 @@ function hookNodes(set: HookSet): HookNode[] {
 }
 
 function stepNode(step: Step): StepNode {
-  if (step.type === "human") return { stepName: step.name, groupId: "", kind: "human", modelLabel: "" }
-  return { stepName: step.stepName, groupId: step.groupId, kind: "agent", modelLabel: launcherStepModelLabel(step) }
+  if (step.type === "human") return { stepName: step.name, groupId: "", kind: "human", modelLabel: "", advisorLabel: "" }
+  const advisor = step.resolvedAdvisor?.target ?? step.advisor
+  const cap = step.advisorMaxCalls ?? defaultAdvisorMaxCalls
+  return {
+    stepName: step.stepName,
+    groupId: step.groupId,
+    kind: "agent",
+    modelLabel: launcherStepModelLabel(step),
+    advisorLabel: advisor ? `${shortModelLabel(advisor)} advisor ×${cap}` : "",
+  }
 }
 
 export function launcherStepModelLabel(step: Pick<AgentStep, "model" | "variant" | "runner">): string {
@@ -1228,6 +1241,8 @@ class LaunchPicker {
     } else {
       lines.push(t`${fg(theme.faint)("steps")}`)
       for (const line of stepTree(choice.steps, width)) lines.push(line)
+      const agentSteps = choice.steps.filter((step) => step.kind === "agent").length
+      lines.push(plain(""), t`${fg(theme.teal)(`Advisors: ${choice.advisedSteps}/${agentSteps} steps advised`)}`)
     }
     lines.push(plain(""))
     for (const line of hookLines(choice.hooks, width)) lines.push(line)
@@ -1750,12 +1765,12 @@ export function stepTree(steps: readonly StepNode[], width: number): StyledText[
     // Human gates never batch; each is its own phase. Agent steps join the
     // current phase only while the groupId holds (contiguous by construction).
     if (node.kind === "human" || !last || last.kind !== "agent" || last.groupId !== node.groupId) {
-      phases.push({ kind: node.kind, groupId: node.groupId, agents: [{ stepName: node.stepName, models: node.modelLabel ? [node.modelLabel] : [] }] })
+      phases.push({ kind: node.kind, groupId: node.groupId, agents: [{ stepName: node.stepName, models: node.modelLabel ? [relationshipLabel(node)] : [] }] })
       continue
     }
     const agent = last.agents.find((candidate) => candidate.stepName === node.stepName)
-    if (agent) agent.models.push(node.modelLabel)
-    else last.agents.push({ stepName: node.stepName, models: [node.modelLabel] })
+    if (agent) agent.models.push(relationshipLabel(node))
+    else last.agents.push({ stepName: node.stepName, models: [relationshipLabel(node)] })
   }
 
   const lines: StyledText[] = []
@@ -1807,6 +1822,10 @@ export function stepTree(steps: readonly StepNode[], width: number): StyledText[
     })
   }
   return lines
+}
+
+function relationshipLabel(node: StepNode): string {
+  return node.advisorLabel ? `${node.modelLabel} → ${node.advisorLabel}` : node.modelLabel
 }
 
 // Previews the shell hooks that wrap the selected pipeline — global hooks

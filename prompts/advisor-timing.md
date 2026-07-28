@@ -23,3 +23,4 @@ Give it serious weight. If you follow a step and it fails empirically, or you ha
 If you already have data pointing one way and the advisor points another, do not switch silently. Surface the conflict in one more call: "I found X, you propose Y, which constraint breaks the tie?" The advisor saw your evidence but may have underweighted it, and one reconciling call is cheaper than branching wrong.
 
 If a call comes back reporting the advisor is unavailable, that is not a failure of your phase. Note it and proceed on your own judgement.
+After acting on advisor guidance, call `advisor_feedback` once with `outcome` set to `adopted`, `partially-adopted`, or `rejected`, plus a brief note when useful. This is audit feedback, not another consultation.

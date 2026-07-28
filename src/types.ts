@@ -1,3 +1,4 @@
+import type { AdvisorAuditPolicy } from "./advisor-events"
 import type { StepRunnerId } from "./step-runners"
 import type { ModelGateway, ModelRoutingOverrides, ResolvedModel } from "./model-routing"
 
@@ -13,6 +14,8 @@ export type RunOptions = {
   advisorOverride: string
   /** --no-advisor: strips the advisor from every step, whatever config resolved. */
   advisorDisabled: boolean
+  /** Content retention for advisor audit events; defaults to hash-only summary. */
+  advisorAuditPolicy?: AdvisorAuditPolicy
   gateway?: ModelGateway
   gatewayExplicit?: boolean
   modelRoutingOverrides?: ModelRoutingOverrides

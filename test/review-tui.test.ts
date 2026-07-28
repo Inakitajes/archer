@@ -57,6 +57,21 @@ describe("run review TUI", () => {
     expect(lines.some((line) => line.includes("zai/glm-5.2 → openrouter/z-ai/glm-5.2"))).toBe(true)
   })
 
+  test("renders routed advisors with the resolved model and their per-attempt limit", () => {
+    const plan = planWith([agentStep({
+      name: "implementer",
+      stepName: "implementer",
+      groupId: "g1",
+      advisor: "anthropic/claude-opus-5",
+      advisorMaxCalls: 4,
+      resolvedAdvisor: resolved("anthropic/claude-opus-5", "vercel/anthropic/claude-opus-5", "vercel"),
+    })])
+
+    const lines = plain(runReviewLines(plan, 120))
+
+    expect(lines.some((line) => line.includes("Advisor anthropic/claude-opus-5 → vercel/anthropic/claude-opus-5 · max 4 calls/attempt"))).toBe(true)
+  })
+
   test("groups concurrent steps under one node and labels human gates", () => {
     const plan = planWith([
       agentStep({ name: "clean-code", stepName: "clean-code", groupId: "audit", readOnly: true, resolvedModel: resolved("openai/gpt-5.6-sol", "openai/gpt-5.6-sol") }),

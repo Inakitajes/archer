@@ -1,5 +1,6 @@
 import { readdir, readFile } from "node:fs/promises"
 import { join } from "node:path"
+import { aggregateAdvisorEvents, readAdvisorEvents, type AdvisorEvent, type AdvisorPhaseAggregate } from "./advisor-events"
 
 /**
  * The executor/advisor token split, read back from a run's attempt logs.
@@ -14,7 +15,10 @@ import { join } from "node:path"
 
 export type AdvisorSplit = {
   executor: { cost: number; outputTokens: number }
+  /** Executor spend grouped by phase when attempt logs are available. */
+  executorPhases?: Record<string, number>
   advisor: { cost: number; outputTokens: number; inputTokens: number; calls: number }
+  phases?: Record<string, AdvisorPhaseAggregate>
   /** Advisor share of output tokens, 0-1. Undefined when nothing was emitted. */
   advisorOutputShare?: number
 }
@@ -31,17 +35,26 @@ type AttemptLog = {
   cost?: unknown
   tokens?: unknown
   advisor?: { calls?: unknown; cost?: unknown; outputTokens?: unknown; inputTokens?: unknown }
+  advisorEvents?: unknown
 }
 
 export async function readAdvisorSplit(runDir: string): Promise<AdvisorSplit> {
   const split: AdvisorSplit = { executor: { cost: 0, outputTokens: 0 }, advisor: { cost: 0, outputTokens: 0, inputTokens: 0, calls: 0 } }
+  const events = await readAdvisorEvents(runDir)
+  const executorPhases: Record<string, number> = {}
 
   let names: string[]
   try {
     names = await readdir(join(runDir, "logs"))
   } catch {
-    return split
+    // A missing/unreadable logs dir must not silence the journal: it is the
+    // authoritative record and may hold the run's only advisor accounting.
+    names = []
   }
+
+  const seenEventIds = new Set(events.map((event) => event.id))
+  const attemptsWithEvents = new Set(events.map((event) => `${event.phase}\0${event.attempt}`))
+  const legacyLogs: { phase: string; attempt: number; advisor: NonNullable<AttemptLog["advisor"]> }[] = []
 
   for (const name of names) {
     // Attempt logs only: the claude-code runner also writes <step>.<n>.claude.jsonl.
@@ -54,11 +67,48 @@ export async function readAdvisorSplit(runDir: string): Promise<AdvisorSplit> {
     }
     split.executor.cost += finite(log.cost)
     split.executor.outputTokens += outputTokensOf(log.tokens)
-    if (log.advisor) {
-      split.advisor.calls += finite(log.advisor.calls)
-      split.advisor.cost += finite(log.advisor.cost)
-      split.advisor.outputTokens += finite(log.advisor.outputTokens)
-      split.advisor.inputTokens += finite(log.advisor.inputTokens)
+    const stem = name.slice(0, -".json".length)
+    const separator = stem.lastIndexOf(".")
+    const phase = separator > 0 ? stem.slice(0, separator) : stem
+    const attempt = separator > 0 ? Number(stem.slice(separator + 1)) : 0
+    executorPhases[phase] = (executorPhases[phase] ?? 0) + finite(log.cost)
+
+    // Attempt logs carry the same lifecycle events as a fallback for failed
+    // journal appends. Merge them (id-deduplicated, scoped to this log's own
+    // phase attempt) before deciding what the legacy `advisor` block must
+    // still account for — otherwise a partial journal could erase cost.
+    if (Array.isArray(log.advisorEvents)) {
+      for (const candidate of log.advisorEvents as AdvisorEvent[]) {
+        if (!candidate || typeof candidate !== "object") continue
+        if (typeof candidate.id !== "string" || typeof candidate.type !== "string" || !candidate.type.startsWith("advisor.")) continue
+        if (candidate.phase !== phase || candidate.attempt !== attempt || seenEventIds.has(candidate.id)) continue
+        seenEventIds.add(candidate.id)
+        attemptsWithEvents.add(`${phase}\0${attempt}`)
+        events.push(candidate)
+      }
+    }
+    if (log.advisor) legacyLogs.push({ phase, attempt, advisor: log.advisor })
+  }
+
+  for (const { phase, attempt, advisor } of legacyLogs) {
+    if (attemptsWithEvents.has(`${phase}\0${attempt}`)) continue
+    split.advisor.calls += finite(advisor.calls)
+    split.advisor.cost += finite(advisor.cost)
+    split.advisor.outputTokens += finite(advisor.outputTokens)
+    split.advisor.inputTokens += finite(advisor.inputTokens)
+  }
+
+  if (Object.keys(executorPhases).length > 0) split.executorPhases = executorPhases
+
+  if (events.length > 0) {
+    const phases: Record<string, AdvisorPhaseAggregate> = {}
+    for (const phase of new Set(events.map((event) => event.phase))) phases[phase] = aggregateAdvisorEvents(events.filter((event) => event.phase === phase))
+    split.phases = phases
+    for (const phase of Object.values(phases)) {
+      split.advisor.calls += phase.attempted
+      split.advisor.cost += phase.cost
+      split.advisor.inputTokens += phase.tokens.input + phase.tokens.cacheRead + phase.tokens.cacheWrite
+      split.advisor.outputTokens += phase.tokens.output + phase.tokens.reasoning
     }
   }
 
@@ -81,6 +131,22 @@ export function renderAdvisorSplit(split: AdvisorSplit): string | undefined {
     `- Advisor share of output: ${share}`,
     "",
   ]
+
+  if (split.phases && Object.keys(split.phases).length > 0) {
+    lines.push(
+      "### Activity by phase",
+      "",
+      "| Phase | Attempted | Succeeded | Failed | Exhausted | Triggers | Cost | Tokens in/out |",
+      "|---|---:|---:|---:|---:|---|---:|---:|",
+    )
+    for (const [phase, activity] of Object.entries(split.phases)) {
+      const triggers = Object.entries(activity.byTrigger).map(([trigger, count]) => `${trigger}:${count}`).join(", ") || "—"
+      const input = activity.tokens.input + activity.tokens.cacheRead + activity.tokens.cacheWrite
+      const output = activity.tokens.output + activity.tokens.reasoning
+      lines.push(`| ${escapeCell(phase)} | ${activity.attempted} | ${activity.succeeded} | ${activity.failed} | ${activity.exhausted} | ${triggers} | ${formatCost(activity.cost)} | ${tokens(input)} / ${tokens(output)} |`)
+    }
+    lines.push("")
+  }
 
   if (split.executor.outputTokens < meaningfulExecutorOutput) {
     // Measured on a real run: a trivial one-step change emitted 95 executor
@@ -110,6 +176,10 @@ export function renderAdvisorSplit(split: AdvisorSplit): string | undefined {
   }
 
   return lines.join("\n")
+}
+
+function escapeCell(value: string): string {
+  return value.replaceAll("|", "\\|")
 }
 
 function tokens(value: number): string {

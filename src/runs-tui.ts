@@ -555,7 +555,10 @@ class RunsBrowser {
       fg(theme.faint)("status  "),
       run.live ? fg(theme.green)("● running") : fg(theme[style.color])(`${style.icon} ${run.status}`),
     ]
-    if (run.cost !== undefined) statusChunks.push(fg(theme.faint)("  ·  "), fg(theme.green)(formatMoney(run.cost)))
+    if (run.cost !== undefined) {
+      statusChunks.push(fg(theme.faint)("  ·  "), fg(theme.green)(formatMoney(run.cost)))
+      if (run.advisorCost) statusChunks.push(fg(theme.faint)(` · executor ${formatMoney(run.executorCost ?? 0)} + advisor ${formatMoney(run.advisorCost)}`))
+    }
     lines.push(new StyledText(statusChunks))
     if (run.live) lines.push(new StyledText([fg(theme.faint)("        "), fg(theme.dim)("enter to attach live")]))
 
@@ -568,7 +571,8 @@ class RunsBrowser {
         const left: TextChunk[] = [statusIcon(phase.status, now), raw(" "), fg(theme.text)(truncate(phase.name, 16))]
         const right: TextChunk[] = []
         if (phase.durationMs !== undefined) right.push(fg(theme.dim)(formatElapsed(phase.durationMs)))
-        if (phase.cost !== undefined) right.push(fg(theme.faint)(` ${formatMoney(phase.cost)}`))
+        if (phase.cost !== undefined) right.push(fg(theme.faint)(` ${formatMoney(phase.cost + (phase.advisorCost ?? 0))}`))
+        if (phase.advisorCost) right.push(fg(theme.teal)(` (${formatMoney(phase.advisorCost)} adv)`))
         lines.push(padBetween(left, right, width))
       }
     }

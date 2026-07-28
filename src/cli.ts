@@ -525,6 +525,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     modelOverride: parsed.modelOverride ?? "",
     advisorOverride: parsed.advisorOverride ?? "",
     advisorDisabled: parsed.advisorDisabled ?? false,
+    advisorAuditPolicy: defaults.advisorAuditPolicy ?? "summary",
     tui: parsed.tui ?? Boolean(process.stdout.isTTY && process.stderr.isTTY),
     humanReview,
     maxAttempts: parsed.maxAttempts ?? defaults.maxAttempts ?? 2,

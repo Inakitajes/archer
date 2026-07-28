@@ -105,6 +105,50 @@ test("review renders the exact target, worktree intent, and routed smart judge",
   expect(compact).not.toContain("Target:  vercel/openai/gpt-5.6-sol")
 })
 
+test("review renders advised-step coverage in compact mode and the routed advisor relationship in detail", () => {
+  const plan: RunPlan = {
+    prompt: { source: "inline", text: "Implement observability" },
+    target: { directory: "/repo", baseRef: "main", worktree: false, dirty: false },
+    pipeline: {
+      name: "implement",
+      steps: [{
+        type: "agent",
+        name: "implementer",
+        stepName: "implementer",
+        groupId: "g1",
+        agentName: "implementer",
+        description: "Implement",
+        model: "openai/gpt-5.6-sol",
+        inputFiles: ["prd.md"],
+        inputDiff: false,
+        reportPath: "reports/implementer.md",
+        advisor: "anthropic/claude-opus-5",
+        advisorMaxCalls: 4,
+        resolvedAdvisor: {
+          configured: "anthropic/claude-opus-5",
+          logical: "anthropic/claude-opus-5",
+          gateway: "vercel",
+          providerID: "vercel",
+          modelID: "anthropic/claude-opus-5",
+          target: "vercel/anthropic/claude-opus-5",
+        },
+      }],
+    },
+    modelRouting: { gateway: "vercel" },
+    hooks: { pre: [], post: [] },
+    attachments: [],
+    permissions: "interactive",
+    maxAttempts: 2,
+  }
+
+  const detailed = renderRunPlan(plan)
+  const compact = renderRunPlan(plan, true)
+
+  expect(compact).toContain("Advisors: 1/1 steps advised")
+  expect(detailed).toContain("Advisor: anthropic/claude-opus-5 → vercel/anthropic/claude-opus-5 · max 4 calls/attempt")
+  expect(detailed).toContain("advisor reviews the executor's full session; it does not own the deliverable")
+})
+
 test("review marks a resume gateway override in every format and shows the confirmed branch", () => {
   const plan: RunPlan = {
     prompt: { source: "resume", text: "continue the work" },

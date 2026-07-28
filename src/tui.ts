@@ -13,7 +13,9 @@ import {
   t,
 } from "@opentui/core"
 
+import { defaultAdvisorMaxCalls } from "./advisor"
 import { openClaudeSessionWindow } from "./claude-code"
+import { aggregateAdvisorEvents, type AdvisorEvent } from "./advisor-events"
 import { copyReportToClipboard, writeClipboardOSC52, type ClipboardResult } from "./clipboard"
 import { startLimitsPoller } from "./limits"
 import { log } from "./log"
@@ -128,8 +130,8 @@ const runnerSessionOpeners: Record<StepRunnerId, (context: RunnerSessionContext)
 }
 
 // The right-hand content panel is a three-tab view of the focused phase.
-export type ContentTab = "logs" | "reports" | "session"
-const contentTabOrder: readonly ContentTab[] = ["session", "reports", "logs"]
+export type ContentTab = "logs" | "reports" | "session" | "advisor"
+const contentTabOrder: readonly ContentTab[] = ["session", "reports", "logs", "advisor"]
 
 type FullscreenView = {
   phase: string
@@ -237,6 +239,7 @@ type PhaseState = ProgressPhase & {
   /** Real duration replayed from a previous run; set only by phaseRestored. */
   restoredDurationMs?: number
   updatedAt: number
+  advisorEvents: AdvisorEvent[]
 }
 
 type FeedEntry = {
@@ -471,7 +474,7 @@ export class TuiProgress implements ProgressUI {
   }
 
   private readonly handleSelection = (selection: Selection) => {
-    if (this.contentTab !== "logs" && this.contentTab !== "session" && this.contentTab !== "reports") return
+    if (this.contentTab !== "logs" && this.contentTab !== "session" && this.contentTab !== "reports" && this.contentTab !== "advisor") return
     const { x, y, width, height } = selection.bounds
     if (
       x < this.feedText.x ||
@@ -642,8 +645,8 @@ export class TuiProgress implements ProgressUI {
         if (this.onPauseToggle) this.onPauseToggle()
         return
     }
-    // Digit keys jump straight to a content tab (1 session · 2 reports · 3 logs).
-    const digitTab: Record<string, ContentTab> = { "1": "session", "2": "reports", "3": "logs" }
+    // Digit keys jump straight to a content tab (1 session · 2 reports · 3 logs · 4 advisor).
+    const digitTab: Record<string, ContentTab> = { "1": "session", "2": "reports", "3": "logs", "4": "advisor" }
     const jump = digitTab[key.name] ?? digitTab[key.raw ?? ""]
     if (jump) {
       consume()
@@ -832,6 +835,7 @@ export class TuiProgress implements ProgressUI {
       usage: new PhaseUsage(),
       now: { kind: "info", message: "" },
       todos: [],
+      advisorEvents: [],
       updatedAt: Date.now(),
     }))
 
@@ -1234,6 +1238,14 @@ export class TuiProgress implements ProgressUI {
     this.scheduleRender()
   }
 
+  phaseAdvisorEvent(name: string, event: AdvisorEvent) {
+    const phase = this.findPhase(name)
+    if (!phase || phase.advisorEvents.some((existing) => existing.id === event.id)) return
+    phase.advisorEvents.push(event)
+    phase.updatedAt = Date.now()
+    this.scheduleRender()
+  }
+
   phaseTodos(name: string, todos: ProgressTodo[]) {
     const phase = this.findPhase(name)
     if (!phase) return
@@ -1286,6 +1298,7 @@ export class TuiProgress implements ProgressUI {
       this.recalculateUsage(phase)
     }
     if (snapshot.model) phase.lastStepModel = snapshot.model
+    if (snapshot.advisorEvents) phase.advisorEvents = [...snapshot.advisorEvents]
     // Live observers can have loaded "missing" while this phase was still
     // running; restoration means its final report is now ready to be retried.
     this.invalidateReport(name)
@@ -1480,6 +1493,7 @@ export class TuiProgress implements ProgressUI {
         this.reportScroll = Math.max(0, this.reportScroll + delta)
         break
       case "logs":
+      case "advisor":
         this.logScroll = Math.max(0, this.logScroll + delta)
         break
       case "session":
@@ -2350,6 +2364,8 @@ export class TuiProgress implements ProgressUI {
       ? this.groupContentLines(group.selection, group.members, now, rightWidth, contentRows)
       : this.contentTab === "reports"
         ? this.reportPanelLines(focus, rightWidth, contentRows)
+        : this.contentTab === "advisor"
+          ? this.advisorPanelLines(focus, rightWidth, contentRows)
         : this.contentTab === "session"
           ? this.sessionLines(focus, rightWidth, contentRows)
           : this.phaseFeedLines(focus, rightWidth, contentRows)
@@ -2366,6 +2382,9 @@ export class TuiProgress implements ProgressUI {
   // the pipeline panel.
   private headerContent(now: number, width: number) {
     const usage = totalUsage(this.phases)
+    const advisor = aggregateAdvisorEvents(this.phases.flatMap((phase) => phase.advisorEvents))
+    const advisorInput = advisor.tokens.input + advisor.tokens.cacheRead + advisor.tokens.cacheWrite
+    const advisorOutput = advisor.tokens.output + advisor.tokens.reasoning
     // The clock and elapsed time freeze at the moment the run ended.
     const endAt = this.finished?.at ?? now
     const totals: TextChunk[] = [
@@ -2373,9 +2392,10 @@ export class TuiProgress implements ProgressUI {
       fg(theme.faint)("  ·  "),
       fg(theme.text)(formatElapsed(endAt - this.startedAt)),
       fg(theme.faint)("  ·  "),
-      fg(theme.green)(formatMoney(usage.cost)),
+      fg(theme.green)(formatMoney(usage.cost + advisor.cost)),
+      ...(advisor.attempted > 0 ? [fg(theme.faint)(` (${formatMoney(usage.cost)} exec + ${formatMoney(advisor.cost)} adv)`)] : []),
       fg(theme.faint)("  ·  "),
-      fg(theme.dim)(`↑${formatCount(usage.tokens.input)} ↓${formatCount(usage.tokens.output)} tokens`),
+      fg(theme.dim)(`↑${formatCount(usage.tokens.input + advisorInput)} ↓${formatCount(usage.tokens.output + advisorOutput)} tokens`),
     ]
     const title: TextChunk[] = [bold(fg(theme.accent)("◆ convoy"))]
     if (!this.finished && this.controlState !== "running") {
@@ -2734,6 +2754,20 @@ export class TuiProgress implements ProgressUI {
     }
     if (meta.length > 0) out.push(new StyledText(meta))
 
+    if (phase.plannedAdvisor) {
+      const advisor = aggregateAdvisorEvents(phase.advisorEvents)
+      const triggers = Object.keys(advisor.byTrigger).join(", ") || "none yet"
+      const feedback = Object.entries(advisor.feedback).map(([outcome, count]) => `${outcome}:${count}`).join(", ") || "unknown"
+      // `attempted` aggregates every retry of the phase, while the cap is per
+      // attempt — presenting them as `used/cap` would read as over-budget after
+      // a single retry, so the cap is labeled with its real scope instead.
+      out.push(new StyledText([
+        fg(theme.teal)("advisor "),
+        fg(theme.dim)(truncate(phase.plannedAdvisor, 28)),
+        fg(theme.faint)(` · budget ${advisor.attempted} used · cap ${phase.advisorMaxCalls ?? defaultAdvisorMaxCalls}/attempt · triggers ${triggers} · adoption ${feedback}`),
+      ]))
+    }
+
     out.push(
       new StyledText([
         fg(theme.faint)("cost "),
@@ -2874,6 +2908,8 @@ export class TuiProgress implements ProgressUI {
         return this.sessionSourceLines(phase, width)
       case "logs":
         return this.phaseFeedSourceLines(phase, width)
+      case "advisor":
+        return this.advisorSourceLines(phase, width)
     }
   }
 
@@ -2897,6 +2933,46 @@ export class TuiProgress implements ProgressUI {
     const value = this.buildPhaseFeedSourceLines(phase, width)
     this.feedLines.set(phase.name, { width, revision: this.feedRevision, value })
     return value
+  }
+
+  private advisorPanelLines(phase: PhaseState | undefined, width: number, visible: number): StyledText[] {
+    this.contentPosition = ""
+    if (visible <= 0) return []
+    if (!phase) return [t`${fg(theme.dim)("no step selected")}`]
+    const lines = this.advisorSourceLines(phase, width)
+    const maxScroll = Math.max(0, lines.length - visible)
+    this.logScroll = Math.max(0, Math.min(this.logScroll, maxScroll))
+    this.contentPosition = scrollPosition(this.logScroll, maxScroll)
+    return lines.slice(this.logScroll, this.logScroll + visible)
+  }
+
+  private advisorSourceLines(phase: PhaseState, width: number): StyledText[] {
+    if (!phase.plannedAdvisor && phase.advisorEvents.length === 0) return [t`${fg(theme.dim)("no advisor configured for this step")}`]
+    if (phase.advisorEvents.length === 0) {
+      return [
+        new StyledText([fg(theme.faint)("advisor "), fg(theme.text)(truncate(phase.plannedAdvisor ?? "configured", Math.max(8, width - 8)))]),
+        t`${fg(theme.dim)(`waiting for activity · budget 0/${phase.advisorMaxCalls ?? defaultAdvisorMaxCalls}`)}`,
+      ]
+    }
+    return phase.advisorEvents.map((event) => {
+      const at = Date.parse(event.timestamp)
+      const time = Number.isFinite(at) ? formatTime(at) : "--:--"
+      const status = event.type.slice("advisor.".length)
+      const detail = event.type === "advisor.completed"
+        ? `${event.latencyMs}ms${event.usage ? ` · ${formatMoney(event.usage.cost)}` : ""}`
+        : event.type === "advisor.failed"
+          ? event.error.code
+          : event.type === "advisor.delivered"
+            ? event.delivery
+            : event.type === "advisor.feedback"
+              ? event.outcome
+              : `${event.budget.used}/${event.budget.max}`
+      const color = event.type === "advisor.failed" || event.type === "advisor.budget_exhausted" ? theme.red : event.type === "advisor.completed" ? theme.green : theme.teal
+      // Attempt marker: retried phases concatenate every attempt's events into
+      // this one timeline, and per-attempt budget counters only make sense when
+      // the attempt they belong to is visible.
+      return new StyledText([fg(theme.faint)(`${time} `), fg(color)(truncate(status, 16).padEnd(17)), fg(theme.dim)(event.trigger.padEnd(12)), fg(theme.faint)(`a${event.attempt} `), fg(theme.text)(truncate(detail, Math.max(5, width - 43)))])
+    })
   }
 
   private buildPhaseFeedSourceLines(phase: PhaseState, width: number): StyledText[] {
@@ -2981,6 +3057,8 @@ export class TuiProgress implements ProgressUI {
     const body =
       this.contentTab === "reports"
         ? this.reportSourceLines(phase, width)
+        : this.contentTab === "advisor"
+          ? this.advisorSourceLines(phase, width)
         : this.contentTab === "session"
           ? this.sessionSourceLines(phase, width)
           : this.phaseFeedSourceLines(phase, width)
@@ -3621,12 +3699,16 @@ function phaseMetaWithCapability(phase: PhaseState, now: number): TextChunk[] {
   return meta.length ? [badge, fg(theme.faint)(" · "), ...meta] : [badge]
 }
 
-export function phaseCapabilityLabel(phase: Pick<ProgressPhase, "readOnly">): string | undefined {
+export function phaseCapabilityLabel(phase: Pick<ProgressPhase, "readOnly" | "plannedAdvisor">): string | undefined {
+  if (phase.plannedAdvisor && phase.readOnly) return "advisor · audit · read-only"
+  if (phase.plannedAdvisor) return "advisor"
   return phase.readOnly ? "audit · read-only" : undefined
 }
 
 // The same badge in shrinking forms for the pipeline tree, longest first.
-export function phaseCapabilityBadges(phase: Pick<ProgressPhase, "readOnly">): string[] {
+export function phaseCapabilityBadges(phase: Pick<ProgressPhase, "readOnly" | "plannedAdvisor">): string[] {
+  if (phase.plannedAdvisor && phase.readOnly) return ["advisor · read-only", "adv · ro", "adv"]
+  if (phase.plannedAdvisor) return ["advisor", "adv"]
   return phase.readOnly ? ["audit · read-only", "read-only", "ro"] : []
 }
 

@@ -4,7 +4,7 @@ import { join } from "node:path"
 
 import { afterAll, describe, expect, test } from "bun:test"
 
-import { advisorToolFileSource, handleAdvise, installAdvisorTool, startAdvisorBridge } from "../src/advisor-bridge"
+import { advisorToolFileSource, handleAdvise, handleFeedback, installAdvisorTool, startAdvisorBridge } from "../src/advisor-bridge"
 import type { AdvisorPhaseHandle, AdvisorRuntime } from "../src/advisor-runtime"
 
 const dirs: string[] = []
@@ -30,10 +30,13 @@ function stubRuntime(sessions: Record<string, string>): { runtime: AdvisorRuntim
       consulted,
       calls: 0,
       usage: [],
+      events: [],
       consult: async (reason, question) => {
         consulted.push({ reason, ...(question ? { question } : {}) })
         return { text: advice, ok: true }
       },
+      delivered: async () => {},
+      feedback: async () => true,
       end: () => {},
     } as StubHandle)
   }
@@ -100,6 +103,42 @@ describe("advisor bridge endpoint", () => {
     expect(response.status).toBe(200)
     expect((await response.json()).advice).toContain("Continue on your own judgement")
   })
+
+  test("validates and records explicit executor feedback", async () => {
+    const { runtime, handles } = stubRuntime({ ses_1: "advice" })
+    let recorded: unknown[] | undefined
+    handles.get("ses_1")!.feedback = async (...args) => {
+      recorded = args
+      return true
+    }
+    const request = new Request("http://127.0.0.1/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ sessionID: "ses_1", outcome: "partially-adopted", note: "Kept the API." }),
+    })
+    expect(await (await handleFeedback(request, runtime, token)).json()).toMatchObject({ recorded: true })
+    expect(recorded).toEqual([undefined, "partially-adopted", "Kept the API."])
+  })
+
+  test("rejects malformed feedback and degrades unknown sessions without recording", async () => {
+    const { runtime } = stubRuntime({})
+    const get = new Request("http://127.0.0.1/feedback", { method: "GET", headers: { authorization: `Bearer ${token}` } })
+    expect((await handleFeedback(get, runtime, token)).status).toBe(405)
+
+    const invalid = new Request("http://127.0.0.1/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ sessionID: "ses_1", outcome: "maybe" }),
+    })
+    expect((await handleFeedback(invalid, runtime, token)).status).toBe(400)
+
+    const unknown = new Request("http://127.0.0.1/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ sessionID: "ses_1", outcome: "adopted" }),
+    })
+    expect(await (await handleFeedback(unknown, runtime, token)).json()).toMatchObject({ recorded: false })
+  })
 })
 
 describe("advisor bridge server", () => {
@@ -151,6 +190,13 @@ describe("advisor tool file", () => {
     expect(source).toContain("args: {}")
     expect(source).toContain("context?.sessionID")
     expect((await stat(path)).mode & 0o777).toBe(0o600)
+
+    const feedbackPath = join(dir, "tools", "advisor_feedback.ts")
+    const feedbackSource = await readFile(feedbackPath, "utf8")
+    expect(feedbackSource).toContain('url.pathname = "/feedback"')
+    expect(feedbackSource).toContain("context?.sessionID")
+    expect(feedbackSource).toContain("partially-adopted")
+    expect((await stat(feedbackPath)).mode & 0o777).toBe(0o600)
   })
 
   test("is valid JavaScript that returns the bridge's advice", async () => {

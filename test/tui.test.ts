@@ -8,6 +8,7 @@ import { formatMoney, limitsRow } from "../src/tui-theme"
 import type { ClipboardResult } from "../src/clipboard"
 import type { LimitsSnapshot } from "../src/limits"
 import type { ProgressPhase } from "../src/progress"
+import type { AdvisorEvent } from "../src/advisor-events"
 
 type DashboardInternals = {
   bodyBox: { primaryAxis: "row" | "column" }
@@ -94,6 +95,58 @@ describe("run dashboard defaults", () => {
     expect(phaseCapabilityLabel({})).toBeUndefined()
     expect(phaseCapabilityBadges({ readOnly: true })).toEqual(["audit · read-only", "read-only", "ro"])
     expect(phaseCapabilityBadges({})).toEqual([])
+    expect(phaseCapabilityLabel({ plannedAdvisor: "anthropic/opus" })).toBe("advisor")
+    expect(phaseCapabilityBadges({ plannedAdvisor: "anthropic/opus" })).toEqual(["advisor", "adv"])
+  })
+
+  test("renders the advisor timeline with lifecycle details after selecting its tab", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(120, 40, [{
+      name: "implement",
+      description: "",
+      plannedAdvisor: "anthropic/opus",
+      advisorMaxCalls: 2,
+    }])
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      const base = {
+        timestamp: new Date(0).toISOString(),
+        callId: "call-1",
+        phase: "implement",
+        attempt: 1,
+        trigger: "on-demand" as const,
+        budget: { used: 1, max: 2 },
+      }
+      const events: AdvisorEvent[] = [
+        { ...base, id: "1", type: "advisor.requested", model: "anthropic/opus" },
+        {
+          ...base,
+          id: "2",
+          type: "advisor.completed",
+          model: "anthropic/opus",
+          latencyMs: 15,
+          adviceChars: 4,
+          usage: { model: "anthropic/opus", cost: 0.02, tokens: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 } },
+        },
+        { ...base, id: "3", type: "advisor.delivered", delivery: "tool" },
+        { ...base, id: "4", type: "advisor.feedback", outcome: "adopted" },
+        { ...base, id: "5", callId: "call-2", type: "advisor.failed", model: "anthropic/opus", latencyMs: 8, error: { code: "unavailable" } },
+      ]
+      for (const event of events) dashboard.phaseAdvisorEvent("implement", event)
+
+      mockInput.pressKey("4")
+      await renderOnce()
+
+      expect(internals.contentTab).toBe("advisor")
+      expect(internals.feedText.plainText).toContain("requested")
+      expect(internals.feedText.plainText).toContain("on-demand")
+      expect(internals.feedText.plainText).toContain("completed")
+      expect(internals.feedText.plainText).toContain("$0.02")
+      expect(internals.feedText.plainText).toContain("tool")
+      expect(internals.feedText.plainText).toContain("adopted")
+      expect(internals.feedText.plainText).toContain("unavailable")
+    } finally {
+      dashboard.stop()
+    }
   })
 
   test("gives the pipeline sidebar one third of the dashboard width", async () => {

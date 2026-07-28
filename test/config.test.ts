@@ -917,6 +917,11 @@ pipelines:
     expect(config.pipelines.advised?.steps[0]).toMatchObject({ advisor: "anthropic/claude-opus-5#high", advisorMaxCalls: 1 })
   })
 
+  test("validates advisor audit retention policies", () => {
+    expect(parseAdvisor("version: 1\ndefaults:\n  advisorAuditPolicy: full\n").defaults.advisorAuditPolicy).toBe("full")
+    expect(() => parseAdvisor("version: 1\ndefaults:\n  advisorAuditPolicy: forever\n")).toThrow(/summary, redacted, or full/)
+  })
+
   test("keeps advisor: false as an explicit opt-out rather than dropping it", () => {
     const config = parseAdvisor(`version: 1
 pipelines:

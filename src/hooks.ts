@@ -1,5 +1,6 @@
 import { join } from "node:path"
 
+import { advisorTokenEnv, advisorUrlEnv } from "./advisor-bridge"
 import { log } from "./log"
 
 import type { ProgressUI } from "./progress"
@@ -127,8 +128,12 @@ function hookLabel(hook: HookSpec): string {
 async function runHookCommand(stage: HookStage, hook: HookSpec, context: RunHookContext): Promise<HookCommandResult> {
   const shell = process.env.SHELL || "/bin/sh"
   const cwd = hook.cwd === "run" ? context.workspace.dir : context.targetDir
+  // The loopback bridge's bearer credential is for the OpenCode custom tools
+  // only. Hooks are arbitrary project commands and do not need either value;
+  // do not let them inherit a live capability to call the bridge.
+  const { [advisorUrlEnv]: _advisorUrl, [advisorTokenEnv]: _advisorToken, ...parentEnv } = process.env
   const env = {
-    ...process.env,
+    ...parentEnv,
     CONVOY_HOOK_STAGE: stage,
     CONVOY_HOOK_NAME: hook.name ?? "",
     CONVOY_PIPELINE: context.pipelineName,

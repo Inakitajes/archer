@@ -135,6 +135,36 @@ describe("advisor budget", () => {
     expect(handle.usage).toHaveLength(1)
     expect(handle.calls).toBe(2)
   })
+
+  test("emits correlated lifecycle, exhaustion, delivery, and feedback events", async () => {
+    const emitted: import("../src/advisor-events").AdvisorEvent[] = []
+    const advisors = createAdvisorRuntime({
+      client,
+      directory: "/repo",
+      auditPolicy: "summary",
+      onEvent: (event) => {
+        emitted.push(event)
+      },
+      consult: async () => ({ kind: "advice", text: "Reuse the parser.", usage: usage(0.02) }),
+    })
+    const handle = advisors.begin("ses_1", step({ advisorMaxCalls: 1 }), 2)!
+    const advice = await handle.consult("on-demand", "Which parser?")
+    await handle.delivered(advice.callId, "tool")
+    expect(await handle.feedback(advice.callId, "adopted", "Reused it.")).toBe(true)
+    await handle.consult("completion")
+
+    expect(emitted.map((event) => event.type)).toEqual([
+      "advisor.requested",
+      "advisor.completed",
+      "advisor.delivered",
+      "advisor.feedback",
+      "advisor.budget_exhausted",
+    ])
+    expect(new Set(emitted.slice(0, 4).map((event) => event.callId)).size).toBe(1)
+    expect(emitted[0]).toMatchObject({ phase: "build", attempt: 2, trigger: "on-demand", questionChars: 13 })
+    expect(emitted[0]).toHaveProperty("questionHash")
+    expect(emitted[0]).not.toHaveProperty("question")
+  })
 })
 
 describe("first-write checkpoint", () => {
