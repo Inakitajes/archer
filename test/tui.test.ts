@@ -21,10 +21,17 @@ type DashboardInternals = {
   contentTab: ContentTab
   fullscreen?: { phase: string; tab: ContentTab; scroll: number }
   fullscreenScrollbar: { visible: boolean; scrollSize: number; viewportSize: number; slider: { value: number } }
-  reportOverlay: { title: string }
+  reportOverlay: { title: string; visible: boolean }
+  overlay: { visible: boolean }
+  modalText: { plainText: string }
+  permissionQueue: unknown[]
   feed: Array<{ message: string }>
+  reportLines: WeakMap<string[], { values: Map<number, unknown> }>
+  reportPanelLines(...args: unknown[]): unknown
+  wrappedReport(report: string[], width: number): unknown
   dirty: boolean
   lastRenderAt: number
+  render(): void
   animationTick(): void
   handleFullscreenKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
   handleNavKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
@@ -485,6 +492,234 @@ describe("dashboard content selection", () => {
 
       internals.handleFullscreenKey({ name: "escape", preventDefault() {}, stopPropagation() {} })
       expect(internals.fullscreen).toBeUndefined()
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("caches inline and fullscreen report wraps while coalescing reader scrolls", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 50)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      const report = ["# Result", "", ...Array.from({ length: 100 }, (_, index) => `- report line ${index + 1}`)]
+      dashboard.start("run", "/target", "/run")
+      internals.reports.set("implement", report)
+      internals.contentTab = "reports"
+      await renderOnce()
+
+      mockInput.pressKey("v")
+      const memo = internals.reportLines.get(report)
+      expect(memo?.values.size).toBe(2)
+      const cachedWraps = [...memo!.values.entries()]
+
+      let renders = 0
+      let hiddenPanelRenders = 0
+      const render = internals.render.bind(dashboard)
+      internals.render = () => {
+        renders++
+        render()
+      }
+      const reportPanelLines = internals.reportPanelLines.bind(dashboard)
+      internals.reportPanelLines = (...args) => {
+        hiddenPanelRenders++
+        return reportPanelLines(...args)
+      }
+      for (let index = 0; index < 10; index++) {
+        internals.handleFullscreenWheel({
+          scroll: { direction: "down", delta: 1 },
+          preventDefault() {},
+          stopPropagation() {},
+        })
+      }
+
+      expect(renders).toBe(0)
+      expect(internals.dirty).toBeTrue()
+      await renderOnce()
+
+      expect(renders).toBe(1)
+      expect(hiddenPanelRenders).toBe(0)
+      for (const [width, value] of cachedWraps) expect(memo!.values.get(width)).toBe(value)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("bounds the per-width wrap cache to the most recent widths", async () => {
+    const { dashboard } = await createDashboard(200, 50)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      const report = ["# Result", "", ...Array.from({ length: 20 }, (_, index) => `- report line ${index + 1}`)]
+      dashboard.start("run", "/target", "/run")
+      internals.reports.set("implement", report)
+      // Wrapping more widths than the cap simulates a resize drag: each width
+      // the panel passes through would otherwise accumulate a permanent wrap.
+      const wraps: unknown[] = []
+      for (const width of [40, 50, 60, 70, 80, 90]) wraps.push(internals.wrappedReport(report, width))
+      const memo = internals.reportLines.get(report)
+      expect(memo?.values.size).toBe(4)
+      // FIFO eviction: the two oldest widths drop, the four newest survive and
+      // keep the exact wrap values returned to their callers — the most recent
+      // width the panel lands on stays cached, so no re-wrap on the next frame.
+      for (const width of [40, 50]) expect(memo!.values.has(width)).toBeFalse()
+      for (let index = 0; index < 4; index++) expect(memo!.values.get([60, 70, 80, 90][index]!)).toBe(wraps[index + 2])
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("bounds the wrap cache under a resize drag while always keeping the width on screen", async () => {
+    const { dashboard, mockInput, renderOnce, resize } = await createDashboard(200, 50)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      const report = ["# Result", "", ...Array.from({ length: 60 }, (_, index) => `- report line ${index + 1}`)]
+      dashboard.start("run", "/target", "/run")
+      internals.reports.set("implement", report)
+      internals.contentTab = "reports"
+      await renderOnce()
+      // The inline panel wraps once at its own width; capture that key.
+      const panelWidth = [...internals.reportLines.get(report)!.values.keys()][0]!
+
+      mockInput.pressKey("v")
+      expect(internals.fullscreen).toBeDefined()
+      // Opening the reader adds a second, distinct width; both survive.
+      expect(internals.reportLines.get(report)!.values.has(panelWidth)).toBeTrue()
+      expect(internals.reportLines.get(report)!.values.size).toBe(2)
+
+      // A resize drag while reading re-wraps only the reader's new width — the
+      // dashboard pass is skipped under the opaque overlay, so the panel's wrap
+      // is never re-touched. In production a running phase's ticker repaints
+      // after the resize; here we mark the screen dirty the way scheduleRender
+      // does, then let renderOnce flush the frame.
+      const readerWidth = (terminal: number) => Math.max(20, terminal - 9)
+      const drag = async (terminal: number) => {
+        resize(terminal, 50)
+        internals.dirty = true
+        await renderOnce()
+      }
+
+      // A short drag stays inside the cap, so the panel's wrap is still there.
+      await drag(160)
+      await drag(120)
+      const memo = internals.reportLines.get(report)!
+      expect(memo.values.has(panelWidth)).toBeTrue()
+      expect(memo.values.has(readerWidth(120))).toBeTrue()
+      expect(memo.values.size).toBeLessThanOrEqual(4)
+
+      // A long drag ages the panel's wrap out — only the reader's width is live
+      // under the overlay, so nothing refreshes the panel entry. That is the
+      // intended trade: bounded memory, at the cost of one re-wrap when the
+      // reader closes. What must never break is the invariant below.
+      for (const terminal of [110, 100, 90, 80]) await drag(terminal)
+      expect(memo.values.has(panelWidth)).toBeFalse()
+
+      // The invariant: the cache stays at the cap no matter how long the drag
+      // runs, and the width the overlay just painted is always still cached, so
+      // no frame is ever forced to re-wrap the document it just rendered.
+      expect(memo.values.size).toBe(4)
+      expect(memo.values.has(readerWidth(80))).toBeTrue()
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("coalesces keyboard scrolls in the fullscreen reader one frame per burst", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 50)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      const report = ["# Result", "", ...Array.from({ length: 100 }, (_, index) => `- report line ${index + 1}`)]
+      dashboard.start("run", "/target", "/run")
+      internals.reports.set("implement", report)
+      internals.contentTab = "reports"
+      await renderOnce()
+
+      mockInput.pressKey("v")
+      expect(internals.fullscreen).toBeDefined()
+      const startScroll = internals.fullscreen!.scroll
+
+      // A flick of j/k repeats must not paint synchronously per keypress: each
+      // press only marks the screen dirty and defers to the next frame, so a
+      // burst collapses to a single render — matching the wheel path.
+      let renders = 0
+      const render = internals.render.bind(dashboard)
+      internals.render = () => {
+        renders++
+        render()
+      }
+      for (const name of ["j", "j", "k", "pageup", "pagedown", "down"]) {
+        internals.handleFullscreenKey({ name, preventDefault() {}, stopPropagation() {} })
+      }
+
+      expect(renders).toBe(0)
+      expect(internals.dirty).toBeTrue()
+      expect(internals.fullscreen!.scroll).not.toBe(startScroll)
+      await renderOnce()
+
+      expect(renders).toBe(1)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("closes the fullscreen reader with an immediate render, not a deferred one", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 50)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      const report = ["# Result", "", "- only line"]
+      dashboard.start("run", "/target", "/run")
+      internals.reports.set("implement", report)
+      internals.contentTab = "reports"
+      await renderOnce()
+
+      mockInput.pressKey("v")
+      expect(internals.fullscreen).toBeDefined()
+
+      // Non-scroll keys (close/quit) paint right away so the dashboard reappears
+      // in the same input tick instead of waiting for the next frame.
+      let renders = 0
+      const render = internals.render.bind(dashboard)
+      internals.render = () => {
+        renders++
+        render()
+      }
+      internals.handleFullscreenKey({ name: "escape", preventDefault() {}, stopPropagation() {} })
+
+      expect(internals.fullscreen).toBeUndefined()
+      expect(renders).toBe(1)
+      expect(internals.dirty).toBeFalse()
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("paints a modal over the open reader without losing it", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 50)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      const report = ["# Result", "", "- only line"]
+      dashboard.start("run", "/target", "/run")
+      internals.reports.set("implement", report)
+      internals.contentTab = "reports"
+      await renderOnce()
+
+      // Open the reader — the opaque overlay takes over the screen.
+      mockInput.pressKey("v")
+      expect(internals.fullscreen).toBeDefined()
+      expect(internals.reportOverlay.visible).toBeTrue()
+
+      // A permission prompt arriving while the reader is open must still paint
+      // over it: the reader does not swallow modal state. The new early-return
+      // branch in render() still calls renderModal(), so the overlay flips on.
+      void dashboard.askPermission({ id: "1", permission: "bash", command: "ls", patterns: [] })
+      expect(internals.permissionQueue.length).toBe(1)
+      await renderOnce()
+
+      expect(internals.overlay.visible).toBeTrue()
+      // The modal text carries the permission label, proving renderModal ran.
+      expect(internals.modalText.plainText).toContain("bash")
+      // The reader stays mounted underneath — closing the reader does not drop
+      // the queued prompt.
+      expect(internals.fullscreen).toBeDefined()
+      expect(internals.reportOverlay.visible).toBeTrue()
     } finally {
       dashboard.stop()
     }
