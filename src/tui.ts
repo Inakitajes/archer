@@ -424,9 +424,10 @@ export class TuiProgress implements ProgressUI {
   // slots because a selected group renders one card per member on every frame,
   // and single slots would have the members evicting each other — a miss now
   // costs a full re-lex, not just a re-wrap. The report memo is keyed on the
-  // source array's identity, which is what `loadReport` swaps to invalidate it,
-  // and holds the parsed document so a resize re-wraps without re-parsing.
-  private readonly reportLines = new WeakMap<string[], { doc: MarkdownDoc; width: number; value: StyledText[] }>()
+  // source array's identity, which is what `loadReport` swaps to invalidate it.
+  // Each parsed document retains wraps for every active width so the inline
+  // panel and fullscreen reader cannot evict one another each frame.
+  private readonly reportLines = new WeakMap<string[], { doc: MarkdownDoc; values: Map<number, StyledText[]> }>()
   private readonly feedLines = new Map<string, { width: number; revision: number; value: StyledText[] }>()
   // Bumped by addEvent; keys the feed memo above.
   private feedRevision = 0
@@ -492,7 +493,7 @@ export class TuiProgress implements ProgressUI {
     event.preventDefault()
     event.stopPropagation()
     this.scrollFullscreen(delta)
-    this.render()
+    this.scheduleRender()
   }
 
   private readonly handleKeyPress = (key: KeyEvent) => {
@@ -734,30 +735,38 @@ export class TuiProgress implements ProgressUI {
     key.preventDefault()
     key.stopPropagation()
     const page = Math.max(1, this.renderer.height - 5)
+    let scroll = false
     switch (key.name) {
       case "up":
       case "k":
         this.scrollFullscreen(-1)
+        scroll = true
         break
       case "down":
       case "j":
         this.scrollFullscreen(1)
+        scroll = true
         break
       case "pageup":
         this.scrollFullscreen(-page)
+        scroll = true
         break
       case "pagedown":
       case "space":
         this.scrollFullscreen(page)
+        scroll = true
         break
       case "home":
         view.scroll = 0
+        scroll = true
         break
       case "end":
         view.scroll = Number.MAX_SAFE_INTEGER
+        scroll = true
         break
       case "g":
         view.scroll = key.shift ? Number.MAX_SAFE_INTEGER : 0
+        scroll = true
         break
       case "c": {
         if (view.tab === "reports") {
@@ -780,7 +789,8 @@ export class TuiProgress implements ProgressUI {
         this.fullscreen = undefined
         break
     }
-    this.render()
+    if (scroll) this.scheduleRender()
+    else this.render()
   }
 
   private scrollFullscreen(delta: number) {
@@ -1084,7 +1094,7 @@ export class TuiProgress implements ProgressUI {
       onChange: (scroll) => {
         if (this.syncingFullscreenScrollbar || !this.fullscreen) return
         this.fullscreen.scroll = scroll
-        this.render()
+        this.scheduleRender()
       },
     })
     this.reportOverlay.add(this.fullscreenScrollbar)
@@ -1462,7 +1472,7 @@ export class TuiProgress implements ProgressUI {
   private scrollContent(delta: number) {
     if (this.selectedGroup) {
       this.groupScroll = Math.max(0, this.groupScroll + delta)
-      this.render()
+      this.scheduleRender()
       return
     }
     switch (this.contentTab) {
@@ -1476,7 +1486,7 @@ export class TuiProgress implements ProgressUI {
         this.sessionScroll = Math.max(0, this.sessionScroll - delta)
         break
     }
-    this.render()
+    this.scheduleRender()
   }
 
   private scrollContentToStart() {
@@ -2260,6 +2270,16 @@ export class TuiProgress implements ProgressUI {
     this.dirty = false
     if (this.renderer.isDestroyed) return
     this.lastRenderAt = Date.now()
+    // The reader's opaque overlay hides the dashboard completely. Rebuilding
+    // it would waste a full layout pass and, for reports, a second markdown
+    // wrap at the inline panel's width. The dashboard catches up when the
+    // reader closes.
+    if (this.fullscreen) {
+      this.renderFullscreenView()
+      this.renderModal()
+      this.renderer.requestRender()
+      return
+    }
     const now = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const compact = this.usesCompactLayout()
@@ -2781,15 +2801,35 @@ export class TuiProgress implements ProgressUI {
 
   // Reports are re-derived on every repaint and can run to thousands of lines,
   // so the result is memoized against the loaded source array — `loadReport`
-  // swaps that reference whenever the file is re-read, invalidating the entry.
+  // swaps that reference whenever the file is re-read, invalidating every
+  // width. A resize re-wraps the parsed document once per width. Only a couple
+  // of widths are ever live at once (the inline panel and, while open, the
+  // reader), so the map is bounded to keep a resize drag from accumulating a
+  // stale wrap per intermediate width — matching feedLines/summaryRows, which
+  // hold a single width and replace it on change.
   private wrappedReport(report: string[], width: number): StyledText[] {
-    const memo = this.reportLines.get(report)
-    if (memo?.width === width) return memo.value
-    // A resize invalidates the wrapping but never the parse, and parsing is the
-    // expensive half, so a drag re-wraps the document it already lexed.
-    const doc = memo?.doc ?? parseMarkdown(report)
-    const value = renderMarkdownDoc(doc, width)
-    this.reportLines.set(report, { doc, width, value })
+    let memo = this.reportLines.get(report)
+    if (!memo) {
+      memo = { doc: parseMarkdown(report), values: new Map() }
+      this.reportLines.set(report, memo)
+    }
+    const cached = memo.values.get(width)
+    if (cached) return cached
+    const value = renderMarkdownDoc(memo.doc, width)
+    memo.values.set(width, value)
+    // Maps iterate in insertion order, so the oldest widths drop first. A single
+    // frame only ever asks one width per report — the reader's while it is open,
+    // the inline panel's otherwise — so eviction can never drop a wrap the frame
+    // in flight still needs. Four covers both of those across the reader's
+    // open/close transition plus a couple of resize intermediates. A long resize
+    // drag under the open reader does age the inline panel's entry out; that
+    // costs one re-wrap when the reader closes, which is the trade for not
+    // retaining a full document wrap per width the drag passed through.
+    while (memo.values.size > 4) {
+      const oldest = memo.values.keys().next().value
+      if (oldest === undefined) break
+      memo.values.delete(oldest)
+    }
     return value
   }
 
