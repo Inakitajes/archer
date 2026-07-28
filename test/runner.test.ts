@@ -17,6 +17,7 @@ import {
   commitRecoveredPhase,
   createConcurrencyLimiter,
   createGitLock,
+  defaultMaxConcurrentAgents,
   describeMessageChunk,
   describeSessionActivity,
   finalizePhaseRepository,
@@ -41,6 +42,10 @@ import type { AgentStep, HumanStep, Pipeline, Step } from "../src/types"
 import type { Workspace } from "../src/workspace"
 
 const recoveryDirs: string[] = []
+
+test("defaults concurrent agent groups to 30 sessions", () => {
+  expect(defaultMaxConcurrentAgents).toBe(30)
+})
 
 afterAll(async () => {
   await Promise.all(recoveryDirs.map((dir) => rm(dir, { recursive: true, force: true })))

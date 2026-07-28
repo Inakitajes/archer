@@ -296,7 +296,7 @@ export function planBatches(steps: readonly Step[]): Step[][] {
 }
 
 /** Default cap on how many agents run at once inside one concurrent group. */
-export const defaultMaxConcurrentAgents = 8
+export const defaultMaxConcurrentAgents = 30
 
 /**
  * Bounds how many jobs run at once. A group smaller than `limit` is never

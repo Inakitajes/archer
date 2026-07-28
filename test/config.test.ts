@@ -684,6 +684,7 @@ describe("default config init", () => {
     const config = parseConvoyConfig(body, path, dir)
 
     expect(body).toContain("# maxAttempts: 2")
+    expect(body).toContain("# maxConcurrentAgents: 30")
     expect(body).toContain("# baseRef: main")
     expect(body).toContain("# pipeline: implement")
     expect(body).toContain("# branchNameModel: anthropic/claude-haiku-4-5")
