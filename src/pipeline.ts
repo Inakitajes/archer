@@ -324,18 +324,22 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "adversarial", model: defaultOpusModel, reports: "all" },
     ],
   },
-  // The advisor←executor pattern as a runnable default: cheap models own the
-  // loops, Opus is consulted at their decision points. Deliberately a separate
-  // pipeline rather than a change to `implement`, so the cost profile of the
-  // existing built-ins is untouched and the two can be compared directly.
+  // The advisor←executor pattern as a runnable default, aimed at the one phase
+  // that earns it: Terra xhigh writes the code and consults Sol at its decision
+  // points, pairing the two GPT 5.6 variants that disagree most usefully. The
+  // audits that follow read a diff that already exists, so they run unadvised
+  // and the pipeline stays comparable to `implement-lite` — same audit
+  // executors, one advised step between them.
   "implement-advised": {
-    description: "Like implement-lite, but every writing phase consults Opus 5 as an advisor at its decision points instead of running on it",
+    description: "Like implement-lite, but the implementation phase runs on Terra xhigh and consults Sol as an advisor at its decision points; the audits run unadvised",
     steps: [
-      { agent: "implementer", model: sonnetModel, advisor: defaultOpusModel, reports: "none" },
-      { agent: "patterns", model: glmModel, advisor: defaultOpusModel },
-      { agent: "security", model: glmModel, advisor: defaultOpusModel },
-      { agent: "design", model: glmModel, advisor: defaultOpusModel },
-      { agent: "tests", model: glmModel, advisor: defaultOpusModel, reports: "none" },
+      { agent: "implementer", model: fallbackModel, advisor: solModel, reports: "none" },
+      // `false` rather than an absent key: absent would inherit a project's
+      // defaults.advisor and quietly re-advise these phases.
+      { agent: "patterns", model: glmModel, advisor: false },
+      { agent: "security", model: glmModel, advisor: false },
+      { agent: "design", model: glmModel, advisor: false },
+      { agent: "tests", model: glmModel, advisor: false, reports: "none" },
       // The adversarial pass is the one place the expensive model should own the
       // loop: its whole job is the judgement an advisor would otherwise supply.
       { agent: "adversarial", model: defaultOpusModel, advisor: false, reports: "all" },
