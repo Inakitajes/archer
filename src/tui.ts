@@ -164,7 +164,19 @@ type FinishModal =
   | { kind: "working"; message: string }
   | { kind: "blocked"; message: string }
   | { kind: "edit"; proposal: FinishProposal; subject: string; cursor: number }
-  | { kind: "done"; outcome: FinishOutcome; message: { subject: string; body: string[] }; pushed: boolean; note?: string }
+  | {
+      kind: "done"
+      outcome: FinishOutcome
+      message: { subject: string; body: string[] }
+      /**
+       * What the screen still offers. "choose" is the fork right after the
+       * commit; "retry-pr" is the push having landed with `gh` having failed;
+       * "settled" is terminal — the branch has left the machine and there is
+       * nothing left to press.
+       */
+      stage: "choose" | "retry-pr" | "settled"
+      note?: string
+    }
 
 function clipboardStatusLabel(status?: ClipboardResult): string {
   if (status === "copied-native" || status === "copied-osc52") return " · copied"
@@ -1815,9 +1827,11 @@ export class TuiProgress implements ProgressUI {
 
     if (modal.kind === "done") {
       // The commit is already made; these only offer what comes after it, and
-      // anything else closes the modal.
-      if (key.name === "p" && !modal.pushed) void this.runFinishFollowUp(modal, "push")
-      else if (key.name === "r" && modal.pushed && this.finishSeam?.canOpenPullRequest()) void this.runFinishFollowUp(modal, "pr")
+      // anything else closes the modal. Once settled nothing matches, so `r`
+      // closes rather than asking gh for a pull request that already exists.
+      const canPr = this.finishSeam?.canOpenPullRequest() ?? false
+      if (key.name === "p" && modal.stage === "choose") void this.runFinishFollowUp(modal, "push")
+      else if (key.name === "r" && canPr && modal.stage !== "settled") void this.runFinishFollowUp(modal, "pr")
       else this.finishModal = undefined
       this.render()
       return
@@ -1916,7 +1930,7 @@ export class TuiProgress implements ProgressUI {
     try {
       const message = { subject, body: proposal.body }
       const outcome = await seam.apply(message)
-      this.finishModal = { kind: "done", outcome, message, pushed: false }
+      this.finishModal = { kind: "done", outcome, message, stage: "choose" }
       this.addEvent("convoy", "system", `finished ${outcome.branch} as ${outcome.sha.slice(0, 8)} (${outcome.replaced} commits squashed)`)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -1930,38 +1944,46 @@ export class TuiProgress implements ProgressUI {
   }
 
   /**
-   * Push and pull request, each asked for explicitly after the commit exists.
-   * Neither ever runs as part of [f] itself: the squash is local and undoable,
-   * while these leave the machine.
+   * Push and pull request, chosen once after the commit exists. Neither ever
+   * runs as part of [f] itself: the squash is local and undoable, while these
+   * leave the machine. "pr" is the whole trip — the push it needs and then the
+   * pull request — so the two are one decision rather than two prompts.
    */
   private async runFinishFollowUp(modal: Extract<FinishModal, { kind: "done" }>, action: "push" | "pr") {
     const seam = this.finishSeam
     if (!seam || this.inSubshell) return
-    this.finishModal = { kind: "working", message: action === "push" ? `pushing ${modal.outcome.branch}…` : "opening a pull request…" }
+    const needsPush = modal.stage === "choose"
+    const working = action === "push" ? `pushing ${modal.outcome.branch}…` : needsPush ? "pushing and opening a pull request…" : "opening a pull request…"
+    this.finishModal = { kind: "working", message: working }
     this.render()
 
     this.inSubshell = true
     this.suspend()
-    let note: string | undefined
-    let pushed = modal.pushed
+    const notes: string[] = []
+    // The stage reached is also what says where a throw came from, and it never
+    // advances to "settled" on failure: the action row stays up to be retried.
+    let stage = modal.stage
     try {
-      if (action === "push") {
+      if (needsPush) {
         await seam.push(modal.outcome.branch)
-        pushed = true
-        note = `pushed to origin/${modal.outcome.branch}`
-      } else {
+        notes.push(`pushed to origin/${modal.outcome.branch}`)
+        stage = action === "push" ? "settled" : "retry-pr"
+      }
+      if (action === "pr") {
         await seam.openPullRequest(modal.message)
-        note = "pull request opened"
+        notes.push("pull request opened")
+        stage = "settled"
       }
     } catch (error) {
-      note = `${action === "push" ? "push" : "gh pr create"} failed: ${error instanceof Error ? error.message : String(error)}`
+      notes.push(`${stage === "choose" ? "push" : "gh pr create"} failed: ${error instanceof Error ? error.message : String(error)}`)
     } finally {
       this.inSubshell = false
       this.resume()
     }
 
-    if (note) this.addEvent("convoy", "system", note)
-    this.finishModal = { ...modal, pushed, ...(note ? { note } : {}) }
+    for (const note of notes) this.addEvent("convoy", "system", note)
+    const note = notes.join(" · ")
+    this.finishModal = { ...modal, stage, ...(note ? { note } : {}) }
     this.render()
   }
 
@@ -3367,9 +3389,21 @@ export class TuiProgress implements ProgressUI {
       lines.push(plain(""))
 
       const actions: TextChunk[] = []
-      if (!modal.pushed) actions.push(fg(theme.accent)("p"), fg(theme.dim)(" push · "))
-      else if (this.finishSeam?.canOpenPullRequest()) actions.push(fg(theme.accent)("r"), fg(theme.dim)(" pull request · "))
-      actions.push(fg(theme.faint)("any other key closes"))
+      const canPr = this.finishSeam?.canOpenPullRequest() ?? false
+      if (modal.stage === "choose") {
+        actions.push(fg(theme.accent)("p"), fg(theme.dim)(" push"))
+        if (canPr) actions.push(fg(theme.dim)(" · "), fg(theme.accent)("r"), fg(theme.dim)(" push and PR"))
+      } else if (modal.stage === "retry-pr" && canPr) {
+        actions.push(fg(theme.accent)("r"), fg(theme.dim)(" retry pull request"))
+      } else {
+        // Settled: the branch is where the user asked for it, so the only thing
+        // left is dismissing the modal.
+        actions.push(fg(theme.faint)("press any key to close"))
+      }
+      // The row is one unwrapped line, so the hint — not an action — is what
+      // gives way when the terminal is too narrow to hold both.
+      const keysWidth = actions.reduce((total, chunk) => total + chunk.text.length, 0)
+      if (modal.stage !== "settled" && keysWidth + 23 <= width) actions.push(fg(theme.dim)(" · "), fg(theme.faint)("any other key closes"))
       lines.push(new StyledText(actions))
     } else {
       const { proposal } = modal
