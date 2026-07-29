@@ -150,7 +150,7 @@ describe("built-in implement-lite pipeline", () => {
       .map(([name]) => name)
 
     // The hunter pipelines use GLM as one specialty voice in their fan-out, not as a cost downgrade.
-    // implement-advised uses it as the executor precisely because an advisor backs it.
+    // implement-advised keeps it as the audit executor, which is what makes it comparable to implement-lite.
     expect(glmPipelines).toEqual(["implement", "implement-lite", "implement-advised", "review-lite", "refine", "hunter", "hunter-max"])
   })
 })
@@ -161,15 +161,21 @@ describe("built-in implement-advised pipeline", () => {
       (step): step is AgentStep => step.type === "agent",
     )
 
-  test("puts a cheap executor in every writing phase with Opus advising it", () => {
-    const steps = advised()
-    const writing = steps.filter((step) => step.name !== "adversarial")
+  test("advises the implementation phase only: Terra xhigh writing, Sol at its decision points", () => {
+    const implementer = advised().find((step) => step.name === "implementer")
 
-    expect(writing.length).toBeGreaterThan(0)
-    for (const step of writing) {
-      expect(step.advisor).toBe(defaultOpusModel)
-      expect(step.model).not.toBe(defaultOpusModel)
+    expect(implementer).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh", advisor: "openai/gpt-5.6-sol" })
+  })
+
+  test("leaves every phase after the implementer unadvised, so only one step carries the advisor cost", () => {
+    const steps = advised()
+    const rest = steps.filter((step) => step.name !== "implementer")
+
+    expect(rest.length).toBeGreaterThan(0)
+    for (const step of rest) {
+      expect(step.advisor).toBeUndefined()
     }
+    expect(steps.filter((step) => step.advisor).length).toBe(1)
   })
 
   test("leaves the adversarial pass owning its own loop on Opus, with no advisor", () => {
