@@ -10,6 +10,7 @@ import { noopProgress } from "../src/progress"
 import type { KeepAwakeState } from "../src/progress"
 import type { AgentStep, Pipeline } from "../src/types"
 import type { Workspace } from "../src/workspace"
+import type { AdvisorEvent } from "../src/advisor-events"
 
 const dirs: string[] = []
 
@@ -259,6 +260,53 @@ describe("run metadata", () => {
     saved = await readRunMetadata(join(ws.dir, "metadata.json"))
     expect(saved?.control.state).toBe("paused")
     expect(saved?.control.pausedAt).toBeNumber()
+  })
+
+  test("persists deduplicated advisor events with their replay aggregate", async () => {
+    const ws = await workspace()
+    const store = await openRunMetadata(ws, "/repo", quick)
+    const base = {
+      timestamp: new Date(0).toISOString(),
+      callId: "call-1",
+      phase: "implementer",
+      attempt: 1,
+      trigger: "on-demand" as const,
+      budget: { used: 1, max: 3 },
+    }
+    const requested: AdvisorEvent = { ...base, id: "evt-requested", type: "advisor.requested", model: "anthropic/opus" }
+    const completed: AdvisorEvent = {
+      ...base,
+      id: "evt-completed",
+      type: "advisor.completed",
+      model: "anthropic/opus",
+      latencyMs: 10,
+      adviceChars: 12,
+      usage: { model: "anthropic/opus", cost: 0.03, tokens: { input: 10, output: 2, reasoning: 1, cacheRead: 3, cacheWrite: 4 } },
+    }
+    const feedback: AdvisorEvent = { ...base, id: "evt-feedback", type: "advisor.feedback", outcome: "adopted" }
+
+    store.phaseAdvisorEvent("implementer", requested)
+    store.phaseAdvisorEvent("implementer", requested)
+    store.phaseAdvisorEvent("implementer", completed)
+    store.phaseAdvisorEvent("implementer", feedback)
+    await store.flush()
+
+    const persisted = await readRunMetadata(join(ws.dir, "metadata.json"))
+    expect(persisted?.phases.implementer?.advisorEvents).toEqual([requested, completed, feedback])
+    expect(persisted?.phases.implementer?.advisor).toMatchObject({
+      attempted: 1,
+      succeeded: 1,
+      byTrigger: { "on-demand": 1 },
+      cost: 0.03,
+      feedback: { adopted: 1 },
+      callIds: ["call-1"],
+    })
+
+    const resumed = await openRunMetadata(ws, "/repo", quick)
+    expect(resumed.snapshot("implementer")).toMatchObject({
+      advisorEvents: [requested, completed, feedback],
+      advisor: { attempted: 1, succeeded: 1, cost: 0.03, feedback: { adopted: 1 } },
+    })
   })
 
   test("persists as schemaVersion 3 and still reads v1 metadata", async () => {

@@ -1,0 +1,72 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+import { afterAll, expect, test } from "bun:test"
+
+import { LiveAttach } from "../src/attach"
+import { noopProgress, type ProgressPhaseSnapshot, type ProgressUI } from "../src/progress"
+
+import type { AdvisorEvent } from "../src/advisor-events"
+import type { OpencodeClient } from "@opencode-ai/sdk/v2"
+
+const dirs: string[] = []
+
+afterAll(async () => Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true }))))
+
+test("live attachment replays advisor journal events before debounced metadata catches up", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "convoy-live-attach-"))
+  dirs.push(dir)
+  const event: AdvisorEvent = {
+    id: "evt-1",
+    type: "advisor.requested",
+    timestamp: new Date(0).toISOString(),
+    callId: "call-1",
+    phase: "build",
+    attempt: 1,
+    trigger: "first-write",
+    budget: { used: 1, max: 3 },
+    model: "anthropic/opus",
+  }
+  await mkdir(join(dir, "events"))
+  await writeFile(join(dir, "events", "advisor.jsonl"), `${JSON.stringify(event)}\n`)
+  // The coordinator has started the phase but has not yet persisted its event
+  // projection. The journal is intentionally newer than this snapshot.
+  await writeFile(join(dir, "metadata.json"), JSON.stringify({
+    schemaVersion: 3,
+    runID: "20260101-000000-test",
+    targetDir: "/repo",
+    createdAt: 0,
+    updatedAt: 0,
+    control: { state: "running" },
+    phases: { build: { status: "running" } },
+  }))
+
+  const started: string[] = []
+  const received: AdvisorEvent[] = []
+  const restored: ProgressPhaseSnapshot[] = []
+  const progress: ProgressUI = {
+    ...noopProgress,
+    phaseStarted: (name) => started.push(name),
+    phaseAdvisorEvent: (_name, advisorEvent) => received.push(advisorEvent),
+    phaseRestored: (_name, snapshot) => restored.push(snapshot),
+  }
+  const attach = new LiveAttach({} as OpencodeClient, progress, "/repo", join(dir, "metadata.json"))
+
+  await attach.start()
+  await writeFile(join(dir, "metadata.json"), JSON.stringify({
+    schemaVersion: 3,
+    runID: "20260101-000000-test",
+    targetDir: "/repo",
+    createdAt: 0,
+    updatedAt: 1,
+    control: { state: "running" },
+    phases: { build: { status: "completed" } },
+  }))
+  await (attach as unknown as { tick(): Promise<void> }).tick()
+  await attach.stop()
+
+  expect(started).toEqual(["build"])
+  expect(received).toEqual([event])
+  expect(restored).toMatchObject([{ status: "completed", advisorEvents: [event], advisor: { attempted: 1 } }])
+})

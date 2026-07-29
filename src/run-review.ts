@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline/promises"
 import { stdin, stdout } from "node:process"
 
+import { defaultAdvisorMaxCalls } from "./advisor"
 import { gatewayLabel } from "./model-routing"
 import { plannedStepAdvisor, plannedStepModel } from "./run-plan"
 import { stepRunnerFor } from "./step-runners"
@@ -26,6 +27,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     `  Worktree: ${plan.target.worktree ? `yes · branch ${plan.target.branch ? sanitizeInline(plan.target.branch) : "named at start"}` : "no"}`,
     `Pipeline: ${sanitizeInline(plan.pipeline.name)} · ${plan.pipeline.steps.length} steps`,
     `Gateway: ${gatewayLabel(plan.modelRouting.gateway)}`,
+    `Advisors: ${plan.pipeline.steps.filter((step) => step.type === "agent" && Boolean(plannedStepAdvisor(step))).length}/${plan.pipeline.steps.filter((step) => step.type === "agent").length} steps advised`,
   ]
   const promptLines = options.fullPrompt && !compact
     ? prompt.split("\n").map((line) => `  ${line}`)
@@ -49,7 +51,11 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
         if (step.resolvedModel) lines.push(`     Logical: ${sanitizeInline(step.resolvedModel.logical)}`, `     Target:  ${sanitizeInline(step.resolvedModel.target)}`)
         else lines.push(`     Model: ${sanitizeInline(plannedStepModel(step))}`)
         const advisor = plannedStepAdvisor(step)
-        if (advisor) lines.push(`     Advisor: ${sanitizeInline(advisor)}`)
+        if (advisor) {
+          const resolved = step.resolvedAdvisor
+          const model = resolved && resolved.logical !== resolved.target ? `${resolved.logical} → ${resolved.target}` : advisor
+          lines.push(`     Advisor: ${sanitizeInline(model)} · max ${step.advisorMaxCalls ?? defaultAdvisorMaxCalls} calls/attempt`, "     Context: advisor reviews the executor's full session; it does not own the deliverable")
+        }
       }
     })
     if (plan.hooks.pre.length || plan.hooks.post.length) {

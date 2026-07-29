@@ -10,6 +10,7 @@ import { advisorNeedsOf, completionQuestion, type AdvisorUsage, type ModelSelect
 import { advisorTokenEnv, advisorUrlEnv, installAdvisorTool, startAdvisorBridge, type AdvisorBridge } from "./advisor-bridge"
 import { readAdvisorSplit, renderAdvisorSplit } from "./advisor-report"
 import { createAdvisorRuntime, totalAdvisorUsage, type AdvisorPhaseHandle, type AdvisorRuntime } from "./advisor-runtime"
+import { aggregateAdvisorEvents, createAdvisorEventJournal, readAdvisorEvents, type AdvisorEvent, type AdvisorEventJournal } from "./advisor-events"
 import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
@@ -394,6 +395,7 @@ export async function run(options: RunOptions) {
   let progress: ProgressUI = noopProgress
   let permissions: PermissionGate | undefined
   let advisorBridge: AdvisorBridge | undefined
+  let advisorJournal: AdvisorEventJournal | undefined
   let metadata: RunMetadataStore | undefined
   let control: RunControl | undefined
   let caffeinate: Caffeinate | undefined
@@ -531,6 +533,18 @@ export async function run(options: RunOptions) {
       client: opencode.client,
       directory: options.targetDir,
       signal: shutdown.signal,
+      auditPolicy: options.advisorAuditPolicy ?? "summary",
+      ...(advisorNeeds.agents.size > 0
+        ? {
+            onEvent: async (event: AdvisorEvent) => {
+              advisorJournal ??= await createAdvisorEventJournal(workspace)
+              await advisorJournal.append(event)
+              progress.phaseAdvisorEvent(event.phase, event)
+              const detail = advisorEventLogLine(event)
+              progress.phaseActivity(event.phase, detail, event.type === "advisor.failed" ? "error" : "info")
+            },
+          }
+        : {}),
     })
 
     permissions = startPermissionGate({
@@ -1078,6 +1092,9 @@ async function runPhaseAttempt(
     // Logged as its own line, never folded into the executor's totals: the whole
     // economic claim of the pattern is that this stays a small fraction.
     ...(result.advisorUsage ? { advisor: totalAdvisorUsage(result.advisorUsage) } : {}),
+    // Fallback copy for writeAttemptLog's journal merge; it is replaced by the
+    // merged event list before the log is written.
+    ...(result.advisorEvents && result.advisorEvents.length > 0 ? { advisorEvents: result.advisorEvents } : {}),
     text: result.assistantText,
   })
 
@@ -1111,6 +1128,7 @@ type PhaseAttemptResult = {
   tokens?: unknown
   error?: unknown
   advisorUsage?: readonly AdvisorUsage[]
+  advisorEvents?: readonly AdvisorEvent[]
 }
 
 const phaseAttemptRunners: Record<StepRunnerId, StepRunnerImpl<PhaseAttemptInput, PhaseAttemptResult>> = {
@@ -1129,6 +1147,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     progress: input.progress,
     shutdown: input.shutdown,
     sessionRef: input.sessionRef,
+    attempt: input.attempt,
     ...(input.advisors ? { advisors: input.advisors } : {}),
   })
   const assistantText = extractAssistantText(result.parts)
@@ -1146,6 +1165,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     tokens: usage?.tokens ?? result.info.tokens,
     error: result.info.error,
     ...(result.advisorUsage && result.advisorUsage.length > 0 ? { advisorUsage: result.advisorUsage } : {}),
+    ...(result.advisorEvents && result.advisorEvents.length > 0 ? { advisorEvents: result.advisorEvents } : {}),
   }
 }
 
@@ -1312,6 +1332,7 @@ async function promptPhase(
     shutdown: RunShutdown
     sessionRef?: SessionRef
     advisors?: AdvisorRuntime
+    attempt: number
   },
 ): Promise<SessionResult> {
   input.shutdown.throwIfRequested()
@@ -1326,7 +1347,7 @@ async function promptPhase(
   if (input.sessionRef) input.sessionRef.id = session.data.id
   // Registered here and not earlier: the permission gate and the on-demand tool
   // both find a phase by its live session, which only exists now.
-  const advisor = input.advisors?.begin(session.data.id, input.phase)
+  const advisor = input.advisors?.begin(session.data.id, input.phase, input.attempt)
   input.progress.phaseSession(input.phase.name, session.data.id)
   input.shutdown.setActiveSession({ client, sessionID: session.data.id, directory: input.targetDir, phaseName: input.phase.name })
   log.info(`[${input.phase.name}] session: ${session.data.id}`)
@@ -1371,7 +1392,11 @@ async function promptPhase(
       input.progress.phaseUsageTotal(input.phase.name, usage)
       log.info(`[${input.phase.name}] usage: ${formatUsageForLog(usage)}`)
     }
-    return { ...reviewed, ...(advisor && advisor.usage.length > 0 ? { advisorUsage: [...advisor.usage] } : {}) }
+    return {
+      ...reviewed,
+      ...(advisor && advisor.usage.length > 0 ? { advisorUsage: [...advisor.usage] } : {}),
+      ...(advisor && advisor.events.length > 0 ? { advisorEvents: [...advisor.events] } : {}),
+    }
   } catch (error) {
     if (!input.shutdown.aborted && !isUserAbortError(error)) {
       await abortSessionQuietly(client, session.data.id, input.targetDir, input.phase.name)
@@ -1391,6 +1416,7 @@ type SessionResult = {
   assistantInfos: AssistantMessage[]
   /** Present only when this attempt consulted an advisor; kept apart from executor usage so the split stays visible. */
   advisorUsage?: readonly AdvisorUsage[]
+  advisorEvents?: readonly AdvisorEvent[]
 }
 
 /** Sentinel the closing checkpoint asks a read-only phase to reply with when the advice changes nothing. */
@@ -1424,7 +1450,7 @@ async function applyCompletionCheckpoint(
   if (!advice.ok) return first
   input.shutdown.throwIfRequested()
 
-  input.progress.message(`${input.phase.name}: advisor reviewed the finished phase`)
+  input.progress.phaseActivity(input.phase.name, "advisor reviewed the finished phase", "info")
 
   const watcher = watchSession(client, {
     directory: input.targetDir,
@@ -1447,6 +1473,7 @@ async function applyCompletionCheckpoint(
       parts: [{ type: "text", text: completionFollowUp(input.phase, advice.text) }],
     }, { signal: input.shutdown.signal })
     if (accepted.error) throw new Error(formatSdkError(accepted.error))
+    await advisor.delivered(advice.callId, "follow-up")
 
     const second = await watcher.result
     // The watcher resolves on a terminal error as readily as on a completion, so
@@ -2213,6 +2240,8 @@ export function progressPhases(pipeline: Pipeline, hooks?: HookSet): ProgressPha
           ...(step.variant ? { plannedVariant: step.variant } : {}),
           ...(step.runner ? { runner: step.runner } : {}),
           ...(step.readOnly ? { readOnly: true } : {}),
+          ...(step.resolvedAdvisor ? { plannedAdvisor: step.resolvedAdvisor.target } : step.advisor ? { plannedAdvisor: step.advisor } : {}),
+          ...(step.advisorMaxCalls !== undefined ? { advisorMaxCalls: step.advisorMaxCalls } : {}),
         }
       : { name: step.name, description: step.description },
   )
@@ -2277,7 +2306,45 @@ async function summaryFromReport(path: string) {
 }
 
 async function writeAttemptLog(workspace: Workspace, phase: AgentStep, attempt: number, payload: unknown) {
-  await writeFile(join(workspace.dir, "logs", `${phase.name}.${attempt}.json`), JSON.stringify(payload, null, 2))
+  const body: Record<string, unknown> = payload && typeof payload === "object" ? { ...(payload as Record<string, unknown>) } : { value: payload }
+  const journaled = (await readAdvisorEvents(workspace.dir)).filter((event) => event.phase === phase.name && event.attempt === attempt)
+  // The journal is authoritative, but its appends are allowed to fail without
+  // blocking the phase. Merge the attempt's in-memory events (carried on the
+  // attempt result for exactly this) so a failed append cannot erase advisor
+  // activity from the attempt log. The aggregate's field names stay a superset
+  // of the legacy `advisor` shape, so historical readers stay compatible.
+  const inMemory = Array.isArray(body.advisorEvents) ? (body.advisorEvents as AdvisorEvent[]) : []
+  const seen = new Set(journaled.map((event) => event.id))
+  const events = [...journaled, ...inMemory.filter((event) => !seen.has(event.id) && event.phase === phase.name && event.attempt === attempt)]
+  if (events.length > 0) {
+    const aggregate = aggregateAdvisorEvents(events)
+    body.advisor = {
+      calls: aggregate.attempted,
+      succeeded: aggregate.succeeded,
+      failed: aggregate.failed,
+      exhausted: aggregate.exhausted,
+      byTrigger: aggregate.byTrigger,
+      callIds: aggregate.callIds,
+      cost: aggregate.cost,
+      inputTokens: aggregate.tokens.input + aggregate.tokens.cacheRead + aggregate.tokens.cacheWrite,
+      outputTokens: aggregate.tokens.output + aggregate.tokens.reasoning,
+      tokens: aggregate.tokens,
+      feedback: aggregate.feedback,
+      lastAt: aggregate.lastAt,
+    }
+    body.advisorEvents = events
+    body.costSplit = { executor: typeof body.cost === "number" ? body.cost : 0, advisor: aggregate.cost }
+  }
+  await writeFile(join(workspace.dir, "logs", `${phase.name}.${attempt}.json`), JSON.stringify(body, null, 2), { mode: 0o600 })
+}
+
+function advisorEventLogLine(event: AdvisorEvent): string {
+  if (event.type === "advisor.requested") return `advisor requested · ${event.trigger} · ${event.budget.used}/${event.budget.max}`
+  if (event.type === "advisor.completed") return `advisor completed · ${event.trigger} · ${event.latencyMs}ms${event.usage ? ` · $${event.usage.cost.toFixed(4)}` : ""}`
+  if (event.type === "advisor.failed") return `advisor failed · ${event.trigger} · ${event.error.code}`
+  if (event.type === "advisor.budget_exhausted") return `advisor budget exhausted · ${event.trigger}`
+  if (event.type === "advisor.delivered") return `advisor delivered · ${event.trigger} · ${event.delivery}`
+  return `advisor feedback · ${event.trigger} · ${event.outcome}`
 }
 
 async function exists(path: string) {

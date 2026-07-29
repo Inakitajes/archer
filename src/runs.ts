@@ -5,6 +5,7 @@ import { stdin, stdout } from "node:process"
 
 import { readRunMetadata, type PhaseMetadataStatus, type RunMetadata } from "./metadata"
 import { isValidRunID, runsRoot } from "./workspace"
+import { readAdvisorSplit } from "./advisor-report"
 
 export type RunStatusKind = "completed" | "failed" | "incomplete" | "empty" | "unknown"
 
@@ -13,6 +14,7 @@ export type RunPhaseInfo = {
   status: PhaseMetadataStatus
   durationMs?: number
   cost?: number
+  advisorCost?: number
   model?: string
 }
 
@@ -28,6 +30,8 @@ export type RunEntry = {
   /** The live server URL, present only when `live`. */
   serverUrl?: string
   cost?: number
+  executorCost?: number
+  advisorCost?: number
   createdAt?: number
   phases: RunPhaseInfo[]
 }
@@ -103,6 +107,9 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
   const metadata = await readRunMetadata(join(dir, "metadata.json"))
   const summary = statusSummary(metadata)
   const live = await isServerLive(metadata?.server)
+  const split = await readAdvisorSplit(dir)
+  const executorCost = totalCost(metadata, split.executorPhases) ?? (split.executor.cost > 0 ? split.executor.cost : undefined)
+  const advisorCost = split.advisor.cost
   return {
     runID,
     dir,
@@ -112,7 +119,9 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
     statusKind: summary.kind,
     live,
     serverUrl: live ? metadata?.server?.url : undefined,
-    cost: totalCost(metadata),
+    cost: executorCost === undefined && advisorCost === 0 ? undefined : (executorCost ?? 0) + advisorCost,
+    executorCost,
+    advisorCost,
     createdAt: metadata?.createdAt,
     phases: phaseInfos(metadata),
   }
@@ -183,13 +192,21 @@ function statusSummary(metadata: RunMetadata | undefined): { label: string; kind
   return { label: `incomplete (${done}/${statuses.length})`, kind: "incomplete" }
 }
 
-function totalCost(metadata: RunMetadata | undefined) {
-  if (!metadata) return undefined
+function totalCost(metadata: RunMetadata | undefined, loggedPhaseCosts: Record<string, number> | undefined) {
+  if (!metadata && !loggedPhaseCosts) return undefined
   let cost = 0
   let seen = false
-  for (const phase of Object.values(metadata.phases)) {
-    if (typeof phase.cost !== "number") continue
-    cost += phase.cost
+  for (const [name, phase] of Object.entries(metadata?.phases ?? {})) {
+    if (typeof phase.cost === "number") {
+      cost += phase.cost
+      seen = true
+    }
+  }
+  for (const [name, costFromLogs] of Object.entries(loggedPhaseCosts ?? {})) {
+    // Metadata holds the authoritative total for phases it has recorded. Its
+    // attempt logs would otherwise count that phase twice.
+    if (typeof metadata?.phases[name]?.cost === "number") continue
+    cost += costFromLogs
     seen = true
   }
   return seen ? cost : undefined
@@ -202,6 +219,7 @@ function phaseInfos(metadata: RunMetadata | undefined): RunPhaseInfo[] {
     status: phase.status,
     durationMs: phase.durationMs,
     cost: phase.cost,
+    advisorCost: phase.advisor?.cost,
     model: phase.model,
   }))
 }
@@ -213,7 +231,7 @@ function printRunList(runs: RunEntry[]) {
   stdout.write(`\nruns in ${runsRoot()}:\n`)
   for (const [index, run] of runs.entries()) {
     const number = String(index + 1).padStart(numberWidth)
-    const cost = (run.cost !== undefined ? `$${run.cost.toFixed(2)}` : "").padStart(8)
+    const cost = (run.cost !== undefined ? `$${run.cost.toFixed(2)}${run.advisorCost ? ` (${run.executorCost?.toFixed(2) ?? "0.00"}+${run.advisorCost.toFixed(2)} adv)` : ""}` : "").padStart(8)
     const marker = run.live ? "●" : " "
     stdout.write(`  ${number}. ${marker} ${run.runID}  ${statusText(run).padEnd(statusWidth)}  ${cost}  ${run.title}\n`)
   }

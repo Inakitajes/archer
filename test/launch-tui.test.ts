@@ -119,6 +119,13 @@ describe("launch TUI pipeline preview", () => {
     expect(launcherStepModelLabel({ model: "openai/gpt-5.6", variant: "xhigh" })).toBe("gpt-5.6 xhigh")
   })
 
+  test("shows executor to advisor relationships and call caps", () => {
+    const lines = plainLines(stepTree([
+      { stepName: "implementer", groupId: "g1", kind: "agent", modelLabel: "glm-5.2", advisorLabel: "claude-opus-5 advisor ×3" },
+    ], 100))
+    expect(lines).toEqual(["○ implementer  · glm-5.2 → claude-opus-5 advisor ×3"])
+  })
+
   test("shows an explicit placeholder when a pipeline has no hooks", () => {
     expect(plainLines(hookLines([], 80))).toEqual(["hooks  · none"])
   })

@@ -1,5 +1,6 @@
 import { log } from "./log"
 import type { StepRunner } from "./types"
+import type { AdvisorEvent, AdvisorPhaseAggregate } from "./advisor-events"
 
 export type ProgressPhase = {
   name: string
@@ -16,6 +17,8 @@ export type ProgressPhase = {
   runner?: StepRunner
   /** Whether Convoy restricts this phase to audit-only behavior. */
   readOnly?: boolean
+  plannedAdvisor?: string
+  advisorMaxCalls?: number
 }
 
 export type ProgressTokens = {
@@ -106,6 +109,8 @@ export type ProgressPhaseSnapshot = {
   cost?: number
   tokens?: ProgressTokens
   model?: string
+  advisor?: AdvisorPhaseAggregate
+  advisorEvents?: AdvisorEvent[]
 }
 
 export type PermissionPromptInfo = {
@@ -198,6 +203,8 @@ export type ProgressUI = {
   phaseMessage(name: string, message: ProgressMessage): void
   phaseStepUsage(name: string, usage: ProgressStepUsage): void
   phaseUsageTotal(name: string, usage: ProgressUsage): void
+  /** One durable advisor lifecycle event, already linked to its real phase. */
+  phaseAdvisorEvent(name: string, event: AdvisorEvent): void
   phaseTodos(name: string, todos: ProgressTodo[]): void
   phaseDiff(name: string, summary: ProgressDiffSummary): void
   phaseCompleted(name: string, detail?: string): void
@@ -236,6 +243,7 @@ export const noopProgress: ProgressUI = {
   phaseMessage() {},
   phaseStepUsage() {},
   phaseUsageTotal() {},
+  phaseAdvisorEvent() {},
   phaseTodos() {},
   phaseDiff() {},
   phaseCompleted() {},

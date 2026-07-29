@@ -16,6 +16,7 @@ import type {
 import type { Pipeline } from "./types"
 import type { ModelGateway } from "./model-routing"
 import { PhaseUsage } from "./usage"
+import { aggregateAdvisorEvents, type AdvisorEvent, type AdvisorPhaseAggregate } from "./advisor-events"
 import type { Workspace } from "./workspace"
 
 export type PhaseMetadataStatus = "pending" | "running" | "completed" | "skipped" | "failed"
@@ -32,6 +33,8 @@ export type PhaseMetadata = {
   logicalModel?: string
   targetModel?: string
   repositoryBaseline?: RepoSnapshot
+  advisor?: AdvisorPhaseAggregate
+  advisorEvents?: AdvisorEvent[]
 }
 
 export type RunMetadata = {
@@ -61,6 +64,7 @@ export type RunMetadataStore = {
   phaseSession(name: string, sessionID: string): void
   phaseStepUsage(name: string, usage: ProgressStepUsage): void
   phaseUsageTotal(name: string, usage: ProgressUsage): void
+  phaseAdvisorEvent(name: string, event: AdvisorEvent): void
   repositoryBaseline(name: string): RepoSnapshot | undefined
   phaseRepositoryBaseline(name: string, baseline: RepoSnapshot): Promise<void>
   phaseEnded(name: string, status: "completed" | "skipped" | "failed"): void
@@ -192,6 +196,8 @@ export async function openRunMetadata(
         cost: entry.cost,
         tokens: entry.tokens,
         model: entry.model,
+        advisor: entry.advisor,
+        advisorEvents: entry.advisorEvents,
       }
     },
     phaseStatus(name) {
@@ -224,6 +230,15 @@ export async function openRunMetadata(
       phaseUsage(name).setTotal(usage_)
       recalculate(name)
       scheduleSave()
+    },
+    phaseAdvisorEvent(name, event) {
+      const entry = phase(name)
+      const events = (entry.advisorEvents ??= [])
+      if (events.some((existing) => existing.id === event.id)) return
+      events.push(event)
+      entry.advisor = aggregateAdvisorEvents(events)
+      // Advisor events are sparse and operationally important; persist now so a crash does not erase them.
+      void persist()
     },
     repositoryBaseline(name) {
       return data.phases[name]?.repositoryBaseline
@@ -307,6 +322,10 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
     phaseUsageTotal(name, usage) {
       store.phaseUsageTotal(name, usage)
       progress.phaseUsageTotal(name, usage)
+    },
+    phaseAdvisorEvent(name, event) {
+      store.phaseAdvisorEvent(name, event)
+      progress.phaseAdvisorEvent(name, event)
     },
     phaseTodos: (name, todos) => progress.phaseTodos(name, todos),
     phaseDiff: (name, summary) => progress.phaseDiff(name, summary),

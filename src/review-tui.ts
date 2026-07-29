@@ -2,6 +2,7 @@ import { homedir } from "node:os"
 
 import { StyledText, fg } from "@opentui/core"
 
+import { defaultAdvisorMaxCalls } from "./advisor"
 import { gatewayLabel } from "./model-routing"
 import { plannedStepAdvisor, plannedStepModel } from "./run-plan"
 import { sanitizeReviewInline, sanitizeReviewText } from "./run-review"
@@ -168,9 +169,12 @@ function executorModelRows(step: AgentStep, indent: number, width: number): Styl
 function advisorRows(step: AgentStep, indent: number, width: number): StyledText[] {
   const advisor = plannedStepAdvisor(step)
   if (!advisor) return []
-  const prefix = "advisor "
+  const prefix = "Advisor "
   const available = Math.max(8, width - indent - prefix.length)
-  return [continuation([fg(theme.faint)(prefix), fg(theme.dim)(truncate(sanitizeReviewInline(advisor), available))], indent)]
+  const suffix = ` · max ${step.advisorMaxCalls ?? defaultAdvisorMaxCalls} calls/attempt`
+  const resolved = step.resolvedAdvisor
+  const relationship = resolved && resolved.logical !== resolved.target ? `${resolved.logical} → ${resolved.target}` : advisor
+  return [continuation([fg(theme.faint)(prefix), fg(theme.dim)(truncate(`${sanitizeReviewInline(relationship)}${suffix}`, available))], indent)]
 }
 
 function hookChunks(stage: "pre" | "post", hook: HookSpec, value: number): TextChunk[] {

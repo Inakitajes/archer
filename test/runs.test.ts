@@ -82,6 +82,49 @@ describe("run history listing", () => {
     expect(newer!.live).toBe(false)
     expect(newer!.serverUrl).toBeUndefined()
   })
+
+  test("combines metadata and attempt-log executor costs without double counting, plus advisor journal cost", async () => {
+    const runID = "20260611-120000-mixd"
+    const dir = join(root, runID)
+    await mkdir(join(dir, "logs"), { recursive: true })
+    await mkdir(join(dir, "events"), { recursive: true })
+    await writeFile(join(dir, "prd.md"), "# Mixed cost recovery\n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3,
+      runID,
+      targetDir: "/tmp/repo",
+      createdAt: 1,
+      updatedAt: 2,
+      control: { state: "running" },
+      phases: {
+        build: { status: "completed", cost: 1 },
+        tests: { status: "completed" },
+      },
+    }))
+    await writeFile(join(dir, "logs", "build.1.json"), JSON.stringify({ cost: 1, tokens: { output: 100 } }))
+    await writeFile(join(dir, "logs", "tests.1.json"), JSON.stringify({ cost: 2, tokens: { output: 200 } }))
+    const event = {
+      id: "evt-1",
+      type: "advisor.completed",
+      timestamp: new Date(0).toISOString(),
+      callId: "call-1",
+      phase: "tests",
+      attempt: 1,
+      trigger: "completion",
+      budget: { used: 1, max: 3 },
+      model: "anthropic/opus",
+      latencyMs: 10,
+      adviceChars: 3,
+      usage: { model: "anthropic/opus", cost: 0.2, tokens: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 } },
+    }
+    await writeFile(join(dir, "events", "advisor.jsonl"), `${JSON.stringify(event)}\n`)
+
+    const run = (await listRuns(root)).find((entry) => entry.runID === runID)!
+
+    expect(run.executorCost).toBe(3)
+    expect(run.advisorCost).toBe(0.2)
+    expect(run.cost).toBe(3.2)
+  })
 })
 
 describe("run liveness detection", () => {

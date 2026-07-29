@@ -61,6 +61,60 @@ describe("readAdvisorSplit", () => {
 
     expect(await readAdvisorSplit(dir)).toEqual({ executor: { cost: 0, outputTokens: 0 }, advisor: { cost: 0, outputTokens: 0, inputTokens: 0, calls: 0 } })
   })
+
+  test("uses the event journal for failed calls and per-phase trigger reporting", async () => {
+    const dir = await runDirWith({ "build.1.json": { cost: 1, tokens: { output: 4_000 } } })
+    await mkdir(join(dir, "events"), { recursive: true })
+    const base = { timestamp: new Date(0).toISOString(), phase: "build", attempt: 1, trigger: "on-demand", budget: { used: 1, max: 3 } }
+    await writeFile(join(dir, "events", "advisor.jsonl"), [
+      JSON.stringify({ ...base, id: "1", callId: "a", type: "advisor.requested", model: "anthropic/opus" }),
+      JSON.stringify({ ...base, id: "2", callId: "a", type: "advisor.failed", model: "anthropic/opus", latencyMs: 10, error: { code: "unavailable", message: "down" } }),
+    ].join("\n"))
+
+    const split = await readAdvisorSplit(dir)
+    expect(split.advisor.calls).toBe(1)
+    expect(split.phases?.build).toMatchObject({ attempted: 1, failed: 1, byTrigger: { "on-demand": 1 } })
+    expect(renderAdvisorSplit(split)).toContain("| build | 1 | 0 | 1 |")
+  })
+
+  test("merges attempt-log events the journal lost without double counting", async () => {
+    const base = { timestamp: new Date(0).toISOString(), phase: "build", attempt: 1, trigger: "on-demand", budget: { used: 1, max: 3 } }
+    const requested = { ...base, id: "1", callId: "a", type: "advisor.requested", model: "anthropic/opus" }
+    const completed = {
+      ...base,
+      id: "2",
+      callId: "a",
+      type: "advisor.completed",
+      model: "anthropic/opus",
+      latencyMs: 10,
+      adviceChars: 5,
+      usage: { model: "anthropic/opus", cost: 0.05, tokens: { input: 100, output: 20, reasoning: 0, cacheRead: 0, cacheWrite: 0 } },
+    }
+    // The journal persisted only the request; the completion survived solely in
+    // the attempt log's fallback copy. The legacy advisor block must be skipped
+    // either way: cost comes from the merged events exactly once.
+    const dir = await runDirWith({
+      "build.1.json": { cost: 1, tokens: { output: 4_000 }, advisor: { calls: 1, cost: 0.05, outputTokens: 20, inputTokens: 100 }, advisorEvents: [requested, completed] },
+    })
+    await mkdir(join(dir, "events"), { recursive: true })
+    await writeFile(join(dir, "events", "advisor.jsonl"), `${JSON.stringify(requested)}\n`)
+
+    const split = await readAdvisorSplit(dir)
+    expect(split.advisor.calls).toBe(1)
+    expect(split.advisor.cost).toBe(0.05)
+    expect(split.advisor.outputTokens).toBe(20)
+    expect(split.phases?.build).toMatchObject({ attempted: 1, succeeded: 1, cost: 0.05 })
+
+    // And when the journal lost everything, the same attempt log alone yields
+    // the same totals rather than doubling them across both readers.
+    const journalGone = await runDirWith({
+      "build.1.json": { cost: 1, tokens: { output: 4_000 }, advisor: { calls: 1, cost: 0.05, outputTokens: 20, inputTokens: 100 }, advisorEvents: [requested, completed] },
+    })
+    const splitGone = await readAdvisorSplit(journalGone)
+    expect(splitGone.advisor.calls).toBe(1)
+    expect(splitGone.advisor.cost).toBe(0.05)
+    expect(splitGone.advisor.outputTokens).toBe(20)
+  })
 })
 
 describe("renderAdvisorSplit", () => {

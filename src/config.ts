@@ -28,6 +28,7 @@ import {
   type StepSpec,
 } from "./pipeline"
 import { isStepRunnerId, normalizeStepRunnerModel, stepRunnerFor, type StepRunnerId } from "./step-runners"
+import type { AdvisorAuditPolicy } from "./advisor-events"
 import type { AgentSpec, HookSet, HookSpec, HooksConfig, HookWhen, PermissionAdditions } from "./types"
 import { isModelGateway, logicalModel, type ModelRoutingConfig, type ModelRoutingOverrides } from "./model-routing"
 import { convoyHome, convoyRoot, globalConfigPath } from "./workspace"
@@ -65,6 +66,8 @@ export type ConvoyDefaults = {
   advisor?: string
   /** Cap on advisor consultations per phase attempt, for steps that don't set their own. */
   advisorMaxCalls?: number
+  /** Advisor content retained in events/advisor.jsonl. Hash-only by default. */
+  advisorAuditPolicy?: AdvisorAuditPolicy
 }
 
 /** A project agent definition, or model/temperature/readOnly overrides for a built-in one. */
@@ -247,6 +250,9 @@ defaults:
   # branchNameModel: anthropic/claude-haiku-4-5 # optional: model that names worktree branches
   # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
   # worktree: true # optional: run each job on a fresh branch in its own worktree (default); false runs in the current tree
+  # advisor: anthropic/claude-opus-5 # optional: reviewing model consulted at phase decision points
+  # advisorMaxCalls: 3 # optional: consultation budget per phase attempt
+  # advisorAuditPolicy: summary # summary (hashes), redacted (lengths), or full content retention
 
 # Agents are matched by name with Markdown prompts next to this config:
 #   agents/<name>.md
@@ -478,6 +484,7 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
     "worktree",
     "advisor",
     "advisorMaxCalls",
+    "advisorAuditPolicy",
   ])
 
   const defaults: ConvoyDefaults = {}
@@ -492,6 +499,11 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
   if (record.worktree !== undefined) defaults.worktree = v.boolean(record.worktree, "defaults.worktree")
   if (record.advisor !== undefined) defaults.advisor = v.model(record.advisor, "defaults.advisor")
   if (record.advisorMaxCalls !== undefined) defaults.advisorMaxCalls = v.positiveInt(record.advisorMaxCalls, "defaults.advisorMaxCalls")
+  if (record.advisorAuditPolicy !== undefined) {
+    const policy = v.nonEmptyString(record.advisorAuditPolicy, "defaults.advisorAuditPolicy")
+    if (policy !== "summary" && policy !== "redacted" && policy !== "full") v.fail("defaults.advisorAuditPolicy", "must be summary, redacted, or full")
+    defaults.advisorAuditPolicy = policy as AdvisorAuditPolicy
+  }
   return defaults
 }
 

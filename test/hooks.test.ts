@@ -4,6 +4,7 @@ import { join } from "node:path"
 
 import { afterAll, describe, expect, test } from "bun:test"
 
+import { advisorTokenEnv, advisorUrlEnv } from "../src/advisor-bridge"
 import { hookPhaseNames, hooksForPipeline, runHooks } from "../src/hooks"
 import { noopProgress, type ProgressUI } from "../src/progress"
 import type { HooksConfig } from "../src/types"
@@ -51,6 +52,24 @@ describe("hooks", () => {
     await runHooks("pre", [{ command: 'printf "%s:%s:%s" "$CONVOY_PIPELINE" "$CONVOY_HOOK_STAGE" "$CONVOY_RUN_ID" > hook.out' }], context)
 
     expect(await readFile(join(context.targetDir, "hook.out"), "utf8")).toBe("implement:pre:20260101-000000-hook")
+  })
+
+  test("does not expose the advisor bridge credentials to project hooks", async () => {
+    const context = await hookContext()
+    const previousUrl = process.env[advisorUrlEnv]
+    const previousToken = process.env[advisorTokenEnv]
+    process.env[advisorUrlEnv] = "http://127.0.0.1:12345/advise"
+    process.env[advisorTokenEnv] = "bridge-secret"
+
+    try {
+      await runHooks("post", [{ command: `printf '%s:%s' "\${${advisorUrlEnv}-unset}" "\${${advisorTokenEnv}-unset}" > hook.out` }], { ...context, status: "success" })
+      expect(await readFile(join(context.targetDir, "hook.out"), "utf8")).toBe("unset:unset")
+    } finally {
+      if (previousUrl === undefined) delete process.env[advisorUrlEnv]
+      else process.env[advisorUrlEnv] = previousUrl
+      if (previousToken === undefined) delete process.env[advisorTokenEnv]
+      else process.env[advisorTokenEnv] = previousToken
+    }
   })
 
   test("post hooks honor run status filters", async () => {

@@ -14,7 +14,7 @@ export async function createWorkspace(prompt: string): Promise<Workspace> {
   const dir = runDir(runID)
 
   await mkdir(dir, { recursive: true, mode: 0o700 })
-  for (const sub of ["logs", "reports", "diffs"]) {
+  for (const sub of ["logs", "reports", "diffs", "events"]) {
     await mkdir(join(dir, sub), { mode: 0o700 })
   }
   await writeFile(join(dir, "prd.md"), prompt, { mode: 0o600 })

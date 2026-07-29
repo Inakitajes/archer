@@ -1,4 +1,4 @@
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { stdout } from "node:process"
 
 import { readRunMetadata, type PhaseMetadata, type RunMetadata } from "./metadata"
@@ -8,6 +8,7 @@ import { progressPhases, watchSession, type SessionWatcher } from "./runner"
 import { stepRunnerFor } from "./step-runners"
 import { createTuiProgress } from "./tui"
 import { runsRoot } from "./workspace"
+import { aggregateAdvisorEvents, readAdvisorEvents } from "./advisor-events"
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 import type { ProgressPhaseSnapshot, ProgressUI } from "./progress"
@@ -31,6 +32,9 @@ export async function openRunDashboard(runID: string): Promise<void> {
     stdout.write(`run ${runID}: no replayable metadata, nothing to open\n`)
     return
   }
+  // The append-only journal is authoritative and can be newer than the last
+  // debounced metadata write after a crash. Merge it before reconstruction.
+  await reconcileAdvisorJournal(metadata, dir)
   const targetDir = metadata.targetDir || process.cwd()
   const phases = progressPhases(metadata.pipeline)
   // Hook phases aren't part of the frozen pipeline but were recorded as they
@@ -91,6 +95,7 @@ export async function openRunDashboard(runID: string): Promise<void> {
   // browsing on the finish screen until they close it.
   if (!userDetached) {
     const latest = (await readRunMetadata(metaPath)) ?? metadata
+    await reconcileAdvisorJournal(latest, dir)
     replayHistory(tui, latest)
     await Promise.race([tui.runFinished?.({ status: overallStatus(latest), runDir: dir }) ?? Promise.resolve(), detached])
   }
@@ -100,7 +105,7 @@ export async function openRunDashboard(runID: string): Promise<void> {
 // Mirrors a live run's opencode activity into the dashboard: history from
 // metadata, plus a watchSession per running phase whose events stream in. All
 // read-only — it never drives the run, only observes it.
-class LiveAttach {
+export class LiveAttach {
   readonly serverGone: Promise<void>
   private resolveServerGone!: () => void
   private readonly watchers = new Map<string, SessionWatcher>()
@@ -133,6 +138,11 @@ class LiveAttach {
     const metadata = await readRunMetadata(this.metaPath)
     if (!metadata) return
 
+    // Metadata writes are debounced, while advisor events are appended
+    // immediately. Reconcile the journal on every poll so an attached viewer
+    // sees activity as it occurs rather than only after phase completion.
+    await reconcileAdvisorJournal(metadata, dirname(this.metaPath))
+
     for (const [name, phase] of Object.entries(metadata.phases)) {
       if (phase.sessionID && !this.sessions.has(name)) {
         this.tui.phaseSession(name, phase.sessionID)
@@ -144,6 +154,7 @@ class LiveAttach {
           this.tui.phaseStarted(name)
           if (phase.model) this.tui.phaseAttempt(name, { attempt: 1, maxAttempts: 1, model: phase.model })
         }
+        for (const event of phase.advisorEvents ?? []) this.tui.phaseAdvisorEvent(name, event)
         if (!this.phasesWithoutLiveAttach.has(name)) this.watch(name, phase.sessionID)
       } else if (phase.status !== "pending" && !this.finalized.has(name)) {
         // Reached a terminal state: stamp its real duration/cost and stop
@@ -192,6 +203,17 @@ class LiveAttach {
   }
 }
 
+/** Merge the authoritative append-only journal over metadata's convenience projection. */
+async function reconcileAdvisorJournal(metadata: RunMetadata, runDir: string) {
+  const advisorEvents = await readAdvisorEvents(runDir)
+  for (const name of new Set(advisorEvents.map((event) => event.phase))) {
+    const events = advisorEvents.filter((event) => event.phase === name)
+    const phase = (metadata.phases[name] ??= { status: "pending" })
+    phase.advisorEvents = events
+    phase.advisor = aggregateAdvisorEvents(events)
+  }
+}
+
 // Replays every non-pending phase from metadata as a restored phase. A stale
 // "running" (a run interrupted mid-phase) reads as failed — it didn't finish.
 function replayHistory(tui: ProgressUI, metadata: RunMetadata) {
@@ -211,6 +233,8 @@ function snapshotOf(phase: PhaseMetadata, status: ProgressPhaseSnapshot["status"
     cost: phase.cost,
     tokens: phase.tokens,
     model: phase.model,
+    advisor: phase.advisor,
+    advisorEvents: phase.advisorEvents,
   }
 }
 

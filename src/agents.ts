@@ -2,7 +2,7 @@ import { readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 
 import type { AgentConfig, Config } from "@opencode-ai/sdk/v2"
-import { advisorProviderOverride, advisorToolName, type ModelSelection } from "./advisor"
+import { advisorFeedbackToolName, advisorProviderOverride, advisorToolName, type ModelSelection } from "./advisor"
 import { bashPolicy, noAdditions } from "./bash-policy"
 import { builtInPrompts } from "./built-in-prompts"
 import { builtInAgents, readOnlyAgentSuffix } from "./pipeline"
@@ -170,6 +170,7 @@ function agentConfig(
         webfetch,
         websearch: false,
         [advisorToolName]: advisor,
+        [advisorFeedbackToolName]: advisor,
       },
       permission: {
         read: "allow",
@@ -202,6 +203,7 @@ function agentConfig(
       bash: true,
       webfetch,
       [advisorToolName]: advisor,
+      [advisorFeedbackToolName]: advisor,
     },
     permission: {
       // Advised steps route edits through the gate so it can enforce the
