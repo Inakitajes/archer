@@ -7,7 +7,7 @@ import { formatMoney, limitsRow } from "../src/tui-theme"
 
 import type { ClipboardResult } from "../src/clipboard"
 import type { LimitsSnapshot } from "../src/limits"
-import type { ProgressPhase } from "../src/progress"
+import type { FinishSeam, ProgressPhase } from "../src/progress"
 import type { AdvisorEvent } from "../src/advisor-events"
 
 type DashboardInternals = {
@@ -41,20 +41,29 @@ type DashboardInternals = {
     preventDefault(): void
     stopPropagation(): void
   }): void
+  finishModal?: { kind: string; stage?: string; note?: string }
+  handleFinishKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
+  openFinishModal(): Promise<void>
 }
 
 async function createDashboard(
   width = 120,
   height = 40,
   phases: ProgressPhase[] = [{ name: "implement", description: "" }],
-  options: { observer?: boolean; onPauseToggle?: () => void; onKeepAwakeToggle?: () => void; copyResult?: ClipboardResult } = {},
+  options: {
+    observer?: boolean
+    onPauseToggle?: () => void
+    onKeepAwakeToggle?: () => void
+    copyResult?: ClipboardResult
+    finishSeam?: FinishSeam
+  } = {},
 ) {
   const testRenderer = await createTestRenderer({ width, height })
   const copied: string[] = []
   const dashboard = new TuiProgress(testRenderer.renderer, phases, undefined, undefined, false, options.observer ?? false, "session", async (text) => {
     copied.push(text)
     return options.copyResult ?? "copied-native"
-  }, options.onPauseToggle, options.onKeepAwakeToggle)
+  }, options.onPauseToggle, options.onKeepAwakeToggle, options.finishSeam)
   testRenderer.renderer.copyToClipboardOSC52 = (text) => {
     copied.push(text)
     return true
@@ -896,6 +905,178 @@ describe("dashboard content selection", () => {
       expect(renderer.listenerCount("selection")).toBe(0)
     } finally {
       if (!renderer.isDestroyed) dashboard.stop()
+    }
+  })
+})
+
+describe("finish modal follow-ups", () => {
+  type SeamOptions = { canPr?: boolean; pushFails?: boolean; prFails?: boolean }
+
+  function fakeSeam(options: SeamOptions = {}) {
+    const calls = { push: 0, pr: 0 }
+    const seam: FinishSeam = {
+      async prepare() {
+        return {
+          ok: true as const,
+          proposal: { branch: "convoy/run", commitCount: 3, subject: "feat: a thing", body: ["did a thing"], notes: [] },
+        }
+      },
+      async apply() {
+        return { sha: "abcdef1234567890", branch: "convoy/run", backupRef: "refs/convoy/finish-backup", replaced: 3 }
+      },
+      async edit() {
+        return undefined
+      },
+      async push() {
+        calls.push++
+        if (options.pushFails) throw new Error("no write access")
+      },
+      canOpenPullRequest: () => options.canPr ?? true,
+      async openPullRequest() {
+        calls.pr++
+        if (options.prFails) throw new Error("gh pr create didn't complete")
+      },
+    }
+    return { seam, calls }
+  }
+
+  const press = (name: string) => ({ name, preventDefault() {}, stopPropagation() {} })
+  // The handlers fire their follow-ups with `void`, so the awaits inside them
+  // need a turn of the loop before the modal is asserted on.
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  /** Drives [f] through prepare and the commit, landing on the "done" screen. */
+  async function commit(options: SeamOptions & { width?: number } = {}) {
+    const { seam, calls } = fakeSeam(options)
+    const harness = await createDashboard(options.width ?? 120, 40, [{ name: "implement", description: "" }], { finishSeam: seam })
+    const internals = harness.dashboard as unknown as DashboardInternals
+    await internals.openFinishModal()
+    internals.handleFinishKey(press("return"))
+    await settle()
+    return { ...harness, internals, calls }
+  }
+
+  test("offers push and push-and-PR as one fork after the commit", async () => {
+    const { internals, dashboard, calls } = await commit()
+    try {
+      expect(internals.finishModal).toMatchObject({ kind: "done", stage: "choose" })
+      const text = internals.modalText.plainText
+      // Both branches are visible at once rather than push unlocking the PR.
+      expect(text).toContain("p push")
+      expect(text).toContain("r push and PR")
+      expect(calls).toEqual({ push: 0, pr: 0 })
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("push alone settles without ever offering a pull request", async () => {
+    const { internals, dashboard, calls } = await commit()
+    try {
+      internals.handleFinishKey(press("p"))
+      await settle()
+
+      expect(calls).toEqual({ push: 1, pr: 0 })
+      expect(internals.finishModal).toMatchObject({ kind: "done", stage: "settled" })
+      const text = internals.modalText.plainText
+      expect(text).toContain("pushed to origin/convoy/run")
+      expect(text).toContain("press any key to close")
+      expect(text).not.toContain("pull request")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("push and PR settles, and a second r closes instead of re-creating it", async () => {
+    const { internals, dashboard, calls } = await commit()
+    try {
+      internals.handleFinishKey(press("r"))
+      await settle()
+
+      expect(calls).toEqual({ push: 1, pr: 1 })
+      expect(internals.finishModal).toMatchObject({ kind: "done", stage: "settled" })
+      const text = internals.modalText.plainText
+      expect(text).toContain("pull request opened")
+      expect(text).toContain("press any key to close")
+
+      // The regression: the settled screen used to keep offering the PR, so a
+      // second r ran `gh pr create` again on a branch that already had one.
+      internals.handleFinishKey(press("r"))
+      await settle()
+      expect(calls).toEqual({ push: 1, pr: 1 })
+      expect(internals.finishModal).toBeUndefined()
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a failed push keeps the fork up and never reaches the pull request", async () => {
+    const { internals, dashboard, calls } = await commit({ pushFails: true })
+    try {
+      internals.handleFinishKey(press("r"))
+      await settle()
+
+      expect(calls).toEqual({ push: 1, pr: 0 })
+      expect(internals.finishModal).toMatchObject({ kind: "done", stage: "choose" })
+      const text = internals.modalText.plainText
+      expect(text).toContain("push failed: no write access")
+      expect(text).toContain("p push")
+      expect(text).toContain("r push and PR")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a failed gh keeps the push and offers just the retry", async () => {
+    const { internals, dashboard, calls } = await commit({ prFails: true })
+    try {
+      internals.handleFinishKey(press("r"))
+      await settle()
+
+      expect(calls).toEqual({ push: 1, pr: 1 })
+      expect(internals.finishModal).toMatchObject({ kind: "done", stage: "retry-pr" })
+      // Both halves are reported: the push landed even though gh didn't. Read
+      // off the state, since the rendered note wraps at the modal's width.
+      expect(internals.finishModal?.note).toBe("pushed to origin/convoy/run · gh pr create failed: gh pr create didn't complete")
+      const text = internals.modalText.plainText
+      expect(text).toContain("pushed to origin/convoy/run")
+      expect(text).toContain("r retry pull request")
+      // The push is done, so re-offering it would only fail on an up-to-date ref.
+      expect(text).not.toContain("p push")
+
+      internals.handleFinishKey(press("r"))
+      await settle()
+      expect(calls).toEqual({ push: 1, pr: 2 })
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("keeps both keys on a narrow terminal by dropping the hint", async () => {
+    const { internals, dashboard } = await commit({ width: 48 })
+    try {
+      const row = internals.modalText.plainText.split("\n").at(-1)
+      // The row is one unwrapped line, so the hint gives way before the keys do.
+      expect(row).toBe("p push · r push and PR")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("without gh the fork is push only", async () => {
+    const { internals, dashboard, calls } = await commit({ canPr: false })
+    try {
+      const text = internals.modalText.plainText
+      expect(text).toContain("p push")
+      expect(text).not.toContain("push and PR")
+
+      // r is not on offer, so it falls through to closing the modal.
+      internals.handleFinishKey(press("r"))
+      await settle()
+      expect(calls).toEqual({ push: 0, pr: 0 })
+      expect(internals.finishModal).toBeUndefined()
+    } finally {
+      dashboard.stop()
     }
   })
 })
