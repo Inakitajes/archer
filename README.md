@@ -159,6 +159,8 @@ convoy update
 
 Updates are explicit: Convoy does not make network calls when it starts. `convoy update` only changes official standalone release binaries; it never modifies a source checkout, `~/.convoy`, project configuration, runs, or worktrees.
 
+Release candidates use prerelease tags such as `v0.2.0-rc.1`. They are published as GitHub prereleases and never replace the stable `latest` release; install one explicitly from its release tag when testing it.
+
 From the root of the target repo, ideally on a working branch:
 
 ```bash
