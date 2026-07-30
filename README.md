@@ -72,7 +72,17 @@ Convoy ships these pipelines; select one with `-p/--pipeline` (no config needed)
 
 ## Requirements
 
-- Bun 1.0+
+### Release binary
+
+- macOS (Apple Silicon or Intel), or Linux (ARM64 or x64)
+- `opencode` installed and authenticated (`opencode auth login`)
+- `git`
+
+Bun is included in the release binary; it is **not** a user requirement.
+
+### Development
+
+- Bun 1.3+ (the release build pins 1.3.14)
 - `opencode` installed and authenticated (`opencode auth login`)
 - `git`
 
@@ -94,16 +104,60 @@ To use different providers, authenticate them in OpenCode and select models as `
 
 ## Installation
 
+### Release binary (recommended)
+
+GitHub Releases are the distribution source and preserve every published version. Download the binary for your platform into `~/.local/bin`, then make it executable:
+
 ```bash
-git clone <this-repo> convoy
+mkdir -p ~/.local/bin
+
+# macOS on Apple Silicon
+curl -fL https://github.com/Inakitajes/convoy/releases/latest/download/convoy-darwin-arm64 -o ~/.local/bin/convoy
+
+# macOS on Intel
+# curl -fL https://github.com/Inakitajes/convoy/releases/latest/download/convoy-darwin-x64 -o ~/.local/bin/convoy
+
+# Linux on ARM64
+# curl -fL https://github.com/Inakitajes/convoy/releases/latest/download/convoy-linux-arm64 -o ~/.local/bin/convoy
+
+# Linux on x64
+# curl -fL https://github.com/Inakitajes/convoy/releases/latest/download/convoy-linux-x64 -o ~/.local/bin/convoy
+
+chmod 755 ~/.local/bin/convoy
+convoy --version
+```
+
+Make sure `~/.local/bin` is on your `PATH`. To install an exact version, replace `/releases/latest/download/` with `/releases/download/v0.1.0/` (or another tag). The [Releases page](https://github.com/Inakitajes/convoy/releases) lists all available versions and their `SHA256SUMS` files.
+
+### Development install
+
+Use the source flow only when developing Convoy itself:
+
+```bash
+git clone https://github.com/Inakitajes/convoy.git
 cd convoy
 bun install
 make install
 ```
 
-This leaves `convoy` in `~/.local/bin/convoy` and creates `~/.convoy/config.yaml` plus `~/.convoy/agents/*.md` with Convoy's default configuration if they do not already exist. Make sure `~/.local/bin` is in your `PATH`.
+This builds a local binary in `~/.local/bin/convoy` and creates `~/.convoy/config.yaml` plus `~/.convoy/agents/*.md` with Convoy's default configuration if they do not already exist.
 
 ## Usage
+
+### Version and updates
+
+```bash
+# Show the release version, build commit, and target platform
+convoy --version
+
+# Check the latest stable GitHub Release without changing files
+convoy update --check
+
+# Download, verify (GitHub SHA-256 digest + SHA256SUMS), and atomically install a newer release
+convoy update
+```
+
+Updates are explicit: Convoy does not make network calls when it starts. `convoy update` only changes official standalone release binaries; it never modifies a source checkout, `~/.convoy`, project configuration, runs, or worktrees.
 
 From the root of the target repo, ideally on a working branch:
 
@@ -495,9 +549,13 @@ convoy/
 │   ├── config.ts        # config loader/validation, global+project merge, YAML writer
 │   ├── config-tui.ts    # interactive config editor (convoy config)
 │   ├── model-catalog.ts # available-model list via OpenCode SDK, models.dev fallback
+│   ├── version.ts       # injected version/commit/platform + --version formatting
+│   ├── update.ts        # GitHub Releases update check + verified atomic self-install
 │   └── pipeline.ts      # built-in agents/pipeline and pipeline-spec resolution
+├── scripts/             # build.ts: local + multi-target release binary compilation
 ├── prompts/             # built-in agent prompts and runtime safety guard rails
 ├── test/                # unit tests for CLI/orchestration
+├── .github/workflows/   # release.yml: tag-triggered build, test, and GitHub Release publish
 ├── package.json
 ├── tsconfig.json
 └── Makefile

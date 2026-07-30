@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out tag
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        # Pinned: the compiled binaries embed this Bun runtime, so the release
+        # must ship the version the test suite ran against, not "latest".
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Verify tag matches package version
+        run: |
+          VERSION="$(bun -e 'const pkg = await Bun.file("package.json").json(); process.stdout.write(pkg.version)')"
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile --os='*' --cpu='*'
+
+      - name: Verify cross-platform native dependencies
+        # OpenTUI resolves `@opentui/core-<platform>-<arch>` through a dynamic
+        # import that bun build embeds per target. If a target's package is
+        # missing, the binary still passes `--version` but crashes on the TUI,
+        # so fail here instead of publishing a broken release.
+        run: |
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            if [ ! -f "node_modules/@opentui/core-$target/package.json" ]; then
+              echo "missing @opentui/core-$target; cannot build a working $target binary" >&2
+              exit 1
+            fi
+          done
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Build release binaries
+        run: bun run build:release
+
+      - name: Smoke-test Linux binary
+        run: ./dist/convoy-linux-x64 --version
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          shasum -a 256 convoy-darwin-arm64 convoy-darwin-x64 convoy-linux-arm64 convoy-linux-x64 > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/convoy-darwin-arm64
+            dist/convoy-darwin-x64
+            dist/convoy-linux-arm64
+            dist/convoy-linux-x64
+            dist/SHA256SUMS

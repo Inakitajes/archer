@@ -1,4 +1,5 @@
 node_modules/
 convoy
+dist/
 .*.bun-build
 .DS_Store
