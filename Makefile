@@ -18,7 +18,7 @@ uninstall:
 	@echo "✓ Uninstalled $(INSTALL_DIR)/$(BIN)"
 
 clean:
-	@rm -f $(BIN) src/$(BIN)
+	@rm -f $(BIN) src/$(BIN) dist/$(BIN)-*
 
 test:
 	bun run typecheck

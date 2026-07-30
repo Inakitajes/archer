@@ -10,7 +10,8 @@
     "dev": "bun run src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "build": "bun build --compile src/main.ts --outfile convoy"
+    "build": "bun run scripts/build.ts",
+    "build:release": "bun run scripts/build.ts --release"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.4",

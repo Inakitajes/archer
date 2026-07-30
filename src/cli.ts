@@ -18,6 +18,8 @@ import { readRunMetadata } from "./metadata"
 import { preflightRunPlan } from "./preflight"
 import type { LaunchBranchCheck, LaunchBranchProposal, LaunchRunPreparation, LaunchRunSelection } from "./launch-tui"
 import type { FinishOptions } from "./finish-command"
+import { formatVersion } from "./version"
+import type { UpdateResult } from "./update"
 
 /**
  * Flags as written: every scalar stays undefined until the user sets it, so
@@ -80,6 +82,8 @@ export type CliCommand =
   | { type: "init"; options: InitOptions }
   | { type: "finish"; options: FinishOptions }
   | { type: "auth"; provider: "openrouter"; action: "set" | "remove" | "status" }
+  | { type: "version" }
+  | { type: "update"; checkOnly: boolean }
 
 export async function parseAndRun(argv: string[]) {
   if (argv.length === 0 && process.stdin.isTTY && process.stdout.isTTY) {
@@ -90,6 +94,15 @@ export async function parseAndRun(argv: string[]) {
   const command = await parseCommand(argv)
   if (command.type === "help") {
     process.stdout.write(command.text)
+    return
+  }
+  if (command.type === "version") {
+    process.stdout.write(`${formatVersion()}\n`)
+    return
+  }
+  if (command.type === "update") {
+    const { runUpdate } = await import("./update")
+    writeUpdateResult(await runUpdate({ checkOnly: command.checkOnly }))
     return
   }
   if (command.type === "runs") {
@@ -344,6 +357,13 @@ async function runAuthCommand(action: "set" | "remove" | "status") {
 }
 
 export async function parseCommand(argv: string[]): Promise<CliCommand> {
+  if (argv.length === 1 && (argv[0] === "--version" || argv[0] === "-V")) return { type: "version" }
+  if (argv[0] === "update") {
+    if (argv.length === 1) return { type: "update", checkOnly: false }
+    if (argv.length === 2 && argv[1] === "--check") return { type: "update", checkOnly: true }
+    if (argv.length === 2 && (argv[1] === "--help" || argv[1] === "-h")) return { type: "help", text: updateHelp() }
+    throw new Error("usage: convoy update [--check]")
+  }
   if (argv[0] === "auth") {
     const rest = argv.slice(1)
     if (rest.length === 0 || (rest.length === 1 && rest[0] === "status")) {
@@ -747,6 +767,7 @@ Usage:
   convoy --pipeline bug-fix --prompt-file bug.md
   convoy init
   convoy finish
+  convoy update [--check]
   convoy runs [run-id]
   convoy config
   convoy auth openrouter
@@ -759,6 +780,8 @@ Commands:
   finish                   Squash this branch's convoy commits into one conventional commit
                            created with your own git identity, so it lands signed and attributed
                            ("convoy finish --help" for options; [f] on the run dashboard does the same)
+  update [--check]         Check GitHub Releases for a newer official binary, or install it
+                           (source checkouts are never modified)
   runs [run-id]            Browse run history: resume a run, read its summary/reports,
                            or open a subshell in its run dir (under ~/.convoy/runs)
   config                   View and edit the global (~/.convoy) and current project config in a TUI
@@ -766,6 +789,7 @@ Commands:
                            header credits meter (--remove deletes it; "auth status" lists sources)
 
 Flags:
+  --version, -V            Print Convoy's version, commit, and build platform
   --prompt-file <path>     Read the PRD/prompt from a file
   --file, -f <path>        Attach a file or directory to all steps (repeatable)
   --pipeline, -p <name>    Pipeline to run (default: "implement"), which runs
@@ -817,6 +841,35 @@ Config keys:
   The same schema lives globally at ~/.convoy/config.yaml; project config merges on top.
   Precedence: CLI flags > project config > global config > built-in defaults.
 `
+}
+
+function updateHelp() {
+  return `convoy update [--check]
+
+Check the latest stable GitHub Release for a binary matching this platform.
+Without --check, download, verify, and atomically install the newer binary.
+Only official standalone release binaries can update themselves; source
+checkouts are never modified.
+
+Options:
+  --check                  Report whether an update is available without changing files
+`
+}
+
+function writeUpdateResult(result: UpdateResult) {
+  switch (result.status) {
+    case "source-install":
+      process.stdout.write(`${result.message}\n`)
+      return
+    case "up-to-date":
+      process.stdout.write(`convoy ${result.currentVersion} is up to date (latest: v${result.latestVersion})\n`)
+      return
+    case "update-available":
+      process.stdout.write(`update available: ${result.currentVersion} → v${result.latestVersion} (${result.assets.binary.name})\n`)
+      return
+    case "updated":
+      process.stdout.write(`updated convoy ${result.currentVersion} → v${result.latestVersion} (${result.assetName})\n`)
+  }
 }
 
 function initHelp() {

@@ -84,6 +84,14 @@ describe("cli parsing", () => {
     if (command.type === "help") expect(command.text).toContain("convoy [prompt]")
   })
 
+  test("parses version and update commands without requiring a prompt", async () => {
+    expect(await parseCommand(["--version"])).toEqual({ type: "version" })
+    expect(await parseCommand(["-V"])).toEqual({ type: "version" })
+    expect(await parseCommand(["update"])).toEqual({ type: "update", checkOnly: false })
+    expect(await parseCommand(["update", "--check"])).toEqual({ type: "update", checkOnly: true })
+    await expect(parseCommand(["update", "--bogus"])).rejects.toThrow("usage: convoy update")
+  })
+
   test("parses the auth subcommand grammar", async () => {
     expect(await parseCommand(["auth"])).toEqual({ type: "auth", provider: "openrouter", action: "status" })
     expect(await parseCommand(["auth", "status"])).toEqual({ type: "auth", provider: "openrouter", action: "status" })
