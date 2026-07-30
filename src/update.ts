@@ -7,6 +7,11 @@ import { versionInfo } from "./version"
 export const githubLatestReleaseUrl = "https://api.github.com/repos/Inakitajes/convoy/releases/latest"
 export const releasesUrl = "https://github.com/Inakitajes/convoy/releases"
 
+const latestReleaseTimeoutMs = 15_000
+const assetDownloadTimeoutMs = 300_000
+const candidateValidationTimeoutMs = 10_000
+const candidateKillGraceMs = 2_000
+
 /**
  * GitHub release asset URLs are served from `github.com` and redirect to
  * `objects.githubusercontent.com`. Restricting downloads to these hosts keeps a
@@ -268,20 +273,23 @@ export function verifyAssetBytes(bytes: Uint8Array, binary: ReleaseAsset, checks
 }
 
 export async function fetchLatestRelease(fetchImpl: FetchLike = globalThis.fetch) {
-  let response: Response
   try {
-    response = await fetchImpl(githubLatestReleaseUrl, {
-      headers: { Accept: "application/vnd.github+json", "User-Agent": "convoy-updater" },
+    return await withTimeout(latestReleaseTimeoutMs, "GitHub Releases request", async (signal) => {
+      const response = await fetchImpl(githubLatestReleaseUrl, {
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "convoy-updater" },
+        signal,
+      })
+      if (!response.ok) throw new UpdateError(`GitHub Releases responded with ${response.status} ${response.statusText}`.trim())
+      try {
+        return validateLatestRelease(await response.json())
+      } catch (error) {
+        if (error instanceof UpdateError) throw error
+        throw new UpdateError(`could not parse the latest GitHub release: ${message(error)}`)
+      }
     })
   } catch (error) {
-    throw new UpdateError(`could not contact GitHub Releases: ${message(error)}`)
-  }
-  if (!response.ok) throw new UpdateError(`GitHub Releases responded with ${response.status} ${response.statusText}`.trim())
-  try {
-    return validateLatestRelease(await response.json())
-  } catch (error) {
     if (error instanceof UpdateError) throw error
-    throw new UpdateError(`could not parse the latest GitHub release: ${message(error)}`)
+    throw new UpdateError(`could not contact GitHub Releases: ${message(error)}`)
   }
 }
 
@@ -304,6 +312,7 @@ export async function checkForUpdate(options: Omit<UpdateOptions, "checkOnly" | 
 /** Runs the explicit update flow; source checkouts are deliberately never modified. */
 export async function runUpdate(options: UpdateOptions = {}): Promise<UpdateResult> {
   const standalone = options.standalone ?? isOfficialStandaloneExecutable()
+  if (options.checkOnly) return checkForUpdate(options)
   if (!standalone) {
     return {
       status: "source-install",
@@ -312,7 +321,7 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<UpdateResu
   }
 
   const check = await checkForUpdate(options)
-  if (check.status === "up-to-date" || options.checkOnly) return check
+  if (check.status === "up-to-date") return check
 
   const fetchImpl = options.fetch ?? globalThis.fetch
   const [binaryBytes, checksumContents] = await Promise.all([
@@ -391,33 +400,68 @@ export function candidateDeclaresVersion(output: string, expectedVersion: string
 }
 
 async function validateCandidateExecutable(path: string, expectedVersion: string) {
+  let child: Bun.Subprocess<"ignore", "pipe", "ignore"> | undefined
+  let exited = false
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  let killTimer: ReturnType<typeof setTimeout> | undefined
+  let timedOut = false
   try {
-    const child = Bun.spawn([path, "--version"], { stdout: "pipe", stderr: "pipe" })
-    const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()])
-    return exitCode === 0 && candidateDeclaresVersion(stdout, expectedVersion)
+    child = Bun.spawn([path, "--version"], { stdout: "pipe", stderr: "ignore" })
+    const kill = (signal: NodeJS.Signals) => {
+      try {
+        child?.kill(signal)
+      } catch {
+        // The candidate may have exited while the timeout was firing.
+      }
+    }
+    timeout = setTimeout(() => {
+      timedOut = true
+      kill("SIGTERM")
+      killTimer = setTimeout(() => kill("SIGKILL"), candidateKillGraceMs)
+      killTimer.unref?.()
+    }, candidateValidationTimeoutMs)
+    timeout.unref?.()
+
+    const stdoutPromise = new Response(child.stdout).text()
+    const exitCode = await child.exited
+    exited = true
+    const stdout = await stdoutPromise
+    return !timedOut && exitCode === 0 && candidateDeclaresVersion(stdout, expectedVersion)
   } catch {
     return false
+  } finally {
+    if (timeout) clearTimeout(timeout)
+    if (killTimer) clearTimeout(killTimer)
+    if (child && !exited) {
+      try {
+        child.kill("SIGKILL")
+      } catch {
+        // The candidate may have exited after the read failed.
+      }
+      await child.exited
+    }
   }
 }
 
 async function downloadBytes(asset: ReleaseAsset, fetchImpl: FetchLike) {
-  const response = await fetchAsset(asset, fetchImpl)
-  return new Uint8Array(await response.arrayBuffer())
+  return new Uint8Array(await fetchAsset(asset, fetchImpl, (response) => response.arrayBuffer()))
 }
 
 async function downloadText(asset: ReleaseAsset, fetchImpl: FetchLike) {
-  return (await fetchAsset(asset, fetchImpl)).text()
+  return fetchAsset(asset, fetchImpl, (response) => response.text())
 }
 
-async function fetchAsset(asset: ReleaseAsset, fetchImpl: FetchLike) {
-  let response: Response
+async function fetchAsset<T>(asset: ReleaseAsset, fetchImpl: FetchLike, consume: (response: Response) => Promise<T>) {
   try {
-    response = await fetchImpl(asset.browserDownloadUrl, { headers: { Accept: "application/octet-stream" } })
+    return await withTimeout(assetDownloadTimeoutMs, `download of ${asset.name}`, async (signal) => {
+      const response = await fetchImpl(asset.browserDownloadUrl, { headers: { Accept: "application/octet-stream" }, signal })
+      if (!response.ok) throw new UpdateError(`could not download ${asset.name}: HTTP ${response.status}`)
+      return consume(response)
+    })
   } catch (error) {
+    if (error instanceof UpdateError) throw error
     throw new UpdateError(`could not download ${asset.name}: ${message(error)}`)
   }
-  if (!response.ok) throw new UpdateError(`could not download ${asset.name}: HTTP ${response.status}`)
-  return response
 }
 
 function exactAsset(release: PublishedRelease, name: string) {
@@ -435,6 +479,23 @@ async function removeIfPresent(path: string, fileOps: UpdateFileOps) {
     await fileOps.rm(path, { force: true })
   } catch {
     // A failed cleanup cannot make the installed executable less safe.
+  }
+}
+
+async function withTimeout<T>(timeoutMs: number, operation: string, callback: (signal: AbortSignal) => Promise<T>) {
+  const controller = new AbortController()
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
+  try {
+    return await callback(controller.signal)
+  } catch (error) {
+    if (timedOut) throw new UpdateError(`${operation} timed out after ${timeoutMs / 1_000}s`)
+    throw error
+  } finally {
+    clearTimeout(timeout)
   }
 }
 

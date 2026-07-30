@@ -1,6 +1,8 @@
 import { mkdir } from "node:fs/promises"
 import { resolve } from "node:path"
 
+import { parseSemVer } from "../src/update"
+
 type PackageManifest = { version?: unknown }
 
 type BuildTarget = {
@@ -26,7 +28,7 @@ const release = process.argv.slice(2).join(" ") === "--release"
 if (!release && process.argv.length > 2) throw new Error("usage: bun run scripts/build.ts [--release]")
 
 const manifest = (await Bun.file("package.json").json()) as PackageManifest
-if (typeof manifest.version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(manifest.version)) {
+if (typeof manifest.version !== "string" || !parseSemVer(manifest.version)) {
   throw new Error("package.json must contain a valid SemVer version")
 }
 
@@ -49,8 +51,9 @@ for (const target of release ? releaseTargets : [localTarget]) {
 }
 
 async function gitCommit() {
-  const child = Bun.spawn(["git", "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" })
+  const child = Bun.spawn(["git", "rev-parse", "HEAD"], { stdout: "pipe", stderr: "ignore" })
+  const stdout = new Response(child.stdout).text()
   if ((await child.exited) !== 0) return "unknown"
-  const commit = (await new Response(child.stdout).text()).trim()
+  const commit = (await stdout).trim()
   return /^[0-9a-f]{40}$/i.test(commit) ? commit : "unknown"
 }

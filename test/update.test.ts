@@ -1,4 +1,4 @@
-import { chmod, copyFile, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
+import { chmod, copyFile, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
@@ -28,6 +28,7 @@ import {
 
 const tempDirs: string[] = []
 const encoder = new TextEncoder()
+const realSetTimeout = globalThis.setTimeout
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
@@ -63,15 +64,106 @@ function fetchFor(release: unknown, bytes: Uint8Array, checksum = `${sha256(byte
   }) as FetchLike
 }
 
+type Settled<T> = { status: "resolved"; value: T } | { status: "rejected"; error: unknown } | { status: "pending" }
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => realSetTimeout(resolve, ms))
+}
+
+async function settleWithin<T>(operation: Promise<T>, ms = 1_000): Promise<Settled<T>> {
+  return Promise.race([
+    operation.then<Settled<T>, Settled<T>>(
+      (value) => ({ status: "resolved", value }),
+      (error: unknown) => ({ status: "rejected", error }),
+    ),
+    wait(ms).then<Settled<T>>(() => ({ status: "pending" })),
+  ])
+}
+
+function useImmediateTimeouts(delay = 0) {
+  const originalSetTimeout = globalThis.setTimeout
+  globalThis.setTimeout = ((handler: () => void) => originalSetTimeout(handler, delay)) as typeof setTimeout
+  return () => {
+    globalThis.setTimeout = originalSetTimeout
+  }
+}
+
+async function terminateRecordedProcesses(pidPath: string) {
+  let pids: number[] = []
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      pids = (await readFile(pidPath, "utf8"))
+        .split("\n")
+        .map(Number)
+        .filter((pid) => Number.isInteger(pid) && pid > 0)
+      if (pids.length > 0) break
+    } catch {
+      // The candidate has not reached its first instruction yet.
+    }
+    await wait(25)
+  }
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch {
+      // The candidate may have exited while the test was reading its PID.
+    }
+  }
+  return pids
+}
+
+function processIsAlive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function expectTimeoutError(outcome: Settled<unknown>) {
+  if (outcome.status !== "rejected") throw new Error("operation did not reject after its deadline")
+  expect(outcome.error).toBeInstanceOf(UpdateError)
+  expect(String(outcome.error)).toContain("timed out")
+}
+
 describe("semantic versions", () => {
   test("parses and compares stable and prerelease versions", () => {
     expect(parseSemVer("v1.2.3")).toMatchObject({ major: 1, minor: 2, patch: 3, prerelease: [] })
     expect(parseSemVer("1.2.3-alpha.1")?.prerelease).toEqual(["alpha", "1"])
     expect(parseSemVer("1.02.3")).toBeUndefined()
     expect(parseSemVer("1.2.3-01")).toBeUndefined()
+    expect(parseSemVer("1.2.3-.")).toBeUndefined()
     expect(compareSemVer("1.2.3", "1.2.3-rc.1")).toBe(1)
     expect(compareSemVer("1.2.3-beta.2", "1.2.3-beta.11")).toBe(-1)
     expect(compareSemVer("1.2.4", "1.2.3")).toBe(1)
+  })
+})
+
+describe("release builds", () => {
+  test("rejects a manifest version that the updater rejects", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "convoy-invalid-build-version-"))
+    tempDirs.push(directory)
+    const root = process.cwd()
+    await Promise.all([
+      symlink(resolve(root, "src"), join(directory, "src"), "dir"),
+      symlink(resolve(root, "node_modules"), join(directory, "node_modules"), "dir"),
+      writeFile(join(directory, "package.json"), JSON.stringify({ name: "convoy-invalid-version", version: "0.01.0", type: "module" })),
+    ])
+
+    const build = Bun.spawn([process.execPath, "run", resolve(root, "scripts/build.ts")], {
+      cwd: directory,
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      build.exited,
+      new Response(build.stdout).text(),
+      new Response(build.stderr).text(),
+    ])
+
+    expect(exitCode).not.toBe(0)
+    expect(`${stdout}\n${stderr}`).toContain("valid SemVer")
   })
 })
 
@@ -196,6 +288,25 @@ describe("safe updater", () => {
     expect(requests).toBe(0)
   })
 
+  test("checks for updates from a source checkout without modifying it", async () => {
+    const bytes = encoder.encode("new binary")
+    let requests = 0
+    const result = await runUpdate({
+      standalone: false,
+      checkOnly: true,
+      currentVersion: "0.0.0-development",
+      platform: "darwin",
+      architecture: "arm64",
+      fetch: (async (input: string | URL | Request) => {
+        requests++
+        return fetchFor(releaseFor(bytes), bytes)(input)
+      }) as FetchLike,
+    })
+
+    expect(result).toMatchObject({ status: "update-available", currentVersion: "0.0.0-development", latestVersion: "0.2.0" })
+    expect(requests).toBe(1)
+  })
+
   test("checks for a newer stable release without modifying the executable", async () => {
     const bytes = encoder.encode("new binary")
     const result = await checkForUpdate({
@@ -234,6 +345,64 @@ describe("safe updater", () => {
     await expect(fetchLatestRelease(fetchImpl)).rejects.toThrow("403")
   })
 
+  test("times out while waiting for GitHub Release response headers", async () => {
+    const fetchImpl = ((_input: string | URL | Request, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true })
+      })
+    }) as FetchLike
+    const restoreTimeouts = useImmediateTimeouts()
+    let outcome: Settled<Awaited<ReturnType<typeof fetchLatestRelease>>>
+    try {
+      outcome = await settleWithin(fetchLatestRelease(fetchImpl))
+    } finally {
+      restoreTimeouts()
+    }
+
+    expectTimeoutError(outcome!)
+  })
+
+  test("times out while consuming a release asset body", async () => {
+    const bytes = encoder.encode("new binary")
+    const release = releaseFor(bytes)
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url === githubLatestReleaseUrl) return new Response(JSON.stringify(release), { status: 200 })
+      if (url.endsWith("convoy-darwin-arm64")) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          arrayBuffer: () =>
+            new Promise<ArrayBuffer>((_resolve, reject) => {
+              const signal = init?.signal
+              signal?.addEventListener("abort", () => reject(signal.reason), { once: true })
+            }),
+        } as Response
+      }
+      if (url.endsWith("SHA256SUMS")) return new Response(`${sha256(bytes)}  convoy-darwin-arm64\n`, { status: 200 })
+      return new Response("not found", { status: 404 })
+    }) as FetchLike
+    const restoreTimeouts = useImmediateTimeouts()
+    let outcome: Settled<Awaited<ReturnType<typeof runUpdate>>>
+    try {
+      outcome = await settleWithin(
+        runUpdate({
+          standalone: true,
+          currentVersion: "0.1.0",
+          platform: "darwin",
+          architecture: "arm64",
+          fetch: fetchImpl,
+        }),
+      )
+    } finally {
+      restoreTimeouts()
+    }
+
+    expectTimeoutError(outcome!)
+  })
+
   test("checkOnly never downloads or installs even when an update is available", async () => {
     const directory = await mkdtemp(join(tmpdir(), "convoy-update-checkonly-"))
     tempDirs.push(directory)
@@ -264,6 +433,87 @@ describe("safe updater", () => {
     expect(await readFile(executablePath, "utf8")).toBe("old binary")
   })
 
+  test("accepts a candidate that writes more than one megabyte to stderr", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "convoy-update-noisy-candidate-"))
+    tempDirs.push(directory)
+    const executablePath = join(directory, "convoy")
+    const pidPath = join(directory, "candidate.pid")
+    const candidate = [
+      "#!/bin/sh",
+      `printf '%s\\n' "$$" > ${JSON.stringify(pidPath)}`,
+      "dd if=/dev/zero bs=1024 count=2048 1>&2 2>/dev/null &",
+      "child=$!",
+      `printf '%s\\n' "$child" >> ${JSON.stringify(pidPath)}`,
+      "wait \"$child\"",
+      "printf '%s\\n' 'convoy 0.2.0 (commit test, darwin-arm64)'",
+      "",
+    ].join("\n")
+    const bytes = encoder.encode(candidate)
+    await writeFile(executablePath, "old binary", { mode: 0o755 })
+    await chmod(executablePath, 0o755)
+
+    const update = runUpdate({
+      standalone: true,
+      currentVersion: "0.1.0",
+      platform: "darwin",
+      architecture: "arm64",
+      executablePath,
+      fetch: fetchFor(releaseFor(bytes), bytes),
+    })
+    const outcome = await settleWithin(update)
+    if (outcome.status === "pending") {
+      await terminateRecordedProcesses(pidPath)
+      await update.catch(() => undefined)
+    }
+    await rm(pidPath, { force: true })
+
+    expect(outcome.status).toBe("resolved")
+    expect(await readFile(executablePath, "utf8")).toBe(candidate)
+    expect((await readdir(directory)).sort()).toEqual(["convoy"])
+  })
+
+  test("rejects a hung candidate and reaps it after the validation deadline", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "convoy-update-hung-candidate-"))
+    tempDirs.push(directory)
+    const executablePath = join(directory, "convoy")
+    const pidPath = join(directory, "candidate.pid")
+    const bytes = encoder.encode([
+      "#!/bin/sh",
+      `printf '%s\\n' "$$" > ${JSON.stringify(pidPath)}`,
+      "exec sleep 60",
+      "",
+    ].join("\n"))
+    await writeFile(executablePath, "old binary", { mode: 0o755 })
+    await chmod(executablePath, 0o755)
+
+    // Let the shell write its PID before the simulated deadline fires so the
+    // test can verify that the updater reaped the actual child process.
+    const restoreTimeouts = useImmediateTimeouts(500)
+    const update = runUpdate({
+      standalone: true,
+      currentVersion: "0.1.0",
+      platform: "darwin",
+      architecture: "arm64",
+      executablePath,
+      fetch: fetchFor(releaseFor(bytes), bytes),
+    })
+    let outcome: Settled<Awaited<ReturnType<typeof runUpdate>>>
+    try {
+      outcome = await settleWithin(update)
+    } finally {
+      restoreTimeouts()
+    }
+    const pids = await terminateRecordedProcesses(pidPath)
+    if (outcome!.status === "pending") await update.catch(() => undefined)
+    await rm(pidPath, { force: true })
+
+    expect(outcome!.status).toBe("rejected")
+    if (outcome!.status === "rejected") expect(outcome!.error).toBeInstanceOf(UpdateError)
+    expect(pids).toHaveLength(1)
+    expect(processIsAlive(pids[0]!)).toBe(false)
+    expect((await readdir(directory)).sort()).toEqual(["convoy"])
+  })
+
   test("does not replace the executable when the candidate fails version validation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "convoy-update-badcandidate-"))
     tempDirs.push(directory)
@@ -286,7 +536,7 @@ describe("safe updater", () => {
     ).rejects.toThrow("did not report the expected version")
     expect(await readFile(executablePath, "utf8")).toBe("old binary")
     // No candidate or backup leftovers remain in the install directory.
-    expect(await readdir(directory)).toEqual(["convoy"])
+    expect((await readdir(directory)).sort()).toEqual(["convoy"])
   })
 
   test("replaceExecutableAtomically restores the previous binary when the final rename fails", async () => {
@@ -322,7 +572,7 @@ describe("safe updater", () => {
     expect(await readFile(executablePath, "utf8")).toBe("original")
     // The temporary backup is cleaned up; the candidate is left for the caller
     // (runUpdate owns candidate cleanup via removeIfPresent).
-    expect(await readdir(directory)).toEqual([".convoy.candidate-restore", "convoy"])
+    expect((await readdir(directory)).sort()).toEqual([".convoy.candidate-restore", "convoy"])
   })
 
   test("installs a verified candidate through a same-directory atomic rename", async () => {
@@ -351,7 +601,7 @@ describe("safe updater", () => {
 
     expect(result).toMatchObject({ status: "updated", latestVersion: "0.2.0" })
     expect(await readFile(executablePath, "utf8")).toBe("new binary")
-    expect(await readdir(directory)).toEqual(["convoy"])
+    expect((await readdir(directory)).sort()).toEqual(["convoy"])
   })
 
   test("leaves the current executable intact after network, hash, or replacement failures", async () => {
