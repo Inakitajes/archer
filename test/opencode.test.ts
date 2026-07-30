@@ -16,7 +16,7 @@ describe("session terminal command", () => {
       expect(command).toContain(" && cd ")
       expect(command).toContain(" && touch ")
 
-      const child = Bun.spawn(["zsh", "-c", command], { stdout: "ignore", stderr: "ignore" })
+      const child = Bun.spawn(["sh", "-c", command], { stdout: "ignore", stderr: "ignore" })
       expect(await child.exited).not.toBe(0)
       expect(await Bun.file(marker).exists()).toBe(false)
     } finally {

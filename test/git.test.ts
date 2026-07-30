@@ -315,6 +315,8 @@ describe("unsigned commits", () => {
     const dir = await mkdtemp(join(tmpdir(), "convoy-unsigned-"))
     dirs.push(dir)
     await git(["init", "-q", "-b", "main"], dir)
+    await git(["config", "user.name", "convoy-test"], dir)
+    await git(["config", "user.email", "convoy-test@example.invalid"], dir)
     await git(["config", "commit.gpgsign", "true"], dir)
     await git(["config", "gpg.format", "ssh"], dir)
     await git(["config", "user.signingkey", join(dir, "nonexistent.pub")], dir)
