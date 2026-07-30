@@ -12,6 +12,7 @@ import { stepRunnerFor } from "./step-runners"
 import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { runReviewLines } from "./review-tui"
 import { joinLines, limitsRow, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { shortVersion } from "./version"
 
 import type { ConvoyConfig } from "./config"
 import type { BoxOptions, CliRenderer, KeyEvent, PasteEvent, TextChunk } from "@opentui/core"
@@ -451,7 +452,16 @@ class LaunchPicker {
       paddingX: 1,
     })
 
-    const header = this.panel({ id: "convoy-launch-header", height: 4, borderColor: theme.border, backgroundColor: theme.bg })
+    // The version rides the border instead of a content row: it never changes
+    // while the launcher is open, so it costs nothing to draw it once as chrome.
+    const header = this.panel({
+      id: "convoy-launch-header",
+      height: 4,
+      borderColor: theme.border,
+      backgroundColor: theme.bg,
+      title: ` convoy ${shortVersion()} `,
+      titleAlignment: "left",
+    })
     const body = new BoxRenderable(renderer, { id: "convoy-launch-body", width: "100%", flexGrow: 1, flexDirection: "row", gap: 1 })
 
     const selectFromList = (event: { y: number; preventDefault(): void; stopPropagation(): void }) => {
@@ -1155,6 +1165,8 @@ class LaunchPicker {
 
   // No "◆ convoy" branding here: the launcher is convoy's own front door, so
   // the target project is the header's anchor and the meter row stays clean.
+  // The version still shows, but as the header box's border title so neither
+  // content row has to give up space for it.
   private headerContent(width: number) {
     const project = basename(this.targetDir) || this.targetDir
     const title: TextChunk[] = [fg(theme.faint)("target "), bold(fg(theme.text)(truncate(project, Math.max(12, width - 32))))]

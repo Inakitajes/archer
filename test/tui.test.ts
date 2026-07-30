@@ -3,7 +3,8 @@ import { createTestRenderer } from "@opentui/core/testing"
 import type { Selection } from "@opentui/core"
 
 import { TuiProgress, autoFollowGroup, comparisonColumnCount, initialContentTab, iteratePrompt, phaseCapabilityBadges, phaseCapabilityLabel, pickBadge, pipelineSelectionTargets, type ContentTab } from "../src/tui"
-import { formatMoney, limitsRow } from "../src/tui-theme"
+import { displayWidth, formatMoney, limitsRow } from "../src/tui-theme"
+import { shortVersion } from "../src/version"
 
 import type { ClipboardResult } from "../src/clipboard"
 import type { LimitsSnapshot } from "../src/limits"
@@ -97,6 +98,22 @@ describe("run dashboard defaults", () => {
     expect(live).toBe("session")
     expect(historical).toBe("reports")
     expect([live, historical]).not.toContain("logs")
+  })
+
+  test("brands the header with the running version and keeps it inside a narrow panel", async () => {
+    const wide = await createDashboard(120, 40)
+    await wide.renderOnce()
+
+    expect((wide.dashboard as unknown as DashboardInternals).headerText.plainText).toContain(`◆ convoy ${shortVersion()}`)
+
+    // The version lengthens the left side of padBetween, which clips the right;
+    // no header line may outgrow the panel and get chopped by its border.
+    const narrow = await createDashboard(60, 40)
+    await narrow.renderOnce()
+    const lines = (narrow.dashboard as unknown as DashboardInternals).headerText.plainText.split("\n")
+
+    expect(lines[0]).toContain(shortVersion())
+    for (const line of lines) expect(displayWidth(line)).toBeLessThanOrEqual(54)
   })
 
   test("labels audit-only phases without tagging writable work", () => {
