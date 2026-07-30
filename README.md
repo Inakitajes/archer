@@ -104,9 +104,43 @@ To use different providers, authenticate them in OpenCode and select models as `
 
 ## Installation
 
-### Release binary (recommended)
+### Install script (recommended)
 
-GitHub Releases are the distribution source and preserve every published version. Download the binary for your platform into `~/.local/bin`, then make it executable:
+```bash
+curl -fsSL https://github.com/Inakitajes/convoy/releases/latest/download/install.sh | sh
+```
+
+The script detects your platform, downloads the matching release binary, **verifies it against the release's `SHA256SUMS`**, installs it into `~/.local/bin`, and creates `~/.convoy/config.yaml` plus `~/.convoy/agents/*.md` if they do not already exist. Nothing is installed unless the checksum matches and the downloaded binary reports its own version, and the final move is atomic, so a failed install never leaves a partial binary behind.
+
+Options are accepted as environment variables, or as flags after `sh -s --`:
+
+| Variable | Flag | Default |
+| --- | --- | --- |
+| `CONVOY_VERSION` | `--version <tag>` | `latest` |
+| `CONVOY_INSTALL_DIR` | `--dir <path>` | `$HOME/.local/bin` |
+| `CONVOY_NO_INIT` | `--no-init` | unset |
+
+```bash
+# Pin an exact release
+curl -fsSL https://github.com/Inakitajes/convoy/releases/download/v0.1.0/install.sh | sh
+
+# Install somewhere else
+curl -fsSL https://github.com/Inakitajes/convoy/releases/latest/download/install.sh | CONVOY_INSTALL_DIR="$HOME/bin" sh
+
+# Skip creating the default configuration
+curl -fsSL https://github.com/Inakitajes/convoy/releases/latest/download/install.sh | sh -s -- --no-init
+```
+
+The script is [`install.sh`](install.sh) in this repository, published as an asset of every release and listed in that release's `SHA256SUMS`, so the URL above always resolves to the script tested against those exact binaries. To read it before running it, drop the pipe:
+
+```bash
+curl -fsSL https://github.com/Inakitajes/convoy/releases/latest/download/install.sh -o install.sh
+less install.sh && sh install.sh
+```
+
+### Manual download
+
+GitHub Releases are the distribution source and preserve every published version. To skip the script, download the binary for your platform into `~/.local/bin`, then make it executable:
 
 ```bash
 mkdir -p ~/.local/bin
@@ -127,7 +161,7 @@ chmod 755 ~/.local/bin/convoy
 convoy --version
 ```
 
-Make sure `~/.local/bin` is on your `PATH`. To install an exact version, replace `/releases/latest/download/` with `/releases/download/v0.1.0/` (or another tag). The [Releases page](https://github.com/Inakitajes/convoy/releases) lists all available versions and their `SHA256SUMS` files.
+This path verifies nothing on its own; every release publishes a `SHA256SUMS` if you want to check the download yourself. Make sure `~/.local/bin` is on your `PATH`. To install an exact version, replace `/releases/latest/download/` with `/releases/download/v0.1.0/` (or another tag). The [Releases page](https://github.com/Inakitajes/convoy/releases) lists all available versions.
 
 ### Development install
 
