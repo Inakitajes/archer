@@ -60,10 +60,18 @@ jobs:
       - name: Smoke-test Linux binary
         run: ./dist/convoy-linux-x64 --version
 
+      - name: Stage the installer
+        # install.sh is published per release so `curl … | sh` resolves to the
+        # script that was tested against these exact binaries, and so a pinned
+        # `/releases/download/<tag>/install.sh` stays reproducible.
+        run: |
+          sh -n install.sh
+          cp install.sh dist/install.sh
+
       - name: Generate checksums
         run: |
           cd dist
-          shasum -a 256 convoy-darwin-arm64 convoy-darwin-x64 convoy-linux-arm64 convoy-linux-x64 > SHA256SUMS
+          shasum -a 256 convoy-darwin-arm64 convoy-darwin-x64 convoy-linux-arm64 convoy-linux-x64 install.sh > SHA256SUMS
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -75,4 +83,5 @@ jobs:
             dist/convoy-darwin-x64
             dist/convoy-linux-arm64
             dist/convoy-linux-x64
+            dist/install.sh
             dist/SHA256SUMS
