@@ -46,6 +46,7 @@ import {
   theme,
   truncate,
 } from "./tui-theme"
+import { shortVersion } from "./version"
 import { convoyRoot, globalConfigPath } from "./workspace"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
@@ -1420,7 +1421,7 @@ export class ConfigEditor {
       const label = `${tab.title}${tab.dirty ? " ●" : ""}`
       tabs.push(index === this.active ? bold(fg(theme.accent)(`▸ ${label}`)) : fg(theme.dim)(`  ${label}`))
     })
-    const title: TextChunk[] = [bold(fg(theme.accent)("◆ convoy")), fg(theme.faint)("  ·  "), fg(theme.text)("config")]
+    const title: TextChunk[] = [bold(fg(theme.accent)("◆ convoy")), fg(theme.faint)(` ${shortVersion()}`), fg(theme.faint)("  ·  "), fg(theme.text)("config")]
     const line1 = padBetween(title, tabs, width)
     const line2 = new StyledText([fg(theme.dim)(truncate(shortenPath(this.tab().path), width))])
     return joinLines([line1, line2])

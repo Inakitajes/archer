@@ -585,7 +585,7 @@ convoy/
 │   ├── config.ts        # config loader/validation, global+project merge, YAML writer
 │   ├── config-tui.ts    # interactive config editor (convoy config)
 │   ├── model-catalog.ts # available-model list via OpenCode SDK, models.dev fallback
-│   ├── version.ts       # injected version/commit/platform + --version formatting
+│   ├── version.ts       # injected version/commit/platform + --version and TUI header formatting
 │   ├── update.ts        # GitHub Releases update check + verified atomic self-install
 │   └── pipeline.ts      # built-in agents/pipeline and pipeline-spec resolution
 ├── scripts/             # build.ts: local + multi-target release binary compilation

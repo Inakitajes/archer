@@ -20,6 +20,7 @@ import {
   theme,
   truncate,
 } from "./tui-theme"
+import { shortVersion } from "./version"
 import { runsRoot } from "./workspace"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
@@ -487,6 +488,7 @@ class RunsBrowser {
 
     const title: TextChunk[] = [
       bold(fg(theme.accent)("◆ convoy")),
+      fg(theme.faint)(` ${shortVersion()}`),
       fg(theme.faint)("  ·  "),
       fg(theme.text)("run history"),
     ]

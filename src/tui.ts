@@ -50,6 +50,7 @@ import {
   truncate,
   wrapLines,
 } from "./tui-theme"
+import { shortVersion } from "./version"
 
 import type { BoxOptions, CliRenderer, KeyEvent, Selection, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
@@ -2419,7 +2420,7 @@ export class TuiProgress implements ProgressUI {
       fg(theme.faint)("  ·  "),
       fg(theme.dim)(`↑${formatCount(usage.tokens.input + advisorInput)} ↓${formatCount(usage.tokens.output + advisorOutput)} tokens`),
     ]
-    const title: TextChunk[] = [bold(fg(theme.accent)("◆ convoy"))]
+    const title: TextChunk[] = [bold(fg(theme.accent)("◆ convoy")), fg(theme.faint)(` ${shortVersion()}`)]
     if (!this.finished && this.controlState !== "running") {
       title.push(
         fg(theme.faint)("  ·  "),
