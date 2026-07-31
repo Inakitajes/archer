@@ -19,16 +19,11 @@ Read `prd.md`, the attached diff when present, repository guidance, relevant sou
 5. reliability and data integrity
 6. supply chain, configuration, and platform
 
-Each specialty is expected from GPT-5.6 Terra xhigh plus one designated API model, for 12 independent source reports:
+Each specialty is audited by more than one independent model, so the phase produces several source reports per specialty.
 
-- correctness: Terra + Claude Opus 5
-- memory: Terra + Grok 4.5
-- performance: Terra + Grok 4.5
-- security: Terra + Kimi K3
-- reliability: Terra + GLM 5.2
-- supply chain: Terra + GLM 5.2
+Do not assume a fixed model roster: the models are configured per run and change between runs. Derive the roster from the attached reports themselves — convoy names each fanned-out report `reports/<specialty>__<provider>-<model>.md`, so the executing model is recoverable from the filename. From the attachments alone, establish which model produced each report, the total number of source pairs, and how many distinct model families are represented; use those derived totals everywhere this prompt refers to them.
 
-Infer the source pair from each report filename and content. Never attribute a finding to a source that did not raise it. The unequal model allocation is intentional; do not compare raw model totals without acknowledging how many specialties each model was assigned.
+Infer the source pair from each report filename and content. Never attribute a finding to a source that did not raise it. The model allocation is deliberate and may be unequal — one model can cover several specialties while another covers one. Do not compare raw model totals without acknowledging how many specialties each model was assigned.
 
 ## Objectives
 
@@ -45,7 +40,7 @@ Infer the source pair from each report filename and content. Never attribute a f
 - Keep separate findings when they require independently fixable changes or affect distinct trust/lifecycle boundaries.
 - Credit a source at most once per unique finding, even if its report repeats the issue.
 - **Raw candidates**: all candidate finding blocks emitted by source reports, including rejected and duplicate candidates.
-- **Accepted observations**: source-to-finding credits after validation but before cross-source deduplication. This equals the sum of accepted counts over all 12 source pairs.
+- **Accepted observations**: source-to-finding credits after validation but before cross-source deduplication. This equals the sum of accepted counts over every source pair received.
 - **Unique confirmed findings**: deduplicated accepted root causes.
 - **Shared findings**: unique findings credited to at least two independent source pairs.
 - **Exclusive findings**: unique findings credited to exactly one source pair.
@@ -78,8 +73,9 @@ One decisive paragraph: `bloquear`, `corregir antes de publicar`, `correcciones 
 
 ### 2. Cobertura recibida
 
-- Number of received and expected reports.
-- A 6 × 2 coverage table with the expected Terra and designated-variant columns, using `received`, `missing`, or `malformed`.
+- Number of received reports, and the model roster you derived from them.
+- A coverage table with one row per specialty and one column per model position, using `received`, `missing`, or `malformed`. Name the model in each column or cell heading.
+- Because the roster is derived rather than given, asymmetry is your signal for a missing source: when one specialty yields fewer reports than its siblings, mark the gap `missing` and say so explicitly.
 - Material limitations affecting confidence.
 
 ### 3. Hallazgos confirmados
@@ -93,7 +89,7 @@ Order by severity and confidence. Assign stable IDs `H-001`, `H-002`, ... For ea
 - impact
 - minimal recommended remediation
 - every credited source as `specialty × model`
-- support as `N/12 source pairs` and `M/5 represented model families`
+- support as `N/T source pairs`, where `T` is the total number of source pairs received, and `M/F represented model families`, where `F` is the number of distinct models in the derived roster
 - classification: `paired-specialty consensus`, `shared`, or `exclusive`
 
 If none survive, say so plainly.
@@ -108,7 +104,7 @@ Do not omit this section when a table is empty; write `none`.
 
 ### 5. Estadísticas por agente
 
-Provide a 6 × 2 matrix with one Terra column and one designated-variant column. Label each variant model in its cell heading. Each cell must be `raw / accepted / exclusive`, where:
+Provide a matrix with one row per specialty and one column per model position in the derived roster. Label each model in its column or cell heading. Each cell must be `raw / accepted / exclusive`, where:
 
 - `raw` is the number of candidates emitted by that source pair
 - `accepted` is the number of unique confirmed findings credited to it
