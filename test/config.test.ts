@@ -345,7 +345,7 @@ describe("agent registry", () => {
     const design = registry.find((agent) => agent.name === "design-polisher")
     expect(design).toMatchObject({ model: "openai/gpt-5.5#xhigh", temperature: 0.5, readOnly: true, builtIn: true })
     // The built-in preference survives underneath the override.
-    expect(design?.defaultModel).toBe("anthropic/claude-opus-5")
+    expect(design?.defaultModel).toBe("openrouter/moonshotai/kimi-k3")
 
     const custom = registry.find((agent) => agent.name === "api-reviewer")
     expect(custom).toMatchObject({ description: "Reviews APIs", readOnly: true, builtIn: false })
@@ -371,6 +371,10 @@ describe("agent registry", () => {
       "implementation-final-review",
       "implementation-fixer",
       "implementation-validator",
+      "fixer-test-author",
+      "fixer-implementer",
+      "fixer-validator",
+      "fixer-reporter",
       "hunter-correctness",
       "hunter-memory",
       "hunter-performance",
@@ -392,7 +396,7 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ultra-implement, ultra-refine)',
+      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ultra-implement, ultra-refine)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
   })

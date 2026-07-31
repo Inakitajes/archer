@@ -22,7 +22,7 @@ Typical uses:
 
 Use it as a **CLI** or as a **TUI**, interchangeably: every run can be launched with plain flags and prompt files (`--no-tui` gives you plain logs for pipes and CI), or driven entirely from the TUI — `convoy` with no arguments opens the interactive launcher, every run gets a live dashboard, `convoy runs` browses past runs, and `convoy config` edits global and project config in place.
 
-**Pipelines are data, not code.** Convoy ships a family of built-in pipelines (`implement` — the default — plus `implement-lite`, `implement-advised`, `ultra-implement`, `refine`, `ultra-refine`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
+**Pipelines are data, not code.** Convoy ships a family of built-in pipelines (`implement` — the default — plus `implement-lite`, `implement-advised`, `ultra-implement`, `refine`, `ultra-refine`, `fixer`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
 
 Beyond sequencing agents, Convoy owns the operational layer around OpenCode: repo context attachment, runtime guard rails, a live permission gate, commit safety, phase reports, diff tracking, and a TUI that shows cost, tokens, and provider limits while the run is live.
 
@@ -44,7 +44,7 @@ PRD ──► implementer ──► patterns ──► security ──► design
 | `implementer` | `implementer` | `openai/gpt-5.6-sol` | Implements the feature respecting repo patterns |
 | `patterns` | `pattern-auditor` | `openai/gpt-5.6-terra#xhigh` | Refactors without changing behavior, aligns with the rest of the code |
 | `security` | `security-auditor` | `openai/gpt-5.6-terra#xhigh` | Audits and fixes security issues |
-| `design` | `design-polisher` | `openrouter/z-ai/glm-5.2` | Polishes UI following the repo's design system |
+| `design` | `design-polisher` | `openrouter/moonshotai/kimi-k3` | Polishes UI following the repo's design system, and strips generic "AI slop" styling |
 | `tests` | `test-engineer` | `openai/gpt-5.6-terra#xhigh` | Automated tests + relevant E2E/integration coverage |
 | `adversarial` | `adversarial-reviewer` | `openrouter/moonshotai/kimi-k3` | Final adversarial review before PR creation |
 
@@ -55,18 +55,19 @@ Convoy ships these pipelines; select one with `-p/--pipeline` (no config needed)
 | Pipeline | Changes code? | What it does |
 |---|---|---|
 | `implement` | yes | **The default** (runs with no `-p`). Implement a PRD, then audit, polish, test, and adversarial review (the table above). |
-| `implement-lite` | yes | Same workflow and agents as `implement`, but the code-writing phases (`implementer`, `patterns`, `security`, `tests`) all drop to `openrouter/z-ai/glm-5.2` for a lower-cost run, and `design`/`adversarial` run on Opus. |
-| `implement-advised` | yes | Same workflow and step names as `implement`, but the `implementer` phase runs on GPT 5.6 Terra xhigh and **consults GPT 5.6 Sol as an advisor** at its decision points. The audits (`patterns`, `security`, `design`, `tests`) run unadvised on `openrouter/z-ai/glm-5.2` and `adversarial` keeps Opus owning its own loop. Directly comparable with `implement-lite`: same audit executors, and the implementation step is the single variable between them. |
+| `implement-lite` | yes | Same workflow and agents as `implement`, but the code-writing phases (`implementer`, `patterns`, `security`, `tests`) all drop to `openrouter/z-ai/glm-5.2` for a lower-cost run; `design` runs on Kimi K3 and `adversarial` on Opus. |
+| `implement-advised` | yes | Same workflow and step names as `implement`, but the `implementer` phase runs on GPT 5.6 Terra xhigh and **consults GPT 5.6 Sol as an advisor** at its decision points. The audits (`patterns`, `security`, `tests`) run unadvised on `openrouter/z-ai/glm-5.2`, `design` on Kimi K3, and `adversarial` keeps Opus owning its own loop. Directly comparable with `implement-lite`: same audit executors, and the implementation step is the single variable between them. |
 | `ultra-implement` | yes | Like `implement`, but the pattern/security/adversarial reviews of the initial diff run in parallel across two models feeding a triage step, and the run ends with an audit-only final review, a fixer that applies only blocking findings, and a final validator. |
 | `refine` | yes | Audit the current diff (scope → bugs → clean-code → security), triage the findings adversarially, apply the accepted fixes, then validate them. |
 | `ultra-refine` | yes | Like `refine`, but every read-only audit is fanned out across two models before triage, fixes, and validation. |
 | `review` | **no — report only** | Scope the diff, run the bug / clean-code(+patterns) / security audits **in parallel across two models each**, then a single step synthesizes everything into one prioritized findings report. Makes no changes; the run's output is `reports/report.md`, which you read to decide whether to follow up with a `refine` run. |
-| `review-lite` | **no — report only** | Same as `review`, but scope and the first audit model swap from Opus / GPT 5.6 Terra xhigh to `openrouter/z-ai/glm-5.2`; the second parallel audit model and the final report stay on Opus 5. |
+| `review-lite` | **no — report only** | Same shape as `review`, but nothing runs on Opus: `openrouter/z-ai/glm-5.2` scopes the diff and writes the final report, and each parallel audit fans out across `openrouter/z-ai/glm-5.2` + `openrouter/moonshotai/kimi-k3`. The cheap way to get a full review report. |
+| `fixer` | yes | The follow-up to a report-only run. Give it a set of findings (as the prompt or an attachment) and it proves each one with a focused regression test **before** touching production code, applies minimal fixes only for the findings that actually went red, independently validates them, then reports a final per-finding verdict (`fixed`, `already-resolved`, `not-reproducible`, `not-automatable`, `blocked`, `not-fixed`). Never promotes an unproven finding to fixed. |
 | `review-cc` | **no — report only** | Same shape as `review`, but each audit is paired with a second run on the locally installed [`claude` CLI](https://code.claude.com) (`runner: claude-code`) instead of a second API model — cross-vendor diversity billed to a Claude subscription rather than per token. Requires `claude` on `PATH`. |
 | `hunter` | **no — report only** | Repo-wide audit across six specialty tracks (correctness, memory, performance, security, reliability, supply chain), each run on GPT 5.6 Terra xhigh plus one specialty model, then reconciled into a single deduplicated, prioritized consensus report. |
 | `hunter-max` | **no — report only** | Like `hunter`, but every track fans out across all five models (30 concurrent audits). Highest recall, slowest and most expensive — reach for it on code you can't afford to get wrong. |
 
-`refine`/`ultra-refine` are the change-applying counterparts of `review`: run `review` first to get a report, then `refine` if you want the fixes applied.
+`refine`/`ultra-refine` are the change-applying counterparts of `review`: run `review` first to get a report, then `refine` if you want the fixes applied. `fixer` is the stricter alternative to `refine` when you already have a specific list of findings and want each one individually proven, fixed, and accounted for rather than triaged in bulk.
 
 `review*` pipelines default to the current branch/PR diff; `hunter*` default to the whole repository unless the prompt scopes them to a branch, PR, or area.
 
@@ -363,7 +364,7 @@ defaults:
   commitMessageModel: anthropic/claude-haiku-4-5     # writes the conventional commit `convoy finish` squashes a run into; you edit it before it lands
   worktree: true                   # run each job on a new branch in its own worktree (default); false runs in the current tree
   advisor: anthropic/claude-opus-5   # optional; a stronger model consulted at every step's decision points
-  advisorMaxCalls: 3                 # optional; consultations allowed per phase attempt (default 3)
+  advisorMaxCalls: 1000              # optional; consultations allowed per phase attempt (default 1000 — effectively unlimited; set it lower to cap advisor spend)
   advisorAuditPolicy: summary        # summary (hash-only default), redacted, or full transcript/advice content
 
 # Project agents: the prompt lives at .convoy/agents/<name>.md (required).

@@ -251,7 +251,7 @@ defaults:
   # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
   # worktree: true # optional: run each job on a fresh branch in its own worktree (default); false runs in the current tree
   # advisor: anthropic/claude-opus-5 # optional: reviewing model consulted at phase decision points
-  # advisorMaxCalls: 3 # optional: consultation budget per phase attempt
+  # advisorMaxCalls: 1000 # optional: consultation budget per phase attempt; the default is effectively unlimited, set this to put a real cap on it
   # advisorAuditPolicy: summary # summary (hashes), redacted (lengths), or full content retention
 
 # Agents are matched by name with Markdown prompts next to this config:

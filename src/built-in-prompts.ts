@@ -4,6 +4,10 @@ import advisorTiming from "../prompts/advisor-timing.md" with { type: "text" }
 import bugAuditor from "../prompts/bug-auditor.md" with { type: "text" }
 import cleanCodeAuditor from "../prompts/clean-code-auditor.md" with { type: "text" }
 import designPolisher from "../prompts/design-polisher.md" with { type: "text" }
+import fixerImplementer from "../prompts/fixer-implementer.md" with { type: "text" }
+import fixerReporter from "../prompts/fixer-reporter.md" with { type: "text" }
+import fixerTestAuthor from "../prompts/fixer-test-author.md" with { type: "text" }
+import fixerValidator from "../prompts/fixer-validator.md" with { type: "text" }
 import hunterCorrectness from "../prompts/hunter-correctness.md" with { type: "text" }
 import hunterMaxReport from "../prompts/hunter-max-report.md" with { type: "text" }
 import hunterMemory from "../prompts/hunter-memory.md" with { type: "text" }
@@ -41,6 +45,10 @@ export const builtInPrompts: Record<string, string> = {
   "bug-auditor": bugAuditor,
   "clean-code-auditor": cleanCodeAuditor,
   "design-polisher": designPolisher,
+  "fixer-implementer": fixerImplementer,
+  "fixer-reporter": fixerReporter,
+  "fixer-test-author": fixerTestAuthor,
+  "fixer-validator": fixerValidator,
   "hunter-correctness": hunterCorrectness,
   "hunter-max-report": hunterMaxReport,
   "hunter-memory": hunterMemory,
