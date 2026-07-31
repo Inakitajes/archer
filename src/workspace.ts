@@ -2,6 +2,9 @@ import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { isAbsolute, join, relative, resolve } from "node:path"
 
+import type { DiffTotals } from "./git"
+import type { PhaseMetadataStatus } from "./metadata"
+
 export type Workspace = {
   dir: string
   runID: string
@@ -37,8 +40,54 @@ export async function cleanupWorkspace(workspace: Workspace) {
   await rm(workspace.dir, { recursive: true, force: true })
 }
 
-export async function writeSummary(workspace: Workspace, phaseNames: string[], extraSections: readonly string[] = []) {
+export type ScoreboardRow = {
+  name: string
+  status: PhaseMetadataStatus | undefined
+  diff: DiffTotals | undefined
+}
+
+/**
+ * Renders the per-phase diffstat scoreboard as a Markdown table.
+ *
+ * Returns `undefined` when every phase has no diff data (all-read-only or
+ * no-commit run), so the caller can omit the section entirely.
+ */
+export function renderScoreboard(rows: ScoreboardRow[]): string | undefined {
+  const withData = rows.filter((row) => row.diff !== undefined)
+  if (withData.length === 0) return undefined
+
+  const totalFiles = withData.reduce((sum, row) => sum + row.diff!.files, 0)
+  const totalInsertions = withData.reduce((sum, row) => sum + row.diff!.insertions, 0)
+  const totalDeletions = withData.reduce((sum, row) => sum + row.diff!.deletions, 0)
+  const totalDelta = totalInsertions - totalDeletions
+
+  const lines: string[] = [
+    "## Scoreboard",
+    "",
+    "| Phase | Files | + | − | Δ net |",
+    "|---|---|---|---|---|",
+  ]
+
+  for (const row of rows) {
+    if (row.diff) {
+      const delta = row.diff.insertions - row.diff.deletions
+      const deltaStr = delta >= 0 ? `+${delta}` : `${delta}`
+      lines.push(`| ${row.name} | ${row.diff.files} | +${row.diff.insertions} | −${row.diff.deletions} | ${deltaStr} |`)
+    } else {
+      lines.push(`| ${row.name} | — | — | — | — |`)
+    }
+  }
+
+  const totalDeltaStr = totalDelta >= 0 ? `+${totalDelta}` : `${totalDelta}`
+  lines.push(`| **Total** | **${totalFiles}** | **+${totalInsertions}** | **−${totalDeletions}** | **${totalDeltaStr}** |`)
+
+  return lines.join("\n")
+}
+
+export async function writeSummary(workspace: Workspace, phaseNames: string[], extraSections: readonly string[] = [], scoreboard?: string) {
   const chunks: string[] = [`# convoy run ${workspace.runID} - summary`, ""]
+
+  if (scoreboard) chunks.push(scoreboard, "")
 
   for (const section of extraSections) chunks.push(section, "")
 

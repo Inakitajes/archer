@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { log } from "./log"
 import { isSafeStepName } from "./pipeline"
 
-import type { RepoSnapshot } from "./git"
+import type { DiffTotals, RepoSnapshot } from "./git"
 import type {
   ProgressPhaseSnapshot,
   ProgressStepUsage,
@@ -35,6 +35,7 @@ export type PhaseMetadata = {
   repositoryBaseline?: RepoSnapshot
   advisor?: AdvisorPhaseAggregate
   advisorEvents?: AdvisorEvent[]
+  diff?: DiffTotals
 }
 
 export type RunMetadata = {
@@ -68,6 +69,8 @@ export type RunMetadataStore = {
   repositoryBaseline(name: string): RepoSnapshot | undefined
   phaseRepositoryBaseline(name: string, baseline: RepoSnapshot): Promise<void>
   phaseEnded(name: string, status: "completed" | "skipped" | "failed"): void
+  recordPhaseDiff(name: string, diff: DiffTotals): void
+  phaseDiff(name: string): DiffTotals | undefined
   controlState(): RunControlState
   setControlState(state: RunControlState): Promise<void>
   flush(): Promise<void>
@@ -253,6 +256,13 @@ export async function openRunMetadata(
       entry.endedAt = Date.now()
       if (entry.startedAt !== undefined) entry.durationMs = entry.endedAt - entry.startedAt
       void persist()
+    },
+    recordPhaseDiff(name, diff) {
+      phase(name).diff = diff
+      scheduleSave()
+    },
+    phaseDiff(name) {
+      return data.phases[name]?.diff
     },
     controlState() {
       return data.control.state

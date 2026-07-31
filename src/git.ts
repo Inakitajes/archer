@@ -414,6 +414,42 @@ export async function diffStat(base: string, head: string, cwd: string): Promise
   return result.exitCode === 0 ? result.stdout : ""
 }
 
+export type DiffTotals = {
+  files: number
+  insertions: number
+  deletions: number
+}
+
+/**
+ * Returns per-file insertion/deletion counts for the range `base..head` by
+ * parsing `git diff --numstat`. Returns `undefined` when the range is empty or
+ * git cannot resolve it (e.g. a read-only phase that made no commit).
+ *
+ * Uses `--numstat` instead of `--stat` because its machine-readable
+ * `<added>\t<deleted>\t<path>` output is locale-independent and trivially
+ * summable, whereas the human-readable `--stat` summary line varies across git
+ * versions and locales.
+ */
+export async function diffTotals(base: string, head: string, cwd: string): Promise<DiffTotals | undefined> {
+  const result = await execFile("git", ["diff", "--numstat", `${base}..${head}`], { cwd, allowFailure: true })
+  if (result.exitCode !== 0 || result.stdout.trim() === "") return undefined
+
+  let files = 0
+  let insertions = 0
+  let deletions = 0
+
+  for (const line of result.stdout.split("\n")) {
+    if (!line.trim()) continue
+    const [added, deleted] = line.split("\t")
+    files++
+    // Binary files are represented as "-\t-\t<path>"; count as 1 file, 0 lines.
+    if (added !== "-") insertions += parseInt(added ?? "0", 10)
+    if (deleted !== "-") deletions += parseInt(deleted ?? "0", 10)
+  }
+
+  return files === 0 ? undefined : { files, insertions, deletions }
+}
+
 /** Points `<ref>` at `<sha>`. Used to stash a pre-rewrite HEAD under refs/convoy/. */
 export async function updateRef(ref: string, sha: string, cwd: string) {
   await execFile("git", ["update-ref", ref, sha], { cwd })

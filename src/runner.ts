@@ -15,7 +15,7 @@ import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
 import { ensureClaudeAvailable, promptClaudePhase } from "./claude-code"
-import { addAllAndCommit, createCleanRepoSnapshot, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
+import { addAllAndCommit, createCleanRepoSnapshot, describeRepoSnapshotDifference, diffTotals, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, resolveCommit, restoreRepoSnapshot, type DiffTotals, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
 import { getSessionEventHub, payloadProperties } from "./event-hub"
 import { runHumanReviewGate } from "./human"
@@ -44,7 +44,7 @@ import { discoverProjectContextFiles } from "./project-context"
 import { createStepRunnerImpl, stepRunnerFor, stepRunnerModel, type StepRunnerId, type StepRunnerImpl } from "./step-runners"
 import type { AgentSpec, AgentStep, HookSet, HookSpec, Pipeline, RunOptions, Step } from "./types"
 import { addTokens, emptyTokens, tokensFromValue } from "./usage"
-import { cleanupWorkspace, createWorkspace, opencodeConfigDir, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
+import { cleanupWorkspace, createWorkspace, opencodeConfigDir, renderScoreboard, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
 
 export type ActiveSession = {
   client: OpencodeClient
@@ -619,10 +619,17 @@ export async function run(options: RunOptions) {
 
     progress.message("writing run summary")
     const advisorSection = advisorNeeds.agents.size > 0 ? renderAdvisorSplit(await readAdvisorSplit(workspace.dir)) : undefined
+    const scoreboardRows = pipeline.steps.map((step) => ({
+      name: step.name,
+      status: runMetadata.phaseStatus(step.name),
+      diff: runMetadata.phaseDiff(step.name),
+    }))
+    const scoreboard = renderScoreboard(scoreboardRows)
     await writeSummary(
       workspace,
       pipeline.steps.map((step) => step.name),
       advisorSection ? [advisorSection] : [],
+      scoreboard,
     )
     postHooksStarted = true
     await runHooks("post", hookSet.post, {
@@ -893,7 +900,8 @@ async function runPhase(
       const assistantText = await runPhaseWithRetries(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors)
       return persistPhaseReport(workspace, phase, assistantText)
     })
-    await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline))
+    const phaseDiff = await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline))
+    if (phaseDiff) metadata.recordPhaseDiff(phase.name, phaseDiff)
     progress.phaseCompleted(phase.name, "report saved and commit checked")
   } catch (error) {
     progress.phaseFailed(phase.name, formatSdkError(error))
@@ -1211,14 +1219,16 @@ async function persistPhaseReport(workspace: Workspace, phase: AgentStep, assist
   return reportAbs
 }
 
-async function commitPhase(phase: AgentStep, reportAbs: string, targetDir: string) {
+async function commitPhase(phase: AgentStep, reportAbs: string, targetDir: string): Promise<string | undefined> {
   const message = `convoy(${phase.name}): ${await summaryFromReport(reportAbs)}`
   const committed = await addAllAndCommit(message, targetDir)
   if (!committed) {
     log.info(`[${phase.name}] no changes - no commit`)
-  } else {
-    log.info(`[${phase.name}] commit: ${message}`)
+    return undefined
   }
+  log.info(`[${phase.name}] commit: ${message}`)
+  // Resolve the new HEAD so the caller can compute a per-phase diffstat.
+  return resolveCommit("HEAD", targetDir)
 }
 
 export async function finalizePhaseRepository(
@@ -1227,17 +1237,20 @@ export async function finalizePhaseRepository(
   targetDir: string,
   baseline: RepoSnapshot | undefined,
   originalError?: unknown,
-): Promise<void> {
+): Promise<DiffTotals | undefined> {
   if (!phase.readOnly) {
-    await commitPhase(phase, reportAbs, targetDir)
-    return
+    const newHead = await commitPhase(phase, reportAbs, targetDir)
+    if (newHead && baseline) {
+      return diffTotals(baseline.head, newHead, targetDir)
+    }
+    return undefined
   }
   if (!baseline) throw new Error(`[${phase.name}] read-only step has no clean repository baseline`)
 
   const difference = await describeRepoSnapshotDifference(baseline, targetDir)
   if (!difference) {
     log.info(`[${phase.name}] read-only step left the repository unchanged`)
-    return
+    return undefined
   }
 
   if (originalError instanceof ReadOnlyRepositoryMutationError) throw originalError

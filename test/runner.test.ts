@@ -1161,6 +1161,71 @@ describe("watchSession turn scoping", () => {
   })
 })
 
+describe("finalizePhaseRepository diffstat", () => {
+  test("returns DiffTotals after committing a write phase", async () => {
+    const dir = await cleanRepo()
+    const baseline = await createCleanRepoSnapshot(dir)
+    if (!baseline) throw new Error("expected a clean baseline")
+
+    const phase = agentStep("implement")
+    const reportDir = join(dir, "reports")
+    await mkdir(reportDir, { recursive: true })
+    await writeFile(join(reportDir, "implement.md"), "# Report\n\nDone.\n")
+    await writeFile(join(dir, "feature.ts"), "export const x = 1\nexport const y = 2\n")
+
+    const result = await finalizePhaseRepository(phase, join(reportDir, "implement.md"), dir, baseline)
+    expect(result).toBeDefined()
+    expect(result?.files).toBeGreaterThanOrEqual(1)
+    expect(result?.insertions).toBeGreaterThan(0)
+    expect(result?.deletions).toBe(0)
+  })
+
+  test("returns undefined when a write phase commits nothing", async () => {
+    const dir = await cleanRepo()
+    const baseline = await createCleanRepoSnapshot(dir)
+    if (!baseline) throw new Error("expected a clean baseline")
+
+    const phase = agentStep("implement")
+    const reportDir = join(dir, "reports")
+    await mkdir(reportDir, { recursive: true })
+    // Pre-commit the report file so the working tree is already clean when
+    // finalizePhaseRepository runs (addAllAndCommit returns false → undefined diff).
+    await writeFile(join(reportDir, "implement.md"), "# Report\n")
+    await git(["add", "-A"], dir)
+    await git(["commit", "-qm", "pre-commit report"], dir)
+
+    // Now the tree is clean — no changes to commit → addAllAndCommit returns false
+    const newBaseline = await createCleanRepoSnapshot(dir)
+    if (!newBaseline) throw new Error("expected clean baseline after pre-commit")
+    const result = await finalizePhaseRepository(phase, join(reportDir, "implement.md"), dir, newBaseline)
+    expect(result).toBeUndefined()
+  })
+
+  test("returns undefined for a write phase when baseline is undefined", async () => {
+    const dir = await cleanRepo()
+
+    const phase = agentStep("implement")
+    const reportDir = join(dir, "reports")
+    await mkdir(reportDir, { recursive: true })
+    await writeFile(join(reportDir, "implement.md"), "# Report\n")
+    await writeFile(join(dir, "feature.ts"), "export const x = 1\n")
+
+    const result = await finalizePhaseRepository(phase, join(reportDir, "implement.md"), dir, undefined)
+    expect(result).toBeUndefined()
+  })
+
+  test("returns undefined for a read-only phase that made no changes", async () => {
+    const dir = await cleanRepo()
+    const baseline = await createCleanRepoSnapshot(dir)
+    if (!baseline) throw new Error("expected a clean baseline")
+
+    const phase = { ...agentStep("security"), readOnly: true }
+    // No changes in tree: finalizePhaseRepository for read-only returns undefined when unchanged
+    const result = await finalizePhaseRepository(phase, "", dir, baseline)
+    expect(result).toBeUndefined()
+  })
+})
+
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }

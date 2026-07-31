@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { addAllAndCommit, addWorktree, branchExists, detectBaseRef, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
+import { addAllAndCommit, addWorktree, branchExists, detectBaseRef, diffTotals, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
 
 describe("findSuspiciousStagedFiles", () => {
   test("flags common secret filenames", () => {
@@ -403,5 +403,145 @@ describe("addWorktree", () => {
     const branch = Bun.spawn(["git", "branch", "--show-current"], { cwd: worktree, stdout: "pipe", stderr: "pipe" })
     expect((await new Response(branch.stdout).text()).trim()).toBe("add-onboarding-flow")
     expect(await branch.exited).toBe(0)
+  })
+})
+
+describe("diffTotals", () => {
+  const dirs: string[] = []
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  async function git(args: string[], cwd: string) {
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "convoy-test",
+        GIT_AUTHOR_EMAIL: "convoy-test@example.invalid",
+        GIT_COMMITTER_NAME: "convoy-test",
+        GIT_COMMITTER_EMAIL: "convoy-test@example.invalid",
+      },
+    })
+    const stdout = await new Response(proc.stdout).text()
+    if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(proc.stderr).text()}`)
+    return stdout.trim()
+  }
+
+  async function repo(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-difftotals-"))
+    dirs.push(dir)
+    await git(["init", "-q", "-b", "main"], dir)
+    await writeFile(join(dir, "base.txt"), "line1\nline2\nline3\n")
+    await git(["add", "-A"], dir)
+    await git(["commit", "-q", "-m", "initial"], dir)
+    return dir
+  }
+
+  test("returns undefined when the range is empty (no diff)", async () => {
+    const dir = await repo()
+    const head = await git(["rev-parse", "HEAD"], dir)
+    expect(await diffTotals(head, head, dir)).toBeUndefined()
+  })
+
+  test("counts insertions for a new file", async () => {
+    const dir = await repo()
+    const base = await git(["rev-parse", "HEAD"], dir)
+    await writeFile(join(dir, "new.ts"), "export const x = 1\nexport const y = 2\n")
+    await git(["add", "-A"], dir)
+    await git(["commit", "-q", "-m", "add new file"], dir)
+    const head = await git(["rev-parse", "HEAD"], dir)
+
+    const result = await diffTotals(base, head, dir)
+    expect(result).toEqual({ files: 1, insertions: 2, deletions: 0 })
+  })
+
+  test("counts deletions for a removed file", async () => {
+    const dir = await repo()
+    const base = await git(["rev-parse", "HEAD"], dir)
+    await git(["rm", "base.txt"], dir)
+    await git(["commit", "-q", "-m", "remove file"], dir)
+    const head = await git(["rev-parse", "HEAD"], dir)
+
+    const result = await diffTotals(base, head, dir)
+    expect(result).toEqual({ files: 1, insertions: 0, deletions: 3 })
+  })
+
+  test("counts both insertions and deletions for a modified file", async () => {
+    const dir = await repo()
+    const base = await git(["rev-parse", "HEAD"], dir)
+    await writeFile(join(dir, "base.txt"), "line1\nline2\nnew-line\n")
+    await git(["add", "-A"], dir)
+    await git(["commit", "-q", "-m", "modify file"], dir)
+    const head = await git(["rev-parse", "HEAD"], dir)
+
+    const result = await diffTotals(base, head, dir)
+    expect(result).toEqual({ files: 1, insertions: 1, deletions: 1 })
+  })
+
+  test("aggregates multiple files in the same commit", async () => {
+    const dir = await repo()
+    const base = await git(["rev-parse", "HEAD"], dir)
+    await writeFile(join(dir, "a.ts"), "const a = 1\n")
+    await writeFile(join(dir, "b.ts"), "const b = 2\nconst c = 3\n")
+    await git(["add", "-A"], dir)
+    await git(["commit", "-q", "-m", "add two files"], dir)
+    const head = await git(["rev-parse", "HEAD"], dir)
+
+    const result = await diffTotals(base, head, dir)
+    expect(result).toEqual({ files: 2, insertions: 3, deletions: 0 })
+  })
+
+  test("counts binary file as 1 file with 0 lines", async () => {
+    const dir = await repo()
+    const base = await git(["rev-parse", "HEAD"], dir)
+    // Write a proper binary with null bytes; git treats null-byte files as binary.
+    const binaryContent = new Uint8Array(16)
+    binaryContent[0] = 0x00 // null byte forces git to detect binary
+    binaryContent[1] = 0x89
+    binaryContent[2] = 0x50
+    binaryContent[3] = 0x4e
+    binaryContent[4] = 0x47
+    binaryContent.fill(0x00, 5) // rest are null bytes
+    await Bun.write(join(dir, "image.bin"), binaryContent)
+    await git(["add", "-A"], dir)
+    await git(["commit", "-q", "-m", "add binary"], dir)
+    const head = await git(["rev-parse", "HEAD"], dir)
+
+    const result = await diffTotals(base, head, dir)
+    expect(result).toEqual({ files: 1, insertions: 0, deletions: 0 })
+  })
+
+  test("returns undefined when git cannot resolve the range", async () => {
+    const dir = await repo()
+    expect(await diffTotals("nonexistent-sha", "HEAD", dir)).toBeUndefined()
+  })
+
+  test("handles file renames correctly", async () => {
+    const dir = await repo()
+    const base = await git(["rev-parse", "HEAD"], dir)
+    await git(["mv", "base.txt", "renamed.txt"], dir)
+    await git(["commit", "-q", "-m", "rename base.txt to renamed.txt"], dir)
+    const head = await git(["rev-parse", "HEAD"], dir)
+
+    const result = await diffTotals(base, head, dir)
+    expect(result).toEqual({ files: 1, insertions: 0, deletions: 0 })
+  })
+
+  test("handles a single-commit range correctly", async () => {
+    const dir = await repo()
+    const base = await git(["rev-parse", "HEAD"], dir)
+    await writeFile(join(dir, "feat.ts"), "export const feature = true\n")
+    await git(["add", "-A"], dir)
+    await git(["commit", "-q", "-m", "add feature"], dir)
+    const head = await git(["rev-parse", "HEAD"], dir)
+
+    const result = await diffTotals(base, head, dir)
+    expect(result).toBeDefined()
+    expect(result?.files).toBe(1)
+    expect(result?.insertions).toBeGreaterThan(0)
+    expect(result?.deletions).toBe(0)
   })
 })

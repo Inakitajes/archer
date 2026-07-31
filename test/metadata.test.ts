@@ -340,4 +340,43 @@ describe("run metadata", () => {
 
     expect((await readRunMetadata(join(ws.dir, "metadata.json")))?.control).toEqual({ state: "running" })
   })
+
+  test("recordPhaseDiff persists diff and phaseDiff retrieves it", async () => {
+    const ws = await workspace()
+    const store = await openRunMetadata(ws, "/repo", quick)
+    const diff = { files: 3, insertions: 42, deletions: 7 }
+
+    store.recordPhaseDiff("implementer", diff)
+    await store.flush()
+
+    const persisted = await readRunMetadata(join(ws.dir, "metadata.json"))
+    expect(persisted?.phases.implementer?.diff).toEqual(diff)
+
+    const resumed = await openRunMetadata(ws, "/repo", quick)
+    expect(resumed.phaseDiff("implementer")).toEqual(diff)
+  })
+
+  test("phaseDiff returns undefined for a phase with no diff (legacy metadata)", async () => {
+    const ws = await workspace()
+    const path = join(ws.dir, "metadata.json")
+    const now = Date.now()
+    // Write metadata without any diff field, simulating a v3 run without this feature.
+    await writeFile(
+      path,
+      JSON.stringify({
+        schemaVersion: 3,
+        runID: ws.runID,
+        targetDir: "/repo",
+        createdAt: now,
+        updatedAt: now,
+        control: { state: "running" },
+        phases: { implementer: { status: "completed" } },
+        pipeline: quick,
+      }),
+    )
+
+    const store = await openRunMetadata(ws, "/repo", quick)
+    expect(store.phaseDiff("implementer")).toBeUndefined()
+    expect(store.phaseDiff("nonexistent")).toBeUndefined()
+  })
 })
