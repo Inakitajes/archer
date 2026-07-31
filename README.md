@@ -111,7 +111,7 @@ To use different providers, authenticate them in OpenCode and select models as `
 curl -fsSL https://github.com/Inakitajes/convoy/releases/latest/download/install.sh | sh
 ```
 
-The script detects your platform, downloads the matching release binary, **verifies it against the release's `SHA256SUMS`**, installs it into `~/.local/bin`, and creates `~/.convoy/config.yaml` plus `~/.convoy/agents/*.md` if they do not already exist. Nothing is installed unless the checksum matches and the downloaded binary reports its own version, and the final move is atomic, so a failed install never leaves a partial binary behind.
+The script detects your platform, downloads the matching release binary, **verifies it against the release's `SHA256SUMS`**, installs it into `~/.local/bin`, and creates `~/.convoy/config.yaml` if it does not already exist. Nothing is installed unless the checksum matches and the downloaded binary reports its own version, and the final move is atomic, so a failed install never leaves a partial binary behind.
 
 Options are accepted as environment variables, or as flags after `sh -s --`:
 
@@ -175,7 +175,7 @@ bun install
 make install
 ```
 
-This builds a local binary in `~/.local/bin/convoy` and creates `~/.convoy/config.yaml` plus `~/.convoy/agents/*.md` with Convoy's default configuration if they do not already exist.
+This builds a local binary in `~/.local/bin/convoy` and creates `~/.convoy/config.yaml` with Convoy's default configuration if it does not already exist.
 
 ## Usage
 
@@ -473,16 +473,31 @@ Keys: `↑/↓` move, `enter` edit/expand, `tab` switch tab, `a` add, `d` delete
 
 ## Initializing config files (`convoy init`)
 
-`convoy config` is interactive; `convoy init` is its non-interactive counterpart: it writes a commented starter config and copies the built-in agent prompts so you can customize them in place.
+`convoy config` is interactive; `convoy init` is its non-interactive counterpart: it writes a commented starter config.
 
 ```bash
-convoy init                # .convoy/config.yaml + .convoy/agents/*.md in the current repo
+convoy init                # .convoy/config.yaml in the current repo
 convoy init --dir ../app   # same, in another repo
-convoy init --global       # ~/.convoy/config.yaml + ~/.convoy/agents/*.md
-convoy init --force        # overwrite existing files
+convoy init --global       # ~/.convoy/config.yaml
+convoy init --force        # overwrite an existing config
 ```
 
-The generated config documents every key (commented out) and inlines the built-in `implement` pipeline so it's immediately editable. The copied `agents/*.md` prompts are picked up by name — edit them to override a built-in agent's prompt, or declare a new agent in the config and add its prompt file. Existing files are never overwritten unless `--force` is given. `make install` runs `convoy init --global` automatically, so a fresh install ships with a ready-to-edit global config.
+`init` deliberately writes **no** agent prompts. A file at `agents/<name>.md` overrides its built-in permanently, so seeding all of them would freeze every prompt at the version you installed and silently discard the improved prompts that later `convoy update` runs ship.
+
+## Overriding an agent prompt (`convoy agents eject`)
+
+To customize a built-in agent's system prompt, copy that one prompt out and edit it:
+
+```bash
+convoy agents                             # list the ejectable agents
+convoy agents eject implementer           # .convoy/agents/implementer.md in the current repo
+convoy agents eject design-polisher --global   # ~/.convoy/agents/design-polisher.md
+convoy agents eject implementer --force   # overwrite a prompt you already ejected
+```
+
+The ejected file wins over the built-in from then on, **including across upgrades** — `convoy update` ships new built-in prompts that an ejected file will shadow. Eject only what you mean to own, and delete the file to go back to the built-in. The runtime-safety and advisor-timing prompts are not ejectable: they are always read from the built-ins, so a copy would be inert.
+
+The generated config documents every key (commented out) and inlines the built-in `implement` pipeline so it's immediately editable. Prompts under `agents/` are picked up by name — eject one to override a built-in agent's prompt, or declare a new agent in the config and add its prompt file by hand. Existing files are never overwritten unless `--force` is given, and `--force` never reclaims an ejected prompt. `make install` runs `convoy init --global` automatically, so a fresh install ships with a ready-to-edit global config.
 
 ## Project Context And Custom Agents
 
@@ -496,7 +511,7 @@ CLAUDE.md
 
 Use `.convoy/rules.md` for project-specific Convoy instructions. It is intentionally the only Convoy rules filename to avoid ambiguous precedence. `AGENTS.md` and `CLAUDE.md` are treated as additional repo context.
 
-Built-in agent prompts live as Markdown files under `prompts/`. A project can fully replace a built-in agent prompt with:
+Built-in agent prompts live as Markdown files under `prompts/` and are compiled into the binary. A project can fully replace one with `convoy agents eject <agent>`, which produces:
 
 ```text
 .convoy/

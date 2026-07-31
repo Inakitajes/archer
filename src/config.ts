@@ -339,27 +339,29 @@ export function projectConfigPath(targetDir: string) {
 /** Re-exported from workspace so callers don't need both modules. */
 export { globalConfigPath }
 
-/** Writes the global config at ~/.convoy/config.yaml (plus default agent prompts). */
+/** Writes the global config at ~/.convoy/config.yaml. */
 export async function writeDefaultGlobalConfig(force = false): Promise<ConfigWriteResult> {
   return writeDefaultConvoyConfig(globalConfigPath(), force)
 }
 
-/** Writes a project config at <targetDir>/.convoy/config.yaml (plus default agent prompts). */
+/** Writes a project config at <targetDir>/.convoy/config.yaml. */
 export async function writeDefaultProjectConfig(targetDir: string, force = false): Promise<ConfigWriteResult> {
   await assertDirectory(targetDir)
   return writeDefaultConvoyConfig(projectConfigPath(targetDir), force)
 }
 
 /**
- * Writes the commented template config and copies every built-in agent prompt
- * to `<dirname(path)>/agents/<name>.md`. Existing files are left alone unless
- * `force` is set. Agent prompts live next to the config file under `agents/`,
- * mirroring how the loader discovers them.
+ * Writes the commented template config. Existing files are left alone unless
+ * `force` is set.
+ *
+ * Deliberately writes no agent prompts. A prompt file under `agents/` shadows
+ * its built-in for good (see `loadAgentPrompt`), so seeding all of them froze
+ * every prompt at the installed version and silently defeated later upgrades.
+ * Prompts are now copied one at a time, on request, by `ejectAgentPrompt`.
  */
 export async function writeDefaultConvoyConfig(path: string, force = false): Promise<ConfigWriteResult> {
   const configDir = dirname(path)
   await mkdir(configDir, { recursive: true })
-  await writeDefaultAgentPrompts(configDir, force)
   try {
     await writeFile(path, defaultConvoyConfig, { flag: force ? "w" : "wx" })
     return { path, created: true }
@@ -369,19 +371,33 @@ export async function writeDefaultConvoyConfig(path: string, force = false): Pro
   }
 }
 
-async function writeDefaultAgentPrompts(configDir: string, force: boolean) {
+/**
+ * Copies one built-in agent prompt to `<configDir>/agents/<name>.md` so it can
+ * be edited as a deliberate override. Only agents are ejectable: the runtime
+ * safety and advisor-timing prompts are always read from the built-ins, so a
+ * copy of either would be inert and misleading.
+ */
+export async function ejectAgentPrompt(configDir: string, agentName: string, force = false): Promise<ConfigWriteResult> {
+  if (!builtInAgents.some((agent) => agent.name === agentName)) {
+    // The pipeline-step aliases are the likeliest near-miss, so resolve rather
+    // than just listing 30 names at someone who typed a name convoy accepts.
+    const aliased = agentAliases[agentName]
+    if (aliased) throw new Error(`${agentName} is a pipeline-step alias; eject the agent itself: convoy agents eject ${aliased}`)
+    const names = builtInAgents.map((agent) => agent.name).sort().join(", ")
+    throw new Error(`unknown built-in agent: ${agentName}\n\nAvailable agents: ${names}`)
+  }
+  const body = builtInPrompts[agentName]
+  if (body === undefined) throw new Error(`missing built-in prompt: add prompts/${agentName}.md to src/built-in-prompts.ts`)
+
   const agentsDir = join(configDir, "agents")
   await mkdir(agentsDir, { recursive: true })
-  for (const agent of builtInAgents) {
-    const target = join(agentsDir, `${agent.name}.md`)
-    const body = builtInPrompts[agent.name]
-    if (body === undefined) throw new Error(`missing built-in prompt: add prompts/${agent.name}.md to src/built-in-prompts.ts`)
-    try {
-      await writeFile(target, body, { flag: force ? "w" : "wx" })
-    } catch (error) {
-      if (!force && isErrno(error, "EEXIST")) continue
-      throw error
-    }
+  const path = join(agentsDir, `${agentName}.md`)
+  try {
+    await writeFile(path, body, { flag: force ? "w" : "wx" })
+    return { path, created: true }
+  } catch (error) {
+    if (!force && isErrno(error, "EEXIST")) return { path, created: false }
+    throw error
   }
 }
 

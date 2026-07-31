@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -409,6 +410,35 @@ describe("init command", () => {
     await expect(parseCommand(["init", "extra"])).rejects.toThrow("usage: convoy init")
   })
 
+  test("parses agents eject, reusing init's flags", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-eject-"))
+    dirs.push(dir)
+
+    const local = await parseCommand(["agents", "eject", "implementer", "--dir", dir, "--force"])
+    expect(local.type).toBe("agents")
+    if (local.type === "agents") {
+      expect(local.agentName).toBe("implementer")
+      expect(local.options).toMatchObject({ targetDir: dir, global: false, force: true })
+    }
+
+    const global = await parseCommand(["agents", "eject", "design-polisher", "--global"])
+    expect(global.type).toBe("agents")
+    if (global.type === "agents") {
+      expect(global.agentName).toBe("design-polisher")
+      expect(global.options).toMatchObject({ global: true })
+    }
+  })
+
+  test("agents without an ejectable target prints help instead of failing", async () => {
+    const bare = await parseCommand(["agents"])
+    expect(bare.type).toBe("help")
+    // The help has to name the agents, since it is the only place they are listed.
+    if (bare.type === "help") expect(bare.text).toContain("implementer")
+
+    await expect(parseCommand(["agents", "eject"])).rejects.toThrow("usage: convoy agents eject")
+    await expect(parseCommand(["agents", "list"])).rejects.toThrow("usage: convoy agents eject")
+  })
+
   test("creates project config without overwriting unless forced", async () => {
     const dir = await mkdtemp(join(tmpdir(), "convoy-cli-init-write-"))
     dirs.push(dir)
@@ -418,16 +448,30 @@ describe("init command", () => {
     expect(await readFile(path, "utf8")).toContain("version: 1")
     expect(await readFile(path, "utf8")).toContain("#   implementer:")
     expect(await readFile(path, "utf8")).toContain("# maxAttempts: 2")
-    expect(await readFile(join(dir, ".convoy", "agents", "implementer.md"), "utf8")).toContain("# Implementer")
+    expect(existsSync(join(dir, ".convoy", "agents"))).toBe(false)
 
     await writeFile(path, "version: 1\nattachments:\n  - custom.md\n")
-    await writeFile(join(dir, ".convoy", "agents", "implementer.md"), "# Custom Implementer\n")
     await parseAndRun(["init", "--dir", dir, "--quiet"])
     expect(await readFile(path, "utf8")).toContain("custom.md")
-    expect(await readFile(join(dir, ".convoy", "agents", "implementer.md"), "utf8")).toContain("# Custom Implementer")
 
     await parseAndRun(["init", "--dir", dir, "--force", "--quiet"])
     expect(await readFile(path, "utf8")).not.toContain("custom.md")
-    expect(await readFile(join(dir, ".convoy", "agents", "implementer.md"), "utf8")).toContain("# Implementer")
+  })
+
+  test("agents eject writes only the requested prompt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-eject-write-"))
+    dirs.push(dir)
+    const prompt = join(dir, ".convoy", "agents", "implementer.md")
+
+    await parseAndRun(["agents", "eject", "implementer", "--dir", dir, "--quiet"])
+    expect(await readFile(prompt, "utf8")).toContain("# Implementer")
+    expect(existsSync(join(dir, ".convoy", "agents", "design-polisher.md"))).toBe(false)
+
+    await writeFile(prompt, "# Mine\n")
+    await parseAndRun(["agents", "eject", "implementer", "--dir", dir, "--quiet"])
+    expect(await readFile(prompt, "utf8")).toBe("# Mine\n")
+
+    await parseAndRun(["agents", "eject", "implementer", "--dir", dir, "--force", "--quiet"])
+    expect(await readFile(prompt, "utf8")).toContain("# Implementer")
   })
 })
