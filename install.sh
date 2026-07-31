@@ -209,8 +209,9 @@ if [ -n "$previous" ] && [ "$previous" != "$installed_version" ]; then
   info "  ${DIM}replaced ${previous}${RESET}"
 fi
 
-# Creates ~/.convoy/config.yaml and ~/.convoy/agents/*.md when absent, matching
-# what `make install` does for source installs. Never overwrites existing config.
+# Creates ~/.convoy/config.yaml when absent, matching what `make install` does
+# for source installs. Never overwrites existing config, and never writes agent
+# prompts -- those are ejected one at a time with `convoy agents eject`.
 if [ -z "$NO_INIT" ]; then
   if "$target" init --global --quiet 2>/dev/null; then
     step "Default configuration ready at ~/.convoy"

@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -9,6 +10,7 @@ import {
   checkPipelineResolves,
   ConfigError,
   defaultConfigTemplate,
+  ejectAgentPrompt,
   isValidModelString,
   loadConvoyConfig,
   loadGlobalConvoyConfig,
@@ -22,6 +24,7 @@ import {
   writeDefaultConvoyConfig,
   writeDefaultProjectConfig,
 } from "../src/config"
+import { loadAgentPrompt } from "../src/agents"
 import {
   builtInAgents,
   builtInPipelines,
@@ -700,9 +703,8 @@ describe("default config init", () => {
     expect(body).toContain("#   api-reviewer:")
     expect(config.defaults).toEqual({})
     expect(config.agents).toEqual({})
-    for (const agent of builtInAgents) {
-      expect(await readFile(join(dir, "agents", `${agent.name}.md`), "utf8")).toContain("#")
-    }
+    // Seeding prompts would shadow every built-in for good, so init writes none.
+    expect(existsSync(join(dir, "agents"))).toBe(false)
     expect(config.pipelines.implement?.steps).toEqual([
       { agent: "implementer", model: defaultImplementerModel, reports: "none" },
       "patterns",
@@ -723,17 +725,27 @@ describe("default config init", () => {
 
     expect(await writeDefaultConvoyConfig(path)).toEqual({ path, created: true })
     expect(await readFile(path, "utf8")).toContain("version: 1")
-    expect(await readFile(join(dir, "agents", "implementer.md"), "utf8")).toContain("# Implementer")
 
     await writeFile(path, "version: 1\nattachments:\n  - custom.md\n")
-    await writeFile(join(dir, "agents", "implementer.md"), "# Custom Implementer\n")
     expect(await writeDefaultConvoyConfig(path)).toEqual({ path, created: false })
     expect(await readFile(path, "utf8")).toContain("custom.md")
-    expect(await readFile(join(dir, "agents", "implementer.md"), "utf8")).toContain("# Custom Implementer")
 
     expect(await writeDefaultConvoyConfig(path, true)).toEqual({ path, created: true })
     expect(await readFile(path, "utf8")).not.toContain("custom.md")
-    expect(await readFile(join(dir, "agents", "implementer.md"), "utf8")).toContain("# Implementer")
+  })
+
+  test("init leaves an ejected prompt alone even with --force", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-config-force-"))
+    dirs.push(dir)
+    const path = join(dir, "config.yaml")
+
+    await writeDefaultConvoyConfig(path)
+    const ejected = await ejectAgentPrompt(dir, "implementer")
+    await writeFile(ejected.path, "# Custom Implementer\n")
+
+    // --force is about the config file; it must never reclaim an override.
+    await writeDefaultConvoyConfig(path, true)
+    expect(await readFile(ejected.path, "utf8")).toBe("# Custom Implementer\n")
   })
 
   test("writes project default config under .convoy", async () => {
@@ -744,7 +756,66 @@ describe("default config init", () => {
     expect(await writeDefaultProjectConfig(dir)).toEqual({ path, created: true })
     expect(await writeDefaultProjectConfig(dir)).toEqual({ path, created: false })
     expect(await readFile(path, "utf8")).toContain("pipelines:")
-    expect(await readFile(join(dir, ".convoy", "agents", "implementer.md"), "utf8")).toContain("# Implementer")
+    expect(existsSync(join(dir, ".convoy", "agents"))).toBe(false)
+  })
+})
+
+describe("ejecting agent prompts", () => {
+  test("copies one built-in prompt and reports whether it wrote", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-eject-"))
+    dirs.push(dir)
+    const path = join(dir, "agents", "implementer.md")
+
+    expect(await ejectAgentPrompt(dir, "implementer")).toEqual({ path, created: true })
+    expect(await readFile(path, "utf8")).toContain("# Implementer")
+    // Only the requested agent lands on disk.
+    expect(existsSync(join(dir, "agents", "design-polisher.md"))).toBe(false)
+  })
+
+  test("refuses to clobber an edited prompt unless forced", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-eject-force-"))
+    dirs.push(dir)
+    const path = join(dir, "agents", "implementer.md")
+
+    await ejectAgentPrompt(dir, "implementer")
+    await writeFile(path, "# Mine\n")
+
+    expect(await ejectAgentPrompt(dir, "implementer")).toEqual({ path, created: false })
+    expect(await readFile(path, "utf8")).toBe("# Mine\n")
+
+    expect(await ejectAgentPrompt(dir, "implementer", true)).toEqual({ path, created: true })
+    expect(await readFile(path, "utf8")).toContain("# Implementer")
+  })
+
+  test("an ejected prompt overrides the built-in for the run", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-eject-override-"))
+    dirs.push(dir)
+    // Point the global home at an empty dir so this asserts the project layer
+    // rather than whatever the developer happens to have in ~/.convoy/agents.
+    const previousHome = process.env.CONVOY_HOME
+    process.env.CONVOY_HOME = dir
+    try {
+      expect(loadAgentPrompt("implementer", dir)).toContain("# Implementer")
+      const ejected = await ejectAgentPrompt(join(dir, ".convoy"), "implementer")
+      await writeFile(ejected.path, "# Overridden\n")
+      expect(loadAgentPrompt("implementer", dir)).toContain("# Overridden")
+    } finally {
+      if (previousHome === undefined) delete process.env.CONVOY_HOME
+      else process.env.CONVOY_HOME = previousHome
+    }
+  })
+
+  test("rejects unknown agents and non-agent prompts, listing what is available", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-eject-unknown-"))
+    dirs.push(dir)
+
+    expect(ejectAgentPrompt(dir, "nope")).rejects.toThrow("unknown built-in agent: nope")
+    expect(ejectAgentPrompt(dir, "nope")).rejects.toThrow("implementer")
+    // An alias is a name convoy otherwise accepts, so it gets redirected rather than listed at.
+    expect(ejectAgentPrompt(dir, "patterns")).rejects.toThrow("convoy agents eject pattern-auditor")
+    // Always read from the built-ins, so a copy would be inert.
+    expect(ejectAgentPrompt(dir, "runtime-safety")).rejects.toThrow("unknown built-in agent")
+    expect(existsSync(join(dir, "agents"))).toBe(false)
   })
 })
 

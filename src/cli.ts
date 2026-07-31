@@ -1,11 +1,11 @@
 import { readFile } from "node:fs/promises"
-import { resolve } from "node:path"
+import { dirname, join, resolve } from "node:path"
 
-import { buildAgentRegistry, emptyHooksConfig, loadMergedConvoyConfig, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ConvoyDefaults } from "./config"
+import { buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, globalConfigPath, loadMergedConvoyConfig, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ConvoyDefaults } from "./config"
 import { detectBaseRef } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
-import { defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
+import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
 import { buildRunPlan } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
@@ -80,6 +80,7 @@ export type CliCommand =
   | { type: "runs"; runID?: string }
   | { type: "config"; targetDir: string }
   | { type: "init"; options: InitOptions }
+  | { type: "agents"; action: "eject"; agentName: string; options: InitOptions }
   | { type: "finish"; options: FinishOptions }
   | { type: "auth"; provider: "openrouter"; action: "set" | "remove" | "status" }
   | { type: "version" }
@@ -129,6 +130,18 @@ export async function parseAndRun(argv: string[]) {
     if (!command.options.quiet) {
       const scope = command.options.global ? "global config" : "project config"
       process.stdout.write(`${result.created ? "created" : "ensured"} ${scope}: ${result.path}\n`)
+    }
+    return
+  }
+  if (command.type === "agents") {
+    const configDir = command.options.global ? dirname(globalConfigPath()) : join(command.options.targetDir, ".convoy")
+    const result = await ejectAgentPrompt(configDir, command.agentName, command.options.force)
+    if (!command.options.quiet) {
+      process.stdout.write(
+        result.created
+          ? `ejected ${command.agentName}: ${result.path}\n\nThis file now overrides the built-in prompt and will keep doing so across upgrades. Delete it to go back to the built-in.\n`
+          : `${result.path} already exists; pass --force to overwrite it\n`,
+      )
     }
     return
   }
@@ -389,6 +402,21 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     const parsed = parseInitArgs(argv.slice(1))
     if (parsed.help) return { type: "help", text: initHelp() }
     return { type: "init", options: parsed }
+  }
+  if (argv[0] === "agents") {
+    const rest = argv.slice(1)
+    if (rest.length === 0 || rest[0] === "--help" || rest[0] === "-h") return { type: "help", text: agentsHelp() }
+    if (rest[0] !== "eject") throw new Error("usage: convoy agents eject <agent> [--global] [--dir <path>] [--force]")
+    // The agent name is positional; everything after it reuses init's flag
+    // parser so --global/--dir/--force mean exactly what they mean for init.
+    const name = rest[1]
+    if (name === undefined || name.startsWith("-")) {
+      if (name === "--help" || name === "-h") return { type: "help", text: agentsHelp() }
+      throw new Error("usage: convoy agents eject <agent> [--global] [--dir <path>] [--force]")
+    }
+    const parsed = parseInitArgs(rest.slice(2))
+    if (parsed.help) return { type: "help", text: agentsHelp() }
+    return { type: "agents", action: "eject", agentName: name, options: parsed }
   }
   if (argv[0] === "finish") {
     const { finishHelp, parseFinishArgs } = await import("./finish-command")
@@ -766,6 +794,7 @@ Usage:
   convoy --prompt-file prd.md --file lib/onboarding --file test/onboarding_test.dart
   convoy --pipeline bug-fix --prompt-file bug.md
   convoy init
+  convoy agents eject <agent>
   convoy finish
   convoy update [--check]
   convoy runs [run-id]
@@ -775,8 +804,10 @@ Usage:
 Commands:
   convoy                   Open an interactive TUI launcher to pick a pipeline,
                            enter a prompt, and toggle run options
-  init                     Create .convoy/config.yaml and .convoy/agents/*.md in the target repo
-  init --global            Create ~/.convoy/config.yaml and ~/.convoy/agents/*.md
+  init                     Create .convoy/config.yaml in the target repo
+  init --global            Create ~/.convoy/config.yaml
+  agents eject <agent>     Copy one built-in agent prompt to agents/<agent>.md to
+                           override it ("convoy agents" lists the available ones)
   finish                   Squash this branch's convoy commits into one conventional commit
                            created with your own git identity, so it lands signed and attributed
                            ("convoy finish --help" for options; [f] on the run dashboard does the same)
@@ -827,7 +858,8 @@ Flags:
 Config files:
   ~/.convoy/config.yaml    user defaults, created by make install or convoy init --global
   .convoy/config.yaml      project-local overrides, created by convoy init
-  agents/*.md              Markdown prompts loaded by matching the agent name
+  agents/*.md              Markdown prompts loaded by matching the agent name; only
+                           present once you eject one, and they shadow the built-in
 
 Config keys:
   defaults:                model, maxAttempts, baseRef, pipeline, worktree, autoAcceptJudgeModel,
@@ -875,12 +907,41 @@ function writeUpdateResult(result: UpdateResult) {
 function initHelp() {
   return `convoy init [--global] [--force] [--dir <path>]
 
-Create Convoy's default config file and agent prompt Markdown files. Existing files are not overwritten unless --force is set.
+Create Convoy's default config file. An existing config is not overwritten unless --force is set.
+
+Writes no agent prompts: a prompt file under agents/ permanently overrides its
+built-in, so copying them all would freeze every prompt at the installed version.
+Use "convoy agents eject <agent>" to copy the one you actually want to change.
 
 Options:
   --global                 Write ~/.convoy/config.yaml instead of a project config
   --dir <path>             Target repo for .convoy/config.yaml (default: cwd)
   --force                  Overwrite an existing config file
   --quiet                  Suppress status output
+`
+}
+
+function agentsHelp() {
+  return `convoy agents eject <agent> [--global] [--force] [--dir <path>]
+
+Copy one built-in agent prompt to agents/<agent>.md so you can edit it.
+
+The copy takes precedence over the built-in from then on, including across
+upgrades -- "convoy update" ships new built-in prompts that an ejected file will
+shadow. Eject only what you mean to own, and delete the file to return to the
+built-in. Delete the file to return to the built-in.
+
+Options:
+  --global                 Write ~/.convoy/agents/<agent>.md instead of a project prompt
+  --dir <path>             Target repo for .convoy/agents/<agent>.md (default: cwd)
+  --force                  Overwrite an existing prompt file
+  --quiet                  Suppress status output
+
+Agents:
+${builtInAgents
+  .map((agent) => agent.name)
+  .sort()
+  .map((name) => `  ${name}`)
+  .join("\n")}
 `
 }
