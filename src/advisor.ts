@@ -23,8 +23,22 @@ import { log } from "./log"
  *    guidance saying so, and the executor carries on.
  */
 
-/** Default cap on consultations per phase attempt, mirroring the reference pattern's `max_uses`. */
-export const defaultAdvisorMaxCalls = 3
+/**
+ * Default cap on consultations per phase attempt.
+ *
+ * Deliberately high enough to never bind in practice. The reference pattern's
+ * `max_uses` is a small number because it assumes one decision worth advising;
+ * a Convoy phase is a whole implementation session, and a low cap silently turns
+ * the advisor off partway through — the executor keeps working, unadvised, which
+ * is the failure mode the feature exists to prevent, and the one hardest to
+ * notice from the outside.
+ *
+ * The budget stays finite so the runtime keeps its cost ceiling, its
+ * `advisor.budget_exhausted` event, and its `used/max` counters. Anyone who
+ * actually wants a tight leash sets `advisorMaxCalls` on the step or in
+ * `defaults`, which both outrank this.
+ */
+export const defaultAdvisorMaxCalls = 1000
 
 /**
  * Name of the custom tool the executor calls to consult its advisor on demand.

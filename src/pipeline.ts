@@ -19,11 +19,13 @@ const kimiModel = "openrouter/moonshotai/kimi-k3"
 /** GPT 5.6 Sol: the implementation workhorse, and at xhigh the consensus reporter for the review/hunter pipelines. */
 const solModel = "openai/gpt-5.6-sol"
 const solXhighModel = `${solModel}#xhigh`
+/** The cheap GPT 5.6: reserved for synthesis steps that only re-read reports another phase already wrote. */
+const lunaModel = "openai/gpt-5.6-luna"
 
 // Per-step models the built-in `implement` pipeline pins. Exported so `convoy init`'s
 // inlined copy of that pipeline stays in sync with the built-in it claims to mirror.
 export const defaultImplementerModel = solModel
-export const defaultImplementReviewModel = glmModel
+export const defaultImplementReviewModel = kimiModel
 export const defaultAdversarialModel = kimiModel
 
 /** The six specialty audit tracks shared by `hunter` and `hunter-max`; each maps to a `hunter-<track>` agent. */
@@ -57,7 +59,7 @@ export const builtInAgents: readonly AgentSpec[] = [
   {
     name: "design-polisher",
     description: "Polishes new UI following the repo's design system, without redesigning",
-    defaultModel: defaultOpusModel,
+    defaultModel: kimiModel,
     temperature: 0.2,
     builtIn: true,
   },
@@ -166,6 +168,37 @@ export const builtInAgents: readonly AgentSpec[] = [
     name: "implementation-validator",
     description: "Final no-edit validator for applied blocking-finding fixes",
     defaultModel: defaultOpusModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  // fixer: supplied findings turned into proven regression tests, minimal fixes, and an audited outcome report.
+  {
+    name: "fixer-test-author",
+    description: "Creates or identifies focused regression tests for supplied findings and proves which ones fail before a production fix",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    builtIn: true,
+  },
+  {
+    name: "fixer-implementer",
+    description: "Applies minimal production fixes only for findings proven by the Fixer reproduction phase",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    builtIn: true,
+  },
+  {
+    name: "fixer-validator",
+    description: "Independently verifies Fixer outcomes, targeted checks, and absence of regressions",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
+  {
+    name: "fixer-reporter",
+    description: "Produces the final per-finding Fixer outcome report from the complete evidence trail",
+    defaultModel: fallbackModel,
     temperature: 0.1,
     readOnly: true,
     builtIn: true,
@@ -314,12 +347,12 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     ],
   },
   "implement-lite": {
-    description: "Like implement, but drops every code-writing phase to GLM 5.2 to reduce cost; design and adversarial run on Opus",
+    description: "Like implement, but drops every code-writing phase to GLM 5.2 to reduce cost; design runs on Kimi K3 and adversarial on Opus",
     steps: [
       { agent: "implementer", model: glmModel, reports: "none" },
       { agent: "patterns", model: glmModel },
       { agent: "security", model: glmModel },
-      { agent: "design", model: defaultOpusModel },
+      { agent: "design", model: kimiModel },
       { agent: "tests", model: glmModel, reports: "none" },
       { agent: "adversarial", model: defaultOpusModel, reports: "all" },
     ],
@@ -338,7 +371,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       // defaults.advisor and quietly re-advise these phases.
       { agent: "patterns", model: glmModel, advisor: false },
       { agent: "security", model: glmModel, advisor: false },
-      { agent: "design", model: glmModel, advisor: false },
+      { agent: "design", model: kimiModel, advisor: false },
       { agent: "tests", model: glmModel, advisor: false, reports: "none" },
       // The adversarial pass is the one place the expensive model should own the
       // loop: its whole job is the judgement an advisor would otherwise supply.
@@ -362,17 +395,17 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   },
   "review-lite": {
     description:
-      "Like review, but swaps GPT 5.6 Terra xhigh for GLM 5.2 in scope and the audit fan-out; the report and the parallel audit slot keep Opus.",
+      "Like review, but every phase runs on a low-cost model: GLM 5.2 scopes and writes the report, and the audit fan-out pairs GLM 5.2 with Kimi K3 instead of Opus.",
     steps: [
       { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true },
       {
         parallel: [
-          { agent: "clean-code-auditor", name: "clean-code", models: [glmModel, defaultOpusModel], reports: ["scope"] },
-          { agent: "security-reviewer", name: "security", models: [glmModel, defaultOpusModel], reports: ["scope"] },
-          { agent: "bug-auditor", name: "bugs", models: [glmModel, defaultOpusModel], reports: ["scope"] },
+          { agent: "clean-code-auditor", name: "clean-code", models: [glmModel, kimiModel], reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", models: [glmModel, kimiModel], reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", models: [glmModel, kimiModel], reports: ["scope"] },
         ],
       },
-      { agent: "review-report", name: "report", model: defaultOpusModel, reports: "all" },
+      { agent: "review-report", name: "report", model: glmModel, reports: "all" },
     ],
   },
   refine: {
@@ -416,11 +449,24 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
         ],
       },
       { agent: "implementation-triage", name: "triage", model: defaultOpusModel },
-      { agent: "design", model: defaultOpusModel },
+      { agent: "design", model: kimiModel },
       { agent: "tests", reports: "none" },
       { agent: "implementation-final-review", name: "final-review", model: defaultOpusModel, reports: "all" },
       { agent: "implementation-fixer", name: "fixes", reports: ["final-review"] },
       { agent: "implementation-validator", name: "validator", model: defaultOpusModel, reports: "all" },
+    ],
+  },
+  // The follow-up to a report-only run: feed it the findings (as the prompt or an
+  // attachment) and every one of them ends with a traceable verdict. The three
+  // working phases carry the cost; the reporter only re-reads reports that already
+  // exist, so it runs on the cheapest GPT 5.6 rather than the most capable model.
+  fixer: {
+    description: "Turn supplied findings into proven regression tests, targeted fixes, independent validation, and a traceable final report",
+    steps: [
+      { agent: "fixer-test-author", name: "reproduction", model: fallbackModel, reports: "none", diff: true },
+      { agent: "fixer-implementer", name: "fixes", model: fallbackModel, reports: ["reproduction"] },
+      { agent: "fixer-validator", name: "validation", model: fallbackModel, reports: ["reproduction", "fixes"] },
+      { agent: "fixer-reporter", name: "report", model: lunaModel, reports: ["reproduction", "fixes", "validation"] },
     ],
   },
   "review-cc": {

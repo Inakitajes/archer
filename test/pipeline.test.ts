@@ -125,7 +125,7 @@ describe("built-in implement-lite pipeline", () => {
     expect(byName.patterns?.model).toBe("openrouter/z-ai/glm-5.2")
     expect(byName.security?.model).toBe("openrouter/z-ai/glm-5.2")
     expect(byName.tests?.model).toBe("openrouter/z-ai/glm-5.2")
-    expect(byName.design?.model).toBe("anthropic/claude-opus-5")
+    expect(byName.design?.model).toBe("openrouter/moonshotai/kimi-k3")
     expect(byName.adversarial?.model).toBe("anthropic/claude-opus-5")
   })
 
@@ -140,18 +140,19 @@ describe("built-in implement-lite pipeline", () => {
     expect(byName.patterns).toMatchObject({ model: "openrouter/z-ai/glm-5.2" })
     expect(byName.security).toMatchObject({ model: "openrouter/z-ai/glm-5.2" })
     expect(byName.tests).toMatchObject({ model: "openrouter/z-ai/glm-5.2" })
-    expect(byName.design).toMatchObject({ model: "anthropic/claude-opus-5" })
+    expect(byName.design).toMatchObject({ model: "openrouter/moonshotai/kimi-k3" })
     expect(byName.adversarial).toMatchObject({ model: "anthropic/claude-opus-5" })
   })
 
-  test("keeps GLM 5.2 scoped to the implementation, lite, advised, refine, and hunter pipelines", () => {
+  test("keeps GLM 5.2 scoped to the lite, advised, refine, and hunter pipelines", () => {
     const glmPipelines = Object.entries(builtInPipelines)
       .filter(([, spec]) => JSON.stringify(spec).includes("openrouter/z-ai/glm-5.2"))
       .map(([name]) => name)
 
     // The hunter pipelines use GLM as one specialty voice in their fan-out, not as a cost downgrade.
     // implement-advised keeps it as the audit executor, which is what makes it comparable to implement-lite.
-    expect(glmPipelines).toEqual(["implement", "implement-lite", "implement-advised", "review-lite", "refine", "hunter", "hunter-max"])
+    // `implement` itself is GLM-free: its one GLM step was design, which now runs on Kimi K3.
+    expect(glmPipelines).toEqual(["implement-lite", "implement-advised", "review-lite", "refine", "hunter", "hunter-max"])
   })
 })
 
@@ -243,16 +244,16 @@ describe("built-in review-lite pipeline", () => {
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
   })
 
-  test("swaps scope and the first audit slot to GLM 5.2 while keeping opus for the second slot and the report", () => {
+  test("runs entirely on low-cost models: GLM 5.2 scopes and reports, and the fan-out pairs GLM 5.2 with Kimi K3", () => {
     const pipeline = reviewLite()
     expect(stepNames(pipeline)).toEqual([
       "scope",
       "clean-code__openrouter-z-ai-glm-5-2",
-      "clean-code__anthropic-claude-opus-5",
+      "clean-code__openrouter-moonshotai-kimi-k3",
       "security__openrouter-z-ai-glm-5-2",
-      "security__anthropic-claude-opus-5",
+      "security__openrouter-moonshotai-kimi-k3",
       "bugs__openrouter-z-ai-glm-5-2",
-      "bugs__anthropic-claude-opus-5",
+      "bugs__openrouter-moonshotai-kimi-k3",
       "report",
     ])
 
@@ -260,17 +261,21 @@ describe("built-in review-lite pipeline", () => {
       pipeline.steps.filter((step): step is AgentStep => step.type === "agent").map((step) => [step.name, step]),
     )
     expect(byName.scope?.model).toBe("openrouter/z-ai/glm-5.2")
-    expect(byName.report?.model).toBe("anthropic/claude-opus-5")
+    expect(byName.report?.model).toBe("openrouter/z-ai/glm-5.2")
     expect(byName.report?.inputFiles).toEqual([
       "prd.md",
       "reports/scope.md",
       "reports/clean-code__openrouter-z-ai-glm-5-2.md",
-      "reports/clean-code__anthropic-claude-opus-5.md",
+      "reports/clean-code__openrouter-moonshotai-kimi-k3.md",
       "reports/security__openrouter-z-ai-glm-5-2.md",
-      "reports/security__anthropic-claude-opus-5.md",
+      "reports/security__openrouter-moonshotai-kimi-k3.md",
       "reports/bugs__openrouter-z-ai-glm-5-2.md",
-      "reports/bugs__anthropic-claude-opus-5.md",
+      "reports/bugs__openrouter-moonshotai-kimi-k3.md",
     ])
+  })
+
+  test("never reaches for Opus, which is what separates it from review", () => {
+    expect(JSON.stringify(builtInPipelines["review-lite"])).not.toContain("opus")
   })
 })
 
@@ -289,6 +294,52 @@ describe("built-in refine pipeline", () => {
     expect(byName.triage).toMatchObject({ model: "anthropic/claude-opus-5" })
     expect(byName.fixes).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
     expect(byName.validator).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
+  })
+})
+
+describe("built-in fixer pipeline", () => {
+  const fixer = () =>
+    resolvePipeline({ name: "fixer", spec: builtInPipelines.fixer!, agents: builtInAgents }).steps.filter(
+      (step): step is AgentStep => step.type === "agent",
+    )
+
+  test("runs reproduction, fixes, validation, and report in that order", () => {
+    expect(fixer().map((step) => step.name)).toEqual(["reproduction", "fixes", "validation", "report"])
+  })
+
+  test("carries the working phases on Terra xhigh and drops the reporter to the cheap GPT 5.6", () => {
+    const byName = Object.fromEntries(fixer().map((step) => [step.name, step]))
+
+    expect(byName.reproduction).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
+    expect(byName.fixes).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
+    expect(byName.validation).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
+    expect(byName.report?.model).toBe("openai/gpt-5.6-luna")
+    expect(byName.report?.variant).toBeUndefined()
+  })
+
+  test("lets reproduction and fixes write, and keeps validation and report audit-only", () => {
+    const byName = Object.fromEntries(fixer().map((step) => [step.name, step]))
+
+    expect(byName.reproduction?.readOnly).toBeUndefined()
+    expect(byName.fixes?.readOnly).toBeUndefined()
+    expect(byName.validation?.readOnly).toBe(true)
+    expect(byName.report?.readOnly).toBe(true)
+  })
+
+  test("gives every phase the exact evidence trail its prompt reads by path", () => {
+    const byName = Object.fromEntries(fixer().map((step) => [step.name, step]))
+
+    // reproduction opens on the findings alone; the diff is what it proves them against.
+    expect(byName.reproduction?.inputFiles).toEqual(["prd.md"])
+    expect(byName.reproduction?.inputDiff).toBe(true)
+    expect(byName.fixes?.inputFiles).toEqual(["prd.md", "reports/reproduction.md"])
+    expect(byName.validation?.inputFiles).toEqual(["prd.md", "reports/reproduction.md", "reports/fixes.md"])
+    expect(byName.report?.inputFiles).toEqual([
+      "prd.md",
+      "reports/reproduction.md",
+      "reports/fixes.md",
+      "reports/validation.md",
+    ])
   })
 })
 
@@ -464,7 +515,7 @@ describe("pipeline resolution", () => {
     }
 
     const withoutDefault = agentSteps(spec)
-    expect(withoutDefault[1]).toMatchObject({ model: "anthropic/claude-opus-5" })
+    expect(withoutDefault[1]).toMatchObject({ model: "openrouter/moonshotai/kimi-k3" })
 
     const [implementer, design, tests] = resolvePipeline({
       name: "test",

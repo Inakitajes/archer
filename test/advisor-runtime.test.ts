@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
-import type { AdvisorResult, AdvisorUsage } from "../src/advisor"
+import { defaultAdvisorMaxCalls, type AdvisorResult, type AdvisorUsage } from "../src/advisor"
 import { createAdvisorRuntime, firstWriteMessage, totalAdvisorUsage } from "../src/advisor-runtime"
 import type { AgentStep } from "../src/types"
 
@@ -112,12 +112,36 @@ describe("advisor budget", () => {
     expect(calls).toHaveLength(2)
   })
 
-  test("defaults to three consultations per attempt", async () => {
+  test("defaults to a budget that does not bind in practice", async () => {
     const { runtime: advisors, calls } = runtime()
     const handle = advisors.begin("ses_1", step())!
 
-    for (let i = 0; i < 4; i++) await handle.consult("on-demand")
-    expect(calls).toHaveLength(3)
+    // A phase is a whole implementation session, so the default must not quietly
+    // switch the advisor off partway through the work it exists to advise.
+    for (let i = 0; i < 50; i++) expect((await handle.consult("on-demand")).ok).toBe(true)
+    expect(calls).toHaveLength(50)
+    expect(defaultAdvisorMaxCalls).toBeGreaterThanOrEqual(1000)
+  })
+
+  test("the default is still finite, so the cost ceiling and its exhausted event survive", async () => {
+    const { runtime: advisors, calls } = runtime()
+    const handle = advisors.begin("ses_1", step())!
+
+    for (let i = 0; i < defaultAdvisorMaxCalls; i++) await handle.consult("on-demand")
+    const overBudget = await handle.consult("on-demand")
+
+    expect(overBudget.ok).toBe(false)
+    expect(overBudget.text).toContain("advisor budget")
+    expect(calls).toHaveLength(defaultAdvisorMaxCalls)
+  })
+
+  test("an explicit cap still outranks the default, in both directions", async () => {
+    const { runtime: advisors, calls } = runtime()
+    const tight = advisors.begin("ses_1", step({ advisorMaxCalls: 1 }))!
+
+    expect((await tight.consult("on-demand")).ok).toBe(true)
+    expect((await tight.consult("on-demand")).ok).toBe(false)
+    expect(calls).toHaveLength(1)
   })
 
   test("accumulates usage from successful consultations only", async () => {
