@@ -11,14 +11,14 @@ import { builtInPipelines, defaultPipelineName, resolvePipeline } from "./pipeli
 import { stepRunnerFor } from "./step-runners"
 import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { runReviewLines } from "./review-tui"
-import { joinLines, limitsRow, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
 
 import type { ConvoyConfig } from "./config"
 import type { BoxOptions, CliRenderer, KeyEvent, PasteEvent, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
 import type { AgentSpec, AgentStep, HookSet, HookSpec, RunOptions, RunPlan, Step } from "./types"
-import type { PaletteColor } from "./tui-theme"
+import type { Hint, PaletteColor } from "./tui-theme"
 
 export type LaunchRunSelection = {
   targetDir: string
@@ -1426,62 +1426,72 @@ class LaunchPicker {
     return flags
   }
 
+  /**
+   * One row per mode, shed by priority when the terminal is too narrow — the
+   * shared helper appends a dim count so a shortened row still admits there are
+   * keys it isn't showing. Priority 1 is whatever gets you back out.
+   */
   private footerContent(width: number) {
-    const right = [fg(theme.faint)(`${this.selected + 1}/${this.choices.length}`)]
+    const row = (hints: Hint[], right: TextChunk[]) => hintsRow(hints, [right], width, { style: "spaced", overflow: moreHintsMarker })
+
     if (this.mode === "pipelines") {
-      return padBetween(
-        [fg(theme.dim)("↑/↓ select · "), fg(theme.accent)("enter"), fg(theme.dim)(" prompt · "), fg(theme.accent)("r"), fg(theme.dim)(" runs · "), fg(theme.accent)("c"), fg(theme.dim)(" config · "), fg(theme.accent)("q"), fg(theme.dim)(" quit")],
-        right,
-        width,
+      return row(
+        [
+          { keys: "↑/↓", label: "select", priority: 2, tone: "dim" },
+          { keys: "enter", label: "prompt", priority: 3 },
+          { keys: "r", label: "runs", priority: 4 },
+          { keys: "c", label: "config", priority: 5 },
+          { keys: "q", label: "quit", priority: 1 },
+        ],
+        [fg(theme.faint)(`${this.selected + 1}/${this.choices.length}`)],
       )
     }
     if (this.mode === "prompt") {
-      return padBetween(
-        [fg(theme.dim)("type/paste · "), fg(theme.accent)("shift+enter"), fg(theme.dim)(" newline · "), fg(theme.accent)("enter"), fg(theme.dim)(" options · "), fg(theme.accent)("esc"), fg(theme.dim)(" back")],
+      return row(
+        [
+          { keys: "type/paste", label: "", priority: 4, tone: "dim" },
+          { keys: "shift+enter", label: "newline", priority: 3 },
+          { keys: "enter", label: "options", priority: 2 },
+          { keys: "esc", label: "back", priority: 1 },
+        ],
         [fg(theme.faint)(`${this.prompt.length} char${this.prompt.length === 1 ? "" : "s"}`)],
-        width,
       )
     }
     if (this.mode === "branch") {
-      return padBetween(
+      return row(
         [
-          fg(theme.accent)("enter"),
-          fg(theme.dim)(this.branchField === "guidance" ? " name it from the hint · " : " review · "),
-          fg(theme.accent)("tab"),
-          fg(theme.dim)(" field · "),
-          fg(theme.accent)("ctrl+R"),
-          fg(theme.dim)(" rename · "),
-          fg(theme.accent)("esc"),
-          fg(theme.dim)(" options"),
+          { keys: "enter", label: this.branchField === "guidance" ? "name it from the hint" : "review", priority: 2 },
+          { keys: "tab", label: "field", priority: 3 },
+          { keys: "ctrl+R", label: "rename", priority: 4 },
+          { keys: "esc", label: "options", priority: 1 },
         ],
         [fg(theme.faint)(this.branchField === "name" ? "branch" : "hint")],
-        width,
       )
     }
     if (this.mode === "review") {
       const end = Math.min(this.reviewScroll + this.listHeight(), this.reviewTotalLines)
-      return padBetween(
+      return row(
         [
-          fg(theme.dim)("↑/↓ scroll · "),
-          fg(theme.accent)("pgup/pgdn"),
-          fg(theme.dim)(" page · "),
-          fg(theme.accent)("p"),
-          fg(theme.dim)(this.reviewFullPrompt ? " collapse prompt · " : " expand prompt · "),
-          fg(theme.accent)("enter/s"),
-          fg(theme.dim)(" start · "),
-          fg(theme.accent)("esc"),
-          fg(theme.dim)(" options · "),
-          fg(theme.accent)("q"),
-          fg(theme.dim)(" cancel"),
+          { keys: "↑/↓", label: "scroll", priority: 3, tone: "dim" },
+          { keys: "pgup/pgdn", label: "page", priority: 4 },
+          { keys: "p", label: this.reviewFullPrompt ? "collapse prompt" : "expand prompt", priority: 5 },
+          { keys: "enter/s", label: "start", priority: 2 },
+          { keys: "esc", label: "options", priority: 1 },
+          { keys: "q", label: "cancel", priority: 6 },
         ],
         [fg(theme.faint)(`${end}/${this.reviewTotalLines}`)],
-        width,
       )
     }
-    return padBetween(
-      [fg(theme.dim)("↑/↓ select · "), fg(theme.accent)("space"), fg(theme.dim)(" toggle · "), fg(theme.accent)("g"), fg(theme.dim)(" gateway · "), fg(theme.accent)("enter"), fg(theme.dim)(" review · "), fg(theme.accent)("p"), fg(theme.dim)(" prompt · "), fg(theme.accent)("q"), fg(theme.dim)(" quit")],
+    return row(
+      [
+        { keys: "↑/↓", label: "select", priority: 3, tone: "dim" },
+        { keys: "space", label: "toggle", priority: 2 },
+        { keys: "g", label: "gateway", priority: 5 },
+        { keys: "enter", label: "review", priority: 4 },
+        { keys: "p", label: "prompt", priority: 6 },
+        { keys: "q", label: "quit", priority: 1 },
+      ],
       [fg(theme.faint)(`${this.optionIndex + 1}/${toggles.length}`)],
-      width,
     )
   }
 

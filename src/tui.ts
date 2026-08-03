@@ -22,6 +22,7 @@ import { log } from "./log"
 import { markdownInlineChunks, markdownLines, parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
 import { openIterateOpencodeWindow, openOpencodeSessionWindow, openStoredSessionWindow, type SessionWindowBackend } from "./opencode"
 import { stepRunnerFor, type StepRunnerId } from "./step-runners"
+import { autoAcceptModeLabel, comparePaletteActions, dashboardActions, shortcutGroupOrder, shortcutGroupTitle } from "./tui-actions"
 import { PhaseUsage, addTokens, emptyTokens } from "./usage"
 import {
   formatAgo,
@@ -31,6 +32,7 @@ import {
   formatTime,
   clipChunks,
   displayWidth,
+  hintsRow,
   indentStyled,
   joinLines,
   limitsRow,
@@ -54,7 +56,8 @@ import { shortVersion } from "./version"
 
 import type { BoxOptions, CliRenderer, KeyEvent, Selection, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
-import type { PaletteColor, PhaseStatus } from "./tui-theme"
+import type { Action, ActionID, DashboardActionState } from "./tui-actions"
+import type { Hint, OverflowHint, PaletteColor, PhaseStatus } from "./tui-theme"
 import type {
   ActivityKind,
   AutoAccept,
@@ -133,6 +136,12 @@ const runnerSessionOpeners: Record<StepRunnerId, (context: RunnerSessionContext)
 // The right-hand content panel is a three-tab view of the focused phase.
 export type ContentTab = "logs" | "reports" | "session" | "advisor"
 const contentTabOrder: readonly ContentTab[] = ["session", "reports", "logs", "advisor"]
+const commandContentTab: Record<"tab-session" | "tab-reports" | "tab-logs" | "tab-advisor", ContentTab> = {
+  "tab-session": "session",
+  "tab-reports": "reports",
+  "tab-logs": "logs",
+  "tab-advisor": "advisor",
+}
 
 type FullscreenView = {
   phase: string
@@ -141,19 +150,16 @@ type FullscreenView = {
   copyStatus?: ClipboardResult
 }
 
-type CommandID = "keep-awake" | "pause" | "permissions" | "interactive" | "help"
-
 type CommandPalette = {
   filter: string
   index: number
   view: "commands" | "help"
+  /** First visible body row: the shortcut table outgrows a short terminal. */
+  scroll: number
 }
 
-type CommandItem = {
-  id: CommandID
-  label: string
-  detail: string
-}
+/** An action the palette can actually run — `label` is what makes it runnable. */
+type CommandItem = Action & { label: string }
 
 /**
  * The [f] flow on the finish screen. "working" covers both halves that take the
@@ -1673,45 +1679,49 @@ export class TuiProgress implements ProgressUI {
   }
 
   private openCommandPalette() {
-    this.commandPalette = { filter: "", index: 0, view: "commands" }
+    this.commandPalette = { filter: "", index: 0, view: "commands", scroll: 0 }
     this.render()
   }
 
-  private commandItems(): CommandItem[] {
-    const items: CommandItem[] = []
-    if (!this.finished && !this.observer) {
-      if (this.onKeepAwakeToggle && this.keepAwake?.status !== "unavailable") {
-        items.push({
-          id: "keep-awake",
-          label: "Keep Mac awake",
-          detail: this.keepAwake?.status === "on" ? "on · release Caffeinate" : "off · prevent screen sleep",
-        })
-      }
-      if (this.onPauseToggle) {
-        items.push({
-          id: "pause",
-          label: this.controlState === "running" ? "Pause pipeline" : "Resume pipeline",
-          detail: this.controlState === "running" ? "after the current batch" : "resume now",
-        })
-      }
-      if (this.autoAccept) {
-        items.push({ id: "permissions", label: "Permission policy", detail: `${autoAcceptModeLabel(this.autoAccept.mode)} · cycle` })
-      }
-      items.push({
-        id: "interactive",
-        label: "Interactive takeover",
-        detail: this.interactiveTakeover.has(this.focusedPhase()?.name ?? "") ? "armed for selected step" : "selected running step",
-      })
+  /**
+   * The keyboard surface for the state the dashboard is in right now. One call
+   * feeds the footer, the palette and the shortcuts view, so those three can no
+   * longer disagree about what the dashboard can do.
+   */
+  private actionState(): DashboardActionState {
+    const fullscreen = this.fullscreen
+    return {
+      finished: this.finished !== undefined,
+      observer: this.observer,
+      contentFocused: this.contentFocused,
+      selectedGroup: this.selectedGroup !== undefined,
+      fullscreen: fullscreen !== undefined,
+      contentTab: fullscreen?.tab ?? this.contentTab,
+      permissionPending: this.permissionQueue.length > 0,
+      humanReviewGate: this.humanReviewQueue[0]?.info.kind === "interactive" ? "interactive" : this.humanReviewQueue.length > 0 ? "review" : undefined,
+      autoAccept: this.autoAccept?.mode,
+      keepAwake: this.keepAwake?.status,
+      controlState: this.controlState,
+      canPause: this.onPauseToggle !== undefined,
+      canKeepAwake: this.onKeepAwakeToggle !== undefined && this.keepAwake?.status !== "unavailable",
+      finishSeam: this.finishSeam !== undefined,
+      interactiveArmed: this.interactiveTakeover.has(this.focusedPhase()?.name ?? ""),
+      reportCopyable: fullscreen !== undefined && Array.isArray(this.reports.get(fullscreen.phase)),
+      autoAcceptChunk: this.autoAccept ? autoAcceptStatusChunk(this.autoAccept.mode) : undefined,
     }
-    items.push({ id: "help", label: "Keyboard shortcuts", detail: "show all controls" })
-    return items
+  }
+
+  private commandItems(): CommandItem[] {
+    return dashboardActions(this.actionState())
+      .filter((action): action is CommandItem => action.available && action.label !== undefined)
+      .sort(comparePaletteActions)
   }
 
   private filteredCommandItems() {
     const palette = this.commandPalette
     if (!palette || palette.view !== "commands") return []
     const query = palette.filter.trim().toLowerCase()
-    const items = this.commandItems().filter((item) => !query || `${item.label} ${item.detail}`.toLowerCase().includes(query))
+    const items = this.commandItems().filter((item) => !query || `${item.label} ${item.detail ?? ""}`.toLowerCase().includes(query))
     palette.index = Math.max(0, Math.min(items.length - 1, palette.index))
     return items
   }
@@ -1723,8 +1733,33 @@ export class TuiProgress implements ProgressUI {
     key.stopPropagation()
 
     if (palette.view === "help") {
-      if (key.name === "escape") this.commandPalette = undefined
-      else if (key.name === "return" || key.name === "linefeed" || key.name === "backspace") palette.view = "commands"
+      switch (key.name) {
+        case "escape":
+          this.commandPalette = undefined
+          break
+        case "return":
+        case "linefeed":
+        case "backspace":
+          palette.view = "commands"
+          palette.scroll = 0
+          break
+        case "up":
+        case "k":
+          palette.scroll = Math.max(0, palette.scroll - 1)
+          break
+        case "down":
+        case "j":
+          palette.scroll += 1
+          break
+        case "pageup":
+          palette.scroll = Math.max(0, palette.scroll - 10)
+          break
+        case "pagedown":
+        case "space":
+          palette.scroll += 10
+          break
+      }
+      // renderCommandPalette clamps `scroll` against the rows it actually built.
       this.render()
       return
     }
@@ -1765,24 +1800,64 @@ export class TuiProgress implements ProgressUI {
   }
 
   private runCommand(item: CommandItem) {
+    const close = () => {
+      this.commandPalette = undefined
+    }
+    // The handlers below already repaint; the ones that fall through to the
+    // bottom (and only those) need the explicit render.
     switch (item.id) {
       case "keep-awake":
-        this.commandPalette = undefined
+        close()
         this.onKeepAwakeToggle?.()
         break
       case "pause":
-        this.commandPalette = undefined
+        close()
         this.onPauseToggle?.()
         break
       case "permissions":
+        // Stays open on purpose: cycling the policy is often done twice.
         this.cycleAutoAccept()
         return
       case "interactive":
-        this.commandPalette = undefined
+        close()
         this.toggleInteractiveTakeover()
         return
+      case "session":
+        close()
+        this.openActiveSessionWindow("key")
+        return
+      case "fullscreen":
+        close()
+        this.openFullscreenView()
+        return
+      case "tab-session":
+      case "tab-reports":
+      case "tab-logs":
+      case "tab-advisor":
+        close()
+        this.setContentTab(commandContentTab[item.id])
+        return
+      case "iterate":
+        close()
+        void this.openIterateWindow()
+        return
+      case "lazygit":
+        close()
+        void this.openGitSubshell()
+        return
+      case "finish":
+        close()
+        void this.openFinishModal()
+        return
+      case "close":
+        close()
+        this.finished?.resolve()
+        return
       case "help":
-        if (this.commandPalette) this.commandPalette.view = "help"
+        if (this.commandPalette) {
+          this.commandPalette.view = "help"
+          this.commandPalette.scroll = 0
+        }
         break
     }
     this.render()
@@ -3192,159 +3267,64 @@ export class TuiProgress implements ProgressUI {
     return lines
   }
 
+  /**
+   * The footer is one unwrapped line in a fixed-height box, so hints that don't
+   * fit used to be chopped off against the border with nothing to say they
+   * existed. Now the row sheds them by priority and the pinned [ctrl+p] hint
+   * changes its wording to point at the palette, where all of them are listed.
+   */
   private footerContent(now: number, width: number) {
-    if (this.finished) {
-      if (this.contentFocused) {
-        const left: TextChunk[] = [
-          fg(theme.dim)("read · ["),
-          fg(theme.accent)("↑↓"),
-          fg(theme.dim)("] scroll · ["),
-          fg(theme.accent)("pgup/pgdn"),
-          fg(theme.dim)("] page · ["),
-          fg(theme.accent)("esc"),
-          fg(theme.dim)("] pipeline · ["),
-          fg(theme.accent)("q"),
-          fg(theme.dim)("] close"),
-        ]
-        if (!this.selectedGroup) left.push(...fullscreenHint(this.contentTab))
-        const right: TextChunk[] = [fg(theme.faint)(this.runID ? `run ${this.runID}` : "run …")]
-        return padBetween(left, right, width)
-      }
-      const left: TextChunk[] = this.selectedGroup
-        ? [
-            fg(theme.dim)("["),
-            fg(theme.accent)("↑↓"),
-            fg(theme.dim)("] node · ["),
-            fg(theme.accent)("enter"),
-            fg(theme.dim)("] read · ["),
-            fg(theme.accent)("←→"),
-            fg(theme.dim)("] tab · select a child for session · ["),
-            fg(theme.accent)("i"),
-            fg(theme.dim)("] iterate · ["),
-            fg(theme.accent)("g"),
-            fg(theme.dim)("] lazygit · ["),
-            ...(this.finishSeam ? [fg(theme.accent)("f"), fg(theme.dim)("] finish · [")] : []),
-            fg(theme.accent)("q"),
-            fg(theme.dim)("] close"),
-          ]
-        : [
-            fg(theme.dim)("["),
-            fg(theme.accent)("↑↓"),
-            fg(theme.dim)("] step · ["),
-            fg(theme.accent)("enter"),
-            fg(theme.dim)("] read · ["),
-            fg(theme.accent)("←→"),
-            fg(theme.dim)("] tab · ["),
-            fg(theme.accent)("o"),
-            fg(theme.dim)("] session · ["),
-            fg(theme.accent)("i"),
-            fg(theme.dim)("] iterate · ["),
-            fg(theme.accent)("g"),
-            fg(theme.dim)("] lazygit · ["),
-            ...(this.finishSeam ? [fg(theme.accent)("f"), fg(theme.dim)("] finish · [")] : []),
-            fg(theme.accent)("q"),
-            fg(theme.dim)("] close"),
-          ]
-      if (!this.selectedGroup) left.push(...fullscreenHint(this.contentTab))
-      const right: TextChunk[] = [fg(theme.faint)(this.runID ? `run ${this.runID}` : "run …")]
-      return padBetween(left, right, width)
-    }
+    const state = this.actionState()
+    const actions = dashboardActions(state)
+    const hints: Hint[] = actions
+      .filter((action) => action.available && action.hint !== undefined && action.keys !== undefined)
+      .map((action) => ({
+        keys: action.keys!,
+        label: action.hint!,
+        priority: action.priority,
+        tone: action.tone,
+        style: action.style,
+        labelChunks: action.labelChunks,
+      }))
 
-    if (this.permissionQueue.length > 0) {
-      const left: TextChunk[] = [
-        fg(theme.yellow)("⚿ "),
-        fg(theme.dim)("←/→ choose · "),
-        fg(theme.accent)("enter"),
-        fg(theme.dim)(" confirm · "),
-        fg(theme.accent)("o"),
-        fg(theme.dim)("nce · "),
-        fg(theme.accent)("a"),
-        fg(theme.dim)("lways · "),
-        fg(theme.accent)("r"),
-        fg(theme.dim)("eject · "),
-        fg(theme.accent)("esc"),
-        fg(theme.dim)(" rejects · "),
-        fg(theme.accent)("shift+tab"),
-        fg(theme.dim)(" auto-accept"),
-      ]
+    if (state.permissionPending) {
       const right: TextChunk[] = this.permissionQueue.length > 1 ? [fg(theme.yellow)(`${this.permissionQueue.length} pending`)] : []
-      return padBetween(left, right, width)
+      return hintsRow(hints, [right], width, { style: "spaced", prefix: [fg(theme.yellow)("⚿ ")] })
     }
 
     const gate = this.humanReviewQueue[0]
     if (gate) {
-      const left: TextChunk[] = [
-        fg(theme.yellow)(gate.info.kind === "interactive" ? "interactive session · " : "human review · "),
-        fg(theme.accent)("c"),
-        fg(theme.dim)(" continue · "),
-        fg(theme.accent)("o"),
-        fg(theme.dim)(" open OpenCode · "),
-        fg(theme.accent)("a"),
-        fg(theme.dim)(" abort"),
-      ]
       const right: TextChunk[] = []
       if (this.humanReviewQueue.length > 1) right.push(fg(theme.yellow)(`${this.humanReviewQueue.length - 1} more waiting`), fg(theme.faint)(" · "))
       if (gate.info.iterations > 0) right.push(fg(theme.faint)(`${gate.info.iterations} iteration${gate.info.iterations === 1 ? "" : "s"}`))
-      return padBetween(left, right, width)
+      const prefix = [fg(theme.yellow)(gate.info.kind === "interactive" ? "interactive session · " : "human review · ")]
+      return hintsRow(hints, [right], width, { style: "spaced", prefix })
     }
 
-    const left: TextChunk[] = this.contentFocused
-      ? [
-          fg(theme.dim)("read · ["),
-          fg(theme.accent)("↑↓"),
-          fg(theme.dim)("] scroll · ["),
-          fg(theme.accent)("pgup/pgdn"),
-          fg(theme.dim)("] page · ["),
-          fg(theme.accent)("esc"),
-          fg(theme.dim)("] pipeline · "),
-          fg(theme.accent)("ctrl+p"),
-          fg(theme.dim)(" commands · "),
-          fg(theme.yellow)("ctrl+c"),
-          fg(theme.dim)(" abort"),
-        ]
-      : this.selectedGroup
-        ? [
-            fg(theme.dim)("["),
-            fg(theme.accent)("↑↓"),
-            fg(theme.dim)("] node · ["),
-            fg(theme.accent)("enter"),
-            fg(theme.dim)("] read · ["),
-            fg(theme.accent)("←→"),
-            fg(theme.dim)("] tab · select a child for OpenCode · "),
-            fg(theme.accent)("ctrl+p"),
-            fg(theme.dim)(" commands · "),
-            fg(theme.yellow)("ctrl+c"),
-            fg(theme.dim)(" abort"),
-          ]
-        : [
-          fg(theme.dim)("["),
-          fg(theme.accent)("↑↓"),
-          fg(theme.dim)("] step · ["),
-          fg(theme.accent)("enter"),
-          fg(theme.dim)("] read · ["),
-          fg(theme.accent)("←→"),
-          fg(theme.dim)("] tab · ["),
-          fg(theme.accent)("o"),
-          fg(theme.dim)("] session · ["),
-          fg(theme.accent)("ctrl+p"),
-          fg(theme.dim)("] commands · "),
-          fg(theme.yellow)("ctrl+c"),
-          fg(theme.dim)(" abort"),
-        ]
-    if (this.autoAccept) {
-      left.push(fg(theme.dim)(" · "), fg(theme.accent)("shift+tab"))
-      left.push(autoAcceptStatusChunk(this.autoAccept.mode))
-    }
-    if (!this.selectedGroup) left.push(...fullscreenHint(this.contentTab))
+    // Pinned: whatever else goes, the way to find the rest stays. The wording
+    // switches to "all shortcuts" the moment a hint is actually dropped.
+    const overflow: OverflowHint = { keys: "ctrl+p", label: "commands", moreLabel: "all shortcuts", priority: 0 }
+    const prefix = state.contentFocused
+      ? [fg(theme.dim)("read · ")]
+      : state.selectedGroup
+        ? [fg(theme.dim)("select a child for session · ")]
+        : []
+    return hintsRow(hints, this.footerStatusCandidates(now), width, { overflow, prefix })
+  }
+
+  /**
+   * Run metadata, longest first. Detail goes before precision: the quiet timer
+   * drops, then the server URL, and the run id is kept whole rather than being
+   * ellipsised mid-value.
+   */
+  private footerStatusCandidates(now: number): TextChunk[][] {
+    const run = fg(theme.faint)(this.runID ? `run ${this.runID}` : "run …")
+    if (this.finished) return [[run]]
     const quiet = now - this.lastActivityAt
-    const right: TextChunk[] = [
-      fg(theme.faint)(this.runID ? `run ${this.runID}` : "run …"),
-      fg(theme.faint)(" · "),
-      fg(theme.faint)(this.serverUrl ? `⚡ ${shortUrl(this.serverUrl)}` : "⚡ starting…"),
-      fg(theme.faint)(" · "),
-      fg(quiet > 60_000 ? theme.yellow : theme.faint)(formatAgo(quiet)),
-    ]
-    return padBetween(left, right, width)
+    const sep = fg(theme.faint)(" · ")
+    const server = fg(theme.faint)(this.serverUrl ? `⚡ ${shortUrl(this.serverUrl)}` : "⚡ starting…")
+    const ago = fg(quiet > 60_000 ? theme.yellow : theme.faint)(formatAgo(quiet))
+    return [[run, sep, server, sep, ago], [run, sep, server], [run]]
   }
 
   private renderModal() {
@@ -3484,50 +3464,68 @@ export class TuiProgress implements ProgressUI {
 
     const boxWidth = Math.max(46, Math.min(72, this.renderer.width - 8))
     const width = boxWidth - 6
-    const lines: StyledText[] = []
+    const head: StyledText[] = []
+    const body: StyledText[] = []
+    // The shortcut table is longer than a short terminal, so the body scrolls
+    // rather than growing the modal past the screen.
+    const maxRows = Math.max(4, this.renderer.height - 10)
 
     if (palette.view === "help") {
-      lines.push(t`${bold(fg(theme.text)("Run dashboard"))}`)
-      lines.push(plain(""))
-      lines.push(t`${fg(theme.accent)("↑↓ / j k")} ${fg(theme.dim)("select a step")}`)
-      lines.push(t`${fg(theme.accent)("enter / esc")} ${fg(theme.dim)("focus / leave the reader")}`)
-      lines.push(t`${fg(theme.accent)("←→ / tab / 1 2 3")} ${fg(theme.dim)("switch content tab")}`)
-      lines.push(t`${fg(theme.accent)("o")} ${fg(theme.dim)("open the selected session")}`)
-      lines.push(t`${fg(theme.accent)("i")} ${fg(theme.dim)("toggle interactive takeover")}`)
-      lines.push(t`${fg(theme.accent)("p")} ${fg(theme.dim)("pause or resume the pipeline")}`)
-      lines.push(t`${fg(theme.accent)("f")} ${fg(theme.dim)("when finished: squash the run into one signed commit")}`)
-      lines.push(t`${fg(theme.accent)("g")} ${fg(theme.dim)("when finished: open lazygit")}`)
-      lines.push(t`${fg(theme.accent)("shift+tab")} ${fg(theme.dim)("cycle permission policy")}`)
-      lines.push(t`${fg(theme.accent)("ctrl+p")} ${fg(theme.dim)("open commands")}`)
-      lines.push(t`${fg(theme.yellow)("ctrl+c")} ${fg(theme.dim)("abort the run")}`)
-      lines.push(plain(""))
-      lines.push(t`${fg(theme.faint)("esc closes · enter returns to commands")}`)
+      // The full reference, generated from the same catalog the footer and the
+      // command list read. It deliberately lists keys the current state can't
+      // reach — that is what a shortcut table is for — so each one says when it
+      // applies rather than quietly disappearing.
+      const documented = dashboardActions(this.actionState()).filter((action) => action.keys !== undefined && action.help !== undefined)
+      const keyColumn = documented.reduce((widest, action) => Math.max(widest, displayWidth(action.keys!)), 0)
+      shortcutGroupOrder.forEach((group) => {
+        const actions = documented.filter((action) => action.group === group)
+        if (actions.length === 0) return
+        if (body.length > 0) body.push(plain(""))
+        body.push(t`${bold(fg(theme.text)(shortcutGroupTitle(group)))}`)
+        actions.forEach((action) => {
+          const keys = action.keys!.padEnd(action.keys!.length + Math.max(0, keyColumn - displayWidth(action.keys!)))
+          body.push(t`${fg(action.tone === "yellow" ? theme.yellow : theme.accent)(keys)}  ${fg(theme.dim)(truncate(action.help!, width - keyColumn - 2))}`)
+        })
+      })
     } else {
-      lines.push(t`${fg(theme.faint)("type to filter · ↑↓ select · enter run · esc close")}`)
-      if (palette.filter) lines.push(t`${fg(theme.dim)("filter ")}${fg(theme.text)(palette.filter)}`)
-      lines.push(plain(""))
+      head.push(t`${fg(theme.faint)("type to filter · ↑↓ select · enter run · esc close")}`)
+      if (palette.filter) head.push(t`${fg(theme.dim)("filter ")}${fg(theme.text)(palette.filter)}`)
+      head.push(plain(""))
       const items = this.filteredCommandItems()
       if (items.length === 0) {
-        lines.push(t`${fg(theme.dim)("no matching commands")}`)
+        body.push(t`${fg(theme.dim)("no matching commands")}`)
       } else {
         items.forEach((item, index) => {
           const selected = index === palette.index
           const left: TextChunk[] = [fg(selected ? theme.accent : theme.faint)(selected ? "› " : "  "), selected ? bold(fg(theme.text)(item.label)) : fg(theme.dim)(item.label)]
-          lines.push(padBetween(left, [fg(selected ? theme.accent : theme.faint)(item.detail)], width))
+          body.push(padBetween(left, item.detail ? [fg(selected ? theme.accent : theme.faint)(item.detail)] : [], width))
         })
+        // The selection drives the window here; in the help view the user does.
+        palette.scroll = Math.min(palette.scroll, palette.index)
+        palette.scroll = Math.max(palette.scroll, palette.index - maxRows + 1)
       }
     }
+
+    const rows = Math.max(0, body.length - maxRows)
+    palette.scroll = Math.max(0, Math.min(palette.scroll, rows))
+    const visible = body.slice(palette.scroll, palette.scroll + maxRows)
+
+    const legend =
+      palette.view === "help"
+        ? rows > 0
+          ? "↑↓ scroll · esc closes · enter returns to commands"
+          : "esc closes · enter returns to commands"
+        : rows > 0
+          ? `${palette.scroll + 1}–${palette.scroll + visible.length} of ${body.length}`
+          : undefined
+
+    const lines = [...head, ...visible]
+    if (legend) lines.push(plain(""), t`${fg(theme.faint)(legend)}`)
 
     this.modal.width = boxWidth
     this.modal.height = lines.length + 4
     this.modalText.content = joinLines(lines)
   }
-}
-
-function autoAcceptModeLabel(mode: AutoAcceptMode): string {
-  if (mode === "all") return "allow all"
-  if (mode === "smart") return "smart"
-  return "ask every time"
 }
 
 /**
@@ -3555,10 +3553,6 @@ function typedCharacter(key: KeyEvent): string | undefined {
   if (key.ctrl || key.meta || key.option || key.super || key.hyper) return undefined
   const raw = key.raw ?? ""
   return [...raw].length === 1 && raw >= " " && raw !== "\u007f" ? raw : undefined
-}
-
-function fullscreenHint(tab: ContentTab): TextChunk[] {
-  return [fg(theme.dim)(" · ["), fg(theme.accent)("v"), fg(theme.dim)(`] full ${tab}`)]
 }
 
 // The detail panel's status word — "ongoing or not" at a glance. A running
