@@ -359,6 +359,63 @@ describe("footer hints and the command palette", () => {
     }
   })
 
+  test("[MF-1] a permission footer suppresses review actions that route to the permission", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
+    try {
+      const permission = dashboard.askPermission({ id: "permission-1", permission: "bash", command: "ls", patterns: [] })
+      const review = dashboard.askHumanReview({ stepName: "implement", iterations: 0 })
+      await renderOnce()
+
+      // Permission routing runs first, so [a] means "always" here rather than
+      // the review gate's advertised "abort" action.
+      const row = footer(dashboard)
+      expect(row).toContain("always")
+
+      mockInput.pressKey("a")
+      expect(await permission).toBe("always")
+
+      // The review remains queued until the next [a], proving the first one
+      // answered the permission prompt rather than aborting the review gate.
+      let reviewReply: string | undefined
+      void review.then((reply) => {
+        reviewReply = reply
+      })
+      await Promise.resolve()
+      expect(reviewReply).toBeUndefined()
+      mockInput.pressKey("a")
+      expect(await review).toBe("abort")
+
+      expect(row).not.toContain("open OpenCode")
+      expect(row).not.toContain("abort")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[SF-1] a narrow permission footer marks choices hidden from the row", async () => {
+    const { dashboard, renderOnce } = await createDashboard(46, 40)
+    try {
+      void dashboard.askPermission({ id: "permission-1", permission: "bash", command: "ls", patterns: [] })
+      await renderOnce()
+
+      expect(footer(dashboard)).toMatch(/\+\d/)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[SF-1] a narrow review footer marks choices hidden from the row", async () => {
+    const { dashboard, renderOnce } = await createDashboard(46, 40)
+    try {
+      void dashboard.askHumanReview({ stepName: "implement", iterations: 0 })
+      await renderOnce()
+
+      expect(footer(dashboard)).toMatch(/\+\d/)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
   // Regression: the palette gated every action behind `!finished`, so the
   // finish screen offered a single entry while five actions sat on the keyboard.
   test("the finish screen's palette lists its own actions", async () => {
@@ -447,6 +504,32 @@ describe("footer hints and the command palette", () => {
       await renderOnce()
       expect(modal(dashboard)).not.toBe(first)
       expect(internals.modal.height).toBeLessThanOrEqual(24)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[MF-2] the focused reader's palette and o key both open the selected session", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(120, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals & {
+        openActiveSessionWindow(source: "click" | "key"): void
+      }
+      const opened: Array<"click" | "key"> = []
+      internals.openActiveSessionWindow = (source) => {
+        opened.push(source)
+      }
+
+      mockInput.pressEnter()
+      mockInput.pressKey("p", { ctrl: true })
+      await renderOnce()
+      const palette = modal(dashboard)
+
+      mockInput.pressEscape()
+      await Bun.sleep(20)
+      mockInput.pressKey("o")
+      expect(opened).toEqual(["key"])
+      expect(palette).toContain("Open session")
     } finally {
       dashboard.stop()
     }

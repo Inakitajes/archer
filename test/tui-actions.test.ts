@@ -143,8 +143,27 @@ describe("dashboard action registry", () => {
     ])
   })
 
+  test("[MF-1] permission takes precedence when a review gate is also waiting", () => {
+    // [a] always allows a permission before it can abort the review gate, so
+    // review actions must not be advertised in this combined state.
+    expect(footer({ permissionPending: true, humanReviewGate: "review" })).toEqual([
+      "permission-choose",
+      "permission-confirm",
+      "permission-once",
+      "permission-always",
+      "permission-reject",
+      "permission-escape",
+      "permission-auto-accept",
+    ])
+  })
+
   test("a review gate owns the row too", () => {
     expect(footer({ humanReviewGate: "review" })).toEqual(["review-continue", "review-open", "review-abort"])
+  })
+
+  test("[MF-2] the focused reader keeps session available to the palette but not its footer", () => {
+    expect(commands({ contentFocused: true })).toContain("session")
+    expect(footer({ contentFocused: true })).not.toContain("session")
   })
 
   test("the copy key exists only in the fullscreen reports reader", () => {

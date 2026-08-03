@@ -36,6 +36,7 @@ import {
   indentStyled,
   joinLines,
   limitsRow,
+  moreHintsMarker,
   padBetween,
   paletteForTerminal,
   plain,
@@ -3289,7 +3290,7 @@ export class TuiProgress implements ProgressUI {
 
     if (state.permissionPending) {
       const right: TextChunk[] = this.permissionQueue.length > 1 ? [fg(theme.yellow)(`${this.permissionQueue.length} pending`)] : []
-      return hintsRow(hints, [right], width, { style: "spaced", prefix: [fg(theme.yellow)("⚿ ")] })
+      return hintsRow(hints, [right], width, { style: "spaced", overflow: moreHintsMarker, prefix: [fg(theme.yellow)("⚿ ")] })
     }
 
     const gate = this.humanReviewQueue[0]
@@ -3298,7 +3299,7 @@ export class TuiProgress implements ProgressUI {
       if (this.humanReviewQueue.length > 1) right.push(fg(theme.yellow)(`${this.humanReviewQueue.length - 1} more waiting`), fg(theme.faint)(" · "))
       if (gate.info.iterations > 0) right.push(fg(theme.faint)(`${gate.info.iterations} iteration${gate.info.iterations === 1 ? "" : "s"}`))
       const prefix = [fg(theme.yellow)(gate.info.kind === "interactive" ? "interactive session · " : "human review · ")]
-      return hintsRow(hints, [right], width, { style: "spaced", prefix })
+      return hintsRow(hints, [right], width, { style: "spaced", overflow: moreHintsMarker, prefix })
     }
 
     // Pinned: whatever else goes, the way to find the rest stays. The wording

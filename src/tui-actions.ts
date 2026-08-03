@@ -203,9 +203,9 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       // footer says what to select instead (the caller's row prefix).
       id: "session",
       group: "session",
-      available: piloting && !state.selectedGroup,
+      available: navigable && !state.selectedGroup,
       keys: "o",
-      hint: "session",
+      hint: state.contentFocused ? undefined : "session",
       label: "Open session",
       detail: "the selected step's session window",
       help: "open the selected step's session",
@@ -436,7 +436,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
     {
       id: "review-continue",
       group: "review",
-      available: state.humanReviewGate !== undefined,
+      available: !state.permissionPending && state.humanReviewGate !== undefined,
       keys: "c",
       hint: "continue",
       style: "spaced",
@@ -446,7 +446,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
     {
       id: "review-open",
       group: "review",
-      available: state.humanReviewGate !== undefined,
+      available: !state.permissionPending && state.humanReviewGate !== undefined,
       keys: "o",
       hint: "open OpenCode",
       style: "spaced",
@@ -456,7 +456,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
     {
       id: "review-abort",
       group: "review",
-      available: state.humanReviewGate !== undefined,
+      available: !state.permissionPending && state.humanReviewGate !== undefined,
       keys: "a",
       hint: "abort",
       style: "spaced",
