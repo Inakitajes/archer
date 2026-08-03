@@ -236,6 +236,152 @@ export function displayWidth(text: string) {
   return Bun.stringWidth(text)
 }
 
+/** `[esc] back` · `esc back` · `q`+`uit` — the three shapes footers already use. */
+export type HintStyle = "bracket" | "spaced" | "glued"
+
+export type HintTone = "accent" | "yellow" | "dim"
+
+/**
+ * One keyboard hint in a footer row. `priority` decides the order of sacrifice
+ * when the row is too narrow for all of them: 0 is pinned and never leaves,
+ * larger numbers leave first.
+ */
+export type Hint = {
+  keys: string
+  label: string
+  priority: number
+  tone?: HintTone
+  style?: HintStyle
+  /** Replaces the dim label when it carries its own colors (a live status). */
+  labelChunks?: TextChunk[]
+}
+
+/**
+ * The trailing hint that survives every drop, so a shortened row always says
+ * where the rest went instead of just ending mid-sentence against the border.
+ * A footer backed by a command palette keeps it visible at all times and only
+ * changes its wording; one without a palette omits `label` so a bare count
+ * appears when — and only when — something has actually been dropped.
+ */
+export type OverflowHint = Omit<Hint, "label"> & {
+  label?: string
+  moreLabel: string | ((dropped: number) => string)
+}
+
+/**
+ * The overflow marker for footers with no command palette behind them: a dim
+ * count that shows up only once hints have actually been dropped, so the row
+ * admits there is more without pointing at a screen that doesn't exist.
+ */
+export const moreHintsMarker: OverflowHint = {
+  keys: "+",
+  moreLabel: (dropped) => String(dropped),
+  priority: 0,
+  tone: "dim",
+  style: "glued",
+}
+
+/**
+ * A footer row that degrades instead of being chopped off by the panel border.
+ * Footers are one unwrapped line in a fixed-height box, so the only honest
+ * response to a narrow terminal is to drop hints — lowest priority first — and
+ * say so. `rightCandidates` is the same ladder `limitsRow` uses: ordered
+ * longest to shortest, first one that fits wins, so the right side loses detail
+ * before the keys on the left do.
+ */
+export function hintsRow(
+  hints: Hint[],
+  rightCandidates: TextChunk[][],
+  width: number,
+  options: { style?: HintStyle; overflow?: OverflowHint; prefix?: TextChunk[] } = {},
+): StyledText {
+  const style = options.style ?? "bracket"
+  const prefix = options.prefix ?? []
+  const overflow = options.overflow
+
+  const tailFor = (dropped: number): Hint[] => {
+    if (!overflow) return []
+    if (dropped > 0) {
+      return [{ ...overflow, label: typeof overflow.moreLabel === "function" ? overflow.moreLabel(dropped) : overflow.moreLabel }]
+    }
+    return overflow.label === undefined ? [] : [{ ...overflow, label: overflow.label }]
+  }
+  const compose = (list: Hint[], dropped: number): TextChunk[] => [...prefix, ...renderHints([...list, ...tailFor(dropped)], style)]
+  const fits = (left: TextChunk[], right: TextChunk[]) => {
+    const rightLen = chunksLength(right)
+    return chunksLength(left) + (rightLen > 0 ? rightLen + 1 : 0) <= width
+  }
+
+  // A row with no status column still has to shed, so it competes against a
+  // single empty candidate rather than skipping the whole calculation.
+  const candidates = rightCandidates.length > 0 ? rightCandidates : [[]]
+
+  // The common case is that everything fits. It is checked against the short
+  // wording first, because reserving room for the longer "there is more"
+  // wording up front would drop a hint that never needed to go.
+  const whole = compose(hints, 0)
+  const roomy = candidates.find((candidate) => fits(whole, candidate))
+  if (roomy) return padBetween(whole, roomy, width)
+
+  // Past here something has to give, so every measurement assumes the worst
+  // case — every droppable hint gone. The trailing hint appears (or grows) the
+  // moment the first drop happens, and it must not push the row back over the
+  // edge; over-reserving only ever makes the finished row shorter.
+  const worst = hints.length
+  const kept = [...hints]
+  let dropped = 0
+  let right = candidates.find((candidate) => fits(compose(kept, worst), candidate)) ?? candidates[candidates.length - 1]!
+  while (!fits(compose(kept, worst), right)) {
+    const victim = dropIndex(kept)
+    if (victim < 0) break
+    kept.splice(victim, 1)
+    dropped += 1
+  }
+  // Last resort: the keys outrank the run metadata sitting beside them.
+  if (!fits(compose(kept, worst), right)) right = []
+  const left = compose(kept, dropped)
+  if (chunksLength(left) <= width) return padBetween(left, right, width)
+
+  // Narrower than the pinned hint's own wording. Strip it back to the bare key,
+  // and clip if even that doesn't fit — a visible ellipsis beats a silent chop
+  // at the border, which is the whole point of this function.
+  const bare = overflow ? [...prefix, ...renderHints([...kept, { ...overflow, label: "" }], style)] : left
+  return new StyledText(clipChunks(bare, width))
+}
+
+// Highest priority number leaves first; ties break toward the end of the row,
+// so the hints nearest the left edge are the ones that survive.
+function dropIndex(hints: Hint[]): number {
+  let victim = -1
+  hints.forEach((hint, index) => {
+    if (hint.priority <= 0) return
+    if (victim < 0 || hint.priority >= hints[victim]!.priority) victim = index
+  })
+  return victim
+}
+
+function renderHints(hints: Hint[], rowStyle: HintStyle): TextChunk[] {
+  const chunks: TextChunk[] = []
+  hints.forEach((hint, index) => {
+    if (index > 0) chunks.push(fg(theme.dim)(" · "))
+    chunks.push(...hintChunks(hint, rowStyle))
+  })
+  return chunks
+}
+
+function hintChunks(hint: Hint, rowStyle: HintStyle): TextChunk[] {
+  const keys = fg(hint.tone === "yellow" ? theme.yellow : hint.tone === "dim" ? theme.dim : theme.accent)(hint.keys)
+  const style = hint.style ?? rowStyle
+  if (style === "bracket") {
+    const open = fg(theme.dim)("[")
+    if (hint.labelChunks) return [open, keys, fg(theme.dim)("]"), ...hint.labelChunks]
+    return [open, keys, fg(theme.dim)(hint.label ? `] ${hint.label}` : "]")]
+  }
+  if (hint.labelChunks) return [keys, ...hint.labelChunks]
+  if (!hint.label) return [keys]
+  return [keys, fg(theme.dim)(style === "glued" ? hint.label : ` ${hint.label}`)]
+}
+
 // Block elements render single-width in every terminal font, and the
 // full-cell blocks read as one solid strip instead of a thin stroke.
 export function progressBar(fraction: number, width: number, color: string): TextChunk[] {

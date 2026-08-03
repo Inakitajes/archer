@@ -8,8 +8,10 @@ import { loadRunSummary } from "./runs"
 import {
   formatElapsed,
   formatMoney,
+  hintsRow,
   joinLines,
   limitsRow,
+  moreHintsMarker,
   padBetween,
   paletteForTerminal,
   plain,
@@ -26,7 +28,7 @@ import { runsRoot } from "./workspace"
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
 import type { RunEntry, RunStatusKind, RunsResolution } from "./runs"
-import type { PaletteColor } from "./tui-theme"
+import type { Hint, PaletteColor } from "./tui-theme"
 
 const runStatusStyles: Record<RunStatusKind, { icon: string; color: PaletteColor }> = {
   completed: { icon: "✓", color: "green" },
@@ -587,31 +589,24 @@ class RunsBrowser {
       const rendered = this.summaryRows(summary.lines, this.summaryWidth())
       const maxScroll = Math.max(0, rendered.length - this.summaryHeight())
       const position = maxScroll === 0 ? "all" : `${Math.min(100, Math.round((Math.min(summary.scroll, maxScroll) / maxScroll) * 100))}%`
-      const left: TextChunk[] = [
-        fg(theme.dim)("↑/↓ scroll · "),
-        fg(theme.accent)("pgup/pgdn"),
-        fg(theme.dim)(" page · "),
-        fg(theme.accent)("esc"),
-        fg(theme.dim)(" back"),
+      const hints: Hint[] = [
+        { keys: "↑/↓", label: "scroll", priority: 2, tone: "dim" },
+        { keys: "pgup/pgdn", label: "page", priority: 3 },
+        { keys: "esc", label: "back", priority: 1 },
       ]
-      return padBetween(left, [fg(theme.faint)(position)], width)
+      return hintsRow(hints, [[fg(theme.faint)(position)]], width, { style: "spaced", overflow: moreHintsMarker })
     }
 
-    const left: TextChunk[] = [
-      fg(theme.dim)("↑/↓ select · "),
-      fg(theme.accent)("enter"),
-      fg(theme.dim)(" open · "),
-      fg(theme.accent)("r"),
-      fg(theme.dim)("esume · "),
-      fg(theme.accent)("s"),
-      fg(theme.dim)("ummary · "),
-      fg(theme.accent)("d"),
-      fg(theme.dim)("ir · "),
-      fg(theme.accent)("q"),
-      fg(theme.dim)("uit"),
+    const hints: Hint[] = [
+      { keys: "↑/↓", label: "select", priority: 3, tone: "dim" },
+      { keys: "enter", label: "open", priority: 2 },
+      { keys: "r", label: "esume", priority: 4, style: "glued" },
+      { keys: "s", label: "ummary", priority: 5, style: "glued" },
+      { keys: "d", label: "ir", priority: 6, style: "glued" },
+      { keys: "q", label: "uit", priority: 1, style: "glued" },
     ]
     const right: TextChunk[] = [fg(theme.faint)(`${this.selected + 1}/${this.runs.length}`)]
-    return padBetween(left, right, width)
+    return hintsRow(hints, [right], width, { style: "spaced", overflow: moreHintsMarker })
   }
 
   private modalWidth() {

@@ -35,13 +35,17 @@ import {
 import { gatewayLabel } from "./model-routing"
 import { claudeCodeModelAliases, normalizeStepRunnerModel, stepRunnerFor } from "./step-runners"
 import {
+  displayWidth,
+  hintsRow,
   joinLines,
+  moreHintsMarker,
   padBetween,
   paletteForTerminal,
   plain,
   raw,
   setTheme,
   spinnerFrame,
+  takeDisplayCells,
   terminalBackgroundHex,
   theme,
   truncate,
@@ -50,7 +54,7 @@ import { shortVersion } from "./version"
 import { convoyRoot, globalConfigPath } from "./workspace"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
-import type { PaletteColor } from "./tui-theme"
+import type { Hint, PaletteColor } from "./tui-theme"
 import type { HookSpec } from "./types"
 
 export async function editConfigTui(options: { targetDir: string }): Promise<void> {
@@ -1547,19 +1551,15 @@ export class ConfigEditor {
   }
 
   private footerContent(width: number) {
-    const left: TextChunk[] = [
-      fg(theme.dim)("↑/↓ move · "),
-      fg(theme.accent)("enter"),
-      fg(theme.dim)(" edit · "),
-      fg(theme.accent)("s"),
-      fg(theme.dim)("ave · "),
-      fg(theme.accent)("tab"),
-      fg(theme.dim)(" switch · "),
-      fg(theme.accent)("q"),
-      fg(theme.dim)("uit"),
+    const hints: Hint[] = [
+      { keys: "↑/↓", label: "move", priority: 4, tone: "dim" },
+      { keys: "enter", label: "edit", priority: 3 },
+      { keys: "s", label: "ave", priority: 2, style: "glued" },
+      { keys: "tab", label: "switch", priority: 5 },
+      { keys: "q", label: "uit", priority: 1, style: "glued" },
     ]
     const dirty = this.tab().dirty ? fg(theme.yellow)("● unsaved") : fg(theme.faint)("saved")
-    return padBetween(left, [dirty], width)
+    return hintsRow(hints, [[dirty]], width, { style: "spaced", overflow: moreHintsMarker })
   }
 
   private modalWidth() {
@@ -2037,9 +2037,12 @@ function shortenPath(path: string): string {
   return home && path.startsWith(home) ? `~${path.slice(home.length)}` : path
 }
 
+// Cuts to terminal cells, not UTF-16 units: a model name with an em dash or a
+// wide glyph counted by `.length` would still push the row past its border.
 function truncateChunkSafe(text: string, width: number): string {
-  if (text.length <= width) return text
-  return `${text.slice(0, Math.max(0, width - 1))}…`
+  if (displayWidth(text) <= width) return text
+  if (width <= 0) return ""
+  return `${takeDisplayCells(text, width - 1).head}…`
 }
 
 function typedChar(key: KeyEvent): string | undefined {

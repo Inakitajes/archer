@@ -306,6 +306,236 @@ describe("run dashboard defaults", () => {
   })
 })
 
+describe("footer hints and the command palette", () => {
+  const footer = (dashboard: unknown) => (dashboard as DashboardInternals).footerText.plainText
+  const modal = (dashboard: unknown) => (dashboard as DashboardInternals).modalText.plainText
+
+  test("the footer stays inside the panel at every terminal width", async () => {
+    // The footer is one unwrapped line in a fixed-height box: anything wider
+    // than the panel is silently chopped off against the border.
+    for (const width of [160, 120, 100, 90, 80, 70, 60, 50, 46]) {
+      const { dashboard, renderOnce } = await createDashboard(width, 40)
+      try {
+        dashboard.start("abc1234", process.cwd())
+        dashboard.serverReady("http://127.0.0.1:41234")
+        dashboard.phaseRunning("implement")
+        await renderOnce()
+        const inner = Math.max(40, width - 6)
+        expect(displayWidth(footer(dashboard)), `width ${width}`).toBeLessThanOrEqual(inner)
+      } finally {
+        dashboard.stop()
+      }
+    }
+  })
+
+  test("a narrow footer keeps the way to the rest of the shortcuts", async () => {
+    const { dashboard, renderOnce } = await createDashboard(60, 40)
+    try {
+      dashboard.start("abc1234", process.cwd())
+      dashboard.phaseRunning("implement")
+      await renderOnce()
+      // Hints were dropped, so the pinned hint says where they went.
+      expect(footer(dashboard)).toContain("ctrl+p")
+      expect(footer(dashboard)).toContain("all shortcuts")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a wide footer keeps its hints and says ctrl+p opens commands", async () => {
+    const { dashboard, renderOnce } = await createDashboard(160, 40)
+    try {
+      dashboard.start("abc1234", process.cwd())
+      dashboard.phaseRunning("implement")
+      await renderOnce()
+      const row = footer(dashboard)
+      expect(row).toContain("[↑↓] step")
+      expect(row).toContain("[enter] read")
+      expect(row).toContain("[o] session")
+      expect(row).toContain("[ctrl+p] commands")
+      expect(row).not.toContain("all shortcuts")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[MF-1] a permission footer suppresses review actions that route to the permission", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
+    try {
+      const permission = dashboard.askPermission({ id: "permission-1", permission: "bash", command: "ls", patterns: [] })
+      const review = dashboard.askHumanReview({ stepName: "implement", iterations: 0 })
+      await renderOnce()
+
+      // Permission routing runs first, so [a] means "always" here rather than
+      // the review gate's advertised "abort" action.
+      const row = footer(dashboard)
+      expect(row).toContain("always")
+
+      mockInput.pressKey("a")
+      expect(await permission).toBe("always")
+
+      // The review remains queued until the next [a], proving the first one
+      // answered the permission prompt rather than aborting the review gate.
+      let reviewReply: string | undefined
+      void review.then((reply) => {
+        reviewReply = reply
+      })
+      await Promise.resolve()
+      expect(reviewReply).toBeUndefined()
+      mockInput.pressKey("a")
+      expect(await review).toBe("abort")
+
+      expect(row).not.toContain("open OpenCode")
+      expect(row).not.toContain("abort")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[SF-1] a narrow permission footer marks choices hidden from the row", async () => {
+    const { dashboard, renderOnce } = await createDashboard(46, 40)
+    try {
+      void dashboard.askPermission({ id: "permission-1", permission: "bash", command: "ls", patterns: [] })
+      await renderOnce()
+
+      expect(footer(dashboard)).toMatch(/\+\d/)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[SF-1] a narrow review footer marks choices hidden from the row", async () => {
+    const { dashboard, renderOnce } = await createDashboard(46, 40)
+    try {
+      void dashboard.askHumanReview({ stepName: "implement", iterations: 0 })
+      await renderOnce()
+
+      expect(footer(dashboard)).toMatch(/\+\d/)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  // Regression: the palette gated every action behind `!finished`, so the
+  // finish screen offered a single entry while five actions sat on the keyboard.
+  test("the finish screen's palette lists its own actions", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(120, 40)
+    try {
+      dashboard.start("abc1234", process.cwd())
+      void dashboard.runFinished({ status: "completed", runDir: "" })
+      await renderOnce()
+
+      mockInput.pressKey("p", { ctrl: true })
+      await renderOnce()
+      const text = modal(dashboard)
+      expect(text).toContain("Iterate in a new session")
+      expect(text).toContain("Open lazygit")
+      expect(text).toContain("Close the dashboard")
+      expect(text).toContain("Keyboard shortcuts")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("the finish screen's footer points at the palette too", async () => {
+    const { dashboard, renderOnce } = await createDashboard(120, 40)
+    try {
+      dashboard.start("abc1234", process.cwd())
+      void dashboard.runFinished({ status: "completed", runDir: "" })
+      await renderOnce()
+      expect(footer(dashboard)).toContain("ctrl+p")
+      expect(footer(dashboard)).toContain("[q] close")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("the shortcuts view documents every content tab, not just three", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(120, 40)
+    try {
+      dashboard.start("abc1234", process.cwd())
+      await renderOnce()
+      mockInput.pressKey("p", { ctrl: true })
+      await renderOnce()
+
+      const internals = dashboard as unknown as { commandPalette?: { view: string; index: number; scroll: number } }
+      // "Keyboard shortcuts" is the last command in the list.
+      const items = (dashboard as unknown as { commandItems(): unknown[] }).commandItems()
+      internals.commandPalette!.index = items.length - 1
+      mockInput.pressEnter()
+      await renderOnce()
+
+      expect(internals.commandPalette?.view).toBe("help")
+      const seen = () => {
+        const rows: string[] = []
+        for (let guard = 0; guard < 20; guard++) {
+          rows.push(modal(dashboard))
+          const before = internals.commandPalette!.scroll
+          mockInput.pressKey("j")
+          if (internals.commandPalette!.scroll === before) break
+        }
+        return rows.join("\n")
+      }
+      const help = seen()
+      expect(help).toContain("show the session tab")
+      expect(help).toContain("show the reports tab")
+      expect(help).toContain("show the logs tab")
+      expect(help).toContain("show the advisor tab")
+      expect(help).toContain("open the fullscreen reader")
+      expect(help).toContain("abort the run")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("the shortcuts view fits the terminal and scrolls instead of overflowing it", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(120, 24)
+    try {
+      dashboard.start("abc1234", process.cwd())
+      await renderOnce()
+      mockInput.pressKey("p", { ctrl: true })
+      const internals = dashboard as unknown as { commandPalette?: { view: string; scroll: number }; modal: { height: number } }
+      internals.commandPalette!.view = "help"
+      await renderOnce()
+
+      expect(internals.modal.height).toBeLessThanOrEqual(24)
+      const first = modal(dashboard)
+      mockInput.pressKey("j")
+      await renderOnce()
+      expect(modal(dashboard)).not.toBe(first)
+      expect(internals.modal.height).toBeLessThanOrEqual(24)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[MF-2] the focused reader's palette and o key both open the selected session", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(120, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals & {
+        openActiveSessionWindow(source: "click" | "key"): void
+      }
+      const opened: Array<"click" | "key"> = []
+      internals.openActiveSessionWindow = (source) => {
+        opened.push(source)
+      }
+
+      mockInput.pressEnter()
+      mockInput.pressKey("p", { ctrl: true })
+      await renderOnce()
+      const palette = modal(dashboard)
+
+      mockInput.pressEscape()
+      await Bun.sleep(20)
+      mockInput.pressKey("o")
+      expect(opened).toEqual(["key"])
+      expect(palette).toContain("Open session")
+    } finally {
+      dashboard.stop()
+    }
+  })
+})
+
 describe("dashboard content selection", () => {
   test("copies selected session text and clears the successful selection", async () => {
     const { dashboard, mockMouse, renderer, renderOnce, copied } = await createDashboard()
