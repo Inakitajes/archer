@@ -60,7 +60,10 @@ export type ConvoyDefaults = {
   branchNameModel?: string
   /** Model that writes the squashed commit message for `convoy finish`; falls back to the built-in cheap default. */
   commitMessageModel?: string
-  /** Run each job on a fresh branch in its own worktree. On by default; set false to run in place. */
+  /**
+   * Force worktree isolation on (true) or off (false) for every run. Unset is
+   * not "on": it decides per branch, isolating only when HEAD sits on a trunk.
+   */
   worktree?: boolean
   /** Advising model for every step that doesn't set its own; unset means no advisor anywhere. */
   advisor?: string
@@ -251,7 +254,7 @@ defaults:
   # pipeline: implement
   # branchNameModel: anthropic/claude-haiku-4-5 # optional: model that names worktree branches
   # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
-  # worktree: true # optional: run each job on a fresh branch in its own worktree (default); false runs in the current tree
+  # worktree: true # optional: force a fresh branch + worktree for every run; false always runs in the current tree. Unset decides per branch: isolate on a trunk (main/master/develop/trunk or the detected base), run in place on any other branch
   # advisor: anthropic/claude-opus-5 # optional: reviewing model consulted at phase decision points
   # advisorMaxCalls: 1000 # optional: consultation budget per phase attempt; the default is effectively unlimited, set this to put a real cap on it
   # advisorAuditPolicy: summary # summary (hashes), redacted (lengths), or full content retention

@@ -5,6 +5,7 @@ import { BoxRenderable, StyledText, TextRenderable, bg, bold, createCliRenderer,
 
 import { defaultAdvisorMaxCalls } from "./advisor"
 import { buildAgentRegistry, emptyHooksConfig, loadMergedConvoyConfig } from "./config"
+import { resolveWorktreeDefault } from "./git"
 import { hooksForPipeline } from "./hooks"
 import { startLimitsPoller } from "./limits"
 import { builtInPipelines, defaultPipelineName, resolvePipeline } from "./pipeline"
@@ -15,6 +16,7 @@ import { hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteFor
 import { shortVersion } from "./version"
 
 import type { ConvoyConfig } from "./config"
+import type { WorktreeDefault } from "./git"
 import type { BoxOptions, CliRenderer, KeyEvent, PasteEvent, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
 import type { AgentSpec, AgentStep, HookSet, HookSpec, RunOptions, RunPlan, Step } from "./types"
@@ -209,7 +211,13 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
   })
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", config?.defaults.worktree ?? true, options).result
+  // Unset config means "decide per branch": isolating is right on a trunk, but
+  // on a branch you're already where the work should land.
+  const worktree =
+    config?.defaults.worktree === undefined
+      ? await resolveWorktreeDefault(options.targetDir)
+      : { isolate: config.defaults.worktree, reason: "set by defaults.worktree" }
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options).result
 }
 
 function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly AgentSpec[]): PipelineChoice[] {
@@ -333,7 +341,7 @@ class LaunchPicker {
     includeDirty: false,
     keepRunDir: true,
     tui: Boolean(process.stdout.isTTY && process.stderr.isTTY),
-    // Overwritten from defaults.worktree in the constructor; on unless turned off.
+    // Always overwritten in the constructor, from defaults.worktree or the branch.
     worktree: true,
   }
 
@@ -432,11 +440,11 @@ class LaunchPicker {
     private readonly targetDir: string,
     private readonly choices: PipelineChoice[],
     private gateway: ModelGateway,
-    worktreeDefault: boolean,
+    private readonly worktreeDefault: WorktreeDefault,
     // Named `callbacks` rather than `hooks`: this file already uses "hooks" for the pipeline's shell hooks.
     private readonly callbacks: Pick<LaunchRunTuiOptions, "prepareRun" | "proposeBranchName" | "checkBranchName">,
   ) {
-    this.toggleState.worktree = worktreeDefault
+    this.toggleState.worktree = worktreeDefault.isolate
     const defaultIndex = choices.findIndex((choice) => choice.isDefault)
     this.selected = defaultIndex >= 0 ? defaultIndex : 0
     this.result = new Promise((resolve) => {
@@ -1354,7 +1362,13 @@ class LaunchPicker {
       const flag = fg(enabled ? theme.green : theme.dim)(spec.flag)
       lines.push(padBetween([marker, ...toggle, raw(" "), label], [flag], width))
       this.optionRows.push(index)
-      lines.push(new StyledText([raw("        "), fg(theme.dim)(truncate(spec.description, Math.max(8, width - 8)))]))
+      // The worktree default depends on which branch you're on, so say why it
+      // landed where it did — otherwise the checkbox looks like it moves on its own.
+      const description =
+        spec.key === "worktree"
+          ? `Default ${this.worktreeDefault.isolate ? "on" : "off"}: ${this.worktreeDefault.reason}. ${spec.description}`
+          : spec.description
+      lines.push(new StyledText([raw("        "), fg(theme.dim)(truncate(description, Math.max(8, width - 8)))]))
       this.optionRows.push(index)
     }
 

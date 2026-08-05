@@ -3,7 +3,17 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { addAllAndCommit, addWorktree, branchExists, detectBaseRef, ensureRepoReady, findSuspiciousStagedFiles, initializeRepoWithInitialCommit, repoBootstrapStatus } from "../src/git"
+import {
+  addAllAndCommit,
+  addWorktree,
+  branchExists,
+  detectBaseRef,
+  ensureRepoReady,
+  findSuspiciousStagedFiles,
+  initializeRepoWithInitialCommit,
+  repoBootstrapStatus,
+  resolveWorktreeDefault,
+} from "../src/git"
 
 describe("findSuspiciousStagedFiles", () => {
   test("flags common secret filenames", () => {
@@ -214,6 +224,54 @@ describe("detectBaseRef", () => {
     const dir = await mkdtemp(join(tmpdir(), "convoy-detect-base-"))
     dirs.push(dir)
     expect(await detectBaseRef(dir)).toBeUndefined()
+  })
+
+  describe("resolveWorktreeDefault", () => {
+    test("isolates on a conventional trunk", async () => {
+      const dir = await repo("main")
+      expect(await resolveWorktreeDefault(dir)).toEqual({ isolate: true, reason: "main is a base branch" })
+    })
+
+    test("runs in place on a branch of your own", async () => {
+      const dir = await repo("main")
+      await git(["checkout", "-q", "-b", "feat/thing"], dir)
+      expect(await resolveWorktreeDefault(dir)).toEqual({ isolate: false, reason: "feat/thing is not a base branch" })
+    })
+
+    test("isolates on develop even when origin/HEAD points at main", async () => {
+      // The union of both criteria: detectBaseRef answers "main" here, so the
+      // conventional-name check is what keeps develop from being treated as a
+      // working branch.
+      const dir = await repo("main")
+      await setOriginHead(dir, "main")
+      await git(["checkout", "-q", "-b", "develop"], dir)
+      expect(await resolveWorktreeDefault(dir)).toEqual({ isolate: true, reason: "develop is a base branch" })
+    })
+
+    test("isolates on an exotically named trunk that origin/HEAD points at", async () => {
+      const dir = await repo("mainline")
+      await setOriginHead(dir, "mainline")
+      expect(await resolveWorktreeDefault(dir)).toEqual({ isolate: true, reason: "mainline is this repo's base branch" })
+    })
+
+    test("isolates on an exotically named branch when the repo has no other base", async () => {
+      // detectBaseRef falls back to the current branch, which makes it the base
+      // by definition — there is nothing else to branch from.
+      const dir = await repo("dev-trunk")
+      expect(await resolveWorktreeDefault(dir)).toEqual({ isolate: true, reason: "dev-trunk is this repo's base branch" })
+    })
+
+    test("isolates when HEAD is detached, where committing in place is never right", async () => {
+      const dir = await repo("main")
+      await git(["checkout", "-q", "--detach"], dir)
+      expect(await resolveWorktreeDefault(dir)).toEqual({ isolate: true, reason: "no branch is checked out" })
+    })
+
+    test("falls back to isolating outside a git repository", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "convoy-worktree-default-"))
+      dirs.push(dir)
+      expect((await resolveWorktreeDefault(dir)).isolate).toBe(true)
+    })
   })
 })
 

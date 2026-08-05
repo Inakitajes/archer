@@ -95,6 +95,9 @@ export type BaseRefDetection = {
   source: "origin-head" | "probe" | "current-branch"
 }
 
+/** Branch names conventionally used as a repo's trunk, probed in order when origin/HEAD says nothing. */
+export const baseBranchNames = ["main", "master", "develop", "trunk"] as const
+
 /**
  * Best-effort detection of the branch to diff against when neither --base nor
  * defaults.baseRef is set: the remote's default branch (origin/HEAD), then
@@ -119,7 +122,7 @@ export async function detectBaseRef(cwd: string): Promise<BaseRefDetection | und
     if (await commitExists(remoteBranch)) return { ref: remoteBranch, source: "origin-head" }
   }
 
-  for (const name of ["main", "master", "develop", "trunk"]) {
+  for (const name of baseBranchNames) {
     if (await commitExists(name)) return { ref: name, source: "probe" }
   }
 
@@ -355,6 +358,47 @@ export async function currentBranch(cwd: string): Promise<string | undefined> {
   const result = await execFile("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd, allowFailure: true })
   if (result.exitCode !== 0) return undefined
   return result.stdout.trim() || undefined
+}
+
+export type WorktreeDefault = {
+  isolate: boolean
+  /** Short human-readable justification, shown next to the launcher's toggle so the default never looks arbitrary. */
+  reason: string
+}
+
+/**
+ * Whether a run should isolate itself in a fresh worktree when nothing said
+ * otherwise: you're on the trunk, so committing here is probably not what you
+ * meant. Already on a branch, the branch is almost certainly where you want the
+ * work to land.
+ *
+ * Two criteria, unioned. `detectBaseRef` is the repo-accurate one but answers
+ * for a single base, so a repo whose origin/HEAD is `main` would not recognize
+ * `develop`; the conventional names cover that. Never throws — anything
+ * unexpected falls back to isolating, which is the older, safer behavior.
+ */
+export async function resolveWorktreeDefault(cwd: string): Promise<WorktreeDefault> {
+  try {
+    // Covers both a detached HEAD and "not a repo at all"; the latter fails in
+    // ensureRepoReady moments later with a message that actually explains it.
+    const branch = await currentBranch(cwd)
+    if (!branch) return { isolate: true, reason: "no branch is checked out" }
+
+    if (baseBranchNames.includes(branch as (typeof baseBranchNames)[number])) {
+      return { isolate: true, reason: `${branch} is a base branch` }
+    }
+
+    const detected = await detectBaseRef(cwd)
+    // detectBaseRef can answer with the remote-tracking form when no local
+    // checkout of the default branch exists (see the origin/HEAD path above).
+    if (detected && (detected.ref === branch || detected.ref === `origin/${branch}`)) {
+      return { isolate: true, reason: `${branch} is this repo's base branch` }
+    }
+
+    return { isolate: false, reason: `${branch} is not a base branch` }
+  } catch {
+    return { isolate: true, reason: "could not read the current branch" }
+  }
 }
 
 /** Resolves `<ref>` to a commit sha, or undefined when it doesn't name one. */

@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 
 import { buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, globalConfigPath, loadMergedConvoyConfig, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ConvoyDefaults } from "./config"
-import { detectBaseRef } from "./git"
+import { detectBaseRef, resolveWorktreeDefault } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
 import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
@@ -583,7 +583,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     // A resumed run continues in the directory its metadata recorded — which is
     // already the worktree, when the original run made one — so it never creates
     // another.
-    worktree: parsed.resumeRunID ? false : (parsed.worktree ?? defaults.worktree ?? true),
+    worktree: parsed.resumeRunID ? false : await resolveWorktreeOption(parsed, defaults),
     ...(parsed.branch ? { branch: parsed.branch } : {}),
     includeDirty: parsed.includeDirty ?? false,
     yolo: parsed.yolo ?? false,
@@ -605,6 +605,19 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
   if (!options.resumeRunID) validateStepFilters(pipeline, options)
 
   return options
+}
+
+// Worktree source: flag > config defaults.worktree > the current branch.
+// An unset config means "decide per branch", not "always isolate": on a trunk a
+// run should get its own worktree, but on a branch you're already where you
+// want the work. The launcher applies the same default itself, so an interactive
+// run reaches this with parsed.worktree already set.
+async function resolveWorktreeOption(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<boolean> {
+  const explicit = parsed.worktree ?? defaults.worktree
+  if (explicit !== undefined) return explicit
+  const auto = await resolveWorktreeDefault(parsed.targetDir)
+  log.info(`worktree: ${auto.isolate ? "on" : "off"} (${auto.reason})`)
+  return auto.isolate
 }
 
 // Base source: flag > config defaults.baseRef > auto-detection (never persisted).
@@ -850,8 +863,9 @@ Flags:
   --max-attempts <n>       Attempts per step before failing (default: 2)
   --max-concurrent <n>     Max agents running at once within a parallel group (default: ${defaultMaxConcurrentAgents}); smaller groups are unaffected
   --base <ref>             Branch/base for calculating diffs (default: auto-detected — origin's default branch, else main/master/develop/trunk, else the current branch)
-  --worktree               Run on a fresh branch in its own worktree under ~/.convoy/worktrees (default)
+  --worktree               Run on a fresh branch in its own worktree under ~/.convoy/worktrees
   --no-worktree            Run in the current working tree instead
+                           (default: worktree on a trunk branch, current tree on any other)
   --branch <name>          Name for the worktree branch, instead of asking the naming model
   --dir <path>             Target repo (default: cwd)
 

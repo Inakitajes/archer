@@ -362,7 +362,7 @@ defaults:
   autoAcceptJudgeModel: anthropic/claude-haiku-4-5   # model for smart auto-accept (--smart); defaults to the run's model
   branchNameModel: anthropic/claude-haiku-4-5        # proposes worktree branch names (may look up referenced issues); you confirm the name
   commitMessageModel: anthropic/claude-haiku-4-5     # writes the conventional commit `convoy finish` squashes a run into; you edit it before it lands
-  worktree: true                   # run each job on a new branch in its own worktree (default); false runs in the current tree
+  worktree: true                   # force a new branch + worktree for every run; false always runs in the current tree. Unset decides per branch (isolate on a trunk, run in place on a branch)
   advisor: anthropic/claude-opus-5   # optional; a stronger model consulted at every step's decision points
   advisorMaxCalls: 1000              # optional; consultations allowed per phase attempt (default 1000 — effectively unlimited; set it lower to cap advisor spend)
   advisorAuditPolicy: summary        # summary (hash-only default), redacted, or full transcript/advice content
@@ -646,7 +646,9 @@ Every interactive manual run now displays its fully resolved plan before reposit
 
 ### Isolating a run in a worktree
 
-**This is the default.** Every run gets a new branch checked out under `~/.convoy/worktrees/<branch>`, leaving your current checkout untouched — which is what makes the branch safely rewritable by [`convoy finish`](#finishing-a-run) afterwards. Opt out per run with `--no-worktree`, or permanently with `defaults.worktree: false`. `--branch <name>` pins the name instead of asking the naming model, which is what an unattended or scripted run should use.
+An isolated run gets a new branch checked out under `~/.convoy/worktrees/<branch>`, leaving your current checkout untouched — which is what makes the branch safely rewritable by [`convoy finish`](#finishing-a-run) afterwards.
+
+**The default depends on where you are.** On a trunk — `main`, `master`, `develop`, `trunk`, or whatever `origin/HEAD` points at — Convoy isolates, because you almost certainly don't want a pipeline committing straight onto it. Once you're on a branch of your own, it runs in place: you already made the branch you want the work on. A detached HEAD isolates too. Force either end per run with `--worktree` / `--no-worktree`, or permanently with `defaults.worktree: true` / `false`; the launcher shows which way the default went and why, next to the toggle. `--branch <name>` pins the name instead of asking the naming model, which is what an unattended or scripted run should use.
 
 The branch is always agreed with you first, in a **Branch** step between Options and Review:
 
