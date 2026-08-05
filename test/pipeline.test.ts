@@ -4,6 +4,7 @@ import {
   builtInAgents,
   builtInPipelines,
   defaultAdversarialModel,
+  defaultImplementAuditModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
   defaultOpusModel,
@@ -65,24 +66,22 @@ describe("default pipeline", () => {
     ])
   })
 
-  test("pins Sol for implementation, GPT for the audits, GLM 5.2 for design, and Kimi K3 for adversarial", () => {
+  test("pins Sol xhigh for implementation, GLM 5.2 xhigh for the audits, and Kimi K3 high for design and adversarial", () => {
     const byName = Object.fromEntries(
       defaultPipeline()
         .steps.filter((step): step is AgentStep => step.type === "agent")
         .map((step) => [step.name, step]),
     )
 
-    expect(byName.implementer).toMatchObject({ model: defaultImplementerModel })
-    expect(byName.implementer?.variant).toBeUndefined()
-    expect(byName.patterns).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName.security).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName.design).toMatchObject({ model: defaultImplementReviewModel })
-    expect(byName.design?.variant).toBeUndefined()
-    expect(byName.tests).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName.adversarial?.model).toBe(defaultAdversarialModel)
+    expect(byName.implementer).toMatchObject({ model: "openai/gpt-5.6-sol", variant: "xhigh" })
+    expect(byName.patterns).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
+    expect(byName.security).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
+    expect(byName.design).toMatchObject({ model: "openrouter/moonshotai/kimi-k3", variant: "high" })
+    expect(byName.tests).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
+    expect(byName.adversarial).toMatchObject({ model: "openrouter/moonshotai/kimi-k3", variant: "high" })
   })
 
-  test("keeps every pinned implement step on its own model even when defaults.model is GPT", () => {
+  test("keeps every implement step on its own model even when defaults.model is GPT", () => {
     const byName = Object.fromEntries(
       resolvePipeline({
         name: "implement",
@@ -94,11 +93,15 @@ describe("default pipeline", () => {
         .map((step) => [step.name, step]),
     )
 
-    // Step models outrank defaults.model, so a global default only moves the unpinned audit steps.
-    expect(byName.implementer?.model).toBe(defaultImplementerModel)
-    expect(byName.design?.model).toBe(defaultImplementReviewModel)
-    expect(byName.adversarial?.model).toBe(defaultAdversarialModel)
-    expect(byName.patterns).toMatchObject({ model: "openai/gpt-5.5", variant: "xhigh" })
+    // Every step is pinned now, so defaults.model moves nothing here at all.
+    const pinned = (value: string) => {
+      const [model, variant] = value.split("#")
+      return variant ? { model, variant } : { model }
+    }
+    expect(byName.implementer).toMatchObject(pinned(defaultImplementerModel))
+    expect(byName.patterns).toMatchObject(pinned(defaultImplementAuditModel))
+    expect(byName.design).toMatchObject(pinned(defaultImplementReviewModel))
+    expect(byName.adversarial).toMatchObject(pinned(defaultAdversarialModel))
   })
 })
 
@@ -144,15 +147,20 @@ describe("built-in implement-lite pipeline", () => {
     expect(byName.adversarial).toMatchObject({ model: "anthropic/claude-opus-5" })
   })
 
-  test("keeps GLM 5.2 scoped to the lite, advised, refine, and hunter pipelines", () => {
-    const glmPipelines = Object.entries(builtInPipelines)
-      .filter(([, spec]) => JSON.stringify(spec).includes("openrouter/z-ai/glm-5.2"))
-      .map(([name]) => name)
+  test("distinguishes itself from implement by the phases that write and judge, not the audits", () => {
+    const lite = Object.fromEntries(implementLite().steps.filter((s): s is AgentStep => s.type === "agent").map((step) => [step.name, step]))
+    const standard = Object.fromEntries(defaultPipeline().steps.filter((s): s is AgentStep => s.type === "agent").map((step) => [step.name, step]))
 
-    // The hunter pipelines use GLM as one specialty voice in their fan-out, not as a cost downgrade.
-    // implement-advised keeps it as the audit executor, which is what makes it comparable to implement-lite.
-    // `implement` itself is GLM-free: its one GLM step was design, which now runs on Kimi K3.
-    expect(glmPipelines).toEqual(["implement-lite", "implement-advised", "review-lite", "refine", "hunter", "hunter-max"])
+    // Both run the audits on GLM 5.2; `implement` just turns its reasoning up.
+    // What the lite variant actually gives up is Sol writing the code and Kimi
+    // judging it at the end.
+    for (const step of ["patterns", "security", "tests"]) {
+      expect(lite[step]?.model).toBe(standard[step]!.model)
+      expect(lite[step]?.variant).toBeUndefined()
+      expect(standard[step]?.variant).toBe("xhigh")
+    }
+    expect(lite.implementer?.model).not.toBe(standard.implementer?.model)
+    expect(lite.adversarial?.model).not.toBe(standard.adversarial?.model)
   })
 })
 
@@ -162,10 +170,15 @@ describe("built-in implement-advised pipeline", () => {
       (step): step is AgentStep => step.type === "agent",
     )
 
-  test("advises the implementation phase only: Terra xhigh writing, Sol at its decision points", () => {
+  test("advises the implementation phase only: Terra xhigh writing, Sol xhigh at its decision points", () => {
     const implementer = advised().find((step) => step.name === "implementer")
 
-    expect(implementer).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh", advisor: "openai/gpt-5.6-sol" })
+    expect(implementer).toMatchObject({
+      model: "openai/gpt-5.6-terra",
+      variant: "xhigh",
+      advisor: "openai/gpt-5.6-sol",
+      advisorVariant: "xhigh",
+    })
   })
 
   test("leaves every phase after the implementer unadvised, so only one step carries the advisor cost", () => {
@@ -179,19 +192,49 @@ describe("built-in implement-advised pipeline", () => {
     expect(steps.filter((step) => step.advisor).length).toBe(1)
   })
 
-  test("leaves the adversarial pass owning its own loop on Opus, with no advisor", () => {
-    const adversarial = advised().find((step) => step.name === "adversarial")
+  test("is implement with one advised step: every other phase matches model for model", () => {
+    const implement = resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents }).steps.filter(
+      (step): step is AgentStep => step.type === "agent",
+    )
+    const byName = Object.fromEntries(implement.map((step) => [step.name, step]))
 
-    expect(adversarial?.model).toBe(defaultOpusModel)
-    expect(adversarial?.advisor).toBeUndefined()
+    // The advised implementation step is the only variable between the two, so a
+    // difference anywhere else would make the comparison meaningless.
+    expect(advised().map((step) => step.name)).toEqual(implement.map((step) => step.name))
+    for (const step of advised()) {
+      if (step.name === "implementer") continue
+      expect({ model: step.model, variant: step.variant }).toEqual({
+        model: byName[step.name]!.model,
+        variant: byName[step.name]!.variant,
+      })
+    }
+  })
+})
+
+describe("built-in ship pipeline", () => {
+  const ship = () =>
+    resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents }).steps.filter(
+      (step): step is AgentStep => step.type === "agent",
+    )
+
+  test("syncs the base in before anything reads the diff", () => {
+    const steps = ship()
+
+    expect(steps[0]).toMatchObject({ name: "sync", agentName: "sync-with-base" })
+    // The sync phase writes: it resolves conflicts and Convoy's phase commit
+    // concludes the merge.
+    expect(steps[0]?.readOnly).toBeUndefined()
+    expect(steps[0]?.inputFiles).toEqual(["prd.md"])
+    // scope is what first reads the diff, and by then it is the merged diff.
+    expect(steps[1]).toMatchObject({ name: "scope", inputDiff: true })
   })
 
-  test("mirrors implement's step names, so the two are directly comparable", () => {
-    expect(advised().map((step) => step.name)).toEqual(
-      resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents })
-        .steps.filter((step): step is AgentStep => step.type === "agent")
-        .map((step) => step.name),
+  test("runs refine's audit chain after the sync", () => {
+    const refine = resolvePipeline({ name: "refine", spec: builtInPipelines.refine!, agents: builtInAgents }).steps.filter(
+      (step): step is AgentStep => step.type === "agent",
     )
+
+    expect(ship().slice(1).map((step) => step.name)).toEqual(refine.map((step) => step.name))
   })
 })
 

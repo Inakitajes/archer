@@ -29,6 +29,7 @@ import reviewValidator from "../prompts/review-validator.md" with { type: "text"
 import runtimeSafety from "../prompts/runtime-safety.md" with { type: "text" }
 import securityAuditor from "../prompts/security-auditor.md" with { type: "text" }
 import securityReviewer from "../prompts/security-reviewer.md" with { type: "text" }
+import syncWithBase from "../prompts/sync-with-base.md" with { type: "text" }
 import testEngineer from "../prompts/test-engineer.md" with { type: "text" }
 
 /**
@@ -69,5 +70,6 @@ export const builtInPrompts: Record<string, string> = {
   "runtime-safety": runtimeSafety,
   "security-auditor": securityAuditor,
   "security-reviewer": securityReviewer,
+  "sync-with-base": syncWithBase,
   "test-engineer": testEngineer,
 }

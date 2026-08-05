@@ -22,7 +22,7 @@ Typical uses:
 
 Use it as a **CLI** or as a **TUI**, interchangeably: every run can be launched with plain flags and prompt files (`--no-tui` gives you plain logs for pipes and CI), or driven entirely from the TUI — `convoy` with no arguments opens the interactive launcher, every run gets a live dashboard, `convoy runs` browses past runs, and `convoy config` edits global and project config in place.
 
-**Pipelines are data, not code.** Convoy ships a family of built-in pipelines (`implement` — the default — plus `implement-lite`, `implement-advised`, `ultra-implement`, `refine`, `ultra-refine`, `fixer`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
+**Pipelines are data, not code.** Convoy ships a family of built-in pipelines (`implement` — the default — plus `implement-lite`, `implement-advised`, `ultra-implement`, `refine`, `ultra-refine`, `ship`, `fixer`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
 
 Beyond sequencing agents, Convoy owns the operational layer around OpenCode: repo context attachment, runtime guard rails, a live permission gate, commit safety, phase reports, diff tracking, and a TUI that shows cost, tokens, and provider limits while the run is live.
 
@@ -41,12 +41,12 @@ PRD ──► implementer ──► patterns ──► security ──► design
 
 | Step | Agent | Model | What it does |
 |---|---|---|---|
-| `implementer` | `implementer` | `openai/gpt-5.6-sol` | Implements the feature respecting repo patterns |
-| `patterns` | `pattern-auditor` | `openai/gpt-5.6-terra#xhigh` | Refactors without changing behavior, aligns with the rest of the code |
-| `security` | `security-auditor` | `openai/gpt-5.6-terra#xhigh` | Audits and fixes security issues |
-| `design` | `design-polisher` | `openrouter/moonshotai/kimi-k3` | Polishes UI following the repo's design system, and strips generic "AI slop" styling |
-| `tests` | `test-engineer` | `openai/gpt-5.6-terra#xhigh` | Automated tests + relevant E2E/integration coverage |
-| `adversarial` | `adversarial-reviewer` | `openrouter/moonshotai/kimi-k3` | Final adversarial review before PR creation |
+| `implementer` | `implementer` | `openai/gpt-5.6-sol#xhigh` | Implements the feature respecting repo patterns |
+| `patterns` | `pattern-auditor` | `openrouter/z-ai/glm-5.2#xhigh` | Refactors without changing behavior, aligns with the rest of the code |
+| `security` | `security-auditor` | `openrouter/z-ai/glm-5.2#xhigh` | Audits and fixes security issues |
+| `design` | `design-polisher` | `openrouter/moonshotai/kimi-k3#high` | Polishes UI following the repo's design system, and strips generic "AI slop" styling |
+| `tests` | `test-engineer` | `openrouter/z-ai/glm-5.2#xhigh` | Automated tests + relevant E2E/integration coverage |
+| `adversarial` | `adversarial-reviewer` | `openrouter/moonshotai/kimi-k3#high` | Final adversarial review before PR creation |
 
 ## Built-in pipelines
 
@@ -55,11 +55,12 @@ Convoy ships these pipelines; select one with `-p/--pipeline` (no config needed)
 | Pipeline | Changes code? | What it does |
 |---|---|---|
 | `implement` | yes | **The default** (runs with no `-p`). Implement a PRD, then audit, polish, test, and adversarial review (the table above). |
-| `implement-lite` | yes | Same workflow and agents as `implement`, but the code-writing phases (`implementer`, `patterns`, `security`, `tests`) all drop to `openrouter/z-ai/glm-5.2` for a lower-cost run; `design` runs on Kimi K3 and `adversarial` on Opus. |
-| `implement-advised` | yes | Same workflow and step names as `implement`, but the `implementer` phase runs on GPT 5.6 Terra xhigh and **consults GPT 5.6 Sol as an advisor** at its decision points. The audits (`patterns`, `security`, `tests`) run unadvised on `openrouter/z-ai/glm-5.2`, `design` on Kimi K3, and `adversarial` keeps Opus owning its own loop. Directly comparable with `implement-lite`: same audit executors, and the implementation step is the single variable between them. |
+| `implement-lite` | yes | Same workflow and agents as `implement`, and the same GLM 5.2 audits — but at base reasoning instead of xhigh, with `implementer` dropping to GLM 5.2 too and `adversarial` to Opus. The cheaper run: what it gives up is Sol writing the code and Kimi judging it. |
+| `implement-advised` | yes | `implement` with exactly one thing changed: the `implementer` phase runs on GPT 5.6 Terra xhigh and **consults GPT 5.6 Sol xhigh as an advisor** at its decision points. Every other phase is `implement`'s, model for model and unadvised, so the advised implementation step is the single variable between the two. |
 | `ultra-implement` | yes | Like `implement`, but the pattern/security/adversarial reviews of the initial diff run in parallel across two models feeding a triage step, and the run ends with an audit-only final review, a fixer that applies only blocking findings, and a final validator. |
 | `refine` | yes | Audit the current diff (scope → bugs → clean-code → security), triage the findings adversarially, apply the accepted fixes, then validate them. |
 | `ultra-refine` | yes | Like `refine`, but every read-only audit is fanned out across two models before triage, fixes, and validation. |
+| `ship` | yes | `refine`, but preceded by a `sync` phase that merges the advanced base branch in and resolves the conflicts — real and semantic — so the audits read the branch as it will actually merge rather than a diff that no longer describes what lands. Two things it expects from your config, because both are machine-local: `permissions.allow` entries for `git merge*`, `git add*` and `git checkout --ours*`/`--theirs*` (without them those commands fall through to "ask" rather than failing), and, optionally, `hooks.pipelines.ship` to fetch the base beforehand and open the PR afterwards — Convoy never runs remote git itself. |
 | `review` | **no — report only** | Scope the diff, run the bug / clean-code(+patterns) / security audits **in parallel across two models each**, then a single step synthesizes everything into one prioritized findings report. Makes no changes; the run's output is `reports/report.md`, which you read to decide whether to follow up with a `refine` run. |
 | `review-lite` | **no — report only** | Same shape as `review`, but nothing runs on Opus: `openrouter/z-ai/glm-5.2` scopes the diff and writes the final report, and each parallel audit fans out across `openrouter/z-ai/glm-5.2` + `openrouter/moonshotai/kimi-k3`. The cheap way to get a full review report. |
 | `fixer` | yes | The follow-up to a report-only run. Give it a set of findings (as the prompt or an attachment) and it proves each one with a focused regression test **before** touching production code, applies minimal fixes only for the findings that actually went red, then independently reruns those proofs and the surrounding checks to report a final per-finding verdict (`fixed`, `already-resolved`, `not-reproducible`, `not-automatable`, `blocked`, `not-fixed`). The validation phase runs the commands itself (see [verifying agents](#project-configuration-convoyconfigyaml)) rather than taking the fix phase's word for it, and never promotes an unproven finding to fixed. |
@@ -67,7 +68,7 @@ Convoy ships these pipelines; select one with `-p/--pipeline` (no config needed)
 | `hunter` | **no — report only** | Repo-wide audit across six specialty tracks (correctness, memory, performance, security, reliability, supply chain), each run on GPT 5.6 Terra xhigh plus one specialty model, then reconciled into a single deduplicated, prioritized consensus report. |
 | `hunter-max` | **no — report only** | Like `hunter`, but every track fans out across all five models (30 concurrent audits). Highest recall, slowest and most expensive — reach for it on code you can't afford to get wrong. |
 
-`refine`/`ultra-refine` are the change-applying counterparts of `review`: run `review` first to get a report, then `refine` if you want the fixes applied. `fixer` is the stricter alternative to `refine` when you already have a specific list of findings and want each one individually proven, fixed, and accounted for rather than triaged in bulk.
+`refine`/`ultra-refine` are the change-applying counterparts of `review`: run `review` first to get a report, then `refine` if you want the fixes applied. `ship` is `refine` for a branch whose base has moved on — it syncs first, so the audit is of the merged result. `fixer` is the stricter alternative to `refine` when you already have a specific list of findings and want each one individually proven, fixed, and accounted for rather than triaged in bulk.
 
 `review*` pipelines default to the current branch/PR diff; `hunter*` default to the whole repository unless the prompt scopes them to a branch, PR, or area.
 

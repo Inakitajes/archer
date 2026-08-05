@@ -11,20 +11,25 @@ const fallbackModel = `${defaultGptModel}#${defaultGptVariant}`
 const sonnetModel = "openrouter/anthropic/claude-sonnet-5"
 /** Lower-cost replacement for the GPT xhigh phases in the lightweight pipelines. */
 const glmModel = "openrouter/z-ai/glm-5.2"
+/** GLM 5.2 with its reasoning turned up: what the audit phases of `implement` run on. */
+const glmXhighModel = `${glmModel}#xhigh`
 /** Opus reached through OpenRouter, so the hunter fan-outs share one provider across every track. */
 const opusViaOpenRouter = "openrouter/anthropic/claude-opus-5"
 /** Remaining specialty models the hunter pipelines fan their audit tracks across. */
 const grokModel = "openrouter/x-ai/grok-4.5"
 const kimiModel = "openrouter/moonshotai/kimi-k3"
+/** Kimi K3 with reasoning raised one notch: the design and adversarial passes earn it, the cheap fan-outs don't. */
+const kimiHighModel = `${kimiModel}#high`
 /** GPT 5.6 Sol: the implementation workhorse, and at xhigh the consensus reporter for the review/hunter pipelines. */
 const solModel = "openai/gpt-5.6-sol"
 const solXhighModel = `${solModel}#xhigh`
 
 // Per-step models the built-in `implement` pipeline pins. Exported so `convoy init`'s
 // inlined copy of that pipeline stays in sync with the built-in it claims to mirror.
-export const defaultImplementerModel = solModel
-export const defaultImplementReviewModel = kimiModel
-export const defaultAdversarialModel = kimiModel
+export const defaultImplementerModel = solXhighModel
+export const defaultImplementAuditModel = glmXhighModel
+export const defaultImplementReviewModel = kimiHighModel
+export const defaultAdversarialModel = kimiHighModel
 
 /** The six specialty audit tracks shared by `hunter` and `hunter-max`; each maps to a `hunter-<track>` agent. */
 const hunterTracks = ["correctness", "memory", "performance", "security", "reliability", "supply-chain"] as const
@@ -137,6 +142,15 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: defaultOpusModel,
     temperature: 0.1,
     readOnly: true,
+    builtIn: true,
+  },
+  // ship: bring the branch up to date before anything reviews it.
+  {
+    name: "sync-with-base",
+    description:
+      "Merges the advanced base branch into the current branch, resolving real and semantic conflicts while preserving both the branch's behaviour and the incoming base changes",
+    defaultModel: defaultOpusModel,
+    temperature: 0.1,
     builtIn: true,
   },
   // ultra-implement: final-review stage over the whole PR.
@@ -328,14 +342,18 @@ export const readOnlyAgentSuffix = "__ro"
 export const defaultPipelineName = "implement"
 
 export const builtInPipelines: Record<string, PipelineSpec> = {
+  // The audits are pinned to GLM 5.2 xhigh rather than left to inherit the run's
+  // model: they read a diff that already exists, which is the work GLM does at
+  // parity with the expensive models, so the budget belongs in the phases that
+  // write (Sol xhigh) and judge (Kimi K3 high).
   implement: {
     description: "Implementation, pattern/security audits, design polish, tests, and adversarial review",
     steps: [
       { agent: "implementer", model: defaultImplementerModel, reports: "none" },
-      "patterns",
-      "security",
+      { agent: "patterns", model: defaultImplementAuditModel },
+      { agent: "security", model: defaultImplementAuditModel },
       { agent: "design", model: defaultImplementReviewModel },
-      { agent: "tests", reports: "none" },
+      { agent: "tests", model: defaultImplementAuditModel, reports: "none" },
       { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
     ],
   },
@@ -351,24 +369,21 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     ],
   },
   // The advisor←executor pattern as a runnable default, aimed at the one phase
-  // that earns it: Terra xhigh writes the code and consults Sol at its decision
-  // points, pairing the two GPT 5.6 variants that disagree most usefully. The
-  // audits that follow read a diff that already exists, so they run unadvised
-  // and the pipeline stays comparable to `implement-lite` — same audit
-  // executors, one advised step between them.
+  // that earns it: Terra xhigh writes the code and consults Sol xhigh at its
+  // decision points, pairing the two GPT 5.6 variants that disagree most
+  // usefully. Every other phase is `implement`'s, unchanged and unadvised, so
+  // the advised implementation step is the single variable between the two.
   "implement-advised": {
-    description: "Like implement-lite, but the implementation phase runs on Terra xhigh and consults Sol as an advisor at its decision points; the audits run unadvised",
+    description: "Like implement, but the implementation phase runs on Terra xhigh and consults Sol as an advisor at its decision points; the audits run unadvised",
     steps: [
-      { agent: "implementer", model: fallbackModel, advisor: solModel, reports: "none" },
+      { agent: "implementer", model: fallbackModel, advisor: solXhighModel, reports: "none" },
       // `false` rather than an absent key: absent would inherit a project's
       // defaults.advisor and quietly re-advise these phases.
-      { agent: "patterns", model: glmModel, advisor: false },
-      { agent: "security", model: glmModel, advisor: false },
-      { agent: "design", model: kimiModel, advisor: false },
-      { agent: "tests", model: glmModel, advisor: false, reports: "none" },
-      // The adversarial pass is the one place the expensive model should own the
-      // loop: its whole job is the judgement an advisor would otherwise supply.
-      { agent: "adversarial", model: defaultOpusModel, advisor: false, reports: "all" },
+      { agent: "patterns", model: defaultImplementAuditModel, advisor: false },
+      { agent: "security", model: defaultImplementAuditModel, advisor: false },
+      { agent: "design", model: defaultImplementReviewModel, advisor: false },
+      { agent: "tests", model: defaultImplementAuditModel, advisor: false, reports: "none" },
+      { agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" },
     ],
   },
   review: {
@@ -404,6 +419,29 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   refine: {
     description: "Audit-only PR review, adversarial finding triage, targeted fixes, and final validation — applies changes.",
     steps: [
+      { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true },
+      { agent: "bug-auditor", name: "bugs", model: fallbackModel, reports: ["scope"] },
+      { agent: "clean-code-auditor", name: "clean-code", model: fallbackModel, reports: ["scope"] },
+      { agent: "security-reviewer", name: "security", model: fallbackModel, reports: ["scope"] },
+      { agent: "review-adversary", name: "triage", model: defaultOpusModel, reports: ["scope", "bugs", "clean-code", "security"] },
+      { agent: "review-fixer", name: "fixes", model: fallbackModel, reports: ["triage"] },
+      { agent: "review-validator", name: "validator", model: fallbackModel, reports: "all" },
+    ],
+  },
+  // refine's audits, but against the branch as it will actually merge: the sync
+  // phase lands the advanced base first, so the auditors read the merged result
+  // instead of a diff that no longer describes what lands.
+  //
+  // Two things it expects from config rather than shipping itself, because both
+  // are machine-local. Conflict resolution needs `git merge*`, `git add*` and
+  // `git checkout --ours*|--theirs*` in `permissions.allow` — without them those
+  // commands fall through to "ask" rather than failing. And fetching the base
+  // beforehand or opening the PR afterwards belongs in `hooks.pipelines.ship`,
+  // since Convoy never runs remote git itself.
+  ship: {
+    description: "Sync the branch with its base (merge + conflict resolution), then audit the merged diff, triage, fix, and validate",
+    steps: [
+      { agent: "sync-with-base", name: "sync", model: fallbackModel, reports: "none" },
       { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true },
       { agent: "bug-auditor", name: "bugs", model: fallbackModel, reports: ["scope"] },
       { agent: "clean-code-auditor", name: "clean-code", model: fallbackModel, reports: ["scope"] },
@@ -453,11 +491,16 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   // attachment) and every one of them ends with a traceable verdict. The three
   // working phases carry the cost; the reporter only re-reads reports that already
   // exist, so it runs on the cheapest GPT 5.6 rather than the most capable model.
+  // The two phases that write get an advisor, because both make a judgement call
+  // that is expensive to get wrong and cheap to check: whether a finding is
+  // genuinely reproducible, and how small the fix can be. Validation runs
+  // unadvised — it reruns the proofs itself, which is a stronger check than a
+  // second opinion on the reasoning.
   fixer: {
     description: "Turn supplied findings into proven regression tests, targeted fixes, and an independently rerun final report",
     steps: [
-      { agent: "fixer-test-author", name: "reproduction", model: fallbackModel, reports: "none", diff: true },
-      { agent: "fixer-implementer", name: "fixes", model: fallbackModel, reports: ["reproduction"] },
+      { agent: "fixer-test-author", name: "reproduction", model: fallbackModel, advisor: solXhighModel, reports: "none", diff: true },
+      { agent: "fixer-implementer", name: "fixes", model: fallbackModel, advisor: solXhighModel, reports: ["reproduction"] },
       { agent: "fixer-validator", name: "validation", model: fallbackModel, reports: ["reproduction", "fixes"] },
     ],
   },
