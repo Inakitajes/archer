@@ -12,6 +12,7 @@ import {
   defaultGptModel,
   defaultGptVariant,
   defaultAdversarialModel,
+  defaultImplementAuditModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
   defaultOpusModel,
@@ -281,6 +282,9 @@ defaults:
 #   ultra-implement      like implement, with dual-model parallel audits and a final review/fix/validate stage
 #   refine               audit the current diff, then apply the triaged fixes (changes code)
 #   ultra-refine         like refine, with every audit fanned out across two models
+#   ship                 merge the advanced base in (resolving conflicts), then refine the merged branch
+#                        wants permissions.allow: git merge*, git add*, git checkout --ours*|--theirs*
+#                        and, optionally, hooks.pipelines.ship to fetch the base first / open the PR after
 #   review               report-only: parallel audits across two models plus one prioritized report (no changes)
 #   review-lite          like review, but swaps GPT 5.6 Terra xhigh for GLM 5.2 (scope + audit fan-out); report stays on Opus
 #   review-cc            like review, but pairs each audit with a Claude Code run (needs the \`claude\` CLI on PATH)
@@ -294,11 +298,14 @@ pipelines:
       - agent: implementer
         model: ${defaultImplementerModel}
         reports: none
-      - patterns
-      - security
+      - agent: patterns
+        model: ${defaultImplementAuditModel}
+      - agent: security
+        model: ${defaultImplementAuditModel}
       - agent: design
         model: ${defaultImplementReviewModel}
       - agent: tests
+        model: ${defaultImplementAuditModel}
         reports: none
       - agent: adversarial
         model: ${defaultAdversarialModel}

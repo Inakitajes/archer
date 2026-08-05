@@ -31,6 +31,7 @@ import {
   defaultAdversarialModel,
   defaultGptModel,
   defaultGptVariant,
+  defaultImplementAuditModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
   defaultOpusModel,
@@ -370,6 +371,7 @@ describe("agent registry", () => {
       "review-fixer",
       "review-validator",
       "review-report",
+      "sync-with-base",
       "implementation-triage",
       "implementation-final-review",
       "implementation-fixer",
@@ -398,7 +400,7 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ultra-implement, ultra-refine)',
+      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ship, ultra-implement, ultra-refine)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
   })
@@ -706,10 +708,10 @@ describe("default config init", () => {
     expect(existsSync(join(dir, "agents"))).toBe(false)
     expect(config.pipelines.implement?.steps).toEqual([
       { agent: "implementer", model: defaultImplementerModel, reports: "none" },
-      "patterns",
-      "security",
+      { agent: "patterns", model: defaultImplementAuditModel },
+      { agent: "security", model: defaultImplementAuditModel },
       { agent: "design", model: defaultImplementReviewModel },
-      { agent: "tests", reports: "none" },
+      { agent: "tests", model: defaultImplementAuditModel, reports: "none" },
       { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
     ])
     expect(config.permissions).toEqual({ allow: [], deny: [] })
