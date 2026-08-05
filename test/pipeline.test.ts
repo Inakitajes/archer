@@ -303,27 +303,27 @@ describe("built-in fixer pipeline", () => {
       (step): step is AgentStep => step.type === "agent",
     )
 
-  test("runs reproduction, fixes, validation, and report in that order", () => {
-    expect(fixer().map((step) => step.name)).toEqual(["reproduction", "fixes", "validation", "report"])
+  test("runs reproduction, fixes, and validation in that order", () => {
+    expect(fixer().map((step) => step.name)).toEqual(["reproduction", "fixes", "validation"])
   })
 
-  test("carries the working phases on Terra xhigh and drops the reporter to the cheap GPT 5.6", () => {
+  test("carries every phase on Terra xhigh", () => {
     const byName = Object.fromEntries(fixer().map((step) => [step.name, step]))
 
     expect(byName.reproduction).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
     expect(byName.fixes).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
     expect(byName.validation).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName.report?.model).toBe("openai/gpt-5.6-luna")
-    expect(byName.report?.variant).toBeUndefined()
   })
 
-  test("lets reproduction and fixes write, and keeps validation and report audit-only", () => {
+  test("lets reproduction and fixes write, and lets validation run checks without editing", () => {
     const byName = Object.fromEntries(fixer().map((step) => [step.name, step]))
 
     expect(byName.reproduction?.readOnly).toBeUndefined()
     expect(byName.fixes?.readOnly).toBeUndefined()
+    // The point of the phase: it cannot edit, but it can rerun the proofs its
+    // prompt tells it to rerun.
     expect(byName.validation?.readOnly).toBe(true)
-    expect(byName.report?.readOnly).toBe(true)
+    expect(byName.validation?.verify).toBe(true)
   })
 
   test("gives every phase the exact evidence trail its prompt reads by path", () => {
@@ -334,12 +334,6 @@ describe("built-in fixer pipeline", () => {
     expect(byName.reproduction?.inputDiff).toBe(true)
     expect(byName.fixes?.inputFiles).toEqual(["prd.md", "reports/reproduction.md"])
     expect(byName.validation?.inputFiles).toEqual(["prd.md", "reports/reproduction.md", "reports/fixes.md"])
-    expect(byName.report?.inputFiles).toEqual([
-      "prd.md",
-      "reports/reproduction.md",
-      "reports/fixes.md",
-      "reports/validation.md",
-    ])
   })
 })
 
@@ -611,6 +605,21 @@ describe("parallel groups", () => {
     expect(security?.readOnly).toBe(true)
   })
 
+  test("a verifying agent loses bash in a parallel block, through its own synthesized variant", () => {
+    const agents = builtInAgents.map((agent) => (agent.name === "security-auditor" ? { ...agent, readOnly: true, verify: true } : agent))
+    const pipeline = resolvePipeline({ name: "test", spec: { steps: [{ parallel: ["security", "patterns"] }] }, agents })
+    const [security] = pipeline.steps as AgentStep[]
+
+    expect(security?.readOnly).toBe(true)
+    expect(security?.verify).toBeUndefined()
+    // Agent configs are per name, so sharing the base name would leak bash into
+    // the parallel step: it needs a stripped variant of its own.
+    expect(security?.agentName).toBe("security-auditor__ro")
+    expect(synthesizeReadOnlyAgents(pipeline, agents)).toContainEqual(
+      expect.objectContaining({ name: "security-auditor__ro", readOnly: true, verify: false }),
+    )
+  })
+
   test("a step inside a parallel block never sees its own siblings' reports, only earlier groups'", () => {
     const [, patterns, security] = agentSteps({ steps: ["implementer", { parallel: ["patterns", "security"] }] })
     expect(patterns?.inputFiles).toEqual(["prd.md", "reports/implementer.md"])
@@ -674,6 +683,19 @@ describe("model fan-out", () => {
     expect(clean1?.readOnly).toBe(true)
     expect(clean2?.readOnly).toBe(true)
     expect(clean1?.agentName).toBe("implementer__ro")
+  })
+
+  test("a models: fan-out also strips bash from a verifying agent", () => {
+    const agents = builtInAgents.map((agent) => (agent.name === "review-validator" ? { ...agent, verify: true } : agent))
+    const [first] = resolvePipeline({
+      name: "test",
+      spec: { steps: [{ agent: "review-validator", name: "validator", models: ["anthropic/claude-opus-4-7", "openai/gpt-5.5#xhigh"] }] },
+      agents,
+    }).steps as AgentStep[]
+
+    expect(first?.readOnly).toBe(true)
+    expect(first?.verify).toBeUndefined()
+    expect(first?.agentName).toBe("review-validator__ro")
   })
 
   test("reports: [stepName] on a fanned-out step expands to every model variant", () => {
@@ -811,6 +833,28 @@ describe("claude-code runner steps", () => {
     const claude = steps.find((step) => step.name === "bugs-claude")
     expect(claude?.runner).toBe("claude-code")
     expect(claude?.readOnly).toBe(true)
+  })
+
+  test("rejects claude-code on a verifying step, which needs bash it cannot give", () => {
+    expect(() => agentSteps({ steps: [{ agent: "review-validator", name: "validator", runner: "claude-code" }] })).toThrow(/can't run commands/)
+  })
+
+  test("accepts claude-code on a verifying agent forced read-only, where bash is dropped anyway", () => {
+    const steps = agentSteps({
+      steps: [
+        { agent: "review-scope", name: "scope", reports: "none", diff: true },
+        {
+          parallel: [
+            { agent: "bug-auditor", name: "bugs", reports: ["scope"] },
+            { agent: "review-validator", name: "validator-claude", runner: "claude-code", reports: ["scope"] },
+          ],
+        },
+      ],
+    })
+
+    const claude = steps.find((step) => step.name === "validator-claude")
+    expect(claude?.readOnly).toBe(true)
+    expect(claude?.verify).toBeUndefined()
   })
 
   test("rejects claude-code combined with a models: fan-out", () => {

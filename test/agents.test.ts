@@ -124,6 +124,41 @@ describe("opencode config", () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  test("verifying agents get bash under the normal policy while staying unable to write", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-verify-agent-"))
+    try {
+      await mkdir(join(dir, ".convoy", "agents"), { recursive: true })
+      await writeFile(join(dir, ".convoy", "agents", "validator.md"), "# Validator\n\nRerun the proofs.")
+
+      const config = opencodeConfig("/tmp/convoy-run", dir, [
+        { name: "validator", description: "Verifies", readOnly: true, verify: true, builtIn: false },
+      ])
+
+      const validator = config.agent?.["validator"]
+      expect(validator?.tools?.read).toBe(true)
+      expect(validator?.tools?.bash).toBe(true)
+      // The whole point: it can run the checks its prompt demands, but the write
+      // path stays closed and runner.ts still holds it to an unchanged repo.
+      expect(validator?.tools?.write).toBe(false)
+      expect(validator?.tools?.edit).toBe(false)
+      expect(validator?.tools?.task).toBe(false)
+      expect(validator?.permission).toMatchObject({ edit: "deny", task: "deny", question: "deny" })
+      const bash = (validator?.permission as { bash?: Record<string, string> } | undefined)?.bash
+      expect(bash).toMatchObject({ "bun test*": "allow", "git commit*": "deny", "*": "ask" })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("verify without readOnly is ignored: a writable agent is already allowed everything", async () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", [
+      { name: "implementer", description: "writes", verify: true, builtIn: true },
+    ])
+
+    expect(config.agent?.implementer?.tools?.write).toBe(true)
+    expect(config.agent?.implementer?.tools?.bash).toBe(true)
+  })
 })
 
 describe("advisor wiring in the opencode config", () => {

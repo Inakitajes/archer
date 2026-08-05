@@ -19,8 +19,6 @@ const kimiModel = "openrouter/moonshotai/kimi-k3"
 /** GPT 5.6 Sol: the implementation workhorse, and at xhigh the consensus reporter for the review/hunter pipelines. */
 const solModel = "openai/gpt-5.6-sol"
 const solXhighModel = `${solModel}#xhigh`
-/** The cheap GPT 5.6: reserved for synthesis steps that only re-read reports another phase already wrote. */
-const lunaModel = "openai/gpt-5.6-luna"
 
 // Per-step models the built-in `implement` pipeline pins. Exported so `convoy init`'s
 // inlined copy of that pipeline stays in sync with the built-in it claims to mirror.
@@ -130,6 +128,7 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: fallbackModel,
     temperature: 0.1,
     readOnly: true,
+    verify: true,
     builtIn: true,
   },
   {
@@ -170,6 +169,7 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: defaultOpusModel,
     temperature: 0.1,
     readOnly: true,
+    verify: true,
     builtIn: true,
   },
   // fixer: supplied findings turned into proven regression tests, minimal fixes, and an audited outcome report.
@@ -189,18 +189,11 @@ export const builtInAgents: readonly AgentSpec[] = [
   },
   {
     name: "fixer-validator",
-    description: "Independently verifies Fixer outcomes, targeted checks, and absence of regressions",
+    description: "Independently reruns the proofs, checks for regressions, and reports the final per-finding outcome",
     defaultModel: fallbackModel,
     temperature: 0.1,
     readOnly: true,
-    builtIn: true,
-  },
-  {
-    name: "fixer-reporter",
-    description: "Produces the final per-finding Fixer outcome report from the complete evidence trail",
-    defaultModel: fallbackModel,
-    temperature: 0.1,
-    readOnly: true,
+    verify: true,
     builtIn: true,
   },
   // hunter / hunter-max: six specialty audit tracks fanned across models, then one consensus report.
@@ -461,12 +454,11 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   // working phases carry the cost; the reporter only re-reads reports that already
   // exist, so it runs on the cheapest GPT 5.6 rather than the most capable model.
   fixer: {
-    description: "Turn supplied findings into proven regression tests, targeted fixes, independent validation, and a traceable final report",
+    description: "Turn supplied findings into proven regression tests, targeted fixes, and an independently rerun final report",
     steps: [
       { agent: "fixer-test-author", name: "reproduction", model: fallbackModel, reports: "none", diff: true },
       { agent: "fixer-implementer", name: "fixes", model: fallbackModel, reports: ["reproduction"] },
       { agent: "fixer-validator", name: "validation", model: fallbackModel, reports: ["reproduction", "fixes"] },
-      { agent: "fixer-reporter", name: "report", model: lunaModel, reports: ["reproduction", "fixes", "validation"] },
     ],
   },
   "review-cc": {
@@ -719,6 +711,13 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
     throw new Error(`pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}")'s "models" needs at least 2 entries; use "model" for a single one`)
   }
 
+  const models = spec.models
+  const forced = ctx.forcedReadOnly || Boolean(models)
+  // A read-only agent keeps bash only when it has the working tree to itself:
+  // parallel and fanned-out steps share one, and concurrent test runs would
+  // fight over the same build caches, so they fall back to strict read-only.
+  const verify = Boolean(agent.readOnly && agent.verify && !forced)
+
   const runnerDefinition = stepRunnerFor(spec.runner)
   // "opencode" is accepted for symmetry but resolves to the default (no runner field).
   const runner: StepRunner | undefined = runnerDefinition.id === "claude-code" ? "claude-code" : undefined
@@ -730,6 +729,11 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
   if (!runnerDefinition.capabilities.writeSteps && !ctx.forcedReadOnly && !agent.readOnly) {
     throw new Error(
       `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") uses runner: ${runnerDefinition.id}, which currently supports read-only audit steps only — agent "${agent.name}" can modify the repo`,
+    )
+  }
+  if (!runnerDefinition.capabilities.verifySteps && verify) {
+    throw new Error(
+      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") uses runner: ${runnerDefinition.id}, which can't run commands — agent "${agent.name}" is a verifying agent that needs bash to check its claims`,
     )
   }
 
@@ -756,14 +760,16 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
     )
   }
 
-  const models = spec.models
-  const forced = ctx.forcedReadOnly || Boolean(models)
   // Runners without global override support own their model namespace and use
   // an empty string for their own configured default.
   const variants = runnerDefinition.capabilities.globalModelOverride
     ? (models ?? [spec.model ?? agent.model ?? ctx.input.defaultModel ?? agent.defaultModel ?? fallbackModel])
     : [spec.model ? normalizeStepRunnerModel(runnerDefinition.id, spec.model) : ""]
-  const agentName = forced && !agent.readOnly ? `${agent.name}${readOnlyAgentSuffix}` : agent.name
+  // Agent configs are registered per agent name, so a forced step needs its own
+  // synthesized variant whenever forcing changes anything: for a writable agent
+  // that means losing every write tool, for a verifying one just losing bash.
+  const strictReadOnly = Boolean(agent.readOnly && !agent.verify)
+  const agentName = forced && !strictReadOnly ? `${agent.name}${readOnlyAgentSuffix}` : agent.name
 
   return variants.map((modelValue, variantIndex) => {
     const name = models ? `${baseName}__${slugifyModel(modelValue)}` : baseName
@@ -788,6 +794,7 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
       inputDiff: spec.diff ?? ctx.priorSteps.length > 0,
       reportPath: `reports/${name}.md`,
       ...(forced || agent.readOnly ? { readOnly: true } : {}),
+      ...(verify ? { verify: true } : {}),
       ...(spec.maxAttempts !== undefined ? { maxAttempts: spec.maxAttempts } : {}),
     }
     return step
@@ -840,7 +847,9 @@ export function synthesizeReadOnlyAgents(pipeline: Pipeline, baseAgents: readonl
     if (!base) {
       throw new Error(`pipeline "${pipeline.name}": step "${step.name}" needs forced-read-only agent "${step.agentName}", but base agent "${baseName}" is not defined`)
     }
-    synthesized.set(step.agentName, { ...base, name: step.agentName, readOnly: true })
+    // verify: false, not just readOnly: true — a verifying agent forced into a
+    // shared working tree loses bash along with its write tools.
+    synthesized.set(step.agentName, { ...base, name: step.agentName, readOnly: true, verify: false })
   }
   return [...synthesized.values()]
 }

@@ -105,6 +105,14 @@ export type AgentSpec = {
   temperature?: number
   /** When true, Convoy disables write/edit/bash tools for this agent. */
   readOnly?: boolean
+  /**
+   * Gives a read-only agent bash back, under the same policy writable steps get,
+   * so a validator can actually run the tests and checks its prompt asks for.
+   * Ignored unless `readOnly` is true, and dropped when a step is forced
+   * read-only for parallel/multi-model execution: concurrent agents running
+   * checks would fight over the same working tree.
+   */
+  verify?: boolean
   /** Advising model for steps using this agent; beats defaults.advisor, loses to the step's own. */
   advisor?: string
   builtIn: boolean
@@ -146,6 +154,8 @@ export type AgentStep = {
   reportPath: string
   /** True when the underlying agent is configured as read-only, or forced read-only for parallel/multi-model execution. */
   readOnly?: boolean
+  /** True when this read-only step may still run bash to verify its claims. Never set without `readOnly`. */
+  verify?: boolean
   /** Per-step override; falls back to --max-attempts when absent. */
   maxAttempts?: number
   /** Shared by every step produced from the same top-level pipeline entry; the runner batches same-groupId steps to run concurrently. */

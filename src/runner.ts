@@ -2162,9 +2162,11 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
     "- Working directory: the directory where `convoy` was invoked (root of the target repo).",
     "",
     "## Access mode",
-    phase.readOnly
-      ? "This phase is read-only: Convoy gives you no write, edit, or bash tools, and that is expected — do not try to write any file, and do not apologize for or comment on being unable to. Convoy saves your report itself by concatenating the text you emit and storing it verbatim, so your visible output for this phase must be the report and nothing else: no preamble (\"I'll review…\", \"Let me write the report…\"), no step-by-step narration, and no closing note about writing. Keep any planning in your private reasoning; begin your visible output at the report's first line (e.g. the `#` heading)."
-      : "This phase may edit the target repository when the phase-specific instructions call for it.",
+    phase.readOnly && phase.verify
+      ? "This phase verifies without editing: you have bash, so run the tests, typecheck, lint, and other checks your instructions call for, and quote the exact command and its real result as evidence — never claim a check you did not run. You have no write or edit tools, and that is expected: do not try to write any file, and do not apologize for or comment on being unable to. Do not run commands that modify the repository either — no snapshot updates (`-u`, `--update-snapshots`), no formatters that rewrite files, no dependency installs; Convoy fails this phase if the repository changes. Convoy saves your report itself by concatenating the text you emit and storing it verbatim, so your visible output for this phase must be the report and nothing else: no preamble (\"I'll verify…\", \"Let me write the report…\"), no step-by-step narration, and no closing note about writing. Keep any planning in your private reasoning; begin your visible output at the report's first line (e.g. the `#` heading)."
+      : phase.readOnly
+        ? "This phase is read-only: Convoy gives you no write, edit, or bash tools, and that is expected — do not try to write any file, and do not apologize for or comment on being unable to. Convoy saves your report itself by concatenating the text you emit and storing it verbatim, so your visible output for this phase must be the report and nothing else: no preamble (\"I'll review…\", \"Let me write the report…\"), no step-by-step narration, and no closing note about writing. Keep any planning in your private reasoning; begin your visible output at the report's first line (e.g. the `#` heading)."
+        : "This phase may edit the target repository when the phase-specific instructions call for it.",
     "",
     "## Attachments",
     "You will receive as file attachments: project context files when present, the original PRD, previous phase reports, the cumulative diff against the base branch, and any `--file` passed by the user. Read them before acting.",
@@ -2175,7 +2177,11 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
     "",
     "## Closing",
     "Before finishing, make sure to:",
-    phase.readOnly ? "1. Have not modified the target repository." : "1. Have applied necessary changes to the repo code.",
+    phase.readOnly && phase.verify
+      ? "1. Have not modified the target repository — only read it and run checks against it."
+      : phase.readOnly
+        ? "1. Have not modified the target repository."
+        : "1. Have applied necessary changes to the repo code.",
     phase.readOnly
       ? "2. Make the report (markdown, max ~80 lines) your entire visible output — Convoy persists it for you. Nothing before or after it."
       : "2. Have written the report (markdown, max ~80 lines) at the absolute path indicated above. If you can't write it, respond with the exact report content and Convoy will save it.",

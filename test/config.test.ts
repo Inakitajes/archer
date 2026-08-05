@@ -377,7 +377,6 @@ describe("agent registry", () => {
       "fixer-test-author",
       "fixer-implementer",
       "fixer-validator",
-      "fixer-reporter",
       "hunter-correctness",
       "hunter-memory",
       "hunter-performance",

@@ -49,6 +49,7 @@ export function opencodeConfig(
       spec.description,
       spec.temperature,
       spec.readOnly,
+      Boolean(spec.readOnly && spec.verify),
       loadAgentPrompt(promptName, targetDir, { advisor: advised }),
       runDir,
       targetDir,
@@ -146,6 +147,10 @@ function agentConfig(
   description: string,
   temperature: number | undefined,
   readOnly: boolean | undefined,
+  // Only meaningful alongside readOnly: bash comes back, write/edit stay gone.
+  // The repository boundary in runner.ts is what still holds the step to its
+  // promise, since bash can write through shell redirection (see bash-policy).
+  verify: boolean,
   prompt: string,
   runDir: string,
   targetDir: string,
@@ -165,7 +170,7 @@ function agentConfig(
         grep: true,
         write: false,
         edit: false,
-        bash: false,
+        bash: verify,
         task: false,
         webfetch,
         websearch: false,
@@ -178,7 +183,7 @@ function agentConfig(
         glob: "allow",
         grep: "allow",
         edit: "deny",
-        bash: "deny",
+        bash: verify ? bashPolicy(targetDir, permissions) : "deny",
         task: "deny",
         question: "deny",
         webfetch: webfetch ? "allow" : "deny",

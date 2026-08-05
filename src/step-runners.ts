@@ -5,6 +5,8 @@ export type StepRunnerCapabilities = {
   liveAttach: boolean
   takeover: boolean
   writeSteps: boolean
+  /** Whether a read-only step can still be given bash to run tests and checks. */
+  verifySteps: boolean
   modelFanout: boolean
   globalModelOverride: boolean
   /**
@@ -49,6 +51,7 @@ const definitions: Record<StepRunnerId, StepRunnerDefinition> = {
       liveAttach: true,
       takeover: true,
       writeSteps: true,
+      verifySteps: true,
       modelFanout: true,
       globalModelOverride: true,
       advisor: true,
@@ -63,6 +66,8 @@ const definitions: Record<StepRunnerId, StepRunnerDefinition> = {
       liveAttach: false,
       takeover: false,
       writeSteps: false,
+      // Its tool flags are fixed and exclude Bash (see claude-code.ts).
+      verifySteps: false,
       modelFanout: false,
       globalModelOverride: false,
       advisor: false,

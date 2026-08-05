@@ -77,6 +77,8 @@ export type ConfigAgent = {
   temperature?: number
   /** Disable write/edit/bash tools for this agent. */
   readOnly?: boolean
+  /** Give a read-only agent bash back so it can run tests and checks. Ignored unless readOnly. */
+  verify?: boolean
   /** Advising model for steps using this agent; beats defaults.advisor. */
   advisor?: string
 }
@@ -535,13 +537,14 @@ function validateAgents(v: Validator, raw: unknown, targetDir: string): Record<s
     if (name.endsWith(readOnlyAgentSuffix)) v.fail(path, `agent names can't end in "${readOnlyAgentSuffix}"; that suffix is reserved for convoy's forced-read-only variants`)
 
     const entry = v.record(value, path)
-    v.knownKeys(entry, path, ["description", "model", "temperature", "readOnly", "advisor"])
+    v.knownKeys(entry, path, ["description", "model", "temperature", "readOnly", "verify", "advisor"])
 
     const agent: ConfigAgent = {}
     if (entry.description !== undefined) agent.description = v.nonEmptyString(entry.description, `${path}.description`)
     if (entry.model !== undefined) agent.model = v.model(entry.model, `${path}.model`)
     if (entry.temperature !== undefined) agent.temperature = v.temperature(entry.temperature, `${path}.temperature`)
     if (entry.readOnly !== undefined) agent.readOnly = v.boolean(entry.readOnly, `${path}.readOnly`)
+    if (entry.verify !== undefined) agent.verify = v.boolean(entry.verify, `${path}.verify`)
     if (entry.advisor !== undefined) agent.advisor = v.model(entry.advisor, `${path}.advisor`)
 
     // Project agents bring their own prompt; built-in overrides keep theirs
@@ -769,6 +772,7 @@ export function buildAgentRegistry(config?: ConvoyConfig): AgentSpec[] {
       if (agent.model !== undefined) existing.model = agent.model
       if (agent.temperature !== undefined) existing.temperature = agent.temperature
       if (agent.readOnly !== undefined) existing.readOnly = agent.readOnly
+      if (agent.verify !== undefined) existing.verify = agent.verify
       if (agent.advisor !== undefined) existing.advisor = agent.advisor
       continue
     }
@@ -778,6 +782,7 @@ export function buildAgentRegistry(config?: ConvoyConfig): AgentSpec[] {
       ...(agent.model !== undefined ? { model: agent.model } : {}),
       ...(agent.temperature !== undefined ? { temperature: agent.temperature } : {}),
       ...(agent.readOnly !== undefined ? { readOnly: agent.readOnly } : {}),
+      ...(agent.verify !== undefined ? { verify: agent.verify } : {}),
       ...(agent.advisor !== undefined ? { advisor: agent.advisor } : {}),
       builtIn: false,
     })
