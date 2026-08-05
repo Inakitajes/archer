@@ -167,14 +167,6 @@ describe("cli parsing", () => {
     expect(() => parseArgs(["--no-worktree=yes", "prompt"])).toThrow("--no-worktree does not take a value")
   })
 
-  test("worktrees are on by default and --no-worktree opts out", async () => {
-    const byDefault = await parseCommand(["prompt"])
-    if (byDefault.type === "run") expect(byDefault.options.worktree).toBe(true)
-
-    const off = await parseCommand(["--no-worktree", "prompt"])
-    if (off.type === "run") expect(off.options.worktree).toBe(false)
-  })
-
   test("a resumed run never creates a second worktree, even with --worktree", async () => {
     // It continues in the directory its metadata recorded, which already is the
     // worktree when the original run made one.
@@ -380,6 +372,67 @@ describe("base ref auto-detection", () => {
 
     const options = await resolveRunOptions(parsed)
     expect(options.baseRef).toBe("squad-x")
+  })
+})
+
+describe("worktree default", () => {
+  const dirs: string[] = []
+
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  async function git(args: string[], cwd: string) {
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "convoy-test",
+        GIT_AUTHOR_EMAIL: "convoy-test@example.invalid",
+        GIT_COMMITTER_NAME: "convoy-test",
+        GIT_COMMITTER_EMAIL: "convoy-test@example.invalid",
+      },
+    })
+    if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(proc.stderr).text()}`)
+  }
+
+  async function repoOn(branch: string) {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-worktree-"))
+    dirs.push(dir)
+    await git(["init", "-q", "-b", "main"], dir)
+    await git(["commit", "-q", "--allow-empty", "-m", "init"], dir)
+    if (branch !== "main") await git(["checkout", "-q", "-b", branch], dir)
+    return dir
+  }
+
+  const worktreeFor = async (argv: string[]) => {
+    const command = await parseCommand(argv)
+    if (command.type !== "run") throw new Error(`expected a run command, got ${command.type}`)
+    return command.options.worktree
+  }
+
+  test("isolates on a trunk and runs in place on a branch, with no flag or config", async () => {
+    expect(await worktreeFor(["--dir", await repoOn("main"), "prompt"])).toBe(true)
+    expect(await worktreeFor(["--dir", await repoOn("feat/thing"), "prompt"])).toBe(false)
+  })
+
+  test("flags override the branch default in both directions", async () => {
+    const trunk = await repoOn("main")
+    const branch = await repoOn("feat/thing")
+
+    expect(await worktreeFor(["--dir", trunk, "--no-worktree", "prompt"])).toBe(false)
+    expect(await worktreeFor(["--dir", branch, "--worktree", "prompt"])).toBe(true)
+  })
+
+  test("an explicit defaults.worktree still wins over the branch", async () => {
+    await writeFile(join(process.env.CONVOY_HOME!, ".convoy", "config.yaml"), "version: 1\ndefaults:\n  worktree: false\n")
+
+    // On a trunk, where the branch alone would have isolated.
+    expect(await worktreeFor(["--dir", await repoOn("main"), "prompt"])).toBe(false)
+    // And the flag still beats the config.
+    expect(await worktreeFor(["--dir", await repoOn("main"), "--worktree", "prompt"])).toBe(true)
   })
 })
 

@@ -2010,7 +2010,7 @@ function describeDefault(key: keyof ConvoyDefaults): string {
     case "commitMessageModel":
       return "Model that writes the squashed commit message for finish (default: anthropic/claude-haiku-4-5)."
     case "worktree":
-      return "Run each job on a fresh branch in its own worktree (on when unset)."
+      return "Run each job on a fresh branch in its own worktree. Unset decides per branch: on for a trunk, off once you're on a branch."
     case "maxAttempts":
       return "Attempts per step before failing."
     case "baseRef":
