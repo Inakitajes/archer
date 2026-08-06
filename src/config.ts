@@ -673,6 +673,7 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
   }
 
   v.knownKeys(record, path, ["agent", "name", "model", "models", "runner", "advisor", "advisorMaxCalls", "maxAttempts", "reports", "diff"])
+
   const agent = validateStepName(v, record.agent, `${path}.agent`)
   if (context.insideParallel && agent === humanReviewStep) v.fail(path, `"${humanReviewStep}" can't run inside a parallel block`)
   if (record.model !== undefined && record.models !== undefined) v.fail(path, `set either "model" or "models", not both`)
@@ -702,6 +703,8 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
       ? undefined
       : validateStepRunnerModel(v, runner ?? "opencode", record.model, `${path}.model`)
 
+  if (record.maxAttempts !== undefined) warnIgnoredMaxAttempts()
+
   return {
     agent,
     ...(record.name !== undefined ? { name: validateStepName(v, record.name, `${path}.name`) } : {}),
@@ -710,7 +713,6 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
     ...(runner !== undefined ? { runner } : {}),
     ...(advisor !== undefined ? { advisor } : {}),
     ...(record.advisorMaxCalls !== undefined ? { advisorMaxCalls: v.positiveInt(record.advisorMaxCalls, `${path}.advisorMaxCalls`) } : {}),
-    ...(record.maxAttempts !== undefined ? (warnIgnoredMaxAttempts(), {}) : {}),
     ...(record.reports !== undefined ? { reports: validateReports(v, record.reports, `${path}.reports`) } : {}),
     ...(record.diff !== undefined ? { diff: v.boolean(record.diff, `${path}.diff`) } : {}),
   }
