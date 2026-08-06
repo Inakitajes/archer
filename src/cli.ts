@@ -576,7 +576,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     advisorDisabled: parsed.advisorDisabled ?? false,
     advisorAuditPolicy: defaults.advisorAuditPolicy ?? "summary",
     tui: parsed.tui ?? Boolean(process.stdout.isTTY && process.stderr.isTTY),
-    notify: parsed.notify ?? true,
+    notify: parsed.notify,
     notifications: config?.notifications ?? {},
     humanReview,
     maxAttempts: parsed.maxAttempts ?? defaults.maxAttempts ?? 2,

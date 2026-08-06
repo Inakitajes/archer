@@ -877,6 +877,7 @@ export function serializeConvoyConfig(config: ConvoyConfig): string {
   const hooks = serializeHooks(config.hooks)
   if (hooks) out.hooks = hooks
   if (config.attachments.length > 0) out.attachments = config.attachments
+  if (Object.keys(config.notifications).length > 0) out.notifications = config.notifications
   if (config.modelRouting && (config.modelRouting.gateway !== undefined || Object.keys(config.modelRouting.overrides).length > 0)) out.modelRouting = config.modelRouting
   return Bun.YAML.stringify(out, null, 2)
 }

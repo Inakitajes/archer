@@ -168,6 +168,28 @@ describe("RunStatusTracker", () => {
     expect(events[1]!.category).toBe("failures")
   })
 
+  test("a failed step remains the title's current step rather than advancing to unstarted work", () => {
+    const { tracker } = trackerWith([agentPhase("plan"), agentPhase("implement"), agentPhase("validate")])
+
+    tracker.phaseStarted("plan")
+    tracker.phaseEnded("plan", "completed")
+    tracker.phaseStarted("implement")
+    tracker.phaseEnded("implement", "failed")
+    tracker.finished({ status: "failed", runDir: "/tmp/run" })
+
+    expect(formatTerminalTitle(tracker.snapshot())).toStartWith("✗ 2/3 ")
+  })
+
+  test("a parallel member's failure names that member instead of the first group member", () => {
+    const phases = [agentPhase("lint", "checks", "lint"), agentPhase("integration", "checks", "integration")]
+    const { tracker, events } = trackerWith(phases)
+
+    tracker.phaseStarted("integration")
+    tracker.phaseEnded("integration", "failed")
+
+    expect(events.at(-1)!.body).toBe("step 1/1 · integration — failed")
+  })
+
   test("activity precedence is stopped > paused > waiting > working", () => {
     const { tracker } = trackerWith(mixedPhases())
     expect(tracker.snapshot().activity).toBe("working")
@@ -287,7 +309,7 @@ describe("trackRunStatus", () => {
     expect(wrapped.runControlState).toBeDefined()
   })
 
-  test("a pending permission prompt puts the run in waiting and releases it on reply", async () => {
+  test("a pending permission prompt uses a generic notification and releases waiting on reply", async () => {
     const phases = [agentPhase("plan")]
     const { tracker, events } = trackerWith(phases)
     let observed: string | undefined
@@ -305,7 +327,7 @@ describe("trackRunStatus", () => {
     expect(reply).toBe("once")
     expect(observed).toBe("waiting")
     expect(tracker.snapshot().activity).toBe("working")
-    expect(events.at(-1)!.body).toBe("waiting for your permission: rm -rf dist")
+    expect(events.at(-1)!.body).toBe("waiting for your permission")
     expect(events.at(-1)!.category).toBe("waiting")
   })
 

@@ -1,6 +1,10 @@
 import type { NotificationCategory, NotificationEvent } from "./run-status"
 
-export type NotifierProcess = { exited: Promise<number> }
+export type NotifierProcess = {
+  exited: Promise<number>
+  kill?(signal?: NodeJS.Signals): void
+  unref?(): void
+}
 export type NotifierSpawn = (command: string[]) => NotifierProcess
 
 /** The `notifications:` block from .convoy/config.yaml, already merged with defaults. */
@@ -36,6 +40,11 @@ const throttleMs: Record<NotificationCategory, number> = {
   finish: 3_000,
   waiting: 10_000,
 }
+
+/** A stalled osascript call is best effort, not permission to hold a run open. */
+const deliveryTimeoutMs = 10_000
+const deliveryKillGraceMs = 1_000
+const stopDrainMs = 250
 
 /**
  * Attributing the notification to the host terminal gives it that app's icon
@@ -93,6 +102,7 @@ export class Notifier {
   private readonly now: () => number
   private readonly settings: NotificationSettings
   private readonly lastSent = new Map<string, number>()
+  private readonly children = new Map<NotifierProcess, Promise<number>>()
   private stopped = false
 
   constructor(options: NotifierOptions = {}) {
@@ -107,9 +117,13 @@ export class Notifier {
     return this.platform === "darwin" && this.settings.enabled
   }
 
-  /** Stops further delivery; in-flight banners are left alone. */
-  stop() {
+  /** Stops delivery, terminates active children, and drains their exits briefly. */
+  async stop() {
+    if (this.stopped) return
     this.stopped = true
+    const children = [...this.children]
+    for (const [child] of children) this.kill(child)
+    await Promise.all(children.map(([, exited]) => this.drain(exited)))
   }
 
   /**
@@ -145,7 +159,7 @@ export class Notifier {
     const bundleId = resolveTerminalBundleId(this.env)
     if (bundleId) {
       const attributed = await this.osascript([`tell application id ${appleString(bundleId)}`, notification, "end tell"])
-      if (attributed) return
+      if (attributed || this.stopped) return
     }
     await this.osascript([notification])
   }
@@ -155,11 +169,49 @@ export class Notifier {
     for (const line of lines) args.push("-e", line)
     try {
       const child = this.spawn(["osascript", ...args])
-      return (await child.exited) === 0
+      return (await this.track(child)) === 0
     } catch {
       // Notifications are best effort: a missing binary, a denied permission,
       // or a spawn limit must never surface into the run.
       return false
     }
+  }
+
+  private track(child: NotifierProcess): Promise<number> {
+    child.unref?.()
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let forceKill: ReturnType<typeof setTimeout> | undefined
+    const exited = child.exited.catch(() => -1)
+    const tracked = exited.finally(() => {
+      if (timeout) clearTimeout(timeout)
+      if (forceKill) clearTimeout(forceKill)
+      this.children.delete(child)
+    })
+    this.children.set(child, tracked)
+    timeout = setTimeout(() => {
+      this.kill(child)
+      forceKill = setTimeout(() => this.kill(child, "SIGKILL"), deliveryKillGraceMs)
+      forceKill.unref?.()
+    }, deliveryTimeoutMs)
+    timeout.unref?.()
+    return tracked
+  }
+
+  private kill(child: NotifierProcess, signal?: NodeJS.Signals) {
+    try {
+      child.kill?.(signal)
+    } catch {
+      // The child may have exited between tracking and teardown.
+    }
+  }
+
+  private async drain(exited: Promise<number>) {
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(resolve, stopDrainMs)
+      void exited.then(() => {
+        clearTimeout(timeout)
+        resolve()
+      })
+    })
   }
 }

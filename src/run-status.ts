@@ -73,8 +73,10 @@ export type StatusStep = {
  */
 export function statusSteps(phases: readonly ProgressPhase[]): StatusStep[] {
   const steps: StatusStep[] = []
+  const labels = new Map<string, string>()
   for (let index = 0; index < phases.length; index++) {
     const phase = phases[index]!
+    labels.set(phase.name, phase.stepName ?? phase.name)
     const previous = index > 0 ? phases[index - 1] : undefined
     const last = steps[steps.length - 1]
     // Group members are guaranteed contiguous by pipeline validation, so
@@ -82,6 +84,10 @@ export function statusSteps(phases: readonly ProgressPhase[]): StatusStep[] {
     const grouped = phase.groupId !== undefined && previous?.groupId === phase.groupId
     if (grouped && last) last.members.push(phase.name)
     else steps.push({ label: phase.stepName ?? phase.name, members: [phase.name] })
+  }
+  for (const step of steps) {
+    const memberLabels = [...new Set(step.members.map((member) => labels.get(member)!))]
+    if (memberLabels.length > 1) step.label = `parallel: ${memberLabels.join(", ")}`
   }
   return steps
 }
@@ -164,9 +170,8 @@ export function formatNotificationTitle(identity: RunIdentity, icon?: string): s
   return icon ? `${label} ${icon}` : label
 }
 
-function describePermission(info: PermissionPromptInfo): string {
-  const detail = info.command ?? info.target ?? info.description ?? info.permission
-  return `${text.waitingPermission}: ${truncateText(cleanText(detail), 80)}`
+function describePermission(): string {
+  return text.waitingPermission
 }
 
 function describeHumanReview(info: HumanReviewPromptInfo): string {
@@ -203,6 +208,7 @@ type StepOutcome = "completed" | "skipped" | "failed"
 export class RunStatusTracker {
   private readonly steps: StatusStep[]
   private readonly stepOfPhase = new Map<string, number>()
+  private readonly phaseLabel = new Map<string, string>()
   private readonly ended = new Map<string, StepOutcome>()
   private readonly startedAt = new Map<number, number>()
   private readonly announcedStart = new Set<number>()
@@ -214,6 +220,8 @@ export class RunStatusTracker {
   private readonly identity: RunIdentity
   private control: RunControlState = "running"
   private outcome?: "completed" | "failed"
+  /** A failed batch remains current through the failed finish state. */
+  private failedIndex?: number
   private halted = false
   private lastTitle?: string
 
@@ -225,6 +233,7 @@ export class RunStatusTracker {
     this.steps.forEach((step, index) => {
       for (const member of step.members) this.stepOfPhase.set(member, index)
     })
+    for (const phase of options.phases) this.phaseLabel.set(phase.name, phase.stepName ?? phase.name)
   }
 
   /**
@@ -269,7 +278,9 @@ export class RunStatusTracker {
     if (index === undefined) return this.publish()
     this.ended.set(name, outcome)
     const step = this.steps[index]!
-    const label = `${text.step} ${index + 1}/${this.steps.length} · ${step.label}`
+    if (outcome === "failed") this.failedIndex = index
+    const stepLabel = outcome === "failed" ? (this.phaseLabel.get(name) ?? step.label) : step.label
+    const label = `${text.step} ${index + 1}/${this.steps.length} · ${stepLabel}`
 
     // Never announce the end of something whose start was never announced.
     // A step can finish without running in this process at all: --resume
@@ -359,6 +370,7 @@ export class RunStatusTracker {
 
   /** First step that has not fully ended; once everything has, the last one. */
   private currentIndex(): number {
+    if (this.failedIndex !== undefined) return this.failedIndex
     const index = this.steps.findIndex((step) => !step.members.every((member) => this.ended.has(member)))
     if (index >= 0) return index
     return Math.max(0, this.steps.length - 1)
@@ -444,7 +456,7 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
   if (askPermission) {
     tracked.askPermission = async (info: PermissionPromptInfo): Promise<PermissionReply> => {
       const key = `permission:${info.id}`
-      tracker.waitBegan(key, describePermission(info))
+      tracker.waitBegan(key, describePermission())
       try {
         return await askPermission(info)
       } finally {

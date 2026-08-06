@@ -600,6 +600,14 @@ describe("model routing config", () => {
 })
 
 describe("serialization", () => {
+  test("preserves notification settings when a config is written and reloaded", () => {
+    const config = parse("notifications:\n  enabled: false\n  waiting: false\n  terminalTitle: false\n  sound: Ping")
+
+    const reparsed = parse(serializeConvoyConfig(config))
+
+    expect(reparsed.notifications).toEqual(config.notifications)
+  })
+
   test("omits empty sections and round-trips through parse", () => {
     const config = parse("defaults:\n  model: openai/gpt-5.5#xhigh\npipelines:\n  default:\n    steps:\n      - implementer\n      - human-review")
     const yaml = serializeConvoyConfig(config)

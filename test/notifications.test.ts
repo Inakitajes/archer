@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { Notifier, resolveTerminalBundleId, type NotifierProcess } from "../src/notifications"
+import { Notifier, resolveTerminalBundleId, type NotifierProcess, type NotifierSpawn } from "../src/notifications"
 import type { NotificationEvent } from "../src/run-status"
 
 const ghostty = { TERM_PROGRAM: "ghostty" }
@@ -122,6 +122,27 @@ describe("Notifier gating", () => {
 
     notifier.stop()
     expect(notifier.notify(event())).toBe(false)
+  })
+
+  test("stop() terminates an unsettled notification child", async () => {
+    let resolveExit!: (code: number) => void
+    const child = {
+      exited: new Promise<number>((resolve) => {
+        resolveExit = resolve
+      }),
+      kill() {
+        resolveExit(1)
+      },
+    }
+    const spawn: NotifierSpawn = () => child
+    const notifier = new Notifier({ platform: "darwin", spawn, env: {} })
+
+    notifier.notify(event())
+    await flush()
+    await notifier.stop()
+
+    const exit = await Promise.race([child.exited, Bun.sleep(10).then(() => "still-running" as const)])
+    expect(exit).toBe(1)
   })
 })
 

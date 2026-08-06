@@ -280,6 +280,27 @@ describe("config precedence", () => {
     expect(command.options.pipeline.name).toBe("implement")
   })
 
+  test("keeps an absent notification flag distinct from explicit --notify and --no-notify", async () => {
+    const dir = await projectWithConfig()
+    await writeFile(join(dir, ".convoy", "config.yaml"), "notifications:\n  enabled: false\n")
+
+    const defaulted = await parseCommand(["--dir", dir, "prompt"])
+    const enabled = await parseCommand(["--dir", dir, "--notify", "prompt"])
+    const disabled = await parseCommand(["--dir", dir, "--no-notify", "prompt"])
+
+    expect(defaulted.type).toBe("run")
+    expect(enabled.type).toBe("run")
+    expect(disabled.type).toBe("run")
+    if (defaulted.type !== "run" || enabled.type !== "run" || disabled.type !== "run") return
+
+    // The runner must be able to distinguish the config-driven default from an
+    // explicit CLI override before merging the final notification settings.
+    expect(defaulted.options.notify).toBeUndefined()
+    expect(enabled.options.notify).toBe(true)
+    expect(disabled.options.notify).toBe(false)
+    expect(enabled.options.notifications).toEqual({ enabled: false })
+  })
+
   test("gateway precedence is CLI, then project, then global", async () => {
     const dir = await projectWithConfig()
     await writeFile(join(process.env.CONVOY_HOME!, ".convoy", "config.yaml"), "modelRouting:\n  gateway: openrouter\n")

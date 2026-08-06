@@ -25,8 +25,8 @@ export type RunOptions = {
   planOnly?: boolean
   noConfirm?: boolean
   tui: boolean
-  /** Master switch for this run's desktop notifications; --no-notify clears it. */
-  notify: boolean
+  /** Explicit CLI override for desktop notifications; unset preserves the configured value. */
+  notify?: boolean
   /** The merged `notifications:` config block; only the keys the user set. */
   notifications: Partial<NotificationSettings>
   humanReview: boolean

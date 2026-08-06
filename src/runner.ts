@@ -457,12 +457,12 @@ export async function run(options: RunOptions) {
       const branch = await currentBranch(options.targetDir)
       if (branch) identity.branch = branch
     }
-    // Resolve the defaults up front: an unset switch means "use the default",
-    // not "off", and --no-notify overrides the config's own enabled flag.
+    // Resolve the defaults up front. An unset CLI switch preserves config;
+    // explicit --notify and --no-notify apply after that merge.
     const notificationSettings = {
       ...defaultNotificationSettings,
       ...options.notifications,
-      ...(options.notify ? {} : { enabled: false }),
+      ...(options.notify === undefined ? {} : { enabled: options.notify }),
     }
     notifier = new Notifier({ settings: notificationSettings })
     const statusTracker = new RunStatusTracker({
@@ -708,7 +708,7 @@ export async function run(options: RunOptions) {
     removeSignalHandlers()
     if (shutdown.aborted) await shutdown.abortActiveSessions(progress)
     await caffeinate?.stop()
-    notifier?.stop()
+    await notifier?.stop()
     await permissions?.stop()
     // Before the server: a tool call still in flight would otherwise hang on a
     // socket nobody is going to answer. The credentials go with it — they are
