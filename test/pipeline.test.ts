@@ -581,14 +581,14 @@ describe("pipeline resolution", () => {
     expect(security).toMatchObject({ agentName: "security-auditor", readOnly: true })
   })
 
-  test("numbers repeated human gates and threads per-step attempts", () => {
+  test("numbers repeated human gates and threads per-step settings", () => {
     const pipeline = resolve({
-      steps: ["implementer", "human-review", { agent: "tests", maxAttempts: 3 }, "human-review"],
+      steps: ["implementer", "human-review", { agent: "tests" }, "human-review"],
     })
 
     expect(stepNames(pipeline)).toEqual(["implementer", "human-review", "tests", "human-review-2"])
     const tests = pipeline.steps[2]
-    if (tests?.type === "agent") expect(tests.maxAttempts).toBe(3)
+    expect(tests).toMatchObject({ type: "agent", agentName: "test-engineer" })
   })
 
   test("rejects broken specs with errors that name the offender", () => {

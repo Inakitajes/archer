@@ -42,7 +42,6 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     hooks,
     attachments: [...input.files],
     permissions: input.yolo ? "yolo" : input.smart ? "smart" : "interactive",
-    maxAttempts: input.maxAttempts,
     ...(input.resumeRunID
       ? {
           resume: {

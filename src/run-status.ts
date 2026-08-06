@@ -31,6 +31,7 @@ const text = {
   waitingPermission: "waiting for your permission",
   waitingReview: "waiting for manual review",
   waitingTakeover: "waiting for interactive takeover",
+  waitingFailure: "step failed — waiting for your decision",
 } as const
 
 const activityIcon: Record<RunActivity, string> = {
@@ -175,6 +176,7 @@ function describePermission(): string {
 }
 
 function describeHumanReview(info: HumanReviewPromptInfo): string {
+  if (info.kind === "failure") return text.waitingFailure
   return info.kind === "interactive" ? text.waitingTakeover : text.waitingReview
 }
 

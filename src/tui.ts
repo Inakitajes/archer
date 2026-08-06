@@ -244,7 +244,6 @@ type PhaseState = ProgressPhase & {
   status: PhaseStatus
   sessionID: string
   attempt: number
-  maxAttempts: number
   /** Model requested for the attempt; lastStepModel (from usage events) wins when present. */
   model: string
   cost: number
@@ -847,7 +846,6 @@ export class TuiProgress implements ProgressUI {
       status: "pending",
       sessionID: "",
       attempt: 0,
-      maxAttempts: 0,
       model: "",
       cost: 0,
       tokens: emptyTokens(),
@@ -1179,11 +1177,10 @@ export class TuiProgress implements ProgressUI {
     const phase = this.findPhase(name)
     if (!phase) return
     phase.attempt = info.attempt
-    phase.maxAttempts = info.maxAttempts
     if (info.model) phase.model = info.model
     phase.updatedAt = Date.now()
     this.activePhase = name
-    this.addEvent(name, "step", `attempt ${info.attempt}/${info.maxAttempts}${info.model ? ` · ${info.model}` : ""}`)
+    this.addEvent(name, "step", `attempt ${info.attempt}${info.model ? ` · ${info.model}` : ""}`)
     this.scheduleRender()
   }
 
@@ -1714,7 +1711,8 @@ export class TuiProgress implements ProgressUI {
       fullscreen: fullscreen !== undefined,
       contentTab: fullscreen?.tab ?? this.contentTab,
       permissionPending: this.permissionQueue.length > 0,
-      humanReviewGate: this.humanReviewQueue[0]?.info.kind === "interactive" ? "interactive" : this.humanReviewQueue.length > 0 ? "review" : undefined,
+      humanReviewGate: this.humanReviewQueue[0]?.info.kind === "interactive" ? "interactive" : this.humanReviewQueue[0]?.info.kind === "failure" ? "failure" : this.humanReviewQueue.length > 0 ? "review" : undefined,
+      reviewCanRetry: this.humanReviewQueue[0]?.info.canRetry ?? false,
       autoAccept: this.autoAccept?.mode,
       keepAwake: this.keepAwake?.status,
       controlState: this.controlState,
@@ -2139,7 +2137,8 @@ export class TuiProgress implements ProgressUI {
   }
 
   private handleHumanReviewKey(key: KeyEvent) {
-    const action = humanReviewActionForKey(key)
+    const gate = this.humanReviewQueue[0]
+    const action = humanReviewActionForKey(key, gate?.info.kind, gate?.info.canRetry ?? false)
     if (!action) return false
     key.preventDefault()
     key.stopPropagation()
@@ -2150,7 +2149,7 @@ export class TuiProgress implements ProgressUI {
   private resolveHumanReview(action: HumanReviewAction) {
     const pending = this.humanReviewQueue.shift()
     if (!pending) return
-    this.addEvent(pending.info.stepName, action === "abort" ? "error" : "permission", humanReviewActionLabel(action, pending.info.kind === "interactive"))
+    this.addEvent(pending.info.stepName, action === "abort" ? "error" : "permission", humanReviewActionLabel(action, pending.info.kind))
     const next = this.humanReviewQueue[0]
     if (next) {
       this.selectPhaseByName(next.info.stepName)
@@ -2207,7 +2206,7 @@ export class TuiProgress implements ProgressUI {
     }
     if (this.interactiveTakeover.has(phase.name)) {
       this.interactiveTakeover.delete(phase.name)
-      this.addEvent(phase.name, "system", "interactive mode off — normal retries apply again")
+      this.addEvent(phase.name, "system", "interactive mode off — a clean finish commits and moves on")
       this.render()
       return
     }
@@ -2217,7 +2216,7 @@ export class TuiProgress implements ProgressUI {
       return
     }
     this.interactiveTakeover.add(phase.name)
-    this.addEvent(phase.name, "system", "interactive mode armed — esc in OpenCode stops the agent; convoy will wait for you")
+    this.addEvent(phase.name, "system", "interactive mode armed — a clean finish holds the step here for you; esc in OpenCode works too")
     this.openSessionWindowForPhase(phase.name, "key")
   }
 
@@ -2860,7 +2859,7 @@ export class TuiProgress implements ProgressUI {
     }
     if (phase.attempt > 0) {
       if (meta.length > 0) meta.push(fg(theme.faint)(" · "))
-      meta.push(fg(theme.faint)("attempt "), fg(phase.attempt > 1 ? theme.yellow : theme.dim)(`${phase.attempt}/${phase.maxAttempts}`))
+      meta.push(fg(theme.faint)("attempt "), fg(phase.attempt > 1 ? theme.yellow : theme.dim)(String(phase.attempt)))
     }
     if (phase.sessionID) {
       if (meta.length > 0) meta.push(fg(theme.faint)(" · "))
@@ -2903,13 +2902,23 @@ export class TuiProgress implements ProgressUI {
     }
     const gate = this.humanReviewQueue[0]
     if (gate?.info.stepName === phase.name) {
+      const isFailure = gate.info.kind === "failure"
       out.push(plain(""))
-      out.push(new StyledText([fg(theme.yellow)(gate.info.kind === "interactive" ? "interactive session" : "human review"), fg(theme.faint)(" · choose from the dashboard shortcuts")]))
-      out.push(new StyledText([fg(theme.accent)("c"), fg(theme.dim)(" continue pipeline   "), fg(theme.accent)("o"), fg(theme.dim)(" open OpenCode   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")]))
+      out.push(new StyledText([fg(theme.yellow)(isFailure ? "step failed" : gate.info.kind === "interactive" ? "interactive session" : "human review"), fg(theme.faint)(" · choose from the dashboard shortcuts")]))
+      if (isFailure && gate.info.error) out.push(new StyledText([fg(theme.red)(truncate(gate.info.error, Math.max(20, width)))]))
+      out.push(
+        new StyledText(
+          isFailure && gate.info.canRetry
+            ? [fg(theme.accent)("r"), fg(theme.dim)(" retry clean   "), fg(theme.accent)("o"), fg(theme.dim)(" open OpenCode   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")]
+            : isFailure
+              ? [fg(theme.accent)("o"), fg(theme.dim)(" open OpenCode   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")]
+              : [fg(theme.accent)("c"), fg(theme.dim)(" continue pipeline   "), fg(theme.accent)("o"), fg(theme.dim)(" open OpenCode   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")],
+        ),
+      )
       out.push(new StyledText([fg(theme.faint)("iterations "), fg(theme.dim)(String(gate.info.iterations))]))
     } else if (phase.status === "running" && this.interactiveTakeover.has(phase.name)) {
       out.push(plain(""))
-      out.push(new StyledText([fg(theme.cyan)("interactive armed"), fg(theme.faint)(" · esc in OpenCode stops the agent; a gate opens here — "), fg(theme.accent)("i"), fg(theme.faint)(" disarms")]))
+      out.push(new StyledText([fg(theme.cyan)("interactive armed"), fg(theme.faint)(" · esc in OpenCode holds the step here; a clean finish waits for you — "), fg(theme.accent)("i"), fg(theme.faint)(" disarms")]))
     }
     return out
   }
@@ -3313,7 +3322,7 @@ export class TuiProgress implements ProgressUI {
       const right: TextChunk[] = []
       if (this.humanReviewQueue.length > 1) right.push(fg(theme.yellow)(`${this.humanReviewQueue.length - 1} more waiting`), fg(theme.faint)(" · "))
       if (gate.info.iterations > 0) right.push(fg(theme.faint)(`${gate.info.iterations} iteration${gate.info.iterations === 1 ? "" : "s"}`))
-      const prefix = [fg(theme.yellow)(gate.info.kind === "interactive" ? "interactive session · " : "human review · ")]
+      const prefix = [fg(theme.yellow)(gate.info.kind === "failure" ? "step failed · " : gate.info.kind === "interactive" ? "interactive session · " : "human review · ")]
       return hintsRow(hints, [right], width, { style: "spaced", overflow: moreHintsMarker, prefix })
     }
 
@@ -3607,20 +3616,24 @@ function wheelDelta(event: WheelEvent): number {
   return scroll.direction === "up" ? -magnitude : magnitude
 }
 
-function humanReviewActionForKey(key: KeyEvent): HumanReviewAction | undefined {
+function humanReviewActionForKey(key: KeyEvent, kind: "interactive" | "failure" | undefined, canRetry: boolean): HumanReviewAction | undefined {
   switch (key.name) {
     case "c":
-      return "continue"
+      // [c] continue is never offered on a failure gate: reaching forward
+      // (continue) from a broken step must require taking control via [o] first.
+      return kind === "failure" ? undefined : "continue"
     case "o":
       return "iterate"
     case "a":
       return "abort"
+    case "r":
+      return kind === "failure" && canRetry ? "retry" : undefined
   }
   return undefined
 }
 
-function humanReviewActionLabel(action: HumanReviewAction, interactive: boolean) {
-  const gate = interactive ? "interactive session" : "human review"
+function humanReviewActionLabel(action: HumanReviewAction, kind: "interactive" | "failure" | undefined) {
+  const gate = kind === "failure" ? "step failed" : kind === "interactive" ? "interactive session" : "human review"
   switch (action) {
     case "continue":
       return `${gate}: continue`
@@ -3628,6 +3641,8 @@ function humanReviewActionLabel(action: HumanReviewAction, interactive: boolean)
       return `${gate}: open OpenCode`
     case "abort":
       return `${gate}: abort`
+    case "retry":
+      return `${gate}: retry clean`
   }
 }
 

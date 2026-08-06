@@ -127,10 +127,6 @@ describe("cli parsing", () => {
     await expect(parseCommand(["--resume", "20260519-103045-zz99"])).rejects.toThrow("doesn't exist")
   })
 
-  test("rejects invalid max attempts", () => {
-    expect(() => parseArgs(["--max-attempts", "0", "prompt"])).toThrow("--max-attempts")
-  })
-
   test("rejects unknown step names against the resolved pipeline", async () => {
     await expect(parseCommand(["--only", "secuirty", "prompt"])).rejects.toThrow('unknown step "secuirty"')
     await expect(parseCommand(["--skip", "desing", "prompt"])).rejects.toThrow('unknown step "desing"')
@@ -231,7 +227,6 @@ describe("config precedence", () => {
       join(dir, ".convoy", "config.yaml"),
       [
         "defaults:",
-        "  maxAttempts: 5",
         "  baseRef: develop",
         "  pipeline: quick",
         "pipelines:",
@@ -252,7 +247,6 @@ describe("config precedence", () => {
 
     expect(command.type).toBe("run")
     if (command.type !== "run") return
-    expect(command.options.maxAttempts).toBe(5)
     expect(command.options.baseRef).toBe("develop")
     expect(command.options.pipeline.name).toBe("quick")
     expect(stepNames(command.options.pipeline)).toEqual(["implementer", "tests"])
@@ -264,8 +258,6 @@ describe("config precedence", () => {
     const command = await parseCommand([
       "--dir",
       dir,
-      "--max-attempts",
-      "1",
       "--base",
       "main",
       "--pipeline",
@@ -275,7 +267,6 @@ describe("config precedence", () => {
 
     expect(command.type).toBe("run")
     if (command.type !== "run") return
-    expect(command.options.maxAttempts).toBe(1)
     expect(command.options.baseRef).toBe("main")
     expect(command.options.pipeline.name).toBe("implement")
   })
@@ -521,7 +512,6 @@ describe("init command", () => {
     await parseAndRun(["init", "--dir", dir, "--quiet"])
     expect(await readFile(path, "utf8")).toContain("version: 1")
     expect(await readFile(path, "utf8")).toContain("#   implementer:")
-    expect(await readFile(path, "utf8")).toContain("# maxAttempts: 2")
     expect(existsSync(join(dir, ".convoy", "agents"))).toBe(false)
 
     await writeFile(path, "version: 1\nattachments:\n  - custom.md\n")

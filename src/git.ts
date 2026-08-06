@@ -59,7 +59,7 @@ async function execFile(command: string, args: string[], options: ExecOptions): 
   return { stdout, stderr, exitCode }
 }
 
-export async function ensureRepoReady(cwd: string, options: { includeDirty?: boolean; maxAttempts?: number; baseRef?: string; allowDirty?: boolean } = {}) {
+export async function ensureRepoReady(cwd: string, options: { includeDirty?: boolean; baseRef?: string; allowDirty?: boolean } = {}) {
   await requireRepoRoot(cwd)
 
   if (options.baseRef) {
@@ -82,9 +82,6 @@ export async function ensureRepoReady(cwd: string, options: { includeDirty?: boo
     if (options.allowDirty) return
     if (!options.includeDirty) {
       throw dirtyTreeError(cwd, status.stdout)
-    }
-    if ((options.maxAttempts ?? 1) > 1) {
-      throw new Error("--include-dirty can't be combined with --max-attempts > 1; use --max-attempts 1")
     }
     log.warn("working tree is not clean; --include-dirty will include those changes in the first commit of the pipeline")
   }

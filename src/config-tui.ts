@@ -129,7 +129,6 @@ const defaultFields: DefaultField[] = [
   { key: "branchNameModel", type: "model" },
   { key: "commitMessageModel", type: "model" },
   { key: "worktree", type: "boolean" },
-  { key: "maxAttempts", type: "number" },
   { key: "baseRef", type: "string" },
   { key: "pipeline", type: "string" },
 ]
@@ -359,7 +358,6 @@ export class ConfigEditor {
         return
       case "m":
         if (key.shift) this.editStepModels()
-        else this.editStepMaxAttempts()
         return
       case "g":
         this.toggleGroup()
@@ -810,23 +808,6 @@ export class ConfigEditor {
       onYes: apply,
     }
     this.render()
-  }
-
-  private editStepMaxAttempts() {
-    const at = this.agentStepUnderCursor()
-    if (!at) return
-    const obj = asStepObject(at.spec)
-    const { pipeline, index, member } = at.meta
-    this.openInput(`${stepLabel(pipeline, index, member)}.maxAttempts`, obj.maxAttempts === undefined ? "" : String(obj.maxAttempts), "positive integer, empty to clear", {
-      validate: (value) => (value.trim() === "" || isPositiveInt(value) ? undefined : "must be a positive integer"),
-      commit: (value) => {
-        const next = { ...obj }
-        if (value.trim() === "") delete next.maxAttempts
-        else next.maxAttempts = Number(value)
-        setSpecAt(at.steps, index, member, collapseStep(next))
-        this.markDirty()
-      },
-    })
   }
 
   private editStepName() {
@@ -1523,7 +1504,7 @@ export class ConfigEditor {
           fg(theme.accent)("M"),
           fg(theme.dim)(runner.capabilities.modelFanout ? " multi-model" : " unavailable"),
         ])
-        push([fg(theme.accent)("m"), fg(theme.dim)(" max-attempts   "), fg(theme.accent)("n"), fg(theme.dim)(" name")])
+        push([fg(theme.accent)("n"), fg(theme.dim)(" name")])
         push([fg(theme.accent)("A"), fg(theme.dim)(runner.capabilities.advisor ? " advisor" : " advisor unavailable")])
         push([fg(theme.accent)("r"), fg(theme.dim)(" reports   "), fg(theme.accent)("R"), fg(theme.dim)(" runner   "), fg(theme.accent)("x"), fg(theme.dim)(" diff")])
         push([fg(theme.accent)("d"), fg(theme.dim)(" delete   "), fg(theme.accent)("g"), fg(theme.dim)(meta.member === undefined ? " make parallel   " : " eject from group   ")])
@@ -1938,7 +1919,6 @@ export function stepValueSummary(spec: string | AgentStepSpec): string {
   if (spec.name !== undefined) parts.push(`name ${spec.name}`)
   if (spec.reports !== undefined) parts.push(`reports ${Array.isArray(spec.reports) ? spec.reports.join(",") : spec.reports}`)
   if (spec.diff !== undefined) parts.push(`diff ${spec.diff ? "on" : "off"}`)
-  if (spec.maxAttempts !== undefined) parts.push(`attempts ${spec.maxAttempts}`)
   if (spec.advisor === false) parts.push("no advisor")
   else if (spec.advisor !== undefined) parts.push(`advisor ${spec.advisor}`)
   if (spec.advisorMaxCalls !== undefined) parts.push(`advisor×${spec.advisorMaxCalls}`)
@@ -2016,8 +1996,6 @@ function describeDefault(key: keyof ConvoyDefaults): string {
       return "Model that writes the squashed commit message for finish (default: anthropic/claude-haiku-4-5)."
     case "worktree":
       return "Run each job on a fresh branch in its own worktree. Unset decides per branch: on for a trunk, off once you're on a branch."
-    case "maxAttempts":
-      return "Attempts per step before failing."
     case "baseRef":
       return "Branch/base used to diff between steps (auto-detected when unset)."
     case "pipeline":

@@ -18,7 +18,7 @@ import { ensureClaudeAvailable, promptClaudePhase } from "./claude-code"
 import { addAllAndCommit, createCleanRepoSnapshot, currentBranch, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
 import { getSessionEventHub, payloadProperties } from "./event-hub"
-import { runHumanReviewGate } from "./human"
+import { askHumanAction, runHumanReviewGate } from "./human"
 import { log } from "./log"
 import { openRunMetadata, recordProgress, type RunMetadataStore } from "./metadata"
 import { openOpencodeSessionWindow, startOpencode } from "./opencode"
@@ -32,6 +32,7 @@ import {
   noopProgress,
   type ActivityKind,
   type AutoAccept,
+  type HumanReviewAction,
   type ProgressDiffSummary,
   type ProgressMessage,
   type ProgressPhase,
@@ -80,10 +81,6 @@ export function isIgnorableRejection(reason: unknown): boolean {
     return /\baborted?\b/i.test(reason.message)
   }
   return false
-}
-
-export function shouldRetryAttempt(error: unknown, signal: AbortSignal, attempt: number, maxAttempts: number) {
-  return !signal.aborted && !isUserAbortError(error) && attempt < maxAttempts
 }
 
 export class RunShutdown {
@@ -384,7 +381,6 @@ export async function run(options: RunOptions) {
   if (options.plan) ensureClaudeAvailable(options.plan.pipeline)
   await ensureRepoReady(options.targetDir, {
     includeDirty: options.includeDirty,
-    maxAttempts: options.maxAttempts,
     baseRef: options.baseRef,
     allowDirty: Boolean(options.resumeRunID),
   })
@@ -938,7 +934,7 @@ async function runPhase(
     })
     if (phase.readOnly && baseline) await metadata.phaseRepositoryBaseline(phase.name, baseline)
     const reportAbs = await withReadOnlyRepositoryBoundary(phase, options.targetDir, baseline, gitLock, async () => {
-      const assistantText = await runPhaseWithRetries(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors)
+      const assistantText = await runPhaseUntilResolved(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors)
       return persistPhaseReport(workspace, phase, assistantText)
     })
     await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline))
@@ -953,7 +949,6 @@ type PreparedPhaseRun = {
   attachments: FilePartInput[]
   prompt: string
   model: ModelSelection
-  maxAttempts: number
 }
 
 async function preparePhaseRun(
@@ -976,9 +971,8 @@ async function preparePhaseRun(
   const attachments = [...contextFiles, ...phaseFiles, ...extraFiles]
   const prompt = buildPhasePrompt(workspace, phase)
   const model = selectedModel(phase, options.modelOverride)
-  const maxAttempts = Math.max(1, phase.maxAttempts ?? options.maxAttempts)
 
-  return { attachments, prompt, model, maxAttempts }
+  return { attachments, prompt, model }
 }
 
 async function projectContextFileParts(paths: string[], targetDir: string) {
@@ -995,7 +989,7 @@ type PhaseRetryDeps = {
   restorePhaseBaseline: typeof restorePhaseBaseline
 }
 
-export async function runPhaseWithRetries(
+export async function runPhaseUntilResolved(
   client: OpencodeClient,
   workspace: Workspace,
   phase: AgentStep,
@@ -1009,106 +1003,135 @@ export async function runPhaseWithRetries(
   deps: PhaseRetryDeps = { runPhaseAttempt, restorePhaseBaseline },
   advisors?: AdvisorRuntime,
 ) {
-  if (!baseline && prepared.maxAttempts > 1) {
-    throw new Error(`[${phase.name}] can't retry with dirty working tree; use --max-attempts 1 or clean the repo`)
-  }
-
-  let lastError: unknown
   const sessionRef: SessionRef = {}
   // Read fresh at each decision point: the user can arm/disarm [i] mid-attempt.
   const armed = () => Boolean(takeover && progress.isInteractiveTakeover?.(phase.name))
 
-  for (let attempt = 1; attempt <= prepared.maxAttempts; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     shutdown.throwIfRequested()
-    progress.phaseAttempt(phase.name, { attempt, maxAttempts: prepared.maxAttempts, model: formatModel(prepared.model) })
-    log.info(`[${phase.name}] attempt ${attempt}/${prepared.maxAttempts} with ${formatModel(prepared.model)}`)
+    progress.phaseAttempt(phase.name, { attempt, model: formatModel(prepared.model) })
+    log.info(`[${phase.name}] attempt ${attempt} with ${formatModel(prepared.model)}`)
     try {
-      const assistantText = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors)
+      const text = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors)
       if (armed()) {
         // Armed means "this step is mine": even a clean finish waits for the
         // user's decision before the step commits and the pipeline moves on.
         log.info(`[${phase.name}] attempt succeeded with interactive mode armed; waiting for manual action`)
-        await waitForInteractiveGate(phase.name, targetDir, sessionRef.id, takeover!, progress)
+        await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, { kind: "interactive", canRetry: false })
       }
-      return assistantText
+      return text
     } catch (error) {
-      if (!shouldRetryAttempt(error, shutdown.signal, attempt, prepared.maxAttempts) && (shutdown.aborted || isUserAbortError(error))) {
-        throw shutdown.abortError(error)
-      }
-      if (armed()) {
-        // The user took over (typically esc in the attached OpenCode window):
-        // no retry and no baseline restore — their manual work must survive.
-        log.info(`[${phase.name}] attempt ended with interactive mode armed (${formatSdkError(error)}); waiting for manual action`)
-        if (!(error instanceof LoggedAttemptError)) {
-          await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
-        }
-        await waitForInteractiveGate(phase.name, targetDir, sessionRef.id, takeover!, progress)
-        return ""
-      }
-      lastError = error
-      progress.phaseRunning(phase.name, `attempt ${attempt} failed`)
+      if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
+      if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
+      progress.phaseRunning(phase.name, "failed — waiting for your decision")
       log.warn(`[${phase.name}] attempt ${attempt} failed: ${formatSdkError(error)}`)
-      if (!(error instanceof LoggedAttemptError)) {
-        await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
+      const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
+        kind: armed() ? "interactive" : "failure",
+        error: formatSdkError(error),
+        canRetry: Boolean(baseline),
+      })
+      if (outcome === "unavailable") throw error
+      if (outcome === "retry") {
+        await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, error))
+        continue
       }
-      if (shouldRetryAttempt(error, shutdown.signal, attempt, prepared.maxAttempts)) await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, error))
+      // "continue": the tree is accepted as-is and the step commits.
+      return ""
     }
   }
-
-  if (lastError) {
-    await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, lastError))
-    throw lastError
-  }
-
-  return ""
 }
 
 /** Last session created for the phase's attempts, so the interactive gate can reopen its window. */
 type SessionRef = { id?: string }
 
-type InteractiveGateDeps = { openWindow: typeof openOpencodeSessionWindow }
+type PhaseGateDeps = { openWindow: typeof openOpencodeSessionWindow }
+
+export type PhaseGateOutcome = "continue" | "retry" | "unavailable"
+
+/** The [c]/[o]/[a] keys a human gate answers with, per mode. */
+function gateAllowedActions(kind: "interactive" | "failure", canRetry: boolean): readonly HumanReviewAction[] {
+  if (kind === "interactive") return ["continue", "iterate", "abort"]
+  return canRetry ? ["retry", "iterate", "abort"] : ["iterate", "abort"]
+}
 
 /**
- * The mid-step gate for phases armed with [i]: holds the pipeline until the
- * user picks continue (commit whatever the tree holds and move on), reopens
- * the session window on iterate, or aborts the run — leaving the working tree
- * untouched either way. Permission prompts stay paused while it waits, since
- * the user's attached OpenCode TUI answers its own.
+ * The decision gate after a phase attempt. In "interactive" mode (armed with
+ * [i]) it holds a clean finish; in "failure" mode it holds a failed step while
+ * the user chooses [r] retry cleanly, [o] open the OpenCode session and fix by
+ * hand, or [a] abort. A successful [o] flips a failure gate to "interactive":
+ * the user now owns the tree, so [c] unlocks (they know what it holds) and [r]
+ * is withdrawn (restoring the baseline would wipe their manual work).
+ *
+ * Permission prompts pause only while an interactive session is owned — in
+ * failure mode a dead step must never freeze the prompts of its live siblings.
+ *
+ * Returns "unavailable" when nobody can be asked (no dashboard and no TTY): the
+ * step then fails with its original error, exactly as it did when attempts ran
+ * out.
  */
-export async function waitForInteractiveGate(
+export async function waitForPhaseGate(
   phaseName: string,
   targetDir: string,
   sessionID: string | undefined,
-  takeover: TakeoverContext,
+  takeover: TakeoverContext | undefined,
   progress: ProgressUI,
-  deps: InteractiveGateDeps = { openWindow: openOpencodeSessionWindow },
-): Promise<void> {
-  const ask = progress.askHumanReview?.bind(progress)
-  if (!ask) return // no dashboard, no gate: arming is impossible without the TUI anyway
+  options: { kind: "interactive" | "failure"; error?: string; canRetry: boolean },
+  deps: PhaseGateDeps = { openWindow: openOpencodeSessionWindow },
+): Promise<PhaseGateOutcome> {
+  const askInTui = progress.askHumanReview?.bind(progress)
+  const usingTui = Boolean(askInTui)
+  if (!usingTui && !(stdin.isTTY && stdout.isTTY)) return "unavailable"
 
-  progress.phaseRunning(phaseName, "interactive session — waiting for your decision")
+  let kind: "interactive" | "failure" = options.kind
+  progress.phaseRunning(phaseName, kind === "interactive" ? "interactive session — waiting for your decision" : "failed — waiting for your decision")
   let iterations = 0
-  takeover.permissions?.pause()
+  let permissionsPaused = false
+  const pausePermissions = () => {
+    if (permissionsPaused || !takeover?.permissions) return
+    permissionsPaused = true
+    takeover.permissions.pause()
+  }
+  // An interactive session owns the terminal and answers its own prompts, so
+  // Convoy's permission gate stays paused while it waits. A failure gate starts
+  // without pausing — a dead step must never freeze its live siblings' prompts.
+  if (kind === "interactive") pausePermissions()
+
+  // The readline fallback owns the terminal; the TUI path keeps the dashboard
+  // active and resolves actions via ProgressUI.askHumanReview.
+  if (!usingTui) progress.suspend()
   try {
     for (;;) {
-      const action = await ask({ stepName: phaseName, iterations, kind: "interactive" })
-      if (action === "continue") return
+      const allowed = gateAllowedActions(kind, kind === "failure" ? options.canRetry : false)
+      const keyLabel = { continue: "c continue", retry: "r retry clean", iterate: "o open OpenCode", abort: "a abort" } as const
+      const action = askInTui
+        ? await askInTui({ stepName: phaseName, iterations, kind, error: options.error, canRetry: kind === "failure" ? options.canRetry : false })
+        : await askHumanAction({ prompt: `Step "${phaseName}" ${options.error ? `failed: ${options.error}; ` : ""}${allowed.map((entry) => keyLabel[entry]).join(", ")} > `, allowed })
+
+      if (action === "continue") return "continue"
       if (action === "abort") throw new UserAbortError("aborted from interactive session gate")
+      if (action === "retry") return "retry"
 
       iterations++
+      if (kind === "failure") {
+        // First successful iterate means the user has opened the session and is
+        // editing by hand: flip to interactive.
+        kind = "interactive"
+        pausePermissions()
+      }
       if (!sessionID) {
         progress.phaseActivity(phaseName, "no session to reopen; use the OpenCode window you already have", "info")
         continue
       }
       try {
-        const backend = await deps.openWindow({ url: takeover.serverUrl, targetDir, sessionID })
+        const backend = await deps.openWindow({ url: takeover?.serverUrl ?? "", targetDir, sessionID })
         progress.phaseActivity(phaseName, `session reopened in ${backend}; return here and press c to continue`, "system")
       } catch (error) {
         progress.phaseActivity(phaseName, `couldn't reopen the session window: ${error instanceof Error ? error.message : String(error)}`, "error")
       }
     }
   } finally {
-    takeover.permissions?.resume()
+    if (permissionsPaused) takeover?.permissions?.resume()
+    if (!usingTui) progress.resume()
   }
 }
 

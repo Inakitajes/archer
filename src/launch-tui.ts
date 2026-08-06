@@ -168,8 +168,8 @@ const toggles: readonly ToggleSpec[] = [
   {
     key: "includeDirty",
     label: "Include dirty tree",
-    flag: "--include-dirty --max-attempts 1",
-    description: "Include existing local changes in the first phase commit. Forces max attempts to 1.",
+    flag: "--include-dirty",
+    description: "Include existing local changes in the first phase commit.",
   },
   {
     key: "keepRunDir",
@@ -1433,7 +1433,7 @@ class LaunchPicker {
     if (this.toggleState.smart) flags.push("--smart")
     if (this.toggleState.yolo) flags.push("--yolo")
     flags.push(this.toggleState.humanReview ? "--human-step" : "--no-human-step")
-    if (this.toggleState.includeDirty) flags.push("--include-dirty", "--max-attempts 1")
+    if (this.toggleState.includeDirty) flags.push("--include-dirty")
     if (!this.toggleState.keepRunDir) flags.push("--no-keep-run-dir")
     flags.push(this.toggleState.tui ? "--tui" : "--no-tui")
     flags.push(this.toggleState.worktree ? "--worktree" : "--no-worktree")

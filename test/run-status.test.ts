@@ -345,6 +345,29 @@ describe("trackRunStatus", () => {
     expect(tracker.snapshot().activity).toBe("working")
   })
 
+  test("a failure gate emits a waiting notification and sets the title to ⏳", async () => {
+    const phases = [agentPhase("plan")]
+    const { tracker, events, titles } = trackerWith(phases)
+    let observed: string | undefined
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: async () => {
+        observed = tracker.snapshot().activity
+        return "continue"
+      },
+    }
+    const wrapped = trackRunStatus(progress, tracker)
+
+    const reply = await wrapped.askHumanReview!({ stepName: "plan", iterations: 0, kind: "failure", error: "network down", canRetry: true })
+
+    expect(reply).toBe("continue")
+    expect(observed).toBe("waiting")
+    expect(tracker.snapshot().activity).toBe("working")
+    expect(events.at(-1)!.body).toBe("step failed — waiting for your decision")
+    expect(events.at(-1)!.category).toBe("waiting")
+    expect(titles.some((status) => status.activity === "waiting" && formatTerminalTitle(status).startsWith("⏳ "))).toBe(true)
+  })
+
   test("forwards every lifecycle call to the wrapped UI unchanged", () => {
     const calls: string[] = []
     const progress: ProgressUI = {

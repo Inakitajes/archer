@@ -184,10 +184,10 @@ describe("runner selection", () => {
 
   test("clears incompatible singular models but preserves unrelated step fields", () => {
     expect(
-      toggleStepRunnerSpec({ agent: "bug-auditor", model: "openai/gpt-5.6", name: "bugs", reports: "all", diff: false, maxAttempts: 3 }, true),
+      toggleStepRunnerSpec({ agent: "bug-auditor", model: "openai/gpt-5.6", name: "bugs", reports: "all", diff: false }, true),
     ).toEqual({
       ok: true,
-      spec: { agent: "bug-auditor", runner: "claude-code", name: "bugs", reports: "all", diff: false, maxAttempts: 3 },
+      spec: { agent: "bug-auditor", runner: "claude-code", name: "bugs", reports: "all", diff: false },
       clearedModel: true,
     })
   })
@@ -225,8 +225,8 @@ describe("reports helpers", () => {
   test("stepValueSummary shows the fan-out count and explicitly set fields", () => {
     expect(stepValueSummary("patterns")).toBe("(inherits)")
     expect(stepValueSummary({ agent: "x", models: ["a/b", "c/d"] })).toBe("2 models")
-    expect(stepValueSummary({ agent: "x", model: "a/b", name: "scope", reports: ["scope"], diff: false, maxAttempts: 3 })).toBe(
-      "a/b · name scope · reports scope · diff off · attempts 3",
+    expect(stepValueSummary({ agent: "x", model: "a/b", name: "scope", reports: ["scope"], diff: false })).toBe(
+      "a/b · name scope · reports scope · diff off",
     )
   })
 

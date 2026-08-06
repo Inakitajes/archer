@@ -51,7 +51,10 @@ export async function runHumanReviewGate(
   progress.phaseStarted(stepName, "waiting for manual action")
 
   let iterations = 0
-  const askAction = async () => (askInTui ? askInTui({ stepName, iterations }) : askHumanAction())
+  const askAction = async () =>
+    askInTui
+      ? askInTui({ stepName, iterations })
+      : askHumanAction({ prompt: "Human step: [c]ontinue pipeline, [o]pen OpenCode, [a]bort > ", allowed: ["continue", "iterate", "abort"] })
 
   // Plain readline fallback still owns the terminal. The TUI path keeps the
   // dashboard active and resolves actions via ProgressUI.askHumanReview.
@@ -114,7 +117,25 @@ async function humanReviewApproved(workspace: Workspace, stepName: string) {
   }
 }
 
-async function askHumanAction(): Promise<HumanReviewAction> {
+export type HumanActionPrompt = {
+  prompt: string
+  allowed: ReadonlyArray<HumanReviewAction>
+}
+
+/** One key per ReviewAction, shared by askHumanAction's prompt and dispatch. */
+const humanActionKeys: Record<HumanReviewAction, string> = {
+  continue: "c",
+  iterate: "o",
+  abort: "a",
+  retry: "r",
+}
+
+/**
+ * General readline fallback for a human gate, resolved by the action set the
+ * caller allows (pipeline human steps answer c/o/a; a failed step answers
+ * r/o/a). Shared by runHumanReviewGate and the phase gate in runner.ts.
+ */
+export async function askHumanAction({ prompt, allowed }: HumanActionPrompt): Promise<HumanReviewAction> {
   const rl = createInterface({ input: stdin, output: stdout })
   const controller = new AbortController()
   let interrupted = false
@@ -127,15 +148,15 @@ async function askHumanAction(): Promise<HumanReviewAction> {
 
   try {
     for (;;) {
-      const answer = (await rl.question("Human step: [c]ontinue pipeline, [o]pen OpenCode, [a]bort > ", {
+      const answer = (await rl.question(prompt, {
         signal: controller.signal,
       }))
         .trim()
         .toLowerCase()
-      if (answer === "c" || answer === "continue") return "continue" as const
-      if (answer === "o" || answer === "open" || answer === "opencode") return "iterate" as const
-      if (answer === "a" || answer === "abort") return "abort" as const
-      stdout.write("Choose c, o, or a.\n")
+      for (const action of allowed) {
+        if (answer === humanActionKeys[action] || answer === action) return action
+      }
+      stdout.write(`Choose ${allowed.map((action) => humanActionKeys[action]).join(", ")}.\n`)
     }
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {

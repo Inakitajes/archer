@@ -79,7 +79,6 @@ describe("config loading", () => {
         "version: 1",
         "defaults:",
         "  model: openai/gpt-5.5#xhigh",
-        "  maxAttempts: 3",
         "  baseRef: develop",
         "  pipeline: quick",
         "  branchNameModel: anthropic/claude-haiku-4-5",
@@ -98,7 +97,6 @@ describe("config loading", () => {
         "        name: planning",
         "        description: Plan implementation interactively",
         "      - agent: tests",
-        "        maxAttempts: 3",
         "      - agent: api-reviewer",
         "        reports: all",
         "permissions:",
@@ -128,7 +126,6 @@ describe("config loading", () => {
 
     expect(config.defaults).toEqual({
       model: "openai/gpt-5.5#xhigh",
-      maxAttempts: 3,
       baseRef: "develop",
       pipeline: "quick",
       branchNameModel: "anthropic/claude-haiku-4-5",
@@ -142,7 +139,7 @@ describe("config loading", () => {
     expect(config.pipelines.quick?.steps).toEqual([
       "implementer",
       { type: "human", name: "planning", description: "Plan implementation interactively" },
-      { agent: "tests", maxAttempts: 3 },
+      { agent: "tests" },
       { agent: "api-reviewer", reports: "all" },
     ])
     expect(config.permissions).toEqual({ allow: ["supabase gen types*"], deny: ["stripe *"] })
@@ -199,7 +196,7 @@ describe("config loading", () => {
 
   test("rejects configs with errors that point at the offending field", async () => {
     expect(() => parse("version: 2")).toThrow("version")
-    expect(() => parse("defaults:\n  maxAttempts: 0")).toThrow("defaults.maxAttempts must be a positive integer")
+    expect(() => parse("defaults:\n  maxConcurrentAgents: 0")).toThrow("defaults.maxConcurrentAgents must be a positive integer")
     expect(() => parse("defaults:\n  model: gpt-5.5")).toThrow("defaults.model must look like provider/model")
     expect(() => parse("agents:\n  implementer:\n    readOnly: sometimes")).toThrow("agents.implementer.readOnly must be true or false")
     expect(() => parse("pipelines:\n  broken:\n    steps: []")).toThrow("pipelines.broken.steps must be a non-empty list")
@@ -461,7 +458,6 @@ describe("config merging", () => {
     const project = parse("defaults:\n  maxAttempts: 2\n  baseRef: dev\n  branchNameModel: openai/gpt-5.5-mini")
     expect(mergeConvoyConfigs(global, project)?.defaults).toEqual({
       model: "openai/gpt-5.5#xhigh",
-      maxAttempts: 2,
       baseRef: "dev",
       branchNameModel: "openai/gpt-5.5-mini",
     })
@@ -723,7 +719,7 @@ describe("global config", () => {
 
     const project = await projectDir("defaults:\n  maxAttempts: 2\n")
     const merged = await loadMergedConvoyConfig(project)
-    expect(merged?.defaults).toEqual({ model: "openai/gpt-5.5#xhigh", maxAttempts: 2 })
+    expect(merged?.defaults).toEqual({ model: "openai/gpt-5.5#xhigh" })
   })
 })
 
@@ -737,7 +733,6 @@ describe("default config init", () => {
     const body = await readFile(path, "utf8")
     const config = parseConvoyConfig(body, path, dir)
 
-    expect(body).toContain("# maxAttempts: 2")
     expect(body).toContain("# maxConcurrentAgents: 30")
     expect(body).toContain("# baseRef: main")
     expect(body).toContain("# pipeline: implement")

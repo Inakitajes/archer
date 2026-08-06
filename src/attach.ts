@@ -152,7 +152,7 @@ export class LiveAttach {
         if (!this.started.has(name)) {
           this.started.add(name)
           this.tui.phaseStarted(name)
-          if (phase.model) this.tui.phaseAttempt(name, { attempt: 1, maxAttempts: 1, model: phase.model })
+          if (phase.model) this.tui.phaseAttempt(name, { attempt: 1, model: phase.model })
         }
         for (const event of phase.advisorEvents ?? []) this.tui.phaseAdvisorEvent(name, event)
         if (!this.phasesWithoutLiveAttach.has(name)) this.watch(name, phase.sessionID)
