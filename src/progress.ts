@@ -188,6 +188,42 @@ export type KeepAwakeState = {
   detail?: string
 }
 
+/**
+ * What the run is doing right now, for surfaces outside the dashboard (the
+ * terminal title, desktop notifications). Deliberately distinct from
+ * RunStatusKind in runs.ts, which classifies a *finished* run in the history
+ * browser; this one is about a live run's moment-to-moment activity.
+ *
+ * Derived with a fixed precedence: stopped > paused > waiting > working.
+ */
+export type RunActivity = "working" | "waiting" | "paused" | "stopped"
+
+/** What this run is *about*, for a glanceable tab title. Every field is best effort. */
+export type RunIdentity = {
+  /** Last segment of the target directory. */
+  project: string
+  pipeline: string
+  branch?: string
+  /** Resolved lazily by a background `gh` poll; absent until (and unless) it lands. */
+  pr?: number
+}
+
+/** Host-local run state, intentionally never persisted with a run. */
+export type RunStatus = {
+  activity: RunActivity
+  /** 1-based index of the concurrent batch in flight; 0 before the first one starts. */
+  step: number
+  /** Batch count, not flat step count: a `parallel:` block or a `models:` fan-out is one. */
+  totalSteps: number
+  /** Logical (pre-fan-out) name of the current batch. */
+  stepName?: string
+  identity: RunIdentity
+  /** Set once the run reaches its finish screen. */
+  outcome?: "completed" | "failed"
+  /** What the run is blocked on while `activity` is "waiting". */
+  waitingFor?: string
+}
+
 export type ProgressUI = {
   /** `runDir` is the run workspace (where phase reports land); passed early so the reports tab works during a live run, not just on the finish screen. */
   start(runID: string, targetDir: string, runDir?: string): void
@@ -226,6 +262,12 @@ export type ProgressUI = {
   runControlState?(state: RunControlState, activePhases: number): void
   /** Host-local keep-awake state, driven by the optional macOS Caffeinate process. */
   keepAwakeState?(state: KeepAwakeState): void
+  /**
+   * Live run state for surfaces outside the dashboard. The TUI implements this
+   * by setting the terminal title only — the dashboard itself never changes
+   * appearance because of it.
+   */
+  runStatus?(status: RunStatus): void
   message(message: string): void
   suspend(): void
   resume(): void

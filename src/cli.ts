@@ -42,6 +42,7 @@ export type ParsedArgs = {
   /** --no-advisor: run every step without an advisor, whatever config says. */
   advisorDisabled?: boolean
   tui?: boolean
+  notify?: boolean
   humanReview?: boolean
   maxAttempts?: number
   maxConcurrent?: number
@@ -575,6 +576,8 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     advisorDisabled: parsed.advisorDisabled ?? false,
     advisorAuditPolicy: defaults.advisorAuditPolicy ?? "summary",
     tui: parsed.tui ?? Boolean(process.stdout.isTTY && process.stderr.isTTY),
+    notify: parsed.notify ?? true,
+    notifications: config?.notifications ?? {},
     humanReview,
     maxAttempts: parsed.maxAttempts ?? defaults.maxAttempts ?? 2,
     maxConcurrentAgents: parsed.maxConcurrent ?? defaults.maxConcurrentAgents ?? defaultMaxConcurrentAgents,
@@ -737,6 +740,14 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "--no-tui":
         parsed.tui = false
         break
+      case "--notify":
+        if (value !== undefined) throw new Error("--notify does not take a value")
+        parsed.notify = true
+        break
+      case "--no-notify":
+        if (value !== undefined) throw new Error("--no-notify does not take a value")
+        parsed.notify = false
+        break
       case "--human-review":
       case "--human-step":
         parsed.humanReview = true
@@ -858,6 +869,7 @@ Flags:
   --no-confirm             Show a compact plan and start without the interactive confirmation
   --tui                    Show visual phase progress (default in interactive terminals)
   --no-tui                 Disable visual phase progress
+  --no-notify              Disable desktop notifications for this run (the terminal title still updates)
   --human-step             Enable human steps (alias: --human-review; default in interactive terminals)
   --no-human-step          Drop all human steps (alias: --no-human-review)
   --max-attempts <n>       Attempts per step before failing (default: 2)

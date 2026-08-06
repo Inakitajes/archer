@@ -15,15 +15,19 @@ import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
 import { ensureClaudeAvailable, promptClaudePhase } from "./claude-code"
-import { addAllAndCommit, createCleanRepoSnapshot, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
+import { addAllAndCommit, createCleanRepoSnapshot, currentBranch, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
 import { getSessionEventHub, payloadProperties } from "./event-hub"
 import { runHumanReviewGate } from "./human"
 import { log } from "./log"
 import { openRunMetadata, recordProgress, type RunMetadataStore } from "./metadata"
 import { openOpencodeSessionWindow, startOpencode } from "./opencode"
+import { defaultNotificationSettings, Notifier } from "./notifications"
 import { startPermissionGate, type PermissionGate } from "./permissions"
 import { splitModelVariant, synthesizeReadOnlyAgents, validateStepFilters } from "./pipeline"
+import { startPullRequestLookup } from "./pull-request"
+import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
+import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
   createProgressUI,
   noopProgress,
@@ -399,6 +403,9 @@ export async function run(options: RunOptions) {
   let metadata: RunMetadataStore | undefined
   let control: RunControl | undefined
   let caffeinate: Caffeinate | undefined
+  let notifier: Notifier | undefined
+  let cancelPullRequestLookup: (() => void) | undefined
+  let titleSaved = false
   let releaseLease: (() => Promise<void>) | undefined
   let hookSet = options.plan?.hooks ?? hooksForPipeline(options.hooks, options.pipeline.name)
   let pipelineNameForHooks = options.pipeline.name
@@ -439,24 +446,69 @@ export async function run(options: RunOptions) {
     await maybeRecoverDirtyTree(workspace, metadata, options)
     control = new RunControl(metadata)
     caffeinate = new Caffeinate()
+
+    // Identity for the terminal title and notifications. The branch is only on
+    // options for worktree runs, so fall back to whatever is checked out.
+    const phases = progressPhases(pipeline, hookSet)
+    const identity = {
+      project: projectName(options.targetDir),
+      pipeline: pipeline.name,
+      ...(options.branch ? { branch: options.branch } : {}),
+    }
+    if (!identity.branch) {
+      const branch = await currentBranch(options.targetDir)
+      if (branch) identity.branch = branch
+    }
+    // Resolve the defaults up front: an unset switch means "use the default",
+    // not "off", and --no-notify overrides the config's own enabled flag.
+    const notificationSettings = {
+      ...defaultNotificationSettings,
+      ...options.notifications,
+      ...(options.notify ? {} : { enabled: false }),
+    }
+    notifier = new Notifier({ settings: notificationSettings })
+    const statusTracker = new RunStatusTracker({
+      phases,
+      identity,
+      sinks: {
+        ...(notifier.available ? { notify: (event) => void notifier?.notify(event) } : {}),
+        // Replaced by bind() below when the UI offers its own title channel;
+        // this fallback is what --no-tui runs use.
+        ...(notificationSettings.terminalTitle ? { title: (status) => void writeTerminalTitle(formatTerminalTitle(status)) } : {}),
+      },
+    })
+    // Saved before the renderer exists so the pop in the finally block hands the
+    // tab back to whatever owned it, rather than leaving Convoy's last title up.
+    if (notificationSettings.terminalTitle) titleSaved = pushTerminalTitle()
+
     // Imported lazily: finish pulls in the commit-message writer (and through it
     // opencode), which a run that never reaches its finish screen shouldn't pay for.
     const { createFinishSeam } = await import("./finish")
-    progress = recordProgress(
-      await createProgressUI(progressPhases(pipeline, hookSet), options.tui, () => shutdown.request("Ctrl+C"), autoAccept, {
-        onPauseToggle: () => {
-          void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
-        },
-        onKeepAwakeToggle: () => {
-          void caffeinate?.toggle().catch((error) => log.warn(`couldn't toggle Caffeinate: ${formatSdkError(error)}`))
-        },
-        finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: workspace.dir }),
-      }),
-      metadata,
+    progress = trackRunStatus(
+      recordProgress(
+        await createProgressUI(phases, options.tui, () => shutdown.request("Ctrl+C"), autoAccept, {
+          onPauseToggle: () => {
+            void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
+          },
+          onKeepAwakeToggle: () => {
+            void caffeinate?.toggle().catch((error) => log.warn(`couldn't toggle Caffeinate: ${formatSdkError(error)}`))
+          },
+          finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: workspace.dir }),
+        }),
+        metadata,
+      ),
+      statusTracker,
     )
     control.bind(progress)
     caffeinate.bind(progress)
+    if (notificationSettings.terminalTitle) statusTracker.bind(progress)
     progress.start(workspace.runID, options.targetDir, workspace.dir)
+    // Best effort and entirely optional: the title simply gains the PR number
+    // if and when `gh` resolves one.
+    cancelPullRequestLookup = startPullRequestLookup({
+      targetDir: options.targetDir,
+      onFound: (pr) => statusTracker.setPullRequest(pr),
+    })
     log.info(`Run ${workspace.runID} - dir: ${workspace.dir}`)
     // Use the captured flag: options.modelOverride was already cleared when a
     // reviewed plan took over, but the Claude Code notice must still fire.
@@ -664,6 +716,8 @@ export async function run(options: RunOptions) {
     removeSignalHandlers()
     if (shutdown.aborted) await shutdown.abortActiveSessions(progress)
     await caffeinate?.stop()
+    cancelPullRequestLookup?.()
+    notifier?.stop()
     await permissions?.stop()
     // Before the server: a tool call still in flight would otherwise hang on a
     // socket nobody is going to answer. The credentials go with it — they are
@@ -678,6 +732,9 @@ export async function run(options: RunOptions) {
     await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
     await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
     progress.stop()
+    // After the renderer is gone: restoring the title while it still owns the
+    // alternate screen would be overwritten by its teardown.
+    if (titleSaved) popTerminalTitle()
     shutdown.dispose()
 
     if (runErr) {

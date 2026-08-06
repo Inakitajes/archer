@@ -1,4 +1,5 @@
 import type { AdvisorAuditPolicy } from "./advisor-events"
+import type { NotificationSettings } from "./notifications"
 import type { StepRunnerId } from "./step-runners"
 import type { ModelGateway, ModelRoutingOverrides, ResolvedModel } from "./model-routing"
 
@@ -24,6 +25,10 @@ export type RunOptions = {
   planOnly?: boolean
   noConfirm?: boolean
   tui: boolean
+  /** Master switch for this run's desktop notifications; --no-notify clears it. */
+  notify: boolean
+  /** The merged `notifications:` config block; only the keys the user set. */
+  notifications: Partial<NotificationSettings>
   humanReview: boolean
   maxAttempts: number
   /** Cap on agents running at once within a concurrent group (`parallel:` block or `models:` fan-out). Groups smaller than this are unaffected. Defaults to `defaultMaxConcurrentAgents` when unset. */

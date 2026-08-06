@@ -159,6 +159,44 @@ describe("config loading", () => {
     expect(config.attachments).toEqual(["docs/architecture.md"])
   })
 
+  test("notifications keeps only the switches the user actually set", () => {
+    // Unset keys must stay absent so they keep following the built-in default
+    // rather than being pinned to whatever it was when the file was written.
+    expect(parse("notifications:\n  steps: false\n  sound: Ping").notifications).toEqual({ steps: false, sound: "Ping" })
+    expect(parse("notifications: {}").notifications).toEqual({})
+    expect(parse("defaults: {}").notifications).toEqual({})
+  })
+
+  test("notifications accepts every switch", () => {
+    const config = parse(
+      ["notifications:", "  enabled: true", "  steps: false", "  waiting: true", "  failures: false", "  finish: true", "  terminalTitle: false", '  sound: ""'].join(
+        "\n",
+      ),
+    )
+    expect(config.notifications).toEqual({
+      enabled: true,
+      steps: false,
+      waiting: true,
+      failures: false,
+      finish: true,
+      terminalTitle: false,
+      sound: "",
+    })
+  })
+
+  test("a project config's notifications override the global one key by key", () => {
+    const global = parse("notifications:\n  enabled: false\n  sound: Ping")
+    const project = parse("notifications:\n  enabled: true")
+    expect(mergeConvoyConfigs(global, project)!.notifications).toEqual({ enabled: true, sound: "Ping" })
+  })
+
+  test("rejects invalid notification values", () => {
+    expect(() => parse("notifications:\n  enabled: sometimes")).toThrow("notifications.enabled must be true or false")
+    expect(() => parse("notifications:\n  sound: 42")).toThrow("notifications.sound must be a string")
+    // The name reaches AppleScript, so anything exotic fails at load time.
+    expect(() => parse('notifications:\n  sound: \'Ping" evil\'')).toThrow("notifications.sound must be a macOS sound name")
+  })
+
   test("rejects configs with errors that point at the offending field", async () => {
     expect(() => parse("version: 2")).toThrow("version")
     expect(() => parse("defaults:\n  maxAttempts: 0")).toThrow("defaults.maxAttempts must be a positive integer")
@@ -902,6 +940,7 @@ describe("materializing built-in pipelines", () => {
     permissions: { allow: [] as string[], deny: [] as string[] },
     hooks: { pre: [], post: [], pipelines: {} },
     attachments: [] as string[],
+    notifications: {},
   })
 
   test("without an effective default model, every built-in materializes to an identical spec", () => {
