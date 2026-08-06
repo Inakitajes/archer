@@ -29,6 +29,7 @@ import {
   type StepSpec,
 } from "./pipeline"
 import { isStepRunnerId, normalizeStepRunnerModel, stepRunnerFor, type StepRunnerId } from "./step-runners"
+import type { NotificationSettings } from "./notifications"
 import type { AdvisorAuditPolicy } from "./advisor-events"
 import type { AgentSpec, HookSet, HookSpec, HooksConfig, HookWhen, PermissionAdditions } from "./types"
 import { isModelGateway, logicalModel, type ModelRoutingConfig, type ModelRoutingOverrides } from "./model-routing"
@@ -45,6 +46,8 @@ export type ConvoyConfig = {
   permissions: PermissionAdditions
   hooks: HooksConfig
   attachments: string[]
+  /** Only the keys the user set; the rest fall back to defaultNotificationSettings. */
+  notifications: Partial<NotificationSettings>
   modelRouting?: ModelRoutingConfig
 }
 
@@ -192,6 +195,7 @@ export function mergeConvoyConfigs(global: ConvoyConfig | undefined, project: Co
     },
     hooks: mergeHooksConfig(global.hooks, project.hooks),
     attachments: [...global.attachments, ...project.attachments],
+    notifications: { ...global.notifications, ...project.notifications },
     modelRouting: {
       ...(global.modelRouting?.gateway !== undefined ? { gateway: global.modelRouting.gateway } : {}),
       ...(project.modelRouting?.gateway !== undefined ? { gateway: project.modelRouting.gateway } : {}),
@@ -336,6 +340,19 @@ permissions:
   deny: []
 
 attachments: []
+
+# Desktop notifications and the terminal window/tab title. macOS only; on other
+# platforms the notifications degrade to nothing and the title still works.
+# One notification per pipeline step, so a parallel block or a models: fan-out
+# counts as one, not one per member.
+# notifications:
+#   enabled: true           # master switch (--no-notify turns it off for one run)
+#   steps: true             # a step started / finished
+#   waiting: true           # a permission prompt or a human gate needs you
+#   failures: true
+#   finish: true            # the run completed or failed
+#   terminalTitle: true     # "⚙ 3/7 convoy · feat/x" in the tab title
+#   sound: ""               # a macOS sound name, e.g. Ping; empty is silent
 `
 
 export type ConfigWriteResult = {
@@ -435,14 +452,14 @@ export function parseConvoyConfig(body: string, source: string, targetDir: strin
     throw new ConfigError(`${source}: invalid YAML: ${error instanceof Error ? error.message : String(error)}`)
   }
 
-  const config: ConvoyConfig = { defaults: {}, agents: {}, pipelines: {}, permissions: { allow: [], deny: [] }, hooks: emptyHooksConfig(), attachments: [], modelRouting: { overrides: {} } }
+  const config: ConvoyConfig = { defaults: {}, agents: {}, pipelines: {}, permissions: { allow: [], deny: [] }, hooks: emptyHooksConfig(), attachments: [], notifications: {}, modelRouting: { overrides: {} } }
   if (raw === null || raw === undefined) return config
 
   const v = new Validator(source)
   const root = v.record(raw, "")
   // Unknown keys warn instead of failing so configs written for a newer
   // convoy still load; typos surface in the warning either way.
-  v.knownKeys(root, "", ["version", "defaults", "agents", "pipelines", "permissions", "hooks", "attachments", "modelRouting"])
+  v.knownKeys(root, "", ["version", "defaults", "agents", "pipelines", "permissions", "hooks", "attachments", "notifications", "modelRouting"])
 
   if (root.version !== undefined && root.version !== 1) v.fail("version", `unsupported value ${JSON.stringify(root.version)}; this convoy reads version 1`)
 
@@ -452,9 +469,38 @@ export function parseConvoyConfig(body: string, source: string, targetDir: strin
   if (root.permissions !== undefined) config.permissions = validatePermissions(v, root.permissions)
   if (root.hooks !== undefined) config.hooks = validateHooks(v, root.hooks)
   if (root.attachments !== undefined) config.attachments = v.stringArray(root.attachments, "attachments")
+  if (root.notifications !== undefined) config.notifications = validateNotifications(v, root.notifications)
   if (root.modelRouting !== undefined) config.modelRouting = validateModelRouting(v, root.modelRouting)
 
   return config
+}
+
+/**
+ * Only the keys the user actually set are returned, so an unset switch keeps
+ * following defaultNotificationSettings rather than being pinned to whatever
+ * the default happened to be when the file was written.
+ */
+function validateNotifications(v: Validator, raw: unknown): Partial<NotificationSettings> {
+  const record = v.record(raw, "notifications")
+  const booleans = ["enabled", "steps", "waiting", "failures", "finish", "terminalTitle"] as const
+  v.knownKeys(record, "notifications", [...booleans, "sound"])
+
+  const notifications: Partial<NotificationSettings> = {}
+  for (const key of booleans) {
+    if (record[key] !== undefined) notifications[key] = v.boolean(record[key], `notifications.${key}`)
+  }
+  if (record.sound !== undefined) {
+    // Empty is meaningful here (silent), so this can't use nonEmptyString.
+    if (typeof record.sound !== "string") v.fail("notifications.sound", "must be a string")
+    const sound = (record.sound as string).trim()
+    // The name reaches AppleScript; anything exotic is a mistake worth
+    // surfacing at load time rather than silently dropping at notify time.
+    if (sound && !/^[A-Za-z0-9 _-]+$/.test(sound)) {
+      v.fail("notifications.sound", "must be a macOS sound name (letters, digits, spaces, - and _), e.g. Ping")
+    }
+    notifications.sound = sound
+  }
+  return notifications
 }
 
 function validateModelRouting(v: Validator, raw: unknown): ModelRoutingConfig {
@@ -831,6 +877,7 @@ export function serializeConvoyConfig(config: ConvoyConfig): string {
   const hooks = serializeHooks(config.hooks)
   if (hooks) out.hooks = hooks
   if (config.attachments.length > 0) out.attachments = config.attachments
+  if (Object.keys(config.notifications).length > 0) out.notifications = config.notifications
   if (config.modelRouting && (config.modelRouting.gateway !== undefined || Object.keys(config.modelRouting.overrides).length > 0)) out.modelRouting = config.modelRouting
   return Bun.YAML.stringify(out, null, 2)
 }
@@ -874,6 +921,7 @@ export function defaultConfigTemplate(): ConvoyConfig {
     permissions: { allow: [], deny: [] },
     hooks: emptyHooksConfig(),
     attachments: [],
+    notifications: {},
     modelRouting: { overrides: {} },
   }
 }

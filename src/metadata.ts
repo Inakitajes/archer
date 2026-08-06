@@ -356,6 +356,8 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
   // Keep-awake is UI-only, but like run-control state its publisher binds to
   // the wrapped progress object owned by the runner.
   if (progress.keepAwakeState) recorder.keepAwakeState = progress.keepAwakeState.bind(progress)
+  // Host-local too: the run status drives the terminal title, never metadata.
+  if (progress.runStatus) recorder.runStatus = progress.runStatus.bind(progress)
   // Same probing contract: the runner only holds the finish screen when the UI offers one.
   if (progress.runFinished) recorder.runFinished = progress.runFinished.bind(progress)
   if (progress.keepRunDirRequested) recorder.keepRunDirRequested = progress.keepRunDirRequested.bind(progress)

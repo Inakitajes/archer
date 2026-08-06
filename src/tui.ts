@@ -21,6 +21,7 @@ import { startLimitsPoller } from "./limits"
 import { log } from "./log"
 import { markdownInlineChunks, markdownLines, parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
 import { openIterateOpencodeWindow, openOpencodeSessionWindow, openStoredSessionWindow, type SessionWindowBackend } from "./opencode"
+import { formatTerminalTitle } from "./run-status"
 import { stepRunnerFor, type StepRunnerId } from "./step-runners"
 import { autoAcceptModeLabel, comparePaletteActions, dashboardActions, shortcutGroupOrder, shortcutGroupTitle } from "./tui-actions"
 import { PhaseUsage, addTokens, emptyTokens } from "./usage"
@@ -84,6 +85,7 @@ import type {
   KeepAwakeState,
   RunControlState,
   RunOutcome,
+  RunStatus,
 } from "./progress"
 
 const kindStyles: Record<ActivityKind, { icon: string; color: PaletteColor }> = {
@@ -1419,6 +1421,19 @@ export class TuiProgress implements ProgressUI {
       this.addEvent("convoy", state.detail ? "error" : "system", message)
     }
     this.render()
+  }
+
+  /**
+   * Publishes the run state to the terminal's window/tab title, and nothing
+   * else: the dashboard itself never changes appearance because of this.
+   *
+   * Routed through OpenTUI rather than a raw OSC write to stdout, because the
+   * renderer owns that stream in alternate-screen mode — setTerminalTitle goes
+   * down the same native path as the paint, so the two cannot interleave.
+   */
+  runStatus(status: RunStatus): void {
+    if (this.renderer.isDestroyed) return
+    this.renderer.setTerminalTitle(formatTerminalTitle(status))
   }
 
   // The focused phase, clamped to a valid index (the pipeline can be empty
