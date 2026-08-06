@@ -869,6 +869,7 @@ Flags:
   --no-confirm             Show a compact plan and start without the interactive confirmation
   --tui                    Show visual phase progress (default in interactive terminals)
   --no-tui                 Disable visual phase progress
+  --notify                 Enable desktop notifications for this run, overriding notifications.enabled in config
   --no-notify              Disable desktop notifications for this run (the terminal title still updates)
   --human-step             Enable human steps (alias: --human-review; default in interactive terminals)
   --no-human-step          Drop all human steps (alias: --no-human-review)

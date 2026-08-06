@@ -113,13 +113,12 @@ function truncateText(value: string, max: number): string {
 function identityText(identity: RunIdentity): string {
   const parts = [identity.project]
   if (identity.branch && identity.branch !== identity.project) parts.push(identity.branch)
-  if (identity.pr !== undefined) parts.push(`#${identity.pr}`)
   if (identity.pipeline) parts.push(identity.pipeline)
   return cleanText(parts.filter(Boolean).join(" · "))
 }
 
 /**
- * `⚙ 3/7 convoy · feat/notify · #52 · implement`
+ * `⚙ 3/7 convoy · feat/notify · implement`
  *
  * State and progress lead so they survive a narrow tab: a truncated title still
  * answers "does this need me?" even when the identity is cut off entirely.
@@ -161,7 +160,6 @@ export type NotificationEvent = {
 export function formatNotificationTitle(identity: RunIdentity, icon?: string): string {
   const parts = [identity.project]
   if (identity.branch && identity.branch !== identity.project) parts.push(identity.branch)
-  if (identity.pr !== undefined) parts.push(`#${identity.pr}`)
   const label = cleanText(parts.join(" · "))
   return icon ? `${label} ${icon}` : label
 }
@@ -213,7 +211,7 @@ export class RunStatusTracker {
   private readonly waits = new Map<string, string>()
   private readonly sinks: RunStatusSinks
   private readonly now: () => number
-  private identity: RunIdentity
+  private readonly identity: RunIdentity
   private control: RunControlState = "running"
   private outcome?: "completed" | "failed"
   private halted = false
@@ -241,24 +239,13 @@ export class RunStatusTracker {
   }
 
   snapshot(): RunStatus {
-    const index = this.currentIndex()
-    const step = this.steps[index]
-    const waitingFor = this.waits.values().next().value
     return {
       activity: this.activity(),
-      step: index + 1,
+      step: this.currentIndex() + 1,
       totalSteps: this.steps.length,
-      ...(step ? { stepName: step.label } : {}),
       identity: this.identity,
       ...(this.outcome ? { outcome: this.outcome } : {}),
-      ...(waitingFor ? { waitingFor } : {}),
     }
-  }
-
-  setPullRequest(pr: number) {
-    if (this.identity.pr === pr) return
-    this.identity = { ...this.identity, pr }
-    this.publish()
   }
 
   phaseStarted(name: string) {
@@ -284,25 +271,33 @@ export class RunStatusTracker {
     const step = this.steps[index]!
     const label = `${text.step} ${index + 1}/${this.steps.length} · ${step.label}`
 
+    // Never announce the end of something whose start was never announced.
+    // A step can finish without running in this process at all: --resume
+    // restores phases completed by an earlier run, and --only/--skip mark the
+    // filtered ones skipped. Both arrive as a burst the moment the run opens,
+    // and each one carries a distinct throttle key, so without this gate
+    // resuming a half-finished run fires a banner per already-completed step
+    // announcing yesterday's work. The progress counter below still advances,
+    // because that work does count towards the run.
+    const ran = this.announcedStart.has(index)
+
     // A failure is urgent and a wide group runs every member to completion
     // before the run gives up, so announce it immediately rather than waiting
     // for the siblings. The completion branch below then stays quiet.
-    if (outcome === "failed" && !this.announcedFailure.has(index)) {
+    if (ran && outcome === "failed" && !this.announcedFailure.has(index)) {
       this.announcedFailure.add(index)
       this.emit({ key: `step-fail:${index}`, category: "failures", icon: "✗", body: `${label} — ${text.failed}` })
     }
 
-    if (step.members.every((member) => this.ended.has(member))) {
-      if (!this.announcedFailure.has(index)) {
-        const skipped = step.members.every((member) => this.ended.get(member) === "skipped")
-        const elapsed = this.startedAt.get(index)
-        const suffix = elapsed !== undefined && !skipped ? ` (${formatDuration(this.now() - elapsed)})` : ""
-        this.emit({
-          key: `step-end:${index}`,
-          category: "steps",
-          body: `${label} — ${skipped ? text.skipped : text.completed}${suffix}`,
-        })
-      }
+    if (ran && !this.announcedFailure.has(index) && step.members.every((member) => this.ended.has(member))) {
+      const skipped = step.members.every((member) => this.ended.get(member) === "skipped")
+      const elapsed = this.startedAt.get(index)
+      const suffix = elapsed !== undefined && !skipped ? ` (${formatDuration(this.now() - elapsed)})` : ""
+      this.emit({
+        key: `step-end:${index}`,
+        category: "steps",
+        body: `${label} — ${skipped ? text.skipped : text.completed}${suffix}`,
+      })
     }
     this.publish()
   }
@@ -369,7 +364,6 @@ export class RunStatusTracker {
     return Math.max(0, this.steps.length - 1)
   }
 
-  /** Builds the notification title from the *current* identity, so a PR number that lands mid-run shows up. */
   private emit(event: { key: string; category: NotificationCategory; icon?: string; body: string }) {
     this.sinks.notify?.({
       key: event.key,

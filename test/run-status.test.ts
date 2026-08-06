@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { noopProgress, type ProgressPhase, type ProgressUI, type RunStatus } from "../src/progress"
+import { planBatches } from "../src/runner"
 import {
   formatTerminalTitle,
   projectName,
@@ -9,8 +10,24 @@ import {
   trackRunStatus,
   type NotificationEvent,
 } from "../src/run-status"
+import type { AgentStep, Step } from "../src/types"
 
 const identity = { project: "convoy", pipeline: "implement", branch: "feat/notify" }
+
+function agentStep(name: string, groupId: string): AgentStep {
+  return {
+    type: "agent",
+    name,
+    agentName: name,
+    description: name,
+    model: "openai/gpt-5.5",
+    inputFiles: [],
+    inputDiff: false,
+    reportPath: `reports/${name}.md`,
+    groupId,
+    stepName: name.split("__")[0]!,
+  }
+}
 
 function agentPhase(name: string, groupId?: string, stepName?: string): ProgressPhase {
   return {
@@ -66,6 +83,28 @@ describe("statusSteps", () => {
   test("an empty pipeline produces no steps", () => {
     expect(statusSteps([])).toEqual([])
   })
+
+  // statusSteps and planBatches answer the same question ("what is one step?")
+  // over different inputs: the dashboard's phase rows vs. the executable step
+  // list. They are deliberately not shared — coupling a cosmetic counter to the
+  // execution loop means a title tweak could reorder real work — so this pins
+  // them to the same answer instead, and fails loudly if either drifts.
+  test("agrees with the runner's own batching", () => {
+    const steps: Step[] = [
+      agentStep("plan", "g-plan"),
+      agentStep("review__opus", "g1"),
+      agentStep("review__gpt", "g1"),
+      { type: "human", name: "human-review", description: "manual gate" },
+      agentStep("ship", "g-ship"),
+    ]
+    const phases = steps.map((step) =>
+      step.type === "agent"
+        ? { name: step.name, description: step.description, groupId: step.groupId, stepName: step.stepName }
+        : { name: step.name, description: step.description },
+    )
+
+    expect(statusSteps(phases).map((step) => step.members)).toEqual(planBatches(steps).map((batch) => batch.map((step) => step.name)))
+  })
 })
 
 describe("formatTerminalTitle", () => {
@@ -90,10 +129,6 @@ describe("formatTerminalTitle", () => {
     expect(title).toStartWith("⚙ 3/7 ")
     expect(title.length).toBeLessThanOrEqual(24)
     expect(title).toEndWith("…")
-  })
-
-  test("the PR number appears once the poller resolves it", () => {
-    expect(formatTerminalTitle({ ...base, identity: { ...identity, pr: 52 } })).toContain("#52")
   })
 
   test("a branch equal to the project name is not repeated", () => {
@@ -139,7 +174,6 @@ describe("RunStatusTracker", () => {
 
     tracker.waitBegan("p1", "waiting for your permission: rm -rf dist")
     expect(tracker.snapshot().activity).toBe("waiting")
-    expect(tracker.snapshot().waitingFor).toBe("waiting for your permission: rm -rf dist")
 
     // A pause outranks a pending prompt.
     tracker.controlState("paused")
@@ -148,6 +182,31 @@ describe("RunStatusTracker", () => {
     tracker.finished({ status: "completed", runDir: "/tmp/run" })
     expect(tracker.snapshot().activity).toBe("stopped")
     expect(tracker.snapshot().outcome).toBe("completed")
+  })
+
+  // Regression: --resume replays every phase an earlier run completed, and
+  // --only/--skip mark the filtered ones skipped. Both arrive as a burst with
+  // distinct throttle keys the instant the run opens.
+  test("work finished by an earlier run advances the counter without notifying", () => {
+    const { tracker, events } = trackerWith(mixedPhases())
+
+    for (const name of ["pre-hook-1", "plan", "review__opus", "review__gpt", "review__gemini"]) {
+      tracker.phaseEnded(name, "completed")
+    }
+
+    expect(events).toEqual([])
+    // The restored work still counts: the run resumes at the last step.
+    expect(tracker.snapshot().step).toBe(4)
+
+    // And the step that actually runs in this process is announced normally.
+    tracker.phaseStarted("human-review")
+    expect(events.map((event) => event.body)).toEqual(["step 4/4 · human-review — started"])
+  })
+
+  test("a step skipped by --only never announces an end it never started", () => {
+    const { tracker, events } = trackerWith(mixedPhases())
+    tracker.phaseEnded("plan", "skipped")
+    expect(events).toEqual([])
   })
 
   test("concurrent waits each hold the state until the last one clears", () => {
@@ -173,7 +232,6 @@ describe("RunStatusTracker", () => {
 
     tracker.phaseStarted("review__opus")
     expect(tracker.snapshot().step).toBe(3)
-    expect(tracker.snapshot().stepName).toBe("review")
     // Two of three members done still means step 3.
     tracker.phaseEnded("review__opus", "completed")
     tracker.phaseEnded("review__gpt", "completed")
@@ -195,15 +253,6 @@ describe("RunStatusTracker", () => {
     // A state change does reach the tab.
     tracker.waitBegan("p1", "needs you")
     expect(titles.length).toBe(after + 1)
-  })
-
-  test("a PR resolved mid-run reaches both the title and later notification titles", () => {
-    const { tracker, events, titles } = trackerWith(mixedPhases())
-    tracker.setPullRequest(52)
-    expect(titles.at(-1)!.identity.pr).toBe(52)
-
-    tracker.phaseStarted("plan")
-    expect(events.at(-1)!.title).toContain("#52")
   })
 
   test("unknown phase names are ignored rather than throwing", () => {

@@ -204,24 +204,18 @@ export type RunIdentity = {
   project: string
   pipeline: string
   branch?: string
-  /** Resolved lazily by a background `gh` poll; absent until (and unless) it lands. */
-  pr?: number
 }
 
 /** Host-local run state, intentionally never persisted with a run. */
 export type RunStatus = {
   activity: RunActivity
-  /** 1-based index of the concurrent batch in flight; 0 before the first one starts. */
+  /** 1-based index of the concurrent batch in flight. */
   step: number
   /** Batch count, not flat step count: a `parallel:` block or a `models:` fan-out is one. */
   totalSteps: number
-  /** Logical (pre-fan-out) name of the current batch. */
-  stepName?: string
   identity: RunIdentity
   /** Set once the run reaches its finish screen. */
   outcome?: "completed" | "failed"
-  /** What the run is blocked on while `activity` is "waiting". */
-  waitingFor?: string
 }
 
 export type ProgressUI = {

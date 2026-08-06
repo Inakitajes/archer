@@ -42,6 +42,10 @@ const throttleMs: Record<NotificationCategory, number> = {
  * and notification settings, instead of the generic Script Editor banner a bare
  * `display notification` produces.
  */
+// Only terminals that actually export TERM_PROGRAM belong here. kitty and
+// Alacritty, for instance, do not set it at all, so listing them would look
+// like coverage while never matching. Anything missing falls back to the bare
+// banner, and CONVOY_NOTIFY_APP_ID covers the rest.
 const terminalBundleIds: Record<string, string> = {
   ghostty: "com.mitchellh.ghostty",
   "iTerm.app": "com.googlecode.iterm2",
@@ -49,10 +53,7 @@ const terminalBundleIds: Record<string, string> = {
   WezTerm: "com.github.wez.wezterm",
   vscode: "com.microsoft.VSCode",
   Hyper: "co.zeit.hyper",
-  kitty: "net.kovidgoyal.kitty",
-  Alacritty: "org.alacritty",
   WarpTerminal: "dev.warp.Warp-Stable",
-  Tabby: "org.tabby",
 }
 
 export type NotifierOptions = {

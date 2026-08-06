@@ -25,7 +25,6 @@ import { openOpencodeSessionWindow, startOpencode } from "./opencode"
 import { defaultNotificationSettings, Notifier } from "./notifications"
 import { startPermissionGate, type PermissionGate } from "./permissions"
 import { splitModelVariant, synthesizeReadOnlyAgents, validateStepFilters } from "./pipeline"
-import { startPullRequestLookup } from "./pull-request"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
@@ -404,7 +403,6 @@ export async function run(options: RunOptions) {
   let control: RunControl | undefined
   let caffeinate: Caffeinate | undefined
   let notifier: Notifier | undefined
-  let cancelPullRequestLookup: (() => void) | undefined
   let titleSaved = false
   let releaseLease: (() => Promise<void>) | undefined
   let hookSet = options.plan?.hooks ?? hooksForPipeline(options.hooks, options.pipeline.name)
@@ -503,12 +501,6 @@ export async function run(options: RunOptions) {
     caffeinate.bind(progress)
     if (notificationSettings.terminalTitle) statusTracker.bind(progress)
     progress.start(workspace.runID, options.targetDir, workspace.dir)
-    // Best effort and entirely optional: the title simply gains the PR number
-    // if and when `gh` resolves one.
-    cancelPullRequestLookup = startPullRequestLookup({
-      targetDir: options.targetDir,
-      onFound: (pr) => statusTracker.setPullRequest(pr),
-    })
     log.info(`Run ${workspace.runID} - dir: ${workspace.dir}`)
     // Use the captured flag: options.modelOverride was already cleared when a
     // reviewed plan took over, but the Claude Code notice must still fire.
@@ -716,7 +708,6 @@ export async function run(options: RunOptions) {
     removeSignalHandlers()
     if (shutdown.aborted) await shutdown.abortActiveSessions(progress)
     await caffeinate?.stop()
-    cancelPullRequestLookup?.()
     notifier?.stop()
     await permissions?.stop()
     // Before the server: a tool call still in flight would otherwise hang on a
