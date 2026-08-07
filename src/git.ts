@@ -210,12 +210,43 @@ export async function createCleanRepoSnapshot(cwd: string): Promise<RepoSnapshot
 }
 
 export async function restoreRepoSnapshot(snapshot: RepoSnapshot, cwd: string) {
-  await execFile("git", ["reset", "--hard"], { cwd })
-  await execFile("git", ["clean", "-fd"], { cwd })
-  await execFile("git", ["checkout", "--detach", snapshot.head], { cwd })
-  if (snapshot.ref) await execFile("git", ["checkout", "-B", snapshot.ref, snapshot.head], { cwd })
-  await execFile("git", ["reset", "--hard", snapshot.head], { cwd })
-  await execFile("git", ["clean", "-fd"], { cwd })
+  // Capture the current HEAD as a backup ref before the restore sequence so a
+  // crash or command failure mid-sequence leaves a recoverable point instead
+  // of a half-reset repository. Without this, a crash between the six git
+  // commands leaves HEAD detached, the branch un-updated, and the working tree
+  // in an undefined state that requires manual `git fsck` / `git reflog`
+  // (HN-009).
+  const backupRef = `refs/convoy/snapshot/restore-${Date.now()}`
+  let backupCreated = false
+  try {
+    await execFile("git", ["update-ref", backupRef, "HEAD"], { cwd })
+    backupCreated = true
+  } catch {
+    // If we can't create a backup ref, proceed best-effort — the restore is
+    // still needed, and update-ref failure is extremely unlikely.
+  }
+
+  try {
+    await execFile("git", ["reset", "--hard"], { cwd })
+    await execFile("git", ["clean", "-fd"], { cwd })
+    await execFile("git", ["checkout", "--detach", snapshot.head], { cwd })
+    if (snapshot.ref) await execFile("git", ["checkout", "-B", snapshot.ref, snapshot.head], { cwd })
+    await execFile("git", ["reset", "--hard", snapshot.head], { cwd })
+    await execFile("git", ["clean", "-fd"], { cwd })
+  } catch (error) {
+    if (backupCreated) {
+      log.error(
+        `restoreRepoSnapshot failed mid-sequence; the repository may be in an inconsistent state. ` +
+          `The pre-restore HEAD was saved as ${backupRef}. Recover with:\n` +
+          `  git reset --hard ${backupRef}\n` +
+          `Then re-run convoy to resume.`,
+      )
+    }
+    throw error
+  }
+
+  // Clean up the backup ref on success to avoid ref namespace pollution.
+  if (backupCreated) await execFile("git", ["update-ref", "-d", backupRef], { cwd, allowFailure: true })
 }
 
 export async function describeRepoSnapshotDifference(snapshot: RepoSnapshot, cwd: string): Promise<string | undefined> {

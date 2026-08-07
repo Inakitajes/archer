@@ -9,6 +9,7 @@ import {
   detectBaseRef,
   diffStat,
   dirtyFilesPreview,
+  findSuspiciousStagedFiles,
   isAncestor,
   mainWorktreeDir,
   mergeBase,
@@ -161,6 +162,20 @@ export async function applySquash(input: ApplySquashInput): Promise<SquashResult
   const backupRef = backupRefFor(plan.branch)
   await updateRef(backupRef, plan.head, cwd)
   await resetSoft(plan.base, cwd)
+
+  // Scan staged files for secrets before committing, matching the same
+  // protection addAllAndCommit provides (git.ts:277-283). The squash commit
+  // would otherwise be the one path that bypasses secret scanning.
+  const squashStatus = await statusPorcelain(cwd)
+  const suspicious = findSuspiciousStagedFiles(squashStatus)
+  if (suspicious.length > 0) {
+    // Restore the branch to the pre-squash state so the user can investigate.
+    await resetSoft(plan.head, cwd)
+    throw new Error(
+      `refusing to squash: the following files look like they contain secrets: ${suspicious.join(", ")}. ` +
+        `Add them to .gitignore (or remove them) and re-run \`convoy finish\`.`,
+    )
+  }
 
   try {
     await commitAsUser(input.message, cwd, {

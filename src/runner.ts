@@ -1,4 +1,4 @@
-import { link, mkdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises"
+import { link, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
 import { stdin, stdout } from "node:process"
@@ -7,7 +7,7 @@ import { createInterface } from "node:readline/promises"
 import type { AssistantMessage, FilePartInput, OpencodeClient, Part } from "@opencode-ai/sdk/v2"
 
 import { advisorNeedsOf, completionQuestion, type AdvisorUsage, type ModelSelection } from "./advisor"
-import { advisorTokenEnv, advisorUrlEnv, installAdvisorTool, startAdvisorBridge, type AdvisorBridge } from "./advisor-bridge"
+import { installAdvisorTool, startAdvisorBridge, type AdvisorBridge } from "./advisor-bridge"
 import { readAdvisorSplit, renderAdvisorSplit } from "./advisor-report"
 import { createAdvisorRuntime, totalAdvisorUsage, type AdvisorPhaseHandle, type AdvisorRuntime } from "./advisor-runtime"
 import { aggregateAdvisorEvents, createAdvisorEventJournal, readAdvisorEvents, type AdvisorEvent, type AdvisorEventJournal } from "./advisor-events"
@@ -553,11 +553,14 @@ export async function run(options: RunOptions) {
     // deferred lookup.
     let advisors: AdvisorRuntime | undefined
     if (advisorNeeds.agents.size > 0) {
-      await installAdvisorTool()
       process.env.OPENCODE_CONFIG_DIR = opencodeConfigDir()
+      // Start the bridge first so we have the URL and token to embed in the
+      // tool source. The tool file must exist before the server spawns, but
+      // the bridge only needs to be listening — no client yet.
       advisorBridge = await startAdvisorBridge({ advisors: () => advisors })
-      process.env[advisorUrlEnv] = advisorBridge.url
-      process.env[advisorTokenEnv] = advisorBridge.token
+      // Embed the URL and token as string literals in the tool source so
+      // subprocesses (bash tool calls) cannot read them via process.env.
+      await installAdvisorTool({ url: advisorBridge.url, token: advisorBridge.token })
     }
     try {
       opencode = await startOpencode(
@@ -713,15 +716,14 @@ export async function run(options: RunOptions) {
     await notifier?.stop()
     await permissions?.stop()
     // Before the server: a tool call still in flight would otherwise hang on a
-    // socket nobody is going to answer. The credentials go with it — they are
-    // inherited by every subprocess Convoy spawns after this, hooks included,
-    // and they would point at a bridge that no longer exists.
+    // socket nobody is going to answer. The bridge goes first — the tool source
+    // carries the URL and token embedded as string literals (not process.env),
+    // and they point at a bridge that no longer exists. The tool's execute will
+    // fail with a fetch error, which it handles gracefully.
     advisorBridge?.close()
-    delete process.env[advisorUrlEnv]
-    delete process.env[advisorTokenEnv]
     // The server dies at the end of this block; clear its metadata entry now so
     // `convoy runs` stops offering to attach to a run that's shutting down.
-    metadata?.serverStopped()
+    await metadata?.serverStopped().catch((error) => log.warn(`couldn't persist server-stopped metadata: ${String(error)}`))
     await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
     await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
     progress.stop()
@@ -889,7 +891,7 @@ export async function commitRecoveredPhase(
   if (committed) log.info(`[${phase.name}] recovered uncommitted changes into a commit; continuing from the next phase`)
   else log.warn(`[${phase.name}] nothing to commit during recovery`)
 
-  metadata.phaseEnded(phase.name, "completed")
+  await metadata.phaseEnded(phase.name, "completed").catch((error) => log.warn(`couldn't persist phase-ended metadata: ${String(error)}`))
   await metadata.flush()
 }
 
@@ -1358,7 +1360,12 @@ async function persistPhaseReport(workspace: Workspace, phase: AgentStep, assist
   const reportAbs = join(workspace.dir, phase.reportPath)
   if (!(await exists(reportAbs)) && assistantText.trim() !== "") {
     await mkdir(dirname(reportAbs), { recursive: true })
-    await writeFile(reportAbs, assistantText)
+    // Write to a temporary path then rename atomically, matching the
+    // metadata.ts pattern (tmp+rename). A crash mid-write must never leave
+    // a truncated report that phaseNeedsRun would treat as complete.
+    const tmpPath = `${reportAbs}.tmp`
+    await writeFile(tmpPath, assistantText)
+    await rename(tmpPath, reportAbs)
   }
 
   if (!(await exists(reportAbs))) {

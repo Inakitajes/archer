@@ -59,15 +59,15 @@ export type RunMetadataStore = {
   phaseStatus(name: string): PhaseMetadataStatus | undefined
   /** Records the run's live opencode server URL so `convoy runs` can attach; cleared by serverStopped. */
   serverStarted(url: string): void
-  serverStopped(): void
-  phaseStarted(name: string): void
+  serverStopped(): Promise<void>
+  phaseStarted(name: string): Promise<void>
   phaseSession(name: string, sessionID: string): void
   phaseStepUsage(name: string, usage: ProgressStepUsage): void
   phaseUsageTotal(name: string, usage: ProgressUsage): void
   phaseAdvisorEvent(name: string, event: AdvisorEvent): void
   repositoryBaseline(name: string): RepoSnapshot | undefined
   phaseRepositoryBaseline(name: string, baseline: RepoSnapshot): Promise<void>
-  phaseEnded(name: string, status: "completed" | "skipped" | "failed"): void
+  phaseEnded(name: string, status: "completed" | "skipped" | "failed"): Promise<void>
   controlState(): RunControlState
   setControlState(state: RunControlState): Promise<void>
   flush(): Promise<void>
@@ -207,15 +207,15 @@ export async function openRunMetadata(
       data.server = { url, pid: process.pid, startedAt: Date.now() }
       void persist()
     },
-    serverStopped() {
+    async serverStopped() {
       data.server = undefined
-      void persist()
+      await persist({ throwOnError: true })
     },
-    phaseStarted(name) {
+    async phaseStarted(name) {
       const entry = phase(name)
       entry.status = "running"
       entry.startedAt ??= Date.now()
-      void persist()
+      await persist({ throwOnError: true })
     },
     phaseSession(name, sessionID) {
       phase(name).sessionID = sessionID
@@ -247,12 +247,12 @@ export async function openRunMetadata(
       phase(name).repositoryBaseline = baseline
       await persist({ throwOnError: true })
     },
-    phaseEnded(name, status) {
+    async phaseEnded(name, status) {
       const entry = phase(name)
       entry.status = status
       entry.endedAt = Date.now()
       if (entry.startedAt !== undefined) entry.durationMs = entry.endedAt - entry.startedAt
-      void persist()
+      await persist({ throwOnError: true })
     },
     controlState() {
       return data.control.state
@@ -302,8 +302,8 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
       store.serverStarted(url)
       progress.serverReady(url)
     },
-    phaseStarted(name, detail) {
-      store.phaseStarted(name)
+    async phaseStarted(name, detail) {
+      await store.phaseStarted(name).catch((error) => log.warn(`couldn't persist phase-started metadata: ${String(error)}`))
       progress.phaseStarted(name, detail)
     },
     phaseRunning: (name, detail) => progress.phaseRunning(name, detail),
@@ -329,16 +329,16 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
     },
     phaseTodos: (name, todos) => progress.phaseTodos(name, todos),
     phaseDiff: (name, summary) => progress.phaseDiff(name, summary),
-    phaseCompleted(name, detail) {
-      store.phaseEnded(name, "completed")
+    async phaseCompleted(name, detail) {
+      await store.phaseEnded(name, "completed").catch((error) => log.warn(`couldn't persist phase-completed metadata: ${String(error)}`))
       progress.phaseCompleted(name, detail)
     },
-    phaseSkipped(name) {
-      store.phaseEnded(name, "skipped")
+    async phaseSkipped(name) {
+      await store.phaseEnded(name, "skipped").catch((error) => log.warn(`couldn't persist phase-skipped metadata: ${String(error)}`))
       progress.phaseSkipped(name)
     },
-    phaseFailed(name, detail) {
-      store.phaseEnded(name, "failed")
+    async phaseFailed(name, detail) {
+      await store.phaseEnded(name, "failed").catch((error) => log.warn(`couldn't persist phase-failed metadata: ${String(error)}`))
       progress.phaseFailed(name, detail)
     },
     phaseRestored: (name, snapshot) => progress.phaseRestored(name, snapshot),
