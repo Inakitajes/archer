@@ -473,7 +473,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       group: "review",
       available: !state.permissionPending && state.humanReviewGate === "failure" && state.reviewCanRetry,
       keys: "r",
-      hint: "retry",
+      hint: "retry clean",
       style: "spaced",
       help: "retry the step from a clean baseline",
       priority: 1,

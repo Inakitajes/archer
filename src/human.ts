@@ -54,7 +54,7 @@ export async function runHumanReviewGate(
   const askAction = async () =>
     askInTui
       ? askInTui({ stepName, iterations })
-      : askHumanAction({ prompt: "Human step: [c]ontinue pipeline, [o]pen OpenCode, [a]bort > ", allowed: ["continue", "iterate", "abort"] })
+      : askHumanAction({ prompt: `Human step: ${humanActionMenu(humanStepActions)} > `, allowed: humanStepActions })
 
   // Plain readline fallback still owns the terminal. The TUI path keeps the
   // dashboard active and resolves actions via ProgressUI.askHumanReview.
@@ -130,6 +130,44 @@ const humanActionKeys: Record<HumanReviewAction, string> = {
   retry: "r",
 }
 
+/** The words each key completes in the [k]ey prompt style ("[o]pen OpenCode"); every label starts with its key. */
+const humanActionLabels: Record<HumanReviewAction, string> = {
+  continue: "continue pipeline",
+  iterate: "open OpenCode",
+  abort: "abort",
+  retry: "retry clean",
+}
+
+/** Extra words an action answers to, beyond its key and action name. */
+const humanActionAliases: Partial<Record<HumanReviewAction, readonly string[]>> = {
+  iterate: ["open", "opencode"],
+}
+
+/** The actions a pipeline human step answers with. */
+const humanStepActions = ["continue", "iterate", "abort"] as const
+
+/**
+ * The bracketed-key menu every readline gate shows:
+ * "[r]etry clean, [o]pen OpenCode, [a]bort".
+ */
+export function humanActionMenu(allowed: ReadonlyArray<HumanReviewAction>): string {
+  return allowed.map((action) => `[${humanActionKeys[action]}]${humanActionLabels[action].slice(1)}`).join(", ")
+}
+
+/**
+ * Readline prompt for the phase gate in runner.ts, in the same "[k]ey" style
+ * as the human-step prompt above. A failure puts the error on its own line so
+ * the menu stays next to the cursor; the terminal wraps long errors for us.
+ */
+export function phaseGatePrompt(info: { stepName: string; kind: "interactive" | "failure"; error?: string; allowed: ReadonlyArray<HumanReviewAction> }): string {
+  const menu = humanActionMenu(info.allowed)
+  if (info.kind === "failure") {
+    const reason = info.error ? `: ${info.error.replace(/\s+/g, " ").trim()}` : ""
+    return `Step "${info.stepName}" failed${reason}\n${menu} > `
+  }
+  return `Interactive session on step "${info.stepName}": ${menu} > `
+}
+
 /**
  * General readline fallback for a human gate, resolved by the action set the
  * caller allows (pipeline human steps answer c/o/a; a failed step answers
@@ -154,9 +192,10 @@ export async function askHumanAction({ prompt, allowed }: HumanActionPrompt): Pr
         .trim()
         .toLowerCase()
       for (const action of allowed) {
-        if (answer === humanActionKeys[action] || answer === action) return action
+        if (answer === humanActionKeys[action] || answer === action || humanActionAliases[action]?.includes(answer)) return action
       }
-      stdout.write(`Choose ${allowed.map((action) => humanActionKeys[action]).join(", ")}.\n`)
+      const keys = allowed.map((action) => humanActionKeys[action])
+      stdout.write(`Choose ${keys.length > 1 ? `${keys.slice(0, -1).join(", ")}, or ${keys[keys.length - 1]}` : keys[0]}.\n`)
     }
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {

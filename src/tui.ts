@@ -1358,7 +1358,7 @@ export class TuiProgress implements ProgressUI {
         this.selectPhaseByName(info.stepName)
         this.manualFocus = false
       }
-      this.addEvent(info.stepName, "permission", info.kind === "interactive" ? "interactive session — waiting for your decision" : "waiting for human review action")
+      this.addEvent(info.stepName, "permission", info.kind === "failure" ? "step failed — waiting for your decision" : info.kind === "interactive" ? "interactive session — waiting for your decision" : "waiting for human review action")
       this.render()
     })
   }
@@ -2216,7 +2216,7 @@ export class TuiProgress implements ProgressUI {
       return
     }
     this.interactiveTakeover.add(phase.name)
-    this.addEvent(phase.name, "system", "interactive mode armed — a clean finish holds the step here for you; esc in OpenCode works too")
+    this.addEvent(phase.name, "system", "interactive mode armed — a clean finish holds the step here for you; esc in OpenCode holds it too")
     this.openSessionWindowForPhase(phase.name, "key")
   }
 

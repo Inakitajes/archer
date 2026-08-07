@@ -18,7 +18,7 @@ import { ensureClaudeAvailable, promptClaudePhase } from "./claude-code"
 import { addAllAndCommit, createCleanRepoSnapshot, currentBranch, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
 import { getSessionEventHub, payloadProperties } from "./event-hub"
-import { askHumanAction, runHumanReviewGate } from "./human"
+import { askHumanAction, phaseGatePrompt, runHumanReviewGate } from "./human"
 import { log } from "./log"
 import { openRunMetadata, recordProgress, type RunMetadataStore } from "./metadata"
 import { openOpencodeSessionWindow, startOpencode } from "./opencode"
@@ -1023,7 +1023,7 @@ export async function runPhaseUntilResolved(
     } catch (error) {
       if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
       if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
-      progress.phaseRunning(phase.name, "failed — waiting for your decision")
+      progress.phaseRunning(phase.name, "step failed — waiting for your decision")
       log.warn(`[${phase.name}] attempt ${attempt} failed: ${formatSdkError(error)}`)
       const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
         kind: armed() ? "interactive" : "failure",
@@ -1083,7 +1083,7 @@ export async function waitForPhaseGate(
   if (!usingTui && !(stdin.isTTY && stdout.isTTY)) return "unavailable"
 
   let kind: "interactive" | "failure" = options.kind
-  progress.phaseRunning(phaseName, kind === "interactive" ? "interactive session — waiting for your decision" : "failed — waiting for your decision")
+  progress.phaseRunning(phaseName, kind === "interactive" ? "interactive session — waiting for your decision" : "step failed — waiting for your decision")
   let iterations = 0
   let permissionsPaused = false
   const pausePermissions = () => {
@@ -1102,10 +1102,9 @@ export async function waitForPhaseGate(
   try {
     for (;;) {
       const allowed = gateAllowedActions(kind, kind === "failure" ? options.canRetry : false)
-      const keyLabel = { continue: "c continue", retry: "r retry clean", iterate: "o open OpenCode", abort: "a abort" } as const
       const action = askInTui
         ? await askInTui({ stepName: phaseName, iterations, kind, error: options.error, canRetry: kind === "failure" ? options.canRetry : false })
-        : await askHumanAction({ prompt: `Step "${phaseName}" ${options.error ? `failed: ${options.error}; ` : ""}${allowed.map((entry) => keyLabel[entry]).join(", ")} > `, allowed })
+        : await askHumanAction({ prompt: phaseGatePrompt({ stepName: phaseName, kind, error: options.error, allowed }), allowed })
 
       if (action === "continue") return "continue"
       if (action === "abort") throw new UserAbortError("aborted from interactive session gate")
