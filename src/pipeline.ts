@@ -331,6 +331,12 @@ export type StepSpec = string | AgentStepSpec | HumanStepSpec | ParallelStepSpec
 
 export type PipelineSpec = {
   description?: string
+  /**
+   * Cap on agents running at once within a concurrent group (`parallel:` block
+   * or `models:` fan-out) for this pipeline only. Beats `defaults.maxConcurrentAgents`;
+   * loses to the `--max-concurrent` CLI flag. Unset inherits the defaults chain.
+   */
+  maxConcurrentAgents?: number
   steps: StepSpec[]
 }
 
@@ -688,7 +694,7 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
     throw new Error(`pipeline "${input.name}" has no agent steps`)
   }
 
-  return { name: input.name, ...(input.spec.description ? { description: input.spec.description } : {}), steps }
+  return { name: input.name, ...(input.spec.description ? { description: input.spec.description } : {}), ...(input.spec.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: input.spec.maxConcurrentAgents } : {}), steps }
 }
 
 export function isParallelSpec(raw: StepSpec): raw is ParallelStepSpec {

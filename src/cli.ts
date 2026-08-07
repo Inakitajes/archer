@@ -576,7 +576,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     notify: parsed.notify,
     notifications: config?.notifications ?? {},
     humanReview,
-    maxConcurrentAgents: parsed.maxConcurrent ?? defaults.maxConcurrentAgents ?? defaultMaxConcurrentAgents,
+    maxConcurrentAgents: parsed.maxConcurrent ?? pipeline.maxConcurrentAgents ?? defaults.maxConcurrentAgents ?? defaultMaxConcurrentAgents,
     baseRef: await resolveBaseRef(parsed, defaults),
     targetDir: parsed.targetDir,
     // A resumed run continues in the directory its metadata recorded — which is
