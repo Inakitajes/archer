@@ -209,6 +209,29 @@ describe("config loading", () => {
     expect(() => parse("not yaml: [unclosed")).toThrow("invalid YAML")
   })
 
+  test("a legacy maxAttempts key is accepted but ignored, not a validation error", () => {
+    // A config that still sets the removed maxAttempts (in defaults and on a
+    // step) must parse without error: the key stays in the allowlist so an old
+    // ~/.convoy/config.yaml doesn't break, but the value is dropped entirely.
+    const config = parse(
+      [
+        "version: 1",
+        "defaults:",
+        "  model: openai/gpt-5.5",
+        "  maxAttempts: 5",
+        "pipelines:",
+        "  impl:",
+        "    steps:",
+        "      - agent: tests",
+        "        maxAttempts: 3",
+      ].join("\n"),
+    )
+
+    expect(config.defaults).toEqual({ model: "openai/gpt-5.5" })
+    expect(config.defaults).not.toHaveProperty("maxAttempts")
+    expect(config.pipelines.impl?.steps).toEqual([{ agent: "tests" }])
+  })
+
   test("rejects step names that can escape the reports directory", () => {
     expect(() =>
       parse("pipelines:\n  audit:\n    steps:\n      - agent: security\n        name: ../../../../tmp/owned"),

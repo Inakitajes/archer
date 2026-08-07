@@ -552,6 +552,51 @@ describe("run phase gate", () => {
     expect(prompts[0]?.canRetry).toBe(true)
   })
 
+  test("retry has no ceiling: a step that keeps failing can be retried indefinitely", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        // Retry the first two failures; the third attempt succeeds so no third gate opens.
+        return Promise.resolve(prompts.length <= 2 ? "retry" : "continue")
+      },
+    }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      agentStep("implementer"),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          if (attempt < 3) throw new Error("still failing")
+          return "# report"
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    // The third attempt succeeds and returns its report — no third gate call.
+    expect(result).toBe("# report")
+    expect(attempts).toEqual([1, 2, 3])
+    expect(restores).toBe(2)
+    expect(prompts).toHaveLength(2)
+    expect(prompts.every((p) => p.kind === "failure" && p.canRetry === true)).toBe(true)
+  })
+
   test("abort throws UserAbortError", async () => {
     const workspace = await retryWorkspace()
     const progress: ProgressUI = {
@@ -1190,6 +1235,45 @@ describe("waitForPhaseGate", () => {
     ).rejects.toBeInstanceOf(UserAbortError)
     expect(events).toEqual([])
     expect(calls.prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "failure", error: "network down", canRetry: true }])
+  })
+
+  test("retry on a failure gate returns the retry outcome without restoring", async () => {
+    const { calls, progress } = gateProgress(["retry"])
+    const { events, permissions } = trackedPermissions()
+
+    const outcome = await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+      kind: "failure",
+      error: "network down",
+      canRetry: true,
+    })
+
+    expect(outcome).toBe("retry")
+    // No permission pause in failure mode, and retry returns before the flip.
+    expect(events).toEqual([])
+    expect(calls.prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "failure", error: "network down", canRetry: true }])
+  })
+
+  test("iterate flips a failure gate to interactive, unlocking [c] and pausing permissions", async () => {
+    const { calls, progress } = gateProgress(["iterate", "continue"])
+    const { events, permissions } = trackedPermissions()
+
+    const outcome = await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+      kind: "failure",
+      error: "network down",
+      canRetry: true,
+    }, {
+      openWindow: async () => "terminal",
+    })
+
+    expect(outcome).toBe("continue")
+    // Failure mode starts without pausing; the flip to interactive pauses, and
+    // the final continue resumes — so the full lifecycle is pause→resume.
+    expect(events).toEqual(["pause", "resume"])
+    // First prompt is failure with canRetry; after iterate the gate flips to
+    // interactive, so the second prompt has canRetry false and kind interactive.
+    expect(calls.prompts).toHaveLength(2)
+    expect(calls.prompts[0]).toMatchObject({ kind: "failure", canRetry: true, iterations: 0 })
+    expect(calls.prompts[1]).toMatchObject({ kind: "interactive", canRetry: false, iterations: 1 })
   })
 
   test("without a dashboard gate or TTY the wait is unavailable", async () => {

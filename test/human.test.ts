@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { runHumanReviewGate } from "../src/human"
+import { humanActionMenu, phaseGatePrompt, runHumanReviewGate } from "../src/human"
 import { noopProgress, type HumanReviewAction, type HumanReviewPromptInfo, type ProgressUI } from "../src/progress"
 
 import type { RunOptions } from "../src/types"
@@ -157,5 +157,39 @@ describe("runHumanReviewGate", () => {
     expect(calls.activities).toContain("couldn't open OpenCode iteration: unsupported platform")
     expect(calls.activities).toContain("falling back to interactive OpenCode in this terminal")
     await expect(readFile(join(workspace.dir, "reports", "human-review.md"), "utf8")).resolves.toContain("- Manual OpenCode iterations: 1")
+  })
+})
+
+describe("humanActionMenu", () => {
+  test("renders the bracketed-key menu in [k]ey style for each allowed action", () => {
+    // Every label starts with its key so the bracket strips the first letter.
+    expect(humanActionMenu(["continue", "iterate", "abort"])).toBe("[c]ontinue pipeline, [o]pen OpenCode, [a]bort")
+    expect(humanActionMenu(["retry", "iterate", "abort"])).toBe("[r]etry clean, [o]pen OpenCode, [a]bort")
+  })
+
+  test("a failure gate without a baseline shows only open and abort", () => {
+    expect(humanActionMenu(["iterate", "abort"])).toBe("[o]pen OpenCode, [a]bort")
+  })
+})
+
+describe("phaseGatePrompt", () => {
+  test("a failure gate puts the error on its own line above the menu", () => {
+    const prompt = phaseGatePrompt({ stepName: "implementer", kind: "failure", error: "network down", allowed: ["retry", "iterate", "abort"] })
+    expect(prompt).toBe('Step "implementer" failed: network down\n[r]etry clean, [o]pen OpenCode, [a]bort > ')
+  })
+
+  test("a failure gate collapses whitespace in a multi-line error", () => {
+    const prompt = phaseGatePrompt({ stepName: "tests", kind: "failure", error: "provider\ntemporarily\nunavailable", allowed: ["iterate", "abort"] })
+    expect(prompt).toBe('Step "tests" failed: provider temporarily unavailable\n[o]pen OpenCode, [a]bort > ')
+  })
+
+  test("a failure gate without an error still shows the menu on the second line", () => {
+    const prompt = phaseGatePrompt({ stepName: "plan", kind: "failure", allowed: ["retry", "iterate", "abort"] })
+    expect(prompt).toBe('Step "plan" failed\n[r]etry clean, [o]pen OpenCode, [a]bort > ')
+  })
+
+  test("an interactive gate uses the session wording on a single line", () => {
+    const prompt = phaseGatePrompt({ stepName: "implementer", kind: "interactive", allowed: ["continue", "iterate", "abort"] })
+    expect(prompt).toBe('Interactive session on step "implementer": [c]ontinue pipeline, [o]pen OpenCode, [a]bort > ')
   })
 })
