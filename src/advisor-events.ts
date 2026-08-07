@@ -101,8 +101,15 @@ export async function createAdvisorEventJournal(workspace: Workspace): Promise<A
   return {
     path,
     async append(event) {
-      const write = writes.then(() => appendFile(path, `${JSON.stringify(event)}\n`, { mode: 0o600 }))
-      writes = write.catch((error) => log.warn(`couldn't write advisor event: ${error instanceof Error ? error.message : String(error)}`))
+      // Update `writes` atomically in a single expression: chain the appendFile
+      // onto the current writes promise, then replace writes with the caught
+      // result — all before the next concurrent caller can capture the old
+      // value. The previous two-statement form (`const write = ...; writes =
+      // write.catch(...)`) let two racing callers both chain on the same base
+      // promise and interleave their appendFile calls (HN-001).
+      writes = writes
+        .then(() => appendFile(path, `${JSON.stringify(event)}\n`, { mode: 0o600 }))
+        .catch((error) => log.warn(`couldn't write advisor event: ${error instanceof Error ? error.message : String(error)}`))
       await writes
     },
   }

@@ -45,7 +45,7 @@ async function git(args: string[], cwd: string): Promise<string> {
 // inconsistent state (detached HEAD, missing branch, dirty tree) that requires
 // manual git fsck. This test verifies the normal-case behavior works and
 // characterizes the non-atomic nature.
-describe("HN-009: restoreRepoSnapshot is non-atomic", () => {
+describe("HN-009: restoreRepoSnapshot now has backup ref recovery", () => {
   async function repoWithChange(): Promise<{ dir: string; snapshot: RepoSnapshot }> {
     const dir = await tmpDir("hn009")
     await git(["init", "-q", "-b", "main"], dir)
@@ -77,29 +77,43 @@ describe("HN-009: restoreRepoSnapshot is non-atomic", () => {
     expect(await Bun.file(join(dir, "untracked.txt")).exists()).toBe(false)
   })
 
-  test("consists of 6 individual git commands with no rollback mechanism", async () => {
-    // This is a structural test: the function's implementation is 6 sequential
-    // execFile calls. No try/catch, no backup ref, no transaction.
-    // The source is at src/git.ts:212-219 and reads:
-    //   reset --hard, clean -fd, checkout --detach, checkout -B, reset --hard, clean -fd
-    // We verify each step is independently observable by running the first
-    // command only and checking the intermediate state.
+  test("creates a backup ref and cleans it up on successful restore (HN-009 fix)", async () => {
     const { dir, snapshot } = await repoWithChange()
+    await restoreRepoSnapshot(snapshot, dir)
 
-    // Step 1: reset --hard (only)
-    const proc1 = Bun.spawn(["git", "reset", "--hard", snapshot.head], { cwd: dir, stdout: "pipe", stderr: "pipe" })
-    expect(await proc1.exited).toBe(0)
-    // After reset --hard, the working tree is clean but the branch is still on the modified commit
-    expect(await git(["rev-parse", "HEAD"], dir)).toBe(snapshot.head)
-    // But the branch ref is still pointing at the old commit, not the snapshot
-    // untracked files remain
-    expect(await Bun.file(join(dir, "untracked.txt")).exists()).toBe(true)
+    // The backup ref should be cleaned up on success — no ref namespace pollution.
+    const refs = await git(["for-each-ref", "--format=%(refname)", "refs/convoy/snapshot/"], dir)
+    expect(refs.trim()).toBe("")
+  })
 
-    // The key observation: if the process died after step 1 (reset --hard),
-    // the tree would be clean BUT untracked files would remain. The next `git status`
-    // would show untracked files that should have been cleaned.
-    expect(await git(["status", "--porcelain"], dir)).toBe("?? untracked.txt")
-    expect(await git(["rev-parse", "main"], dir)).toBe(snapshot.head)
+  test("preserves a backup ref for recovery when restore fails mid-sequence (HN-009 fix)", async () => {
+    const { dir, snapshot } = await repoWithChange()
+    const beforeHead = await git(["rev-parse", "HEAD"], dir)
+
+    // An invalid head triggers a failure at `git checkout --detach`, mid-sequence.
+    const badSnapshot: RepoSnapshot = { head: "0".repeat(40), ref: "main" }
+    await expect(restoreRepoSnapshot(badSnapshot, dir)).rejects.toThrow()
+
+    // The backup ref should still exist, pointing at the pre-restore HEAD.
+    const refs = await git(["for-each-ref", "--format=%(refname)", "refs/convoy/snapshot/"], dir)
+    const refLines = refs.split("\n").filter(Boolean)
+    expect(refLines.length).toBe(1)
+    expect(await git(["rev-parse", refLines[0]!], dir)).toBe(beforeHead)
+  })
+
+  test("source contains backup ref, try/catch, and recovery instructions (HN-009 fix)", async () => {
+    const source = await readFile(
+      join(import.meta.dir, "..", "src", "git.ts"),
+      "utf8",
+    )
+
+    const restoreSection = source.match(/export async function restoreRepoSnapshot[\s\S]{1,2000}/)
+    expect(restoreSection).not.toBeNull()
+    expect(restoreSection![0]).toContain("refs/convoy/snapshot/")
+    expect(restoreSection![0]).toContain("update-ref")
+    expect(restoreSection![0]).toContain("catch (error)")
+    expect(restoreSection![0]).toContain("git reset --hard")
+    expect(restoreSection![0]).toContain("Then re-run convoy to resume")
   })
 })
 
@@ -223,6 +237,50 @@ describe("HN-002: metadata lifecycle methods", () => {
     // setControlState uses `await persist({ throwOnError: true })`
     const setControlAwait = source.match(/setControlState[\s\S]{0,300}await persist\(\{ throwOnError: true \}\)/)
     expect(setControlAwait).not.toBeNull()
+  })
+
+  test("RunMetadataStore interface declares Promise<void> for lifecycle methods (HN-002 fix)", async () => {
+    const source = await readFile(
+      join(import.meta.dir, "..", "src", "metadata.ts"),
+      "utf8",
+    )
+
+    // The interface should now declare Promise<void> so callers must await
+    expect(source).toContain("serverStopped(): Promise<void>")
+    expect(source).toContain("phaseStarted(name: string): Promise<void>")
+    expect(source).toContain('phaseEnded(name: string, status: "completed" | "skipped" | "failed"): Promise<void>')
+  })
+
+  test("direct call sites in runner.ts await the store methods (HN-002 fix)", async () => {
+    const source = await readFile(
+      join(import.meta.dir, "..", "src", "runner.ts"),
+      "utf8",
+    )
+
+    // serverStopped should be awaited with .catch() in the finally block
+    expect(source).toContain("await metadata?.serverStopped().catch(")
+    // phaseEnded in commitRecoveredPhase should be awaited with .catch()
+    expect(source).toContain('await metadata.phaseEnded(phase.name, "completed").catch(')
+  })
+
+  test("recordProgress callbacks await store methods with error handling (HN-002 fix)", async () => {
+    const source = await readFile(
+      join(import.meta.dir, "..", "src", "metadata.ts"),
+      "utf8",
+    )
+
+    // phaseStarted callback should be async and await store.phaseStarted with .catch()
+    expect(source).toContain("async phaseStarted(name, detail)")
+    expect(source).toContain("await store.phaseStarted(name).catch(")
+    // phaseCompleted callback should be async and await store.phaseEnded with .catch()
+    expect(source).toContain("async phaseCompleted(name, detail)")
+    expect(source).toContain('await store.phaseEnded(name, "completed").catch(')
+    // phaseSkipped callback should be async and await store.phaseEnded with .catch()
+    expect(source).toContain("async phaseSkipped(name)")
+    expect(source).toContain('await store.phaseEnded(name, "skipped").catch(')
+    // phaseFailed callback should be async and await store.phaseEnded with .catch()
+    expect(source).toContain("async phaseFailed(name, detail)")
+    expect(source).toContain('await store.phaseEnded(name, "failed").catch(')
   })
 })
 

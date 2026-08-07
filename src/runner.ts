@@ -723,7 +723,7 @@ export async function run(options: RunOptions) {
     advisorBridge?.close()
     // The server dies at the end of this block; clear its metadata entry now so
     // `convoy runs` stops offering to attach to a run that's shutting down.
-    metadata?.serverStopped()
+    await metadata?.serverStopped().catch((error) => log.warn(`couldn't persist server-stopped metadata: ${String(error)}`))
     await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
     await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
     progress.stop()
@@ -891,7 +891,7 @@ export async function commitRecoveredPhase(
   if (committed) log.info(`[${phase.name}] recovered uncommitted changes into a commit; continuing from the next phase`)
   else log.warn(`[${phase.name}] nothing to commit during recovery`)
 
-  metadata.phaseEnded(phase.name, "completed")
+  await metadata.phaseEnded(phase.name, "completed").catch((error) => log.warn(`couldn't persist phase-ended metadata: ${String(error)}`))
   await metadata.flush()
 }
 
