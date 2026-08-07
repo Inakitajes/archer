@@ -1,13 +1,13 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { stdin, stdout } from "node:process"
-import { createInterface } from "node:readline/promises"
 
 import { addAllAndCommit } from "./git"
 import { log } from "./log"
 import { openInteractiveOpencodeWindow } from "./opencode"
 import { noopProgress, type HumanReviewAction, type ProgressUI } from "./progress"
 import type { PermissionGate } from "./permissions"
+import { createTerminalInput, type TerminalInput, TerminalInterrupt } from "./terminal-input"
 import type { RunOptions } from "./types"
 import type { Workspace } from "./workspace"
 
@@ -51,7 +51,10 @@ export async function runHumanReviewGate(
   progress.phaseStarted(stepName, "waiting for manual action")
 
   let iterations = 0
-  const askAction = async () => (askInTui ? askInTui({ stepName, iterations }) : askHumanAction())
+  const askAction = async () =>
+    askInTui
+      ? askInTui({ stepName, iterations })
+      : askHumanAction({ prompt: `Human step: ${humanActionMenu(humanStepActions)} > `, allowed: humanStepActions })
 
   // Plain readline fallback still owns the terminal. The TUI path keeps the
   // dashboard active and resolves actions via ProgressUI.askHumanReview.
@@ -114,41 +117,96 @@ async function humanReviewApproved(workspace: Workspace, stepName: string) {
   }
 }
 
-async function askHumanAction(): Promise<HumanReviewAction> {
-  const rl = createInterface({ input: stdin, output: stdout })
-  const controller = new AbortController()
-  let interrupted = false
-  // Raw-mode input never raises a process SIGINT; readline surfaces Ctrl+C
-  // here instead, so without this listener the prompt would just hang.
-  rl.on("SIGINT", () => {
-    interrupted = true
-    controller.abort()
-  })
+export type HumanActionPrompt = {
+  prompt: string
+  allowed: ReadonlyArray<HumanReviewAction>
+  /**
+   * Serializes this readline fallback with the permission gate's so a --no-tui
+   * parallel run never opens two prompts on stdin at once. The phase gate
+   * passes the run's shared arbiter; the solo human-review gate leaves it unset.
+   */
+  terminalInput?: TerminalInput
+}
 
-  try {
-    for (;;) {
-      const answer = (await rl.question("Human step: [c]ontinue pipeline, [o]pen OpenCode, [a]bort > ", {
-        signal: controller.signal,
-      }))
-        .trim()
-        .toLowerCase()
-      if (answer === "c" || answer === "continue") return "continue" as const
-      if (answer === "o" || answer === "open" || answer === "opencode") return "iterate" as const
-      if (answer === "a" || answer === "abort") return "abort" as const
-      stdout.write("Choose c, o, or a.\n")
-    }
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      stdout.write("\n")
-      if (interrupted) {
-        log.warn("[human-step] Ctrl+C received; aborting")
-        return "abort"
-      }
-    }
-    throw error
-  } finally {
-    rl.close()
+/** One key per ReviewAction, shared by askHumanAction's prompt and dispatch. */
+const humanActionKeys: Record<HumanReviewAction, string> = {
+  continue: "c",
+  iterate: "o",
+  abort: "a",
+  retry: "r",
+}
+
+/** The words each key completes in the [k]ey prompt style ("[o]pen OpenCode"); every label starts with its key. */
+const humanActionLabels: Record<HumanReviewAction, string> = {
+  continue: "continue pipeline",
+  iterate: "open OpenCode",
+  abort: "abort",
+  retry: "retry clean",
+}
+
+/** Extra words an action answers to, beyond its key and action name. */
+const humanActionAliases: Partial<Record<HumanReviewAction, readonly string[]>> = {
+  iterate: ["open", "opencode"],
+}
+
+/** The actions a pipeline human step answers with. */
+const humanStepActions = ["continue", "iterate", "abort"] as const
+
+/**
+ * The bracketed-key menu every readline gate shows:
+ * "[r]etry clean, [o]pen OpenCode, [a]bort".
+ */
+export function humanActionMenu(allowed: ReadonlyArray<HumanReviewAction>): string {
+  return allowed.map((action) => `[${humanActionKeys[action]}]${humanActionLabels[action].slice(1)}`).join(", ")
+}
+
+/**
+ * Readline prompt for the phase gate in runner.ts, in the same "[k]ey" style
+ * as the human-step prompt above. A failure puts the error on its own line so
+ * the menu stays next to the cursor; the terminal wraps long errors for us.
+ */
+export function phaseGatePrompt(info: { stepName: string; kind: "interactive" | "failure"; error?: string; allowed: ReadonlyArray<HumanReviewAction> }): string {
+  const menu = humanActionMenu(info.allowed)
+  if (info.kind === "failure") {
+    const reason = info.error ? `: ${info.error.replace(/\s+/g, " ").trim()}` : ""
+    return `Step "${info.stepName}" failed${reason}\n${menu} > `
   }
+  return `Interactive session on step "${info.stepName}": ${menu} > `
+}
+
+/**
+ * General readline fallback for a human gate, resolved by the action set the
+ * caller allows (pipeline human steps answer c/o/a; a failed step answers
+ * r/o/a). Shared by runHumanReviewGate and the phase gate in runner.ts.
+ *
+ * The whole interaction loop runs under the shared terminal-input arbiter, so
+ * a phase gate waiting on stdin and a live sibling's permission prompt can
+ * never both read the same stdin in a --no-tui parallel run.
+ */
+export async function askHumanAction({ prompt, allowed, terminalInput }: HumanActionPrompt): Promise<HumanReviewAction> {
+  const input = terminalInput ?? createTerminalInput()
+  return input.withInput(async (ask) => {
+    for (;;) {
+      let answer: string
+      try {
+        answer = (await ask.ask(prompt)).trim().toLowerCase()
+      } catch (error) {
+        // Ctrl+C surfaces as TerminalInterrupt; map it to abort so the gate
+        // shuts the run down instead of looping on a dead prompt.
+        if (error instanceof TerminalInterrupt) {
+          stdout.write("\n")
+          log.warn("[human-step] Ctrl+C received; aborting")
+          return "abort"
+        }
+        throw error
+      }
+      for (const action of allowed) {
+        if (answer === humanActionKeys[action] || answer === action || humanActionAliases[action]?.includes(answer)) return action
+      }
+      const keys = allowed.map((action) => humanActionKeys[action])
+      stdout.write(`Choose ${keys.length > 1 ? `${keys.slice(0, -1).join(", ")}, or ${keys[keys.length - 1]}` : keys[0]}.\n`)
+    }
+  })
 }
 
 async function openExternalIteration(

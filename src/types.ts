@@ -30,7 +30,6 @@ export type RunOptions = {
   /** The merged `notifications:` config block; only the keys the user set. */
   notifications: Partial<NotificationSettings>
   humanReview: boolean
-  maxAttempts: number
   /** Cap on agents running at once within a concurrent group (`parallel:` block or `models:` fan-out). Groups smaller than this are unaffected. Defaults to `defaultMaxConcurrentAgents` when unset. */
   maxConcurrentAgents?: number
   baseRef: string
@@ -161,8 +160,6 @@ export type AgentStep = {
   readOnly?: boolean
   /** True when this read-only step may still run bash to verify its claims. Never set without `readOnly`. */
   verify?: boolean
-  /** Per-step override; falls back to --max-attempts when absent. */
-  maxAttempts?: number
   /** Shared by every step produced from the same top-level pipeline entry; the runner batches same-groupId steps to run concurrently. */
   groupId: string
   /** Pre-fan-out logical name; equals `name` unless this step was produced by a `models:` fan-out. */
@@ -201,7 +198,6 @@ export type RunPlan = {
   hooks: HookSet
   attachments: string[]
   permissions: "interactive" | "smart" | "yolo"
-  maxAttempts: number
   resume?: {
     runID: string
     /** Set when an explicit --gateway reroutes pending phases away from the run's frozen gateway. */

@@ -121,8 +121,7 @@ function pushStepRows(rows: StyledText[], plan: RunPlan, width: number) {
     } else {
       const shared = members.every((member) => member.stepName === members[0]!.stepName)
       const title = shared ? members[0]!.stepName : "parallel"
-      const attempts = members[0]!.maxAttempts ?? plan.maxAttempts
-      const meta = `${members.length} runs · ${members[0]!.readOnly ? "read-only" : "writable"} · ${attemptsLabel(attempts)}`
+      const meta = `${members.length} runs · ${members[0]!.readOnly ? "read-only" : "writable"}`
       rows.push(continuation([fg(theme.faint)("○ "), fg(theme.text)(truncate(sanitizeReviewInline(title), Math.max(8, width - labelWidth - meta.length - 6))), fg(theme.faint)(` · ${meta}`)]))
       members.forEach((member, memberIndex) => {
         const connector = memberIndex === members.length - 1 ? "└─ " : "├─ "
@@ -138,9 +137,8 @@ function pushStepRows(rows: StyledText[], plan: RunPlan, width: number) {
 
 function pushAgentStep(rows: StyledText[], step: AgentStep, plan: RunPlan, width: number) {
   const runner = stepRunnerFor(step.runner)
-  const attempts = step.maxAttempts ?? plan.maxAttempts
   const engine = runner.id === "opencode" ? "" : `${runner.displayName.toLowerCase()} · `
-  const meta = `${engine}${step.readOnly ? "read-only" : "writable"} · ${attemptsLabel(attempts)}`
+  const meta = `${engine}${step.readOnly ? "read-only" : "writable"}`
   rows.push(continuation([fg(theme.faint)("○ "), fg(theme.text)(truncate(sanitizeReviewInline(step.name), Math.max(8, width - labelWidth - meta.length - 5))), fg(theme.faint)(` · ${meta}`)]))
   rows.push(...modelRows(step, labelWidth + 2, width))
 }
@@ -181,10 +179,6 @@ function hookChunks(stage: "pre" | "post", hook: HookSpec, value: number): TextC
   const chunks: TextChunk[] = [fg(theme.teal)(stage.padEnd(4)), fg(theme.faint)("  · "), fg(theme.text)(truncate(sanitizeReviewInline(hook.command), Math.max(8, value - 8)))]
   if (stage === "post" && hook.when && hook.when !== "success") chunks.push(fg(theme.faint)(` · ${sanitizeReviewInline(hook.when)}`))
   return chunks
-}
-
-function attemptsLabel(attempts: number) {
-  return `${attempts} attempt${attempts === 1 ? "" : "s"}`
 }
 
 function labelRow(label: string, value: TextChunk[]): StyledText {

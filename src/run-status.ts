@@ -31,6 +31,7 @@ const text = {
   waitingPermission: "waiting for your permission",
   waitingReview: "waiting for manual review",
   waitingTakeover: "waiting for interactive takeover",
+  waitingFailure: "step failed — waiting for your decision",
 } as const
 
 const activityIcon: Record<RunActivity, string> = {
@@ -175,6 +176,7 @@ function describePermission(): string {
 }
 
 function describeHumanReview(info: HumanReviewPromptInfo): string {
+  if (info.kind === "failure") return text.waitingFailure
   return info.kind === "interactive" ? text.waitingTakeover : text.waitingReview
 }
 
@@ -405,6 +407,28 @@ export class RunStatusTracker {
  * batch loop, the permission gate and the human gate untouched.
  */
 export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker): ProgressUI {
+  // The dashboard wrapper below tracks in-TUI gates directly. The readline
+  // fallback has no askHumanReview method to wrap, so phaseRunning marks its
+  // gate open and lifecycle transitions close it again.
+  const humanWaits = new Map<string, string>()
+  const humanWaitKey = (name: string, kind: HumanReviewPromptInfo["kind"]) => `human:${name}:${kind ?? "review"}`
+  const beginHumanWait = (name: string, kind: HumanReviewPromptInfo["kind"], reason: string) => {
+    const key = humanWaitKey(name, kind)
+    const previous = humanWaits.get(name)
+    if (previous && previous !== key) tracker.waitEnded(previous)
+    humanWaits.set(name, key)
+    tracker.waitBegan(key, reason)
+    return key
+  }
+  const endHumanWait = (name: string, key?: string) => {
+    const active = humanWaits.get(name)
+    if (!active || (key && active !== key)) return
+    tracker.waitEnded(active)
+    humanWaits.delete(name)
+  }
+  const phaseGateKind = (detail: string | undefined): HumanReviewPromptInfo["kind"] | undefined =>
+    detail === text.waitingFailure ? "failure" : detail === "interactive session — waiting for your decision" ? "interactive" : undefined
+
   const tracked: ProgressUI = {
     start: (runID, targetDir, runDir) => progress.start(runID, targetDir, runDir),
     serverReady: (url) => progress.serverReady(url),
@@ -412,8 +436,15 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
       tracker.phaseStarted(name)
       progress.phaseStarted(name, detail)
     },
-    phaseRunning: (name, detail) => progress.phaseRunning(name, detail),
-    phaseAttempt: (name, info) => progress.phaseAttempt(name, info),
+    phaseRunning(name, detail) {
+      const kind = phaseGateKind(detail)
+      if (kind) beginHumanWait(name, kind, kind === "failure" ? text.waitingFailure : text.waitingTakeover)
+      progress.phaseRunning(name, detail)
+    },
+    phaseAttempt(name, info) {
+      endHumanWait(name)
+      progress.phaseAttempt(name, info)
+    },
     phaseSession: (name, sessionID) => progress.phaseSession(name, sessionID),
     phaseActivity: (name, detail, kind, pulse) => progress.phaseActivity(name, detail, kind, pulse),
     phaseMessage: (name, message) => progress.phaseMessage(name, message),
@@ -423,14 +454,17 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
     phaseTodos: (name, todos) => progress.phaseTodos(name, todos),
     phaseDiff: (name, summary) => progress.phaseDiff(name, summary),
     phaseCompleted(name, detail) {
+      endHumanWait(name)
       tracker.phaseEnded(name, "completed")
       progress.phaseCompleted(name, detail)
     },
     phaseSkipped(name) {
+      endHumanWait(name)
       tracker.phaseEnded(name, "skipped")
       progress.phaseSkipped(name)
     },
     phaseFailed(name, detail) {
+      endHumanWait(name)
       tracker.phaseEnded(name, "failed")
       progress.phaseFailed(name, detail)
     },
@@ -468,12 +502,11 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
   const askHumanReview = progress.askHumanReview?.bind(progress)
   if (askHumanReview) {
     tracked.askHumanReview = async (info: HumanReviewPromptInfo): Promise<HumanReviewAction> => {
-      const key = `human:${info.stepName}:${info.kind ?? "review"}`
-      tracker.waitBegan(key, describeHumanReview(info))
+      const key = beginHumanWait(info.stepName, info.kind, describeHumanReview(info))
       try {
         return await askHumanReview(info)
       } finally {
-        tracker.waitEnded(key)
+        endHumanWait(info.stepName, key)
       }
     }
   }

@@ -44,7 +44,6 @@ export type ParsedArgs = {
   tui?: boolean
   notify?: boolean
   humanReview?: boolean
-  maxAttempts?: number
   maxConcurrent?: number
   baseRef?: string
   /** --worktree / --no-worktree: isolate the run on a fresh branch in its own worktree. */
@@ -228,7 +227,6 @@ async function launchInteractiveRun(targetDir: string) {
   await ensureRepoReady(targetDir, {
     baseRef: options.baseRef,
     includeDirty: options.includeDirty,
-    maxAttempts: options.maxAttempts,
     // A fresh worktree starts clean, so source changes are intentionally left
     // untouched and don't need to be included in this run.
     allowDirty: options.worktree,
@@ -255,7 +253,6 @@ async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSele
   parsed.gateway = selection.gateway
   parsed.worktree = Boolean(selection.isolateWorktree)
   if (selection.branchName) parsed.branch = selection.branchName
-  if (selection.includeDirty) parsed.maxAttempts = 1
 
   const options = { ...(await resolveRunOptions(parsed)), prompt: selection.prompt }
   // The branch was named and confirmed in the launcher's branch step, so the
@@ -579,7 +576,6 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     notify: parsed.notify,
     notifications: config?.notifications ?? {},
     humanReview,
-    maxAttempts: parsed.maxAttempts ?? defaults.maxAttempts ?? 2,
     maxConcurrentAgents: parsed.maxConcurrent ?? defaults.maxConcurrentAgents ?? defaultMaxConcurrentAgents,
     baseRef: await resolveBaseRef(parsed, defaults),
     targetDir: parsed.targetDir,
@@ -756,12 +752,6 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "--no-human-step":
         parsed.humanReview = false
         break
-      case "--max-attempts":
-        parsed.maxAttempts = parseInt(takeValue(), 10)
-        if (!Number.isInteger(parsed.maxAttempts) || parsed.maxAttempts < 1) {
-          throw new Error("--max-attempts must be a positive integer")
-        }
-        break
       case "--max-concurrent":
         parsed.maxConcurrent = parseInt(takeValue(), 10)
         if (!Number.isInteger(parsed.maxConcurrent) || parsed.maxConcurrent < 1) {
@@ -858,7 +848,7 @@ Flags:
   --yolo                   Auto-allow ask-level permissions (hard denylist still applies; shift+tab cycles it live in the TUI)
   --smart                  Smart auto-accept: an AI judge auto-allows safe ask-level requests and escalates risky ones (shift+tab cycles)
   --smart-model <provider/model[#variant]> Model for the smart auto-accept judge (default: defaults.autoAcceptJudgeModel, else the run's model)
-  --include-dirty          Include existing changes in the first commit (requires --max-attempts 1)
+  --include-dirty          Include existing changes in the first commit
   --model <provider/model[#variant]> Force a model for OpenCode steps (Claude Code steps keep their CLI model)
   --advisor <provider/model[#variant]> Force an advising model on every OpenCode step: a stronger model
                            consulted at decision points (before the first write, before declaring done,
@@ -873,7 +863,6 @@ Flags:
   --no-notify              Disable desktop notifications for this run (the terminal title still updates)
   --human-step             Enable human steps (alias: --human-review; default in interactive terminals)
   --no-human-step          Drop all human steps (alias: --no-human-review)
-  --max-attempts <n>       Attempts per step before failing (default: 2)
   --max-concurrent <n>     Max agents running at once within a parallel group (default: ${defaultMaxConcurrentAgents}); smaller groups are unaffected
   --base <ref>             Branch/base for calculating diffs (default: auto-detected — origin's default branch, else main/master/develop/trunk, else the current branch)
   --worktree               Run on a fresh branch in its own worktree under ~/.convoy/worktrees
@@ -889,7 +878,7 @@ Config files:
                            present once you eject one, and they shadow the built-in
 
 Config keys:
-  defaults:                model, maxAttempts, baseRef, pipeline, worktree, autoAcceptJudgeModel,
+  defaults:                model, baseRef, pipeline, worktree, autoAcceptJudgeModel,
                            branchNameModel, commitMessageModel
   modelRouting:            gateway and explicit per-logical-model overrides
   agents:                  project agents or built-in overrides; prompts live at agents/<name>.md

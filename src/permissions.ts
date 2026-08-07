@@ -1,5 +1,4 @@
-import { stdin, stdout } from "node:process"
-import { createInterface } from "node:readline/promises"
+import { stdout } from "node:process"
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
@@ -7,6 +6,7 @@ import { getSessionEventHub } from "./event-hub"
 import { log } from "./log"
 import { noopProgress, type AutoAccept, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "./progress"
 import { judgeCommand } from "./safety-judge"
+import { createTerminalInput, type TerminalInput } from "./terminal-input"
 
 type PermissionRequest = {
   id: string
@@ -22,9 +22,17 @@ type Reply = PermissionReply
 
 export type PermissionGate = {
   stop(): Promise<void>
-  /** While paused, permission requests are left for whoever owns the terminal (e.g. an interactive OpenCode TUI). */
-  pause(): void
-  resume(): void
+  /**
+   * While a session is paused, its permission requests are left for whoever owns
+   * the terminal (e.g. an interactive OpenCode TUI the user opened with [o]).
+   * Sibling sessions in the same `models:`/`parallel` batch keep being handled,
+   * so a failed step's recovery can never deadlock a live sibling's prompts.
+   *
+   * Omit `sessionID` to pause every session (the solo human-review gate, which
+   * never shares a batch with live siblings).
+   */
+  pause(sessionID?: string): void
+  resume(sessionID?: string): void
 }
 
 /**
@@ -58,6 +66,8 @@ export type StartGateOptions = {
    * which is what makes the advisor reliable rather than a matter of judgement.
    */
   advisorCheckpoint?: AdvisorCheckpoint
+  /** Serializes terminal input with the phase gate so a --no-tui parallel run never opens two readlines on stdin. */
+  terminalInput?: TerminalInput
 }
 
 export function startPermissionGate(options: StartGateOptions): PermissionGate {
@@ -65,7 +75,14 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
   const controller = new AbortController()
   const handled = new Set<string>()
   const queue = serialQueue()
-  let paused = false
+  // Session-scoped pause: only the session an interactive TUI owns is left for
+  // that owner. A directory-wide flag would also drop the prompts of live
+  // siblings in the same parallel batch, deadlocking them waiting for replies
+  // Convoy would never send. `pausedAll` covers the solo human-review gate,
+  // which never shares a batch with concurrent siblings.
+  const pausedSessions = new Set<string>()
+  let pausedAll = false
+  const terminalInput = options.terminalInput ?? createTerminalInput()
 
   // permission.asked is delivered on the directory-scoped event bus, so we share
   // the run's single subscription for that directory (see event-hub) instead of
@@ -75,12 +92,12 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
   const unsubscribe = hub.onAny((payload) => {
     if (controller.signal.aborted) return
     if (!isPermissionAsked(payload)) return
-    if (paused) return
     const request = payload.properties
+    if (pausedAll || pausedSessions.has(request.sessionID)) return
     if (handled.has(request.id)) return
     handled.add(request.id)
     queue(() =>
-      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal, options.advisorCheckpoint),
+      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal, options.advisorCheckpoint, terminalInput),
     )
   })
 
@@ -89,11 +106,13 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
       unsubscribe()
       controller.abort(new Error("permission gate stopped"))
     },
-    pause() {
-      paused = true
+    pause(sessionID) {
+      if (sessionID) pausedSessions.add(sessionID)
+      else pausedAll = true
     },
-    resume() {
-      paused = false
+    resume(sessionID) {
+      if (sessionID) pausedSessions.delete(sessionID)
+      else pausedAll = false
     },
   }
 }
@@ -116,6 +135,7 @@ async function handleRequest(
   judgeModel?: { providerID: string; modelID: string },
   signal?: AbortSignal,
   advisorCheckpoint?: AdvisorCheckpoint,
+  terminalInput: TerminalInput = createTerminalInput(),
 ) {
   const summary = describeRequest(request)
 
@@ -170,7 +190,9 @@ async function handleRequest(
   }
 
   // The TUI resolves the prompt in-place; suspending to readline is only the
-  // plain-logs fallback so the run never drops to a bare black screen.
+  // plain-logs fallback so the run never drops to a bare black screen. That
+  // fallback goes through the shared terminal-input arbiter so it can never
+  // race a phase-gate readline for the same stdin in a --no-tui parallel run.
   const ask = progress.askPermission?.bind(progress)
   if (ask) {
     const answer = await ask(promptInfo(request, judgeReason))
@@ -179,16 +201,24 @@ async function handleRequest(
     return
   }
 
-  progress.suspend()
-  try {
-    log.section("permission request")
-    stdout.write(formatRequest(request, judgeReason))
-    const answer = await askReply()
-    log.info(`[permission] replied ${answer} for ${request.permission}`)
-    await reply(client, request.id, directory, answer, answer === "reject" ? "rejected by user" : undefined)
-  } finally {
-    progress.resume()
-  }
+  const answer = await terminalInput.withInput(async (prompt) => {
+    progress.suspend()
+    try {
+      log.section("permission request")
+      stdout.write(formatRequest(request, judgeReason))
+      for (;;) {
+        const raw = (await prompt.ask("approve? [o]nce, [a]lways, [r]eject > ")).trim().toLowerCase()
+        if (raw === "o" || raw === "once" || raw === "y" || raw === "yes") return "once" as Reply
+        if (raw === "a" || raw === "always") return "always" as Reply
+        if (raw === "r" || raw === "reject" || raw === "n" || raw === "no") return "reject" as Reply
+        stdout.write("Choose o, a, or r.\n")
+      }
+    } finally {
+      progress.resume()
+    }
+  })
+  log.info(`[permission] replied ${answer} for ${request.permission}`)
+  await reply(client, request.id, directory, answer, answer === "reject" ? "rejected by user" : undefined)
 }
 
 function promptInfo(request: PermissionRequest, judgeReason?: string): PermissionPromptInfo {
@@ -246,21 +276,6 @@ function pickString(metadata: Record<string, unknown>, keys: string[]) {
 function truncate(value: string, max: number) {
   if (value.length <= max) return value
   return `${value.slice(0, max - 1)}…`
-}
-
-async function askReply(): Promise<Reply> {
-  const rl = createInterface({ input: stdin, output: stdout })
-  try {
-    for (;;) {
-      const raw = (await rl.question("approve? [o]nce, [a]lways, [r]eject > ")).trim().toLowerCase()
-      if (raw === "o" || raw === "once" || raw === "y" || raw === "yes") return "once"
-      if (raw === "a" || raw === "always") return "always"
-      if (raw === "r" || raw === "reject" || raw === "n" || raw === "no") return "reject"
-      stdout.write("Choose o, a, or r.\n")
-    }
-  } finally {
-    rl.close()
-  }
 }
 
 function serialQueue() {

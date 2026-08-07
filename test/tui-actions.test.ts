@@ -11,6 +11,7 @@ function state(overrides: Partial<DashboardActionState> = {}): DashboardActionSt
     fullscreen: false,
     contentTab: "session",
     permissionPending: false,
+    reviewCanRetry: false,
     controlState: "running",
     canPause: true,
     canKeepAwake: true,
@@ -159,6 +160,18 @@ describe("dashboard action registry", () => {
 
   test("a review gate owns the row too", () => {
     expect(footer({ humanReviewGate: "review" })).toEqual(["review-continue", "review-open", "review-abort"])
+  })
+
+  test("a failure gate swaps continue for retry, offered only when a baseline exists", () => {
+    // [c] is never offered on a failure gate: taking control via [o] is the only
+    // safe way forward. [r] appears only when canRetry (a baseline snapshot).
+    expect(available({ humanReviewGate: "failure", reviewCanRetry: true })).not.toContain("review-continue")
+    expect(available({ humanReviewGate: "failure", reviewCanRetry: true })).toContain("review-retry")
+    expect(available({ humanReviewGate: "failure", reviewCanRetry: true })).toContain("review-open")
+    expect(available({ humanReviewGate: "failure", reviewCanRetry: true })).toContain("review-abort")
+    expect(available({ humanReviewGate: "failure", reviewCanRetry: false })).not.toContain("review-retry")
+    expect(available({ humanReviewGate: "interactive", reviewCanRetry: true })).toContain("review-continue")
+    expect(available({ humanReviewGate: "interactive", reviewCanRetry: true })).not.toContain("review-retry")
   })
 
   test("[MF-2] the focused reader keeps session available to the palette but not its footer", () => {

@@ -47,7 +47,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     plan.pipeline.steps.forEach((step, index) => {
       if (step.type === "human") lines.push(`  ${index + 1}. ${sanitizeInline(step.name)} · human gate`)
       else {
-        lines.push(`  ${index + 1}. ${sanitizeInline(step.name)} · ${stepRunnerFor(step.runner).displayName} · ${step.readOnly ? "read-only" : "writable"} · ${step.maxAttempts ?? plan.maxAttempts} attempts`)
+        lines.push(`  ${index + 1}. ${sanitizeInline(step.name)} · ${stepRunnerFor(step.runner).displayName} · ${step.readOnly ? "read-only" : "writable"}`)
         if (step.resolvedModel) lines.push(`     Logical: ${sanitizeInline(step.resolvedModel.logical)}`, `     Target:  ${sanitizeInline(step.resolvedModel.target)}`)
         else lines.push(`     Model: ${sanitizeInline(plannedStepModel(step))}`)
         const advisor = plannedStepAdvisor(step)

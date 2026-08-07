@@ -36,7 +36,6 @@ function planWith(steps: Step[], extra: Partial<RunPlan> = {}): RunPlan {
     hooks: { pre: [], post: [] },
     attachments: [],
     permissions: "interactive",
-    maxAttempts: 2,
     ...extra,
   }
 }
@@ -50,7 +49,7 @@ describe("run review TUI", () => {
 
     const lines = plain(runReviewLines(plan, 100))
 
-    expect(lines.some((line) => line.includes("implementer · writable · 2 attempts"))).toBe(true)
+    expect(lines.some((line) => line.includes("implementer · writable"))).toBe(true)
     const solRows = lines.filter((line) => line.includes("gpt-5.6-sol"))
     expect(solRows).toHaveLength(1)
     expect(solRows[0]).not.toContain("→")
@@ -82,7 +81,7 @@ describe("run review TUI", () => {
     const lines = plain(runReviewLines(plan, 100))
 
     expect(lines.some((line) => line.includes("pipeline implement · 3 steps · 2 read-only · 1 manual"))).toBe(true)
-    expect(lines.some((line) => line.includes("parallel · 2 runs · read-only · 2 attempts"))).toBe(true)
+    expect(lines.some((line) => line.includes("parallel · 2 runs · read-only"))).toBe(true)
     expect(lines.some((line) => line.includes("├─ clean-code"))).toBe(true)
     expect(lines.some((line) => line.includes("└─ security"))).toBe(true)
     expect(lines.some((line) => line.includes("approve · manual gate"))).toBe(true)
@@ -93,7 +92,7 @@ describe("run review TUI", () => {
 
     const lines = plain(runReviewLines(plan, 100))
 
-    expect(lines.some((line) => line.includes("security · claude code · read-only · 2 attempts"))).toBe(true)
+    expect(lines.some((line) => line.includes("security · claude code · read-only"))).toBe(true)
     expect(lines.some((line) => line.includes("claude-code/opus"))).toBe(true)
   })
 

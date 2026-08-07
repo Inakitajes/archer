@@ -61,6 +61,7 @@ export type ActionID =
   | "review-continue"
   | "review-open"
   | "review-abort"
+  | "review-retry"
 
 export type Action = {
   id: ActionID
@@ -93,7 +94,9 @@ export type DashboardActionState = {
   fullscreen: boolean
   contentTab: ContentTab
   permissionPending: boolean
-  humanReviewGate?: "interactive" | "review"
+  humanReviewGate?: "interactive" | "failure" | "review"
+  /** Whether a failure gate can offer [r]: true only when a baseline snapshot exists. */
+  reviewCanRetry: boolean
   autoAccept?: AutoAcceptMode
   keepAwake?: KeepAwakeState["status"]
   controlState: RunControlState
@@ -436,7 +439,9 @@ export function dashboardActions(state: DashboardActionState): Action[] {
     {
       id: "review-continue",
       group: "review",
-      available: !state.permissionPending && state.humanReviewGate !== undefined,
+      // [c] is never offered on a failure gate: taking control ([o]) then
+      // continuing at the flipped interactive gate is the only safe way forward.
+      available: !state.permissionPending && state.humanReviewGate !== undefined && state.humanReviewGate !== "failure",
       keys: "c",
       hint: "continue",
       style: "spaced",
@@ -462,6 +467,16 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       style: "spaced",
       help: "abort the run",
       priority: 3,
+    },
+    {
+      id: "review-retry",
+      group: "review",
+      available: !state.permissionPending && state.humanReviewGate === "failure" && state.reviewCanRetry,
+      keys: "r",
+      hint: "retry clean",
+      style: "spaced",
+      help: "retry the step from a clean baseline",
+      priority: 1,
     },
   ]
 }

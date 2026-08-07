@@ -308,7 +308,6 @@ export type AgentStepSpec = {
   advisor?: string | false
   /** Cap on advisor consultations per phase attempt. */
   advisorMaxCalls?: number
-  maxAttempts?: number
   /** Which previous step reports to attach: the nearest group (default), all of them, none, or an explicit list of step names. */
   reports?: "previous" | "all" | "none" | string[]
   /** Attach the cumulative diff against the base branch. Defaults to true except for the first agent step. */
@@ -838,7 +837,6 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
       reportPath: `reports/${name}.md`,
       ...(forced || agent.readOnly ? { readOnly: true } : {}),
       ...(verify ? { verify: true } : {}),
-      ...(spec.maxAttempts !== undefined ? { maxAttempts: spec.maxAttempts } : {}),
     }
     return step
   })

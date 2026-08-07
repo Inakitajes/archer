@@ -36,7 +36,6 @@ test("run review renders untrusted plan fields without terminal or layout inject
     hooks: { pre: [{ command: "bun test\nrm -rf /" }], post: [] },
     attachments: [],
     permissions: "interactive",
-    maxAttempts: 1,
   }
 
   const rendered = renderRunPlan(plan)
@@ -72,7 +71,6 @@ test("review renders the exact target, worktree intent, and routed smart judge",
           inputFiles: ["prd.md"],
           inputDiff: true,
           reportPath: "reports/security.md",
-          maxAttempts: 3,
         },
       ],
     },
@@ -90,7 +88,6 @@ test("review renders the exact target, worktree intent, and routed smart judge",
     hooks: { pre: [{ command: "bun run lint" }], post: [] },
     attachments: ["docs/architecture.md"],
     permissions: "smart",
-    maxAttempts: 2,
   }
 
   const detailed = renderRunPlan(plan)
@@ -138,7 +135,6 @@ test("review renders advised-step coverage in compact mode and the routed adviso
     hooks: { pre: [], post: [] },
     attachments: [],
     permissions: "interactive",
-    maxAttempts: 2,
   }
 
   const detailed = renderRunPlan(plan)
@@ -165,7 +161,6 @@ test("review marks a resume gateway override in every format and shows the confi
     hooks: { pre: [], post: [] },
     attachments: [],
     permissions: "interactive",
-    maxAttempts: 2,
     resume: { runID: "20260720-135802-5bbh", gatewayOverride: { original: "vercel", pending: "openrouter" } },
   }
 
@@ -193,7 +188,6 @@ test("review can expand the complete sanitized prompt for the launcher", () => {
     hooks: { pre: [], post: [] },
     attachments: [],
     permissions: "interactive",
-    maxAttempts: 1,
   }
 
   const excerpt = renderRunPlan(plan)

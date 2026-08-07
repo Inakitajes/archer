@@ -13,7 +13,7 @@ import {
   RunControl,
   SessionAbortedError,
   UserAbortError,
-  waitForInteractiveGate,
+  waitForPhaseGate,
   commitRecoveredPhase,
   createConcurrencyLimiter,
   createGitLock,
@@ -29,10 +29,9 @@ import {
   parseModel,
   planBatches,
   progressPhases,
-  runPhaseWithRetries,
+  runPhaseUntilResolved,
   restorePhaseFromPreviousRun,
   selectInterruptedPhase,
-  shouldRetryAttempt,
   shouldSkip,
   watchSession,
   withReadOnlyRepositoryBoundary,
@@ -119,7 +118,6 @@ describe("runner helpers", () => {
     const wrapped = new SessionAbortedError(error)
     expect(wrapped.name).toBe("SessionAbortedError")
     expect(wrapped.cause).toBe(error)
-    expect(shouldRetryAttempt(wrapped, new AbortController().signal, 1, 2)).toBeTrue()
   })
 
   test("parses provider/model values", () => {
@@ -299,7 +297,8 @@ describe("runner helpers", () => {
       }
       return { dir, runID: "20260101-000000-test" } as Workspace
     }
-    const metadataWith = (snapshot?: ProgressPhaseSnapshot) => ({ snapshot: () => snapshot }) as unknown as RunMetadataStore
+    const metadataWith = (snapshot?: ProgressPhaseSnapshot, status?: "running" | "failed" | "completed") =>
+      ({ snapshot: () => snapshot, phaseStatus: () => status }) as unknown as RunMetadataStore
     const progressSpy = () => {
       const calls: string[] = []
       return {
@@ -332,16 +331,12 @@ describe("runner helpers", () => {
     const legacySpy = progressSpy()
     expect(await restorePhaseFromPreviousRun(legacy, metadataWith(undefined), phase, legacySpy.progress)).toBe(true)
     expect(legacySpy.calls).toEqual(["completed"])
-  })
 
-  test("does not retry after user abort", () => {
-    const controller = new AbortController()
-    expect(shouldRetryAttempt(new Error("temporary"), controller.signal, 1, 2)).toBe(true)
-
-    controller.abort(new UserAbortError())
-    expect(shouldRetryAttempt(new Error("aborted fetch"), controller.signal, 1, 2)).toBe(false)
-    expect(shouldRetryAttempt(new UserAbortError(), new AbortController().signal, 1, 2)).toBe(false)
-    expect(shouldRetryAttempt(new Error("exhausted"), new AbortController().signal, 2, 2)).toBe(false)
+    // A writable phase can write its report before the commit; a crashed process
+    // leaves metadata running, so resume must rerun instead of accepting it.
+    const interrupted = await workspaceWith(true)
+    expect(await restorePhaseFromPreviousRun(interrupted, metadataWith({ status: "completed" }, "running"), phase, noopProgress)).toBe(false)
+    expect(await Bun.file(join(interrupted.dir, "reports", "design.md")).exists()).toBe(false)
   })
 
   test("only the benign SSE abort is ignorable; real faults must surface", () => {
@@ -423,12 +418,11 @@ describe("RunControl", () => {
   })
 })
 
-describe("run phase retries", () => {
+describe("run phase gate", () => {
   const prepared = {
     attachments: [],
     prompt: "test prompt",
     model: { providerID: "openai", modelID: "gpt-5.5" },
-    maxAttempts: 2,
   }
   async function retryWorkspace(): Promise<Workspace> {
     const dir = await mkdtemp(join(tmpdir(), "convoy-retry-"))
@@ -437,7 +431,7 @@ describe("run phase retries", () => {
     return { dir, runID: "20260724-110022-test" }
   }
 
-  test("an armed takeover turns an OpenCode Esc cancellation into one gate without retrying or restoring", async () => {
+  test("an armed takeover turns an OpenCode Esc cancellation into one interactive gate without retrying or restoring", async () => {
     const attempts: number[] = []
     const prompts: HumanReviewPromptInfo[] = []
     let restores = 0
@@ -451,7 +445,7 @@ describe("run phase retries", () => {
       },
     }
 
-    const result = await runPhaseWithRetries(
+    const result = await runPhaseUntilResolved(
       {} as never,
       workspace,
       agentStep("implementer"),
@@ -476,29 +470,81 @@ describe("run phase retries", () => {
     expect(result).toBe("")
     expect(attempts).toEqual([1])
     expect(restores).toBe(0)
-    expect(prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "interactive" }])
+    expect(prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "interactive", error: expect.any(String), canRetry: false }])
   })
 
-  test("a non-abort agent failure restores the baseline and retries normally", async () => {
+  test("a failure does not relaunch on its own, does not restore the baseline, and waits", async () => {
     const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
     let restores = 0
     const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("continue")
+      },
+    }
 
-    const result = await runPhaseWithRetries(
+    const result = await runPhaseUntilResolved(
       {} as never,
       workspace,
       agentStep("implementer"),
       "/repo",
       prepared,
       { head: "baseline" },
-      noopProgress,
+      progress,
       new RunShutdown(),
       createGitLock(),
-      undefined,
+      { serverUrl: "http://127.0.0.1:1" },
       {
         runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
           attempts.push(attempt)
-          if (attempt === 1) throw new Error("provider temporarily unavailable")
+          throw new Error("provider temporarily unavailable")
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    expect(result).toBe("")
+    expect(attempts).toEqual([1])
+    expect(restores).toBe(0)
+    expect(prompts[0]?.kind).toBe("failure")
+    expect(prompts[0]?.canRetry).toBe(true)
+  })
+
+  test("retry restores the baseline and runs the attempt again", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    await mkdir(join(workspace.dir, "reports"))
+    await writeFile(join(workspace.dir, "reports", "implementer.md"), "# stale failed report")
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("retry")
+      },
+    }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      agentStep("implementer"),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          if (attempt === 1) throw new Error("network blip")
           return "# report"
         },
         restorePhaseBaseline: async () => {
@@ -510,6 +556,150 @@ describe("run phase retries", () => {
     expect(result).toBe("# report")
     expect(attempts).toEqual([1, 2])
     expect(restores).toBe(1)
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("failure")
+    expect(prompts[0]?.canRetry).toBe(true)
+    expect(await Bun.file(join(workspace.dir, "reports", "implementer.md")).exists()).toBe(false)
+  })
+
+  test("retry has no ceiling: a step that keeps failing can be retried indefinitely", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        // Retry the first two failures; the third attempt succeeds so no third gate opens.
+        return Promise.resolve(prompts.length <= 2 ? "retry" : "continue")
+      },
+    }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      agentStep("implementer"),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          if (attempt < 3) throw new Error("still failing")
+          return "# report"
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    // The third attempt succeeds and returns its report — no third gate call.
+    expect(result).toBe("# report")
+    expect(attempts).toEqual([1, 2, 3])
+    expect(restores).toBe(2)
+    expect(prompts).toHaveLength(2)
+    expect(prompts.every((p) => p.kind === "failure" && p.canRetry === true)).toBe(true)
+  })
+
+  test("abort throws UserAbortError and requests a run-wide shutdown", async () => {
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: () => Promise.resolve("abort"),
+    }
+
+    const shutdown = new RunShutdown()
+    try {
+      await expect(
+        runPhaseUntilResolved(
+          {} as never,
+          workspace,
+          agentStep("implementer"),
+          "/repo",
+          prepared,
+          { head: "baseline" },
+          progress,
+          shutdown,
+          createGitLock(),
+          { serverUrl: "http://127.0.0.1:1" },
+          {
+            runPhaseAttempt: async () => {
+              throw new Error("provider temporarily unavailable")
+            },
+            restorePhaseBaseline: async () => {},
+          },
+        ),
+      ).rejects.toThrow(UserAbortError)
+      expect(shutdown.aborted).toBe(true)
+    } finally {
+      shutdown.dispose()
+    }
+  })
+
+  test("without a dashboard or TTY the original error propagates", async () => {
+    const workspace = await retryWorkspace()
+
+    await expect(
+      runPhaseUntilResolved(
+        {} as never,
+        workspace,
+        agentStep("implementer"),
+        "/repo",
+        prepared,
+        { head: "baseline" },
+        noopProgress,
+        new RunShutdown(),
+        createGitLock(),
+        { serverUrl: "http://127.0.0.1:1" },
+        {
+          runPhaseAttempt: async () => {
+            throw new Error("network down")
+          },
+          restorePhaseBaseline: async () => {},
+        },
+      ),
+    ).rejects.toThrow("network down")
+  })
+
+  test("without a baseline the failure gate reports canRetry false", async () => {
+    const workspace = await retryWorkspace()
+    const prompts: HumanReviewPromptInfo[] = []
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("abort")
+      },
+    }
+
+    await expect(
+      runPhaseUntilResolved(
+        {} as never,
+        workspace,
+        agentStep("implementer"),
+        "/repo",
+        prepared,
+        undefined,
+        progress,
+        new RunShutdown(),
+        createGitLock(),
+        { serverUrl: "http://127.0.0.1:1" },
+        {
+          runPhaseAttempt: async () => {
+            throw new Error("boom")
+          },
+          restorePhaseBaseline: async () => {},
+        },
+      ),
+    ).rejects.toThrow(UserAbortError)
+    expect(prompts[0]?.kind).toBe("failure")
+    expect(prompts[0]?.canRetry).toBe(false)
   })
 })
 
@@ -972,7 +1162,7 @@ describe("dirty-tree recovery", () => {
   })
 })
 
-describe("waitForInteractiveGate", () => {
+describe("waitForPhaseGate", () => {
   function gateProgress(actions: HumanReviewAction[]) {
     const calls = { prompts: [] as HumanReviewPromptInfo[], activities: [] as string[] }
     const progress: ProgressUI = {
@@ -988,22 +1178,31 @@ describe("waitForInteractiveGate", () => {
 
   function trackedPermissions() {
     const events: string[] = []
+    const pauseCalls: (string | undefined)[] = []
+    const resumeCalls: (string | undefined)[] = []
     const permissions = {
       stop: async () => {},
-      pause: () => void events.push("pause"),
-      resume: () => void events.push("resume"),
+      pause: (sessionID?: string) => {
+        pauseCalls.push(sessionID)
+        events.push("pause")
+      },
+      resume: (sessionID?: string) => {
+        resumeCalls.push(sessionID)
+        events.push("resume")
+      },
     }
-    return { events, permissions }
+    return { events, permissions, pauseCalls, resumeCalls }
   }
 
-  test("continue resolves the gate and pauses permissions only while waiting", async () => {
+  test("continue resolves the interactive gate and pauses permissions only while waiting", async () => {
     const { calls, progress } = gateProgress(["continue"])
     const { events, permissions } = trackedPermissions()
 
-    await waitForInteractiveGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress)
+    const outcome = await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "interactive", canRetry: false })
 
+    expect(outcome).toBe("continue")
     expect(events).toEqual(["pause", "resume"])
-    expect(calls.prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "interactive" }])
+    expect(calls.prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "interactive", canRetry: false }])
   })
 
   test("iterate reopens the phase session window, then waits again", async () => {
@@ -1011,7 +1210,7 @@ describe("waitForInteractiveGate", () => {
     const { permissions } = trackedPermissions()
     const opened: unknown[] = []
 
-    await waitForInteractiveGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+    await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "interactive", canRetry: false }, {
       openWindow: async (input) => {
         opened.push(input)
         return "terminal"
@@ -1027,7 +1226,7 @@ describe("waitForInteractiveGate", () => {
     const { calls, progress } = gateProgress(["iterate", "continue"])
     const { events, permissions } = trackedPermissions()
 
-    await waitForInteractiveGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+    await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "interactive", canRetry: false }, {
       openWindow: async () => {
         throw new Error("no window backend")
       },
@@ -1042,16 +1241,208 @@ describe("waitForInteractiveGate", () => {
     const { events, permissions } = trackedPermissions()
 
     await expect(
-      waitForInteractiveGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress),
+      waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "interactive", canRetry: false }),
     ).rejects.toBeInstanceOf(UserAbortError)
     expect(events).toEqual(["pause", "resume"])
   })
 
-  test("without a dashboard gate the wait is a no-op", async () => {
+  test("a failure gate reports the error and canRetry, and pauses no permissions", async () => {
+    const { calls, progress } = gateProgress(["abort"])
     const { events, permissions } = trackedPermissions()
 
-    await waitForInteractiveGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, noopProgress)
+    await expect(
+      waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+        kind: "failure",
+        error: "network down",
+        canRetry: true,
+      }),
+    ).rejects.toBeInstanceOf(UserAbortError)
+    expect(events).toEqual([])
+    expect(calls.prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "failure", error: "network down", canRetry: true }])
+  })
 
+  test("retry on a failure gate returns the retry outcome without restoring", async () => {
+    const { calls, progress } = gateProgress(["retry"])
+    const { events, permissions } = trackedPermissions()
+
+    const outcome = await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+      kind: "failure",
+      error: "network down",
+      canRetry: true,
+    })
+
+    expect(outcome).toBe("retry")
+    // No permission pause in failure mode, and retry returns before the flip.
+    expect(events).toEqual([])
+    expect(calls.prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "failure", error: "network down", canRetry: true }])
+  })
+
+  test("iterate flips a failure gate to interactive, unlocking [c] and pausing permissions", async () => {
+    const { calls, progress } = gateProgress(["iterate", "continue"])
+    const { events, permissions } = trackedPermissions()
+
+    const outcome = await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+      kind: "failure",
+      error: "network down",
+      canRetry: true,
+    }, {
+      openWindow: async () => "terminal",
+    })
+
+    expect(outcome).toBe("continue")
+    // Failure mode starts without pausing; the flip to interactive pauses, and
+    // the final continue resumes — so the full lifecycle is pause→resume.
+    expect(events).toEqual(["pause", "resume"])
+    // First prompt is failure with canRetry; after iterate the gate flips to
+    // interactive, so the second prompt has canRetry false and kind interactive.
+    expect(calls.prompts).toHaveLength(2)
+    expect(calls.prompts[0]).toMatchObject({ kind: "failure", canRetry: true, iterations: 0 })
+    expect(calls.prompts[1]).toMatchObject({ kind: "interactive", canRetry: false, iterations: 1 })
+  })
+
+  test("a failed session open keeps the gate in failure mode, with retry still available", async () => {
+    const { calls, progress } = gateProgress(["iterate", "abort"])
+    const { events, permissions } = trackedPermissions()
+
+    await expect(
+      waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "failure", canRetry: true }, {
+        openWindow: async () => {
+          throw new Error("no window backend")
+        },
+      }),
+    ).rejects.toBeInstanceOf(UserAbortError)
+
+    expect(events).toEqual([])
+    expect(calls.prompts.map((prompt) => ({ kind: prompt.kind, canRetry: prompt.canRetry }))).toEqual([
+      { kind: "failure", canRetry: true },
+      { kind: "failure", canRetry: true },
+    ])
+  })
+
+  test("a missing session keeps the failure gate from unlocking continue", async () => {
+    const { calls, progress } = gateProgress(["iterate", "abort"])
+    const { events, permissions } = trackedPermissions()
+
+    await expect(
+      waitForPhaseGate("implementer", "/repo", undefined, { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "failure", canRetry: true }),
+    ).rejects.toBeInstanceOf(UserAbortError)
+
+    expect(events).toEqual([])
+    expect(calls.prompts.map((prompt) => prompt.kind)).toEqual(["failure", "failure"])
+  })
+
+  test("a Claude Code failure reopens its transcript through the Claude CLI", async () => {
+    const { calls, progress } = gateProgress(["iterate", "continue"])
+    const opened: unknown[] = []
+
+    await waitForPhaseGate("security", "/repo", "claude-session", { serverUrl: "http://127.0.0.1:1" }, progress, {
+      kind: "failure",
+      canRetry: true,
+      runner: "claude-code",
+      runDir: "/run",
+    }, {
+      openWindow: async () => {
+        throw new Error("OpenCode opener should not be used for Claude")
+      },
+      openClaudeWindow: async (input) => {
+        opened.push(input)
+        return "terminal"
+      },
+    })
+
+    expect(opened).toEqual([{ targetDir: "/repo", sessionID: "claude-session", runDir: "/run" }])
+    expect(calls.prompts.map((prompt) => prompt.kind)).toEqual(["failure", "interactive"])
+  })
+
+  test("pauses only the phase's session so a live sibling keeps being handled", async () => {
+    const { progress } = gateProgress(["continue"])
+    const { events, permissions, pauseCalls, resumeCalls } = trackedPermissions()
+
+    await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "interactive", canRetry: false })
+
+    // A directory-wide pause would freeze a live sibling's prompts; the gate
+    // scopes the pause to the session the interactive TUI owns instead.
+    expect(events).toEqual(["pause", "resume"])
+    expect(pauseCalls).toEqual(["ses_1"])
+    expect(resumeCalls).toEqual(["ses_1"])
+  })
+
+  test("a failure gate that reopens the session pauses only that session", async () => {
+    const { progress } = gateProgress(["iterate", "continue"])
+    const { permissions, pauseCalls, resumeCalls } = trackedPermissions()
+
+    await waitForPhaseGate(
+      "implementer",
+      "/repo",
+      "ses_1",
+      { serverUrl: "http://127.0.0.1:1", permissions },
+      progress,
+      { kind: "failure", error: "network down", canRetry: true },
+      { openWindow: async () => "terminal" },
+    )
+
+    expect(pauseCalls).toEqual(["ses_1"])
+    expect(resumeCalls).toEqual(["ses_1"])
+  })
+
+  test("an interactive gate with no session pauses nothing, so siblings keep being handled", async () => {
+    const { progress } = gateProgress(["continue"])
+    const { permissions, pauseCalls, resumeCalls } = trackedPermissions()
+
+    await waitForPhaseGate("implementer", "/repo", undefined, { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "interactive", canRetry: false })
+
+    // No session to hand to an interactive TUI means no session to pause for, so
+    // Convoy must keep handling every live sibling's permission prompts.
+    expect(pauseCalls).toEqual([])
+    expect(resumeCalls).toEqual([])
+  })
+
+  test("a failed window reopen pauses nothing until a real session opens", async () => {
+    const { progress } = gateProgress(["iterate", "abort"])
+    const { permissions, pauseCalls } = trackedPermissions()
+
+    await expect(
+      waitForPhaseGate(
+        "implementer",
+        "/repo",
+        "ses_1",
+        { serverUrl: "http://127.0.0.1:1", permissions },
+        progress,
+        { kind: "failure", error: "network down", canRetry: true },
+        { openWindow: async () => { throw new Error("no window backend") } },
+      ),
+    ).rejects.toBeInstanceOf(UserAbortError)
+
+    // The failure gate starts without pausing, and a failed reopen must not
+    // flip to interactive (and so pause) — only a successfully opened session proves the user took control.
+    expect(pauseCalls).toEqual([])
+  })
+
+  test("a run-wide shutdown resolves a dashboard gate without waiting for input", async () => {
+    const controller = new AbortController()
+    const { events, permissions } = trackedPermissions()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: () => new Promise<HumanReviewAction>(() => {}),
+    }
+
+    const waiting = waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+      kind: "interactive",
+      canRetry: false,
+      signal: controller.signal,
+    })
+    controller.abort(new UserAbortError("test shutdown"))
+
+    await expect(waiting).rejects.toThrow("test shutdown")
+    expect(events).toEqual(["pause", "resume"])
+  })
+
+  test("without a dashboard gate or TTY the wait is unavailable", async () => {
+    const { events, permissions } = trackedPermissions()
+
+    const outcome = await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, noopProgress, { kind: "failure", canRetry: true })
+
+    expect(outcome).toBe("unavailable")
     expect(events).toEqual([])
   })
 })

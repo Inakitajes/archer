@@ -53,7 +53,6 @@ export type ConvoyConfig = {
 
 export type ConvoyDefaults = {
   model?: string
-  maxAttempts?: number
   /** Cap on agents running concurrently within a group; unset means the built-in default. */
   maxConcurrentAgents?: number
   baseRef?: string
@@ -253,7 +252,6 @@ version: 1
 
 defaults:
   # model: openai/gpt-5.6-terra#xhigh # optional: uncomment to force every agent unless a step/agent overrides it
-  # maxAttempts: 2
   # maxConcurrentAgents: 30 # optional: cap agents running at once within a parallel group
   # baseRef: main # optional: when unset, convoy auto-detects (origin default branch, else main/master/develop/trunk, else current branch)
   # pipeline: implement
@@ -544,10 +542,21 @@ function mergeRoutingOverrides(global: ModelRoutingOverrides, project: ModelRout
   return result
 }
 
+/** Warns once (not per parse) that a legacy maxAttempts key is being ignored. */
+let warnedIgnoredMaxAttempts = false
+function warnIgnoredMaxAttempts() {
+  if (warnedIgnoredMaxAttempts) return
+  warnedIgnoredMaxAttempts = true
+  log.warn("maxAttempts is no longer used; a failed step now waits for your decision")
+}
+
 function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
   const record = v.record(raw, "defaults")
   v.knownKeys(record, "defaults", [
     "model",
+    // Accepted so a legacy config that still sets it parses, then warned about
+    // and ignored: a failed step now waits for the user's decision, so there is
+    // no per-step attempt cap to configure.
     "maxAttempts",
     "maxConcurrentAgents",
     "baseRef",
@@ -563,7 +572,7 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
 
   const defaults: ConvoyDefaults = {}
   if (record.model !== undefined) defaults.model = v.model(record.model, "defaults.model")
-  if (record.maxAttempts !== undefined) defaults.maxAttempts = v.positiveInt(record.maxAttempts, "defaults.maxAttempts")
+  if (record.maxAttempts !== undefined) warnIgnoredMaxAttempts()
   if (record.maxConcurrentAgents !== undefined) defaults.maxConcurrentAgents = v.positiveInt(record.maxConcurrentAgents, "defaults.maxConcurrentAgents")
   if (record.baseRef !== undefined) defaults.baseRef = v.nonEmptyString(record.baseRef, "defaults.baseRef")
   if (record.pipeline !== undefined) defaults.pipeline = v.nonEmptyString(record.pipeline, "defaults.pipeline")
@@ -694,6 +703,8 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
       ? undefined
       : validateStepRunnerModel(v, runner ?? "opencode", record.model, `${path}.model`)
 
+  if (record.maxAttempts !== undefined) warnIgnoredMaxAttempts()
+
   return {
     agent,
     ...(record.name !== undefined ? { name: validateStepName(v, record.name, `${path}.name`) } : {}),
@@ -702,7 +713,6 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
     ...(runner !== undefined ? { runner } : {}),
     ...(advisor !== undefined ? { advisor } : {}),
     ...(record.advisorMaxCalls !== undefined ? { advisorMaxCalls: v.positiveInt(record.advisorMaxCalls, `${path}.advisorMaxCalls`) } : {}),
-    ...(record.maxAttempts !== undefined ? { maxAttempts: v.positiveInt(record.maxAttempts, `${path}.maxAttempts`) } : {}),
     ...(record.reports !== undefined ? { reports: validateReports(v, record.reports, `${path}.reports`) } : {}),
     ...(record.diff !== undefined ? { diff: v.boolean(record.diff, `${path}.diff`) } : {}),
   }
@@ -915,7 +925,7 @@ export async function writeConvoyConfig(path: string, config: ConvoyConfig, targ
 export function defaultConfigTemplate(): ConvoyConfig {
   const globalModel = `${defaultGptModel}#${defaultGptVariant}`
   return {
-    defaults: { model: globalModel, maxAttempts: 2 },
+    defaults: { model: globalModel },
     agents: {},
     pipelines: { implement: materializePipelineSpec(builtInPipelines[defaultPipelineName]!, globalModel) },
     permissions: { allow: [], deny: [] },

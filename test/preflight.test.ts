@@ -37,7 +37,6 @@ function plan(): RunPlan {
     hooks: { pre: [], post: [] },
     attachments: [],
     permissions: "interactive",
-    maxAttempts: 2,
   }
 }
 

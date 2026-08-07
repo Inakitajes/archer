@@ -43,7 +43,6 @@ export type ProgressStepUsage = ProgressUsage & {
 
 export type ProgressAttempt = {
   attempt: number
-  maxAttempts: number
   model?: string
 }
 
@@ -125,13 +124,17 @@ export type PermissionPromptInfo = {
   judgeReason?: string
 }
 
-export type HumanReviewAction = "continue" | "iterate" | "abort"
+export type HumanReviewAction = "continue" | "iterate" | "abort" | "retry"
 
 export type HumanReviewPromptInfo = {
   stepName: string
   iterations: number
-  /** "interactive" marks the mid-step takeover gate (armed with [i]); absent for pipeline human steps. */
-  kind?: "interactive"
+  /** Gate mode. "interactive" is the mid-step takeover gate (armed with [i]); "failure" is a failed step waiting for a decision; absent for pipeline human steps. */
+  kind?: "interactive" | "failure"
+  /** The SDK error a failed step surfaced, shown in the dashboard instead of a generic label. */
+  error?: string
+  /** Whether [r] (retry clean) is offered: true only for a failure gate with a baseline snapshot. */
+  canRetry?: boolean
 }
 
 export type RunOutcome = {
@@ -246,7 +249,7 @@ export type ProgressUI = {
   askPermission?(info: PermissionPromptInfo): Promise<PermissionReply>
   /** When present, the UI keeps manual review gates inside the dashboard. */
   askHumanReview?(info: HumanReviewPromptInfo): Promise<HumanReviewAction>
-  /** True while the user has armed interactive takeover ([i]) for this phase: the runner must not retry, restore, or complete it without asking. */
+  /** True while the user has armed interactive takeover ([i]) for this phase: the runner holds a successful finish on the gate. */
   isInteractiveTakeover?(name: string): boolean
   /** Holds the dashboard open on a finish screen (phase browser) and resolves when the user dismisses it. */
   runFinished?(outcome: RunOutcome): Promise<void>
