@@ -631,13 +631,14 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
   for (const [name, value] of Object.entries(record)) {
     const path = `pipelines.${name}`
     const entry = v.record(value, path)
-    v.knownKeys(entry, path, ["description", "steps"])
+    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "steps"])
 
     if (!Array.isArray(entry.steps) || entry.steps.length === 0) v.fail(`${path}.steps`, "must be a non-empty list of steps")
     const steps = (entry.steps as unknown[]).map((step, index) => validateStep(v, step, `${path}.steps[${index}]`))
 
     pipelines[name] = {
       ...(entry.description !== undefined ? { description: v.nonEmptyString(entry.description, `${path}.description`) } : {}),
+      ...(entry.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: v.positiveInt(entry.maxConcurrentAgents, `${path}.maxConcurrentAgents`) } : {}),
       steps,
     }
   }

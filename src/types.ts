@@ -177,6 +177,8 @@ export type Step = AgentStep | HumanStep
 export type Pipeline = {
   name: string
   description?: string
+  /** Per-pipeline cap on concurrent agents within a group; unset inherits the defaults/CLI chain. */
+  maxConcurrentAgents?: number
   steps: Step[]
 }
 
