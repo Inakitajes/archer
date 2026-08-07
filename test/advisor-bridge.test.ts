@@ -182,7 +182,7 @@ describe("advisor bridge server", () => {
 describe("advisor tool file", () => {
   test("is written with restrictive permissions and no imports, so it survives a failed dep install", async () => {
     const dir = await scratch()
-    const path = await installAdvisorTool(dir)
+    const path = await installAdvisorTool({ dir })
 
     const source = await readFile(path, "utf8")
     expect(path).toBe(join(dir, "tools", "advisor.ts"))
@@ -233,15 +233,15 @@ describe("advisor tool file", () => {
 
   test("rewrites only when the content changed, so OpenCode's watcher isn't churned", async () => {
     const dir = await scratch()
-    const path = await installAdvisorTool(dir)
+    const path = await installAdvisorTool({ dir })
     const first = (await stat(path)).mtimeMs
 
     await new Promise((resolve) => setTimeout(resolve, 20))
-    await installAdvisorTool(dir)
+    await installAdvisorTool({ dir })
     expect((await stat(path)).mtimeMs).toBe(first)
 
     await writeFile(path, "// stale shim from an older Convoy\n")
-    await installAdvisorTool(dir)
+    await installAdvisorTool({ dir })
     expect(await readFile(path, "utf8")).toBe(advisorToolFileSource)
   })
 })

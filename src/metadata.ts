@@ -207,15 +207,15 @@ export async function openRunMetadata(
       data.server = { url, pid: process.pid, startedAt: Date.now() }
       void persist()
     },
-    serverStopped() {
+    async serverStopped() {
       data.server = undefined
-      void persist()
+      await persist({ throwOnError: true })
     },
-    phaseStarted(name) {
+    async phaseStarted(name) {
       const entry = phase(name)
       entry.status = "running"
       entry.startedAt ??= Date.now()
-      void persist()
+      await persist({ throwOnError: true })
     },
     phaseSession(name, sessionID) {
       phase(name).sessionID = sessionID
@@ -247,12 +247,12 @@ export async function openRunMetadata(
       phase(name).repositoryBaseline = baseline
       await persist({ throwOnError: true })
     },
-    phaseEnded(name, status) {
+    async phaseEnded(name, status) {
       const entry = phase(name)
       entry.status = status
       entry.endedAt = Date.now()
       if (entry.startedAt !== undefined) entry.durationMs = entry.endedAt - entry.startedAt
-      void persist()
+      await persist({ throwOnError: true })
     },
     controlState() {
       return data.control.state
