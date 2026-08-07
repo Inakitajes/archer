@@ -58,6 +58,8 @@ export type ActionID =
   | "permission-reject"
   | "permission-escape"
   | "permission-auto-accept"
+  | "permission-inspect"
+  | "permission-explain"
   | "review-continue"
   | "review-open"
   | "review-abort"
@@ -379,6 +381,26 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       hint: "confirm",
       style: "spaced",
       help: "send the selected answer",
+      priority: 3,
+    },
+    {
+      id: "permission-inspect",
+      group: "permissions",
+      available: state.permissionPending,
+      keys: "i",
+      hint: "nspect",
+      style: "glued",
+      help: "open the opencode session that asked",
+      priority: 3,
+    },
+    {
+      id: "permission-explain",
+      group: "permissions",
+      available: state.permissionPending,
+      keys: "e",
+      hint: "xplain",
+      style: "glued",
+      help: "ask the safety judge why",
       priority: 3,
     },
     {

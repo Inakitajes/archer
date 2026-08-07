@@ -122,6 +122,12 @@ export type PermissionPromptInfo = {
   sessionID?: string
   /** Present when smart auto-accept's judge escalated this request; explains why. */
   judgeReason?: string
+  /**
+   * Asks the judge for a prose explanation of this request ([e] in the dashboard).
+   * Provided by the gate, which holds the opencode client and the judge model;
+   * absent when there is no judge to ask.
+   */
+  explain?(signal?: AbortSignal): Promise<string>
 }
 
 export type HumanReviewAction = "continue" | "iterate" | "abort" | "retry"

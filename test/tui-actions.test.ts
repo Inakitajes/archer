@@ -136,6 +136,8 @@ describe("dashboard action registry", () => {
     expect(footer({ permissionPending: true })).toEqual([
       "permission-choose",
       "permission-confirm",
+      "permission-inspect",
+      "permission-explain",
       "permission-once",
       "permission-always",
       "permission-reject",
@@ -150,6 +152,8 @@ describe("dashboard action registry", () => {
     expect(footer({ permissionPending: true, humanReviewGate: "review" })).toEqual([
       "permission-choose",
       "permission-confirm",
+      "permission-inspect",
+      "permission-explain",
       "permission-once",
       "permission-always",
       "permission-reject",

@@ -14,6 +14,8 @@ type GateHarness = {
   progress: ProgressUI
   replies: ReplyCall[]
   asked: PermissionPromptInfo[]
+  /** The text of every judge prompt the fake client received, in order. */
+  prompts: string[]
 }
 
 const askedRequest = {
@@ -32,6 +34,7 @@ const askedRequest = {
 function harness(opts: { judgeAnswer?: string; askReply?: PermissionReply; permission?: string }): GateHarness {
   const replies: ReplyCall[] = []
   const asked: PermissionPromptInfo[] = []
+  const prompts: string[] = []
   let delivered = false
   const request = { ...askedRequest, ...(opts.permission ? { permission: opts.permission, patterns: [opts.permission] } : {}) }
 
@@ -54,7 +57,10 @@ function harness(opts: { judgeAnswer?: string; askReply?: PermissionReply; permi
     },
     session: {
       create: async () => ({ data: { id: "judge-session" }, error: undefined }),
-      prompt: async () => ({ data: { info: {}, parts: [{ type: "text", text: opts.judgeAnswer ?? "" }] }, error: undefined }),
+      prompt: async ({ parts }: { parts: Array<{ type: string; text?: string }> }) => {
+        prompts.push(parts.find((p) => p.type === "text")?.text ?? "")
+        return { data: { info: {}, parts: [{ type: "text", text: opts.judgeAnswer ?? "" }] }, error: undefined }
+      },
       delete: async () => ({ data: undefined, error: undefined }),
     },
   } as unknown as OpencodeClient
@@ -67,7 +73,7 @@ function harness(opts: { judgeAnswer?: string; askReply?: PermissionReply; permi
     },
   }
 
-  return { client, progress, replies, asked }
+  return { client, progress, replies, asked, prompts }
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000) {
@@ -137,6 +143,78 @@ describe("permission gate auto-accept modes", () => {
     const { asked } = await drive({ mode: "smart", judgeAnswer: "not json", askReply: "reject" })
     expect(asked).toHaveLength(1)
     expect(asked[0]?.judgeReason).toBeDefined()
+  })
+})
+
+describe("permission gate explain callback", () => {
+  test("the PermissionPromptInfo carries explain when a judge model is configured", async () => {
+    const { asked } = await drive({ mode: "smart", judgeAnswer: '{"safe": false, "reason": "deletes files"}', askReply: "reject" })
+    expect(asked).toHaveLength(1)
+    expect(typeof asked[0]?.explain).toBe("function")
+  })
+
+  test("without a judge model the info has no explain callback", async () => {
+    const h = harness({ askReply: "reject" })
+    const gate = startPermissionGate({
+      client: h.client,
+      progress: h.progress,
+      interactive: true,
+      directory: "/tmp",
+      autoAccept: { mode: "off" },
+    })
+    try {
+      await waitFor(() => h.replies.length > 0)
+    } finally {
+      await gate.stop()
+    }
+    expect(h.asked[0]?.explain).toBeUndefined()
+  })
+
+  test("calling explain() reaches the judge with the verdictReason", async () => {
+    const h = harness({ judgeAnswer: '{"safe": false, "reason": "dangerous command"}', askReply: "reject" })
+    const gate = startPermissionGate({
+      client: h.client,
+      progress: h.progress,
+      interactive: true,
+      directory: "/tmp",
+      autoAccept: { mode: "smart" },
+      judgeModel: { providerID: "openai", modelID: "gpt-5.5" },
+    })
+    try {
+      await waitFor(() => h.asked.length > 0)
+    } finally {
+      await gate.stop()
+    }
+    const info = h.asked[0]!
+    expect(typeof info.explain).toBe("function")
+    const text = await info.explain!()
+    expect(text).toBeTruthy()
+    // The judgeCommand prompt text (prompts[0]) is the plain request without
+    // verdictReason, while the explain call (prompts[1]) includes it.
+    expect(h.prompts[0]).not.toContain("previously escalated")
+    expect(h.prompts[1]).toContain("dangerous command")
+  })
+
+  test("the JudgeRequest that goes to judgeCommand is the plain promptInfo without callbacks", async () => {
+    const h = harness({ judgeAnswer: '{"safe": false, "reason": "risky"}', askReply: "reject" })
+    const gate = startPermissionGate({
+      client: h.client,
+      progress: h.progress,
+      interactive: true,
+      directory: "/tmp",
+      autoAccept: { mode: "smart" },
+      judgeModel: { providerID: "openai", modelID: "gpt-5.5" },
+    })
+    try {
+      await waitFor(() => h.asked.length > 0)
+    } finally {
+      await gate.stop()
+    }
+    // The judgeCommand prompt (prompts[0]) is the rendered request text:
+    // it should not contain any explain-related content.
+    expect(h.prompts[0]).toContain("category: bash")
+    expect(h.prompts[0]).toContain("command: ls -la")
+    expect(h.prompts[0]).toContain("Is it safe to auto-approve")
   })
 })
 

@@ -293,9 +293,20 @@ const transcriptCap = 24_000
 // memoize their wrapped lines.
 const animationTickMs = 80
 
+type PermissionExplainState =
+  | { status: "loading" }
+  | { status: "ready"; lines: string[]; scroll: number }
+  | { status: "error"; message: string }
+
 type PendingPermission = {
   info: PermissionPromptInfo
   resolve: (reply: PermissionReply) => void
+  /** State of [e]; absent until the user requests it. */
+  explain?: PermissionExplainState
+  /** Aborts an in-flight explanation when the request is answered or the queue is drained. */
+  explainAbort?: AbortController
+  /** Result of [i], for in-modal feedback (the feed is hidden behind the overlay). */
+  inspect?: { backend?: SessionWindowBackend; error?: string }
 }
 
 type PendingHumanReview = {
@@ -1384,7 +1395,10 @@ export class TuiProgress implements ProgressUI {
         this.manualFocus = true
       }
       this.resetContentScroll()
-      for (const pending of this.permissionQueue.splice(0)) pending.resolve("reject")
+      for (const pending of this.permissionQueue.splice(0)) {
+        pending.explainAbort?.abort()
+        pending.resolve("reject")
+      }
       this.addEvent(
         "convoy",
         outcome.status === "completed" ? "system" : "error",
@@ -1636,7 +1650,10 @@ export class TuiProgress implements ProgressUI {
     // up; resolving here keeps that promise from leaking.
     this.finished?.resolve()
     for (const pending of this.humanReviewQueue.splice(0)) pending.resolve("abort")
-    for (const pending of this.permissionQueue.splice(0)) pending.resolve("reject")
+    for (const pending of this.permissionQueue.splice(0)) {
+      pending.explainAbort?.abort()
+      pending.resolve("reject")
+    }
     if (this.renderer.isDestroyed) return
     this.renderer.destroy()
   }
@@ -2104,7 +2121,100 @@ export class TuiProgress implements ProgressUI {
       case "escape":
         this.resolvePermission("reject")
         break
+      case "e":
+        this.requestPermissionExplain()
+        break
+      case "i":
+        this.openPermissionSessionWindow()
+        break
+      case "up":
+      case "k":
+        this.scrollPermissionExplain(-1)
+        break
+      case "down":
+      case "j":
+        this.scrollPermissionExplain(1)
+        break
     }
+    this.render()
+  }
+
+  /**
+   * The [e] deep-explain: asks the judge for a prose explanation of the head
+   * request and paints it inside the modal. o/a/r keep working while loading.
+   */
+  private requestPermissionExplain() {
+    const pending = this.permissionQueue[0]
+    if (!pending) return
+    const explain = pending.info.explain
+    if (!explain) {
+      this.addEvent("convoy", "permission", "no safety judge configured to explain this")
+      this.render()
+      return
+    }
+    if (pending.explain?.status === "loading") return
+    const controller = new AbortController()
+    pending.explainAbort = controller
+    pending.explain = { status: "loading" }
+    this.addEvent("convoy", "permission", "asking the safety judge to explain")
+    this.render()
+    explain(controller.signal)
+      .then((text) => {
+        // The user may have answered while the judge was thinking; the modal
+        // renders the head of the queue, so drop a stale result by identity.
+        if (this.permissionQueue[0] !== pending) return
+        pending.explain = { status: "ready", lines: wrapLines(text.split("\n"), permissionModalWidth(this.renderer.width) - 6), scroll: 0 }
+        this.render()
+      })
+      .catch((error: unknown) => {
+        if (this.permissionQueue[0] !== pending) return
+        if (controller.signal.aborted) return
+        pending.explain = { status: "error", message: error instanceof Error ? error.message : String(error) }
+        this.render()
+      })
+  }
+
+  private scrollPermissionExplain(delta: number) {
+    const pending = this.permissionQueue[0]
+    if (pending?.explain?.status !== "ready") return
+    const lines = pending.explain.lines
+    const maxRows = permissionExplainMaxRows(this.renderer.height)
+    const maxScroll = Math.max(0, lines.length - maxRows)
+    pending.explain = { status: "ready", lines, scroll: Math.max(0, Math.min(pending.explain.scroll + delta, maxScroll)) }
+  }
+
+  /**
+   * The [i] inspect: opens the opencode session that asked for this permission
+   * in a new window. The attached window sees the same pending request and can
+   * answer it; whichever reply lands first wins, the other fails and is logged
+   * by the existing error branch in `reply()` (src/permissions.ts). The gate
+   * must NOT be paused: the request is already being held, and pause() only
+   * affects requests that arrive afterwards.
+   */
+  private openPermissionSessionWindow() {
+    const pending = this.permissionQueue[0]
+    if (!pending) return
+    if (!pending.info.sessionID) {
+      pending.inspect = { error: "this request has no session to inspect" }
+      this.render()
+      return
+    }
+    if (!this.serverUrl) {
+      pending.inspect = { error: "no live opencode server to attach to" }
+      this.render()
+      return
+    }
+    const targetDir = this.targetDir || process.cwd()
+    this.addEvent("convoy", "permission", `[i]: opening session ${shortID(pending.info.sessionID)}`)
+    openOpencodeSessionWindow({ url: this.serverUrl, targetDir, sessionID: pending.info.sessionID })
+      .then((backend) => {
+        pending.inspect = { backend }
+        this.render()
+      })
+      .catch((error: unknown) => {
+        pending.inspect = { error: error instanceof Error ? error.message : String(error) }
+        this.render()
+      })
     this.render()
   }
 
@@ -2118,6 +2228,7 @@ export class TuiProgress implements ProgressUI {
     // prompts for the user (re-judging an open prompt would be surprising).
     if (next === "all") {
       for (const pending of this.permissionQueue.splice(0)) {
+        pending.explainAbort?.abort()
         this.addEvent("convoy", "permission", `auto-allowed: ${permissionSummary(pending.info)}`)
         pending.resolve("once")
       }
@@ -2129,6 +2240,7 @@ export class TuiProgress implements ProgressUI {
   private resolvePermission(reply: PermissionReply) {
     const pending = this.permissionQueue.shift()
     if (!pending) return
+    pending.explainAbort?.abort()
     this.permissionChoice = 0
     const verdict = reply === "once" ? "allowed once" : reply === "always" ? "always allowed" : "rejected"
     this.addEvent("convoy", "permission", `${verdict}: ${permissionSummary(pending.info)}`)
@@ -2401,6 +2513,7 @@ export class TuiProgress implements ProgressUI {
     // its spinner covers the message-writing call and the signing commit.
     if (this.finishModal?.kind === "working") return true
     if (this.finished) return false
+    if (this.permissionQueue[0]?.explain?.status === "loading") return true
     return this.phases.some((phase) => phase.status === "running")
   }
 
@@ -3462,7 +3575,7 @@ export class TuiProgress implements ProgressUI {
     this.overlay.visible = true
     this.modal.title = " ⚿ permission required "
 
-    const boxWidth = Math.max(44, Math.min(68, this.renderer.width - 8))
+    const boxWidth = permissionModalWidth(this.renderer.width)
     const width = boxWidth - 6
     const info = pending.info
     const lines: StyledText[] = []
@@ -3479,6 +3592,39 @@ export class TuiProgress implements ProgressUI {
     if (info.description) lines.push(t`${fg(theme.faint)(truncate(info.description, width))}`)
     if (info.judgeReason) lines.push(new StyledText([fg(theme.yellow)("⚠ "), fg(theme.yellow)(truncate(info.judgeReason, width - 2))]))
     if (info.sessionID) lines.push(t`${fg(theme.faint)(`session ${shortID(info.sessionID)}`)}`)
+
+    // [e] explain section: loading spinner, ready text, or error
+    const explain = pending.explain
+    if (explain) {
+      if (explain.status === "loading") {
+        lines.push(plain(""))
+        lines.push(new StyledText([fg(theme.accent)(spinnerFrame(Date.now())), fg(theme.dim)(" judge  thinking…")]))
+      } else if (explain.status === "ready") {
+        lines.push(plain(""))
+        const maxRows = permissionExplainMaxRows(this.renderer.height)
+        const visible = explain.lines.slice(explain.scroll, explain.scroll + maxRows)
+        for (const line of visible) {
+          lines.push(t`${fg(theme.dim)(line)}`)
+        }
+        if (explain.lines.length > maxRows) {
+          lines.push(plain(""), t`${fg(theme.dim)(`↑↓ scroll  (${explain.scroll + 1}–${Math.min(explain.scroll + maxRows, explain.lines.length)} of ${explain.lines.length})`)}`)
+        }
+      } else if (explain.status === "error") {
+        lines.push(plain(""))
+        lines.push(t`${fg(theme.yellow)(explain.message)}`)
+      }
+    }
+
+    // [i] inspect feedback line
+    if (pending.inspect) {
+      lines.push(plain(""))
+      if (pending.inspect.backend) {
+        lines.push(t`${fg(theme.faint)(`inspect  opened in ${pending.inspect.backend}`)}`)
+      } else if (pending.inspect.error) {
+        lines.push(t`${fg(theme.yellow)(`inspect  ${pending.inspect.error}`)}`)
+      }
+    }
+
     lines.push(plain(""))
 
     const buttons: TextChunk[] = []
@@ -4053,4 +4199,14 @@ async function fileReadable(path: string) {
   } catch {
     return false
   }
+}
+
+/** The box width for the permission modal, matching the extraction in renderPermissionModal. */
+function permissionModalWidth(rendererWidth: number): number {
+  return Math.max(44, Math.min(68, rendererWidth - 8))
+}
+
+/** Max rows of explain text visible in the permission modal. */
+function permissionExplainMaxRows(rendererHeight: number): number {
+  return Math.max(3, rendererHeight - 16)
 }
