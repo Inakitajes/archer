@@ -1,13 +1,13 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { stdin, stdout } from "node:process"
-import { createInterface } from "node:readline/promises"
 
 import { addAllAndCommit } from "./git"
 import { log } from "./log"
 import { openInteractiveOpencodeWindow } from "./opencode"
 import { noopProgress, type HumanReviewAction, type ProgressUI } from "./progress"
 import type { PermissionGate } from "./permissions"
+import { createTerminalInput, type TerminalInput, TerminalInterrupt } from "./terminal-input"
 import type { RunOptions } from "./types"
 import type { Workspace } from "./workspace"
 
@@ -120,6 +120,12 @@ async function humanReviewApproved(workspace: Workspace, stepName: string) {
 export type HumanActionPrompt = {
   prompt: string
   allowed: ReadonlyArray<HumanReviewAction>
+  /**
+   * Serializes this readline fallback with the permission gate's so a --no-tui
+   * parallel run never opens two prompts on stdin at once. The phase gate
+   * passes the run's shared arbiter; the solo human-review gate leaves it unset.
+   */
+  terminalInput?: TerminalInput
 }
 
 /** One key per ReviewAction, shared by askHumanAction's prompt and dispatch. */
@@ -172,43 +178,35 @@ export function phaseGatePrompt(info: { stepName: string; kind: "interactive" | 
  * General readline fallback for a human gate, resolved by the action set the
  * caller allows (pipeline human steps answer c/o/a; a failed step answers
  * r/o/a). Shared by runHumanReviewGate and the phase gate in runner.ts.
+ *
+ * The whole interaction loop runs under the shared terminal-input arbiter, so
+ * a phase gate waiting on stdin and a live sibling's permission prompt can
+ * never both read the same stdin in a --no-tui parallel run.
  */
-export async function askHumanAction({ prompt, allowed }: HumanActionPrompt): Promise<HumanReviewAction> {
-  const rl = createInterface({ input: stdin, output: stdout })
-  const controller = new AbortController()
-  let interrupted = false
-  // Raw-mode input never raises a process SIGINT; readline surfaces Ctrl+C
-  // here instead, so without this listener the prompt would just hang.
-  rl.on("SIGINT", () => {
-    interrupted = true
-    controller.abort()
-  })
-
-  try {
+export async function askHumanAction({ prompt, allowed, terminalInput }: HumanActionPrompt): Promise<HumanReviewAction> {
+  const input = terminalInput ?? createTerminalInput()
+  return input.withInput(async (ask) => {
     for (;;) {
-      const answer = (await rl.question(prompt, {
-        signal: controller.signal,
-      }))
-        .trim()
-        .toLowerCase()
+      let answer: string
+      try {
+        answer = (await ask.ask(prompt)).trim().toLowerCase()
+      } catch (error) {
+        // Ctrl+C surfaces as TerminalInterrupt; map it to abort so the gate
+        // shuts the run down instead of looping on a dead prompt.
+        if (error instanceof TerminalInterrupt) {
+          stdout.write("\n")
+          log.warn("[human-step] Ctrl+C received; aborting")
+          return "abort"
+        }
+        throw error
+      }
       for (const action of allowed) {
         if (answer === humanActionKeys[action] || answer === action || humanActionAliases[action]?.includes(answer)) return action
       }
       const keys = allowed.map((action) => humanActionKeys[action])
       stdout.write(`Choose ${keys.length > 1 ? `${keys.slice(0, -1).join(", ")}, or ${keys[keys.length - 1]}` : keys[0]}.\n`)
     }
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      stdout.write("\n")
-      if (interrupted) {
-        log.warn("[human-step] Ctrl+C received; aborting")
-        return "abort"
-      }
-    }
-    throw error
-  } finally {
-    rl.close()
-  }
+  })
 }
 
 async function openExternalIteration(

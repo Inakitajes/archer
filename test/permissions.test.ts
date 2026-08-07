@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test"
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
+import { askHumanAction } from "../src/human"
 import { startPermissionGate, type AdvisorCheckpoint } from "../src/permissions"
-import { noopProgress, type AutoAcceptMode, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "../src/progress"
+import { noopProgress, type AutoAcceptMode, type HumanReviewAction, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "../src/progress"
+import type { TerminalInput, TerminalPrompt } from "../src/terminal-input"
 
 type ReplyCall = { reply: PermissionReply; message?: string }
 
@@ -189,5 +191,252 @@ describe("permission gate advisor checkpoint", () => {
 
     expect(seen).toHaveLength(0)
     expect(replies).toEqual([{ reply: "once" }])
+  })
+})
+
+/**
+ * A stream the test pushes events into on demand, so a single gate can see
+ * requests from several sessions (a failed member plus its live siblings).
+ */
+function pushableStream() {
+  const queue: unknown[] = []
+  const waiters: Array<(value: IteratorResult<unknown>) => void> = []
+  const push = (event: unknown) => {
+    const waiter = waiters.shift()
+    if (waiter) waiter({ value: event, done: false })
+    else queue.push(event)
+  }
+  const stream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<unknown>> {
+          if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false })
+          return new Promise((resolve) => waiters.push(resolve))
+        },
+        return: async () => ({ value: undefined, done: true as const }),
+      }
+    },
+  }
+  return { stream, push }
+}
+
+function permAsked(id: string, sessionID: string, command = "ls -la") {
+  return { type: "permission.asked", properties: { id, sessionID, permission: "bash", patterns: ["bash"], metadata: { command }, always: [] } }
+}
+
+/** A gate backed by a pushable stream and a recorder keyed by request id. */
+function multiHarness() {
+  const { stream, push } = pushableStream()
+  const replies = new Map<string, PermissionReply>()
+  const client = {
+    event: { subscribe: async () => ({ stream }) },
+    permission: {
+      reply: async ({ requestID, reply }: { requestID: string; reply: PermissionReply }) => {
+        replies.set(requestID, reply)
+        return { data: undefined, error: undefined }
+      },
+    },
+    session: {
+      create: async () => ({ data: { id: "judge-session" }, error: undefined }),
+      prompt: async () => ({ data: { info: {}, parts: [] }, error: undefined }),
+      delete: async () => ({ data: undefined, error: undefined }),
+    },
+  } as unknown as OpencodeClient
+  return { client, replies, push }
+}
+
+/** A terminal-input arbiter whose `ask` blocks until the test answers it. */
+function controllableTerminalInput() {
+  const order: string[] = []
+  let current: ((answer: string) => void) | undefined
+  let tail: Promise<void> = Promise.resolve()
+  const input: TerminalInput = {
+    withInput(fn) {
+      const run = async () => {
+        order.push("start")
+        const prompt: TerminalPrompt = { ask: () => new Promise<string>((resolve) => (current = resolve)) }
+        try {
+          return await fn(prompt)
+        } finally {
+          order.push("end")
+        }
+      }
+      const result = tail.then(run, run)
+      tail = result.then(
+        () => undefined,
+        () => undefined,
+      )
+      return result
+    },
+  }
+  const answer = (value: string) => {
+    const resolve = current
+    current = undefined
+    resolve?.(value)
+  }
+  return { input, order, answer }
+}
+
+describe("permission gate session-scoped pause", () => {
+  test("a paused session's prompts are left for the interactive owner while live siblings keep being handled", async () => {
+    const { client, replies, push } = multiHarness()
+    const gate = startPermissionGate({
+      client,
+      progress: noopProgress,
+      interactive: true,
+      directory: "/tmp",
+      autoAccept: { mode: "all" },
+    })
+
+    // The failed member's interactive session is paused; its prompts belong to
+    // the OpenCode TUI the user opened with [o].
+    gate.pause("sess-A")
+    push(permAsked("pA", "sess-A"))
+    push(permAsked("pB", "sess-B"))
+
+    // The live sibling is auto-allowed; the paused member is never replied to.
+    await waitFor(() => replies.has("pB"))
+    expect(replies.get("pB")).toBe("once")
+    expect(replies.has("pA")).toBe(false)
+
+    await gate.stop()
+  })
+
+  test("resuming a session lets its later prompts be handled again", async () => {
+    const { client, replies, push } = multiHarness()
+    const gate = startPermissionGate({ client, progress: noopProgress, interactive: true, directory: "/tmp", autoAccept: { mode: "all" } })
+
+    gate.pause("sess-A")
+    push(permAsked("pA1", "sess-A"))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(replies.has("pA1")).toBe(false)
+
+    gate.resume("sess-A")
+    push(permAsked("pA2", "sess-A"))
+    await waitFor(() => replies.has("pA2"))
+    expect(replies.get("pA2")).toBe("once")
+
+    await gate.stop()
+  })
+
+  test("pausing without a session leaves every session for an interactive owner (solo human gate)", async () => {
+    const { client, replies, push } = multiHarness()
+    const gate = startPermissionGate({ client, progress: noopProgress, interactive: true, directory: "/tmp", autoAccept: { mode: "all" } })
+
+    gate.pause()
+    push(permAsked("pA", "sess-A"))
+    push(permAsked("pB", "sess-B"))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    // Both dropped while paused — the interactive OpenCode owns the terminal.
+    expect(replies.size).toBe(0)
+
+    gate.resume()
+    push(permAsked("pC", "sess-C"))
+    push(permAsked("pD", "sess-D"))
+    await waitFor(() => replies.has("pC") && replies.has("pD"))
+    expect(replies.get("pC")).toBe("once")
+    expect(replies.get("pD")).toBe("once")
+
+    await gate.stop()
+  })
+
+  test("two paused sessions resume independently so neither outlives the other", async () => {
+    const { client, replies, push } = multiHarness()
+    const gate = startPermissionGate({ client, progress: noopProgress, interactive: true, directory: "/tmp", autoAccept: { mode: "all" } })
+
+    gate.pause("sess-A")
+    gate.pause("sess-B")
+    push(permAsked("pA", "sess-A"))
+    push(permAsked("pB", "sess-B"))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(replies.size).toBe(0)
+
+    // Resuming only A must not unlock B's prompts too.
+    gate.resume("sess-A")
+    push(permAsked("pA2", "sess-A"))
+    await waitFor(() => replies.has("pA2"))
+    expect(replies.get("pA2")).toBe("once")
+    push(permAsked("pB2", "sess-B"))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(replies.has("pB2")).toBe(false)
+
+    gate.resume("sess-B")
+    push(permAsked("pB3", "sess-B"))
+    await waitFor(() => replies.has("pB3"))
+    expect(replies.get("pB3")).toBe("once")
+
+    await gate.stop()
+  })
+})
+
+describe("permission gate terminal-input arbiter", () => {
+  test("the readline fallback routes through the shared arbiter instead of opening its own readline", async () => {
+    const { client, replies, push } = multiHarness()
+    let withInputCalls = 0
+    const input: TerminalInput = {
+      async withInput(fn) {
+        withInputCalls++
+        // Canned "once" answer, no real readline.
+        return fn({ ask: async () => "o" })
+      },
+    }
+
+    const gate = startPermissionGate({
+      client,
+      progress: noopProgress,
+      interactive: true,
+      directory: "/tmp",
+      autoAccept: { mode: "off" },
+      terminalInput: input,
+    })
+    push(permAsked("p1", "sess-1"))
+
+    await waitFor(() => replies.has("p1"))
+    expect(replies.get("p1")).toBe("once")
+    expect(withInputCalls).toBe(1)
+
+    await gate.stop()
+  })
+
+  test("a failed member's gate and a live sibling's permission prompt serialize on the shared arbiter", async () => {
+    const { input, order, answer } = controllableTerminalInput()
+    const { client, replies, push } = multiHarness()
+    const gate = startPermissionGate({
+      client,
+      progress: noopProgress,
+      interactive: true,
+      directory: "/tmp",
+      autoAccept: { mode: "off" },
+      terminalInput: input,
+    })
+
+    // A live sibling in the same parallel batch raises a permission prompt; it
+    // takes the shared arbiter first and holds it waiting for input.
+    push(permAsked("pSib", "sess-sibling"))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(order).toEqual(["start"])
+
+    // The failed member's phase gate asks for a decision through the SAME
+    // arbiter; it must queue behind the permission prompt, not race for stdin.
+    let gateAction: HumanReviewAction | undefined
+    const gateDone = askHumanAction({ prompt: "decide > ", allowed: ["continue", "iterate", "abort"], terminalInput: input }).then((action) => {
+      gateAction = action
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(order).toEqual(["start"])
+
+    // Answering the permission prompt releases the arbiter to the phase gate.
+    answer("o")
+    await waitFor(() => replies.has("pSib"))
+    expect(replies.get("pSib")).toBe("once")
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(order).toEqual(["start", "end", "start"])
+
+    answer("c")
+    await gateDone
+    expect(gateAction).toBe("continue")
+    expect(order).toEqual(["start", "end", "start", "end"])
+
+    await gate.stop()
   })
 })

@@ -1178,12 +1178,20 @@ describe("waitForPhaseGate", () => {
 
   function trackedPermissions() {
     const events: string[] = []
+    const pauseCalls: (string | undefined)[] = []
+    const resumeCalls: (string | undefined)[] = []
     const permissions = {
       stop: async () => {},
-      pause: () => void events.push("pause"),
-      resume: () => void events.push("resume"),
+      pause: (sessionID?: string) => {
+        pauseCalls.push(sessionID)
+        events.push("pause")
+      },
+      resume: (sessionID?: string) => {
+        resumeCalls.push(sessionID)
+        events.push("resume")
+      },
     }
-    return { events, permissions }
+    return { events, permissions, pauseCalls, resumeCalls }
   }
 
   test("continue resolves the interactive gate and pauses permissions only while waiting", async () => {
@@ -1344,6 +1352,70 @@ describe("waitForPhaseGate", () => {
 
     expect(opened).toEqual([{ targetDir: "/repo", sessionID: "claude-session", runDir: "/run" }])
     expect(calls.prompts.map((prompt) => prompt.kind)).toEqual(["failure", "interactive"])
+  })
+
+  test("pauses only the phase's session so a live sibling keeps being handled", async () => {
+    const { progress } = gateProgress(["continue"])
+    const { events, permissions, pauseCalls, resumeCalls } = trackedPermissions()
+
+    await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "interactive", canRetry: false })
+
+    // A directory-wide pause would freeze a live sibling's prompts; the gate
+    // scopes the pause to the session the interactive TUI owns instead.
+    expect(events).toEqual(["pause", "resume"])
+    expect(pauseCalls).toEqual(["ses_1"])
+    expect(resumeCalls).toEqual(["ses_1"])
+  })
+
+  test("a failure gate that reopens the session pauses only that session", async () => {
+    const { progress } = gateProgress(["iterate", "continue"])
+    const { permissions, pauseCalls, resumeCalls } = trackedPermissions()
+
+    await waitForPhaseGate(
+      "implementer",
+      "/repo",
+      "ses_1",
+      { serverUrl: "http://127.0.0.1:1", permissions },
+      progress,
+      { kind: "failure", error: "network down", canRetry: true },
+      { openWindow: async () => "terminal" },
+    )
+
+    expect(pauseCalls).toEqual(["ses_1"])
+    expect(resumeCalls).toEqual(["ses_1"])
+  })
+
+  test("an interactive gate with no session pauses nothing, so siblings keep being handled", async () => {
+    const { progress } = gateProgress(["continue"])
+    const { permissions, pauseCalls, resumeCalls } = trackedPermissions()
+
+    await waitForPhaseGate("implementer", "/repo", undefined, { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "interactive", canRetry: false })
+
+    // No session to hand to an interactive TUI means no session to pause for, so
+    // Convoy must keep handling every live sibling's permission prompts.
+    expect(pauseCalls).toEqual([])
+    expect(resumeCalls).toEqual([])
+  })
+
+  test("a failed window reopen pauses nothing until a real session opens", async () => {
+    const { progress } = gateProgress(["iterate", "abort"])
+    const { permissions, pauseCalls } = trackedPermissions()
+
+    await expect(
+      waitForPhaseGate(
+        "implementer",
+        "/repo",
+        "ses_1",
+        { serverUrl: "http://127.0.0.1:1", permissions },
+        progress,
+        { kind: "failure", error: "network down", canRetry: true },
+        { openWindow: async () => { throw new Error("no window backend") } },
+      ),
+    ).rejects.toBeInstanceOf(UserAbortError)
+
+    // The failure gate starts without pausing, and a failed reopen must not
+    // flip to interactive (and so pause) — only a successfully opened session proves the user took control.
+    expect(pauseCalls).toEqual([])
   })
 
   test("a run-wide shutdown resolves a dashboard gate without waiting for input", async () => {

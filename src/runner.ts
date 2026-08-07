@@ -46,6 +46,7 @@ import {
 } from "./progress"
 import { discoverProjectContextFiles } from "./project-context"
 import { createStepRunnerImpl, stepRunnerFor, stepRunnerModel, type StepRunnerId, type StepRunnerImpl } from "./step-runners"
+import { createTerminalInput, type TerminalInput } from "./terminal-input"
 import type { AgentSpec, AgentStep, HookSet, HookSpec, Pipeline, RunOptions, Step } from "./types"
 import { addTokens, emptyTokens, tokensFromValue } from "./usage"
 import { cleanupWorkspace, createWorkspace, opencodeConfigDir, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
@@ -393,6 +394,9 @@ export async function run(options: RunOptions) {
   let opencode: Awaited<ReturnType<typeof startOpencode>> | undefined
   let progress: ProgressUI = noopProgress
   let permissions: PermissionGate | undefined
+  // One arbiter shared by the permission gate and every phase gate so a --no-tui
+  // parallel run never opens two readlines on stdin at once.
+  const terminalInput = createTerminalInput()
   let advisorBridge: AdvisorBridge | undefined
   let advisorJournal: AdvisorEventJournal | undefined
   let metadata: RunMetadataStore | undefined
@@ -594,6 +598,7 @@ export async function run(options: RunOptions) {
       directory: options.targetDir,
       autoAccept,
       judgeModel,
+      terminalInput,
       ...(advisorNeeds.agents.size > 0 ? { advisorCheckpoint: advisors.checkpoint } : {}),
     })
 
@@ -640,7 +645,7 @@ export async function run(options: RunOptions) {
           await limitAgents(async () => {
             const restored = resuming && (await restorePhaseFromPreviousRun(workspace, runMetadata, step, progress))
             if (!restored) {
-              await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions }, advisors)
+              await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions, terminalInput }, advisors)
             }
           })
         }),
@@ -789,7 +794,7 @@ async function removePhaseReport(workspace: Workspace, phase: AgentStep): Promis
 async function phaseNeedsRun(workspace: Workspace, metadata: RunMetadataStore, phase: AgentStep): Promise<boolean> {
   if (metadata.phaseStatus?.(phase.name) === "skipped") return false
   if (!(await exists(join(workspace.dir, phase.reportPath)))) return true
-  if (metadata.phaseStatus(phase.name) === "running") return true
+  if (metadata.phaseStatus?.(phase.name) === "running") return true
   return metadata.snapshot(phase.name)?.status === "failed"
 }
 
@@ -902,6 +907,8 @@ function recoveryReport(phaseName: string) {
 export type TakeoverContext = {
   serverUrl: string
   permissions?: PermissionGate
+  /** Shared terminal-input arbiter so a failed member's gate and a live sibling's permission prompt never both read stdin. */
+  terminalInput?: TerminalInput
 }
 
 async function runPhase(
@@ -1126,18 +1133,25 @@ export async function waitForPhaseGate(
   progress.phaseRunning(phaseName, kind === "interactive" ? "interactive session — waiting for your decision" : "step failed — waiting for your decision")
   let iterations = 0
   let permissionsPaused = false
+  // Pause only the session the interactive TUI owns, never the whole directory:
+  // a directory-wide pause would also drop the prompts of live siblings in the
+  // same parallel batch, deadlocking them waiting for replies Convoy never sends.
   const pausePermissions = () => {
-    if (permissionsPaused || !takeover?.permissions) return
+    if (permissionsPaused || !takeover?.permissions || !sessionID) return
     permissionsPaused = true
-    takeover.permissions.pause()
+    takeover.permissions.pause(sessionID)
   }
   // An interactive session owns the terminal and answers its own prompts, so
-  // Convoy's permission gate stays paused while it waits. A failure gate starts
-  // without pausing — a dead step must never freeze its live siblings' prompts.
+  // Convoy's permission gate stays paused for that session while it waits. A
+  // failure gate starts without pausing — a dead step must never freeze its
+  // live siblings' prompts.
   if (kind === "interactive") pausePermissions()
 
   // The readline fallback owns the terminal; the TUI path keeps the dashboard
-  // active and resolves actions via ProgressUI.askHumanReview.
+  // active and resolves actions via ProgressUI.askHumanReview. The fallback
+  // goes through the run's shared terminal-input arbiter so it can't race a
+  // permission prompt for stdin in a --no-tui parallel run.
+  const terminalInput = takeover?.terminalInput
   if (!usingTui) progress.suspend()
   try {
     for (;;) {
@@ -1145,7 +1159,7 @@ export async function waitForPhaseGate(
       const action = await awaitActionOrAbort(
         askInTui
           ? askInTui({ stepName: phaseName, iterations, kind, error: options.error, canRetry: kind === "failure" ? options.canRetry : false })
-          : askHumanAction({ prompt: phaseGatePrompt({ stepName: phaseName, kind, error: options.error, allowed }), allowed }),
+          : askHumanAction({ prompt: phaseGatePrompt({ stepName: phaseName, kind, error: options.error, allowed }), allowed, ...(terminalInput ? { terminalInput } : {}) }),
         options.signal,
       )
 
@@ -1178,7 +1192,7 @@ export async function waitForPhaseGate(
       }
     }
   } finally {
-    if (permissionsPaused) takeover?.permissions?.resume()
+    if (permissionsPaused) takeover?.permissions?.resume(sessionID)
     if (!usingTui) progress.resume()
   }
 }

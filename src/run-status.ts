@@ -426,7 +426,7 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
     tracker.waitEnded(active)
     humanWaits.delete(name)
   }
-  const phaseGateKind = (detail: string): HumanReviewPromptInfo["kind"] | undefined =>
+  const phaseGateKind = (detail: string | undefined): HumanReviewPromptInfo["kind"] | undefined =>
     detail === text.waitingFailure ? "failure" : detail === "interactive session — waiting for your decision" ? "interactive" : undefined
 
   const tracked: ProgressUI = {

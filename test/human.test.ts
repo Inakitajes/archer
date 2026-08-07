@@ -3,8 +3,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { humanActionMenu, phaseGatePrompt, runHumanReviewGate } from "../src/human"
+import { humanActionMenu, phaseGatePrompt, runHumanReviewGate, askHumanAction } from "../src/human"
 import { noopProgress, type HumanReviewAction, type HumanReviewPromptInfo, type ProgressUI } from "../src/progress"
+import type { TerminalInput, TerminalPrompt } from "../src/terminal-input"
 
 import type { RunOptions } from "../src/types"
 import type { Workspace } from "../src/workspace"
@@ -191,5 +192,43 @@ describe("phaseGatePrompt", () => {
   test("an interactive gate uses the session wording on a single line", () => {
     const prompt = phaseGatePrompt({ stepName: "implementer", kind: "interactive", allowed: ["continue", "iterate", "abort"] })
     expect(prompt).toBe('Interactive session on step "implementer": [c]ontinue pipeline, [o]pen OpenCode, [a]bort > ')
+  })
+})
+
+/**
+ * A terminal-input arbiter that records each block and replays canned answers,
+ * so askHumanAction can be driven without a real TTY and we can assert it
+ * routes through the shared arbiter rather than opening its own readline.
+ */
+function scriptedTerminalInput(answers: string[]) {
+  let withInputCalls = 0
+  const queue = [...answers]
+  const input: TerminalInput = {
+    async withInput(fn) {
+      withInputCalls++
+      // Each ask consumes the next canned answer, so a re-prompt loop gets a
+      // fresh input rather than spinning on the first one forever.
+      const prompt: TerminalPrompt = { ask: async () => queue.shift() ?? "" }
+      return fn(prompt)
+    },
+  }
+  return { input, get calls() { return withInputCalls } }
+}
+
+describe("askHumanAction", () => {
+  test("routes through the shared terminal-input arbiter and maps the answer to an action", async () => {
+    const fake = scriptedTerminalInput(["c"])
+    const action = await askHumanAction({ prompt: "decide > ", allowed: ["continue", "iterate", "abort"], terminalInput: fake.input })
+    expect(action).toBe("continue")
+    expect(fake.calls).toBe(1)
+  })
+
+  test("re-prompts under the same lock when the input matches no action", async () => {
+    const fake = scriptedTerminalInput(["x", "a"])
+    const action = await askHumanAction({ prompt: "decide > ", allowed: ["continue", "iterate", "abort"], terminalInput: fake.input })
+    expect(action).toBe("abort")
+    // The whole loop stays inside one withInput block so a sibling permission
+    // prompt can't steal stdin between an invalid answer and the re-prompt.
+    expect(fake.calls).toBe(1)
   })
 })
