@@ -32,6 +32,7 @@ describe("parseVerdict", () => {
 type FakeClientOptions = {
   promptText?: string
   promptThrows?: boolean
+  promptHangs?: boolean
   onDelete?: (id: string) => void
 }
 
@@ -39,8 +40,17 @@ function fakeClient(opts: FakeClientOptions): OpencodeClient {
   return {
     session: {
       create: async () => ({ data: { id: "judge-session" }, error: undefined }),
-      prompt: async () => {
+      prompt: async (_args: unknown, { signal }: { signal?: AbortSignal } = {}) => {
         if (opts.promptThrows) throw new Error("provider unavailable")
+        if (opts.promptHangs) {
+          // Never resolves on its own; the timeout fires the abort and the SDK
+          // rejects with the abort reason ("safety judge timed out").
+          return new Promise<never>((_resolve, reject) => {
+            if (!signal) return
+            if (signal.aborted) reject(signal.reason)
+            else signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+          })
+        }
         return { data: { info: {}, parts: [{ type: "text", text: opts.promptText ?? "" }] }, error: undefined }
       },
       delete: async ({ sessionID }: { sessionID: string }) => {
@@ -102,11 +112,11 @@ describe("explainCommand", () => {
   })
 
   test("returns a readable fallback on timeout", async () => {
-    // A prompt that never resolves would trigger the timeout; we simulate
-    // by making the prompt throw a timeout error through the abort controller.
-    const client = fakeClient({ promptThrows: true })
-    const text = await explainCommand(client, { request, model, directory: "/tmp" })
-    expect(text).toContain("the judge could not explain it")
+    // A prompt that hangs until the abort fires: the timeout expires and the
+    // SDK rejects with the abort reason ("safety judge timed out").
+    const client = fakeClient({ promptHangs: true })
+    const text = await explainCommand(client, { request, model, directory: "/tmp", timeoutMs: 50 })
+    expect(text).toContain("the judge could not explain it (timed out)")
   })
 
   test("includes verdictReason in the rendered request when provided", async () => {

@@ -1494,7 +1494,6 @@ describe("permission modal [e] explain and [i] inspect", () => {
   test("[e] with explain renders thinking then the wrapped text", async () => {
     const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
     try {
-      const internals = dashboard as unknown as DashboardInternals
       let resolveExplain: (text: string) => void = () => {}
       const explain = (_signal?: AbortSignal) => new Promise<string>((resolve) => { resolveExplain = resolve })
       void dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [], explain })
@@ -1521,7 +1520,6 @@ describe("permission modal [e] explain and [i] inspect", () => {
   test("[o] resolves during an explain in flight and aborts it", async () => {
     const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
     try {
-      const internals = dashboard as unknown as DashboardInternals
       let resolveExplain: ((text: string) => void) | undefined
       const explain = (_signal?: AbortSignal) => new Promise<string>((resolve) => { resolveExplain = resolve })
       const promise = dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [], explain })
@@ -1546,7 +1544,6 @@ describe("permission modal [e] explain and [i] inspect", () => {
   test("[i] without serverUrl reports the error inside the modal", async () => {
     const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
     try {
-      const internals = dashboard as unknown as DashboardInternals
       void dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [], sessionID: "sess-1" })
       await renderOnce()
 
@@ -1563,7 +1560,6 @@ describe("permission modal [e] explain and [i] inspect", () => {
   test("[i] without sessionID reports the error inside the modal", async () => {
     const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
     try {
-      const internals = dashboard as unknown as DashboardInternals
       void dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [] })
       await renderOnce()
 

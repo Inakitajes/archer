@@ -218,18 +218,14 @@ async function handleRequest(
         if (raw === "r" || raw === "reject" || raw === "n" || raw === "no") return "reject" as Reply
         if (raw === "e" || raw === "explain") {
           if (judgeModel) {
-            try {
-              const explanation = await explainCommand(client, {
-                request: promptInfo(request),
-                model: judgeModel,
-                directory,
-                signal: AbortSignal.any([signal ?? new AbortController().signal, new AbortController().signal]),
-                verdictReason,
-              })
-              stdout.write(`\n${explanation}\n\n`)
-            } catch {
-              stdout.write("\nthe judge could not explain it\n\n")
-            }
+            const explanation = await explainCommand(client, {
+              request: promptInfo(request),
+              model: judgeModel,
+              directory,
+              signal: AbortSignal.any([signal ?? new AbortController().signal, new AbortController().signal]),
+              verdictReason,
+            })
+            stdout.write(`\n${explanation}\n\n`)
           } else {
             stdout.write("\nno safety judge configured to explain this\n\n")
           }

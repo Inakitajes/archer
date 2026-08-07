@@ -123,9 +123,9 @@ export type PermissionPromptInfo = {
   /** Present when smart auto-accept's judge escalated this request; explains why. */
   judgeReason?: string
   /**
-   * Pide al juez una explicación larga de esta petición ([e] en el dashboard).
-   * La aporta el gate, que es quien tiene el cliente de opencode y el modelo
-   * juez; ausente cuando no hay juez al que preguntar.
+   * Asks the judge for a prose explanation of this request ([e] in the dashboard).
+   * Provided by the gate, which holds the opencode client and the judge model;
+   * absent when there is no judge to ask.
    */
   explain?(signal?: AbortSignal): Promise<string>
 }

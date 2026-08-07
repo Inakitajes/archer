@@ -301,11 +301,11 @@ type PermissionExplainState =
 type PendingPermission = {
   info: PermissionPromptInfo
   resolve: (reply: PermissionReply) => void
-  /** Estado de [e]; ausente hasta que el usuario lo pide. */
+  /** State of [e]; absent until the user requests it. */
   explain?: PermissionExplainState
-  /** Corta la explicación en vuelo cuando se responde o se drena el prompt. */
+  /** Aborts an in-flight explanation when the request is answered or the queue is drained. */
   explainAbort?: AbortController
-  /** Resultado de [i], para dar feedback dentro del modal (el feed queda tapado). */
+  /** Result of [i], for in-modal feedback (the feed is hidden behind the overlay). */
   inspect?: { backend?: SessionWindowBackend; error?: string }
 }
 

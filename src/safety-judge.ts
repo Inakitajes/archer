@@ -148,7 +148,7 @@ export async function judgeCommand(client: OpencodeClient, input: JudgeInput): P
 }
 
 export type ExplainInput = JudgeInput & {
-  /** La razón del veredicto que escaló la petición, cuando smart mode produjo una. */
+  /** The verdict reason that escalated this request, when smart mode produced one. */
   verdictReason?: string
 }
 
