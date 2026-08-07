@@ -2187,6 +2187,11 @@ export class TuiProgress implements ProgressUI {
       this.render()
       return
     }
+    if (this.humanReviewQueue[0]?.info.kind === "failure") {
+      this.addEvent("convoy", "system", "use [o] in the step failed gate before taking over a session")
+      this.render()
+      return
+    }
     if (this.selectedGroup) {
       this.addEvent("convoy", "system", "select a running model row before enabling interactive mode")
       this.render()
@@ -2221,6 +2226,14 @@ export class TuiProgress implements ProgressUI {
   }
 
   private openSessionWindowForPhase(name: string, source: "click" | "key") {
+    if (this.humanReviewQueue[0]?.info.kind === "failure") {
+      // Opening a session through the normal navigation path would leave the
+      // failure gate offering [r], whose clean restore could erase those edits.
+      // The gate's own [o] flips it to interactive only after the open succeeds.
+      this.addEvent("convoy", "system", "use [o] in the step failed gate before opening a session")
+      this.render()
+      return
+    }
     const phase = this.findPhase(name)
     if (!phase) return
     const runner = stepRunnerFor(phase.runner)

@@ -14,7 +14,7 @@ import { aggregateAdvisorEvents, createAdvisorEventJournal, readAdvisorEvents, t
 import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
-import { ensureClaudeAvailable, promptClaudePhase } from "./claude-code"
+import { ensureClaudeAvailable, openClaudeSessionWindow, promptClaudePhase } from "./claude-code"
 import { addAllAndCommit, createCleanRepoSnapshot, currentBranch, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
 import { getSessionEventHub, payloadProperties } from "./event-hub"
@@ -751,11 +751,10 @@ async function holdFinishScreen(progress: ProgressUI, shutdown: RunShutdown, out
   ])
 }
 
-// A failed phase can still leave a report behind (the agent writes it
-// mid-session before the commit step or a later attempt blows up), so the
-// report's existence alone can't prove the phase finished: a phase the
-// metadata marks as failed must retry, and its stale report must go first or
-// persistPhaseReport would keep it on the rerun.
+// A failed or interrupted phase can still leave a report behind (the agent
+// writes it mid-session before the commit step or a later attempt blows up),
+// so the report's existence alone can't prove the phase finished. Its stale
+// report must go before persistPhaseReport would keep it on the rerun.
 export async function restorePhaseFromPreviousRun(
   workspace: Workspace,
   metadata: RunMetadataStore,
@@ -763,11 +762,7 @@ export async function restorePhaseFromPreviousRun(
   progress: ProgressUI,
 ): Promise<boolean> {
   if (await phaseNeedsRun(workspace, metadata, phase)) {
-    // A failed phase can leave its report behind; drop it so persistPhaseReport
-    // writes a fresh one on the rerun instead of keeping the stale one.
-    const reportAbs = join(workspace.dir, phase.reportPath)
-    if (await exists(reportAbs)) {
-      await rm(reportAbs, { force: true })
+    if (await removePhaseReport(workspace, phase)) {
       log.info(`[${phase.name}] failed in the previous run; retrying`)
     }
     return false
@@ -780,15 +775,21 @@ export async function restorePhaseFromPreviousRun(
   return true
 }
 
+async function removePhaseReport(workspace: Workspace, phase: AgentStep): Promise<boolean> {
+  const reportAbs = join(workspace.dir, phase.reportPath)
+  if (!(await exists(reportAbs))) return false
+  await rm(reportAbs, { force: true })
+  return true
+}
+
 // A phase still needs to run on resume when its report is missing (it never
-// finished) or the metadata marks it failed (its report, if any, is stale).
+// finished), or metadata says the earlier process never finalized it. A report
+// can be written before the phase commit, so it cannot turn a running/failed
+// phase into a completed one.
 async function phaseNeedsRun(workspace: Workspace, metadata: RunMetadataStore, phase: AgentStep): Promise<boolean> {
   if (metadata.phaseStatus?.(phase.name) === "skipped") return false
   if (!(await exists(join(workspace.dir, phase.reportPath)))) return true
-  // A read-only report is written before the repository boundary is checked.
-  // If the process died while still running, resume must revalidate/retry it
-  // rather than treating that unfinalized report as completed.
-  if (phase.readOnly && metadata.phaseStatus(phase.name) === "running") return true
+  if (metadata.phaseStatus(phase.name) === "running") return true
   return metadata.snapshot(phase.name)?.status === "failed"
 }
 
@@ -1017,7 +1018,16 @@ export async function runPhaseUntilResolved(
         // Armed means "this step is mine": even a clean finish waits for the
         // user's decision before the step commits and the pipeline moves on.
         log.info(`[${phase.name}] attempt succeeded with interactive mode armed; waiting for manual action`)
-        await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, { kind: "interactive", canRetry: false })
+        await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
+          kind: "interactive",
+          canRetry: false,
+          signal: shutdown.signal,
+          onAbort: () => {
+            if (!shutdown.aborted) shutdown.request("phase gate abort")
+          },
+          runner: phase.runner,
+          runDir: workspace.dir,
+        })
       }
       return text
     } catch (error) {
@@ -1029,10 +1039,19 @@ export async function runPhaseUntilResolved(
         kind: armed() ? "interactive" : "failure",
         error: formatSdkError(error),
         canRetry: Boolean(baseline),
+        signal: shutdown.signal,
+        onAbort: () => {
+          if (!shutdown.aborted) shutdown.request("phase gate abort")
+        },
+        runner: phase.runner,
+        runDir: workspace.dir,
       })
       if (outcome === "unavailable") throw error
       if (outcome === "retry") {
         await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, error))
+        // An agent can write its report before the attempt fails. A clean retry
+        // must not later commit or feed that stale report to following phases.
+        await removePhaseReport(workspace, phase)
         continue
       }
       // "continue": the tree is accepted as-is and the step commits.
@@ -1044,7 +1063,28 @@ export async function runPhaseUntilResolved(
 /** Last session created for the phase's attempts, so the interactive gate can reopen its window. */
 type SessionRef = { id?: string }
 
-type PhaseGateDeps = { openWindow: typeof openOpencodeSessionWindow }
+type PhaseGateDeps = {
+  openWindow: typeof openOpencodeSessionWindow
+  openClaudeWindow?: typeof openClaudeSessionWindow
+}
+
+type PhaseGateOptions = {
+  kind: "interactive" | "failure"
+  error?: string
+  canRetry: boolean
+  /** Cancels an open decision gate promptly during a run-wide shutdown. */
+  signal?: AbortSignal
+  /** A gate-level abort must also stop live siblings in a parallel batch. */
+  onAbort?: () => void
+  /** Claude Code sessions reopen through its own CLI, not the OpenCode server. */
+  runner?: StepRunnerId
+  runDir?: string
+}
+
+const defaultPhaseGateDeps: Required<PhaseGateDeps> = {
+  openWindow: openOpencodeSessionWindow,
+  openClaudeWindow: openClaudeSessionWindow,
+}
 
 export type PhaseGateOutcome = "continue" | "retry" | "unavailable"
 
@@ -1075,8 +1115,8 @@ export async function waitForPhaseGate(
   sessionID: string | undefined,
   takeover: TakeoverContext | undefined,
   progress: ProgressUI,
-  options: { kind: "interactive" | "failure"; error?: string; canRetry: boolean },
-  deps: PhaseGateDeps = { openWindow: openOpencodeSessionWindow },
+  options: PhaseGateOptions,
+  deps: PhaseGateDeps = defaultPhaseGateDeps,
 ): Promise<PhaseGateOutcome> {
   const askInTui = progress.askHumanReview?.bind(progress)
   const usingTui = Boolean(askInTui)
@@ -1102,27 +1142,36 @@ export async function waitForPhaseGate(
   try {
     for (;;) {
       const allowed = gateAllowedActions(kind, kind === "failure" ? options.canRetry : false)
-      const action = askInTui
-        ? await askInTui({ stepName: phaseName, iterations, kind, error: options.error, canRetry: kind === "failure" ? options.canRetry : false })
-        : await askHumanAction({ prompt: phaseGatePrompt({ stepName: phaseName, kind, error: options.error, allowed }), allowed })
+      const action = await awaitActionOrAbort(
+        askInTui
+          ? askInTui({ stepName: phaseName, iterations, kind, error: options.error, canRetry: kind === "failure" ? options.canRetry : false })
+          : askHumanAction({ prompt: phaseGatePrompt({ stepName: phaseName, kind, error: options.error, allowed }), allowed }),
+        options.signal,
+      )
 
       if (action === "continue") return "continue"
-      if (action === "abort") throw new UserAbortError("aborted from interactive session gate")
+      if (action === "abort") {
+        options.onAbort?.()
+        throw new UserAbortError("aborted from phase gate")
+      }
       if (action === "retry") return "retry"
 
       iterations++
-      if (kind === "failure") {
-        // First successful iterate means the user has opened the session and is
-        // editing by hand: flip to interactive.
-        kind = "interactive"
-        pausePermissions()
-      }
       if (!sessionID) {
         progress.phaseActivity(phaseName, "no session to reopen; use the OpenCode window you already have", "info")
         continue
       }
       try {
-        const backend = await deps.openWindow({ url: takeover?.serverUrl ?? "", targetDir, sessionID })
+        const backend =
+          options.runner === "claude-code"
+            ? await (deps.openClaudeWindow ?? openClaudeSessionWindow)({ targetDir, sessionID, runDir: options.runDir ?? "" })
+            : await deps.openWindow({ url: takeover?.serverUrl ?? "", targetDir, sessionID })
+        if (kind === "failure") {
+          // Only a successfully opened session proves the user took control.
+          // Until then, keep [c] unavailable and preserve [r].
+          kind = "interactive"
+          pausePermissions()
+        }
         progress.phaseActivity(phaseName, `session reopened in ${backend}; return here and press c to continue`, "system")
       } catch (error) {
         progress.phaseActivity(phaseName, `couldn't reopen the session window: ${error instanceof Error ? error.message : String(error)}`, "error")
@@ -1132,6 +1181,29 @@ export async function waitForPhaseGate(
     if (permissionsPaused) takeover?.permissions?.resume()
     if (!usingTui) progress.resume()
   }
+}
+
+/** Resolves a dashboard/readline action unless a run-wide shutdown arrives first. */
+function awaitActionOrAbort<T>(action: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return action
+  if (signal.aborted) return Promise.reject(signal.reason ?? new UserAbortError())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort)
+      reject(signal.reason ?? new UserAbortError())
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    void action.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort)
+        reject(error)
+      },
+    )
+  })
 }
 
 async function runPhaseAttempt(

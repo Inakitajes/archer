@@ -368,6 +368,22 @@ describe("trackRunStatus", () => {
     expect(titles.some((status) => status.activity === "waiting" && formatTerminalTitle(status).startsWith("⏳ "))).toBe(true)
   })
 
+  test("a readline failure gate emits the same waiting status until the phase advances", () => {
+    const phases = [agentPhase("plan")]
+    const { tracker, events, titles } = trackerWith(phases)
+    const wrapped = trackRunStatus(noopProgress, tracker)
+
+    wrapped.phaseStarted("plan")
+    wrapped.phaseRunning("plan", "step failed — waiting for your decision")
+
+    expect(tracker.snapshot().activity).toBe("waiting")
+    expect(events.at(-1)?.body).toBe("step failed — waiting for your decision")
+    expect(titles.some((status) => status.activity === "waiting" && formatTerminalTitle(status).startsWith("⏳ "))).toBe(true)
+
+    wrapped.phaseAttempt("plan", { attempt: 2 })
+    expect(tracker.snapshot().activity).toBe("working")
+  })
+
   test("forwards every lifecycle call to the wrapped UI unchanged", () => {
     const calls: string[] = []
     const progress: ProgressUI = {

@@ -297,7 +297,8 @@ describe("runner helpers", () => {
       }
       return { dir, runID: "20260101-000000-test" } as Workspace
     }
-    const metadataWith = (snapshot?: ProgressPhaseSnapshot) => ({ snapshot: () => snapshot }) as unknown as RunMetadataStore
+    const metadataWith = (snapshot?: ProgressPhaseSnapshot, status?: "running" | "failed" | "completed") =>
+      ({ snapshot: () => snapshot, phaseStatus: () => status }) as unknown as RunMetadataStore
     const progressSpy = () => {
       const calls: string[] = []
       return {
@@ -330,6 +331,12 @@ describe("runner helpers", () => {
     const legacySpy = progressSpy()
     expect(await restorePhaseFromPreviousRun(legacy, metadataWith(undefined), phase, legacySpy.progress)).toBe(true)
     expect(legacySpy.calls).toEqual(["completed"])
+
+    // A writable phase can write its report before the commit; a crashed process
+    // leaves metadata running, so resume must rerun instead of accepting it.
+    const interrupted = await workspaceWith(true)
+    expect(await restorePhaseFromPreviousRun(interrupted, metadataWith({ status: "completed" }, "running"), phase, noopProgress)).toBe(false)
+    expect(await Bun.file(join(interrupted.dir, "reports", "design.md")).exists()).toBe(false)
   })
 
   test("only the benign SSE abort is ignorable; real faults must surface", () => {
@@ -513,6 +520,8 @@ describe("run phase gate", () => {
     const prompts: HumanReviewPromptInfo[] = []
     let restores = 0
     const workspace = await retryWorkspace()
+    await mkdir(join(workspace.dir, "reports"))
+    await writeFile(join(workspace.dir, "reports", "implementer.md"), "# stale failed report")
     const progress: ProgressUI = {
       ...noopProgress,
       askHumanReview: (info) => {
@@ -550,6 +559,7 @@ describe("run phase gate", () => {
     expect(prompts).toHaveLength(1)
     expect(prompts[0]?.kind).toBe("failure")
     expect(prompts[0]?.canRetry).toBe(true)
+    expect(await Bun.file(join(workspace.dir, "reports", "implementer.md")).exists()).toBe(false)
   })
 
   test("retry has no ceiling: a step that keeps failing can be retried indefinitely", async () => {
@@ -597,33 +607,39 @@ describe("run phase gate", () => {
     expect(prompts.every((p) => p.kind === "failure" && p.canRetry === true)).toBe(true)
   })
 
-  test("abort throws UserAbortError", async () => {
+  test("abort throws UserAbortError and requests a run-wide shutdown", async () => {
     const workspace = await retryWorkspace()
     const progress: ProgressUI = {
       ...noopProgress,
       askHumanReview: () => Promise.resolve("abort"),
     }
 
-    await expect(
-      runPhaseUntilResolved(
-        {} as never,
-        workspace,
-        agentStep("implementer"),
-        "/repo",
-        prepared,
-        { head: "baseline" },
-        progress,
-        new RunShutdown(),
-        createGitLock(),
-        { serverUrl: "http://127.0.0.1:1" },
-        {
-          runPhaseAttempt: async () => {
-            throw new Error("provider temporarily unavailable")
+    const shutdown = new RunShutdown()
+    try {
+      await expect(
+        runPhaseUntilResolved(
+          {} as never,
+          workspace,
+          agentStep("implementer"),
+          "/repo",
+          prepared,
+          { head: "baseline" },
+          progress,
+          shutdown,
+          createGitLock(),
+          { serverUrl: "http://127.0.0.1:1" },
+          {
+            runPhaseAttempt: async () => {
+              throw new Error("provider temporarily unavailable")
+            },
+            restorePhaseBaseline: async () => {},
           },
-          restorePhaseBaseline: async () => {},
-        },
-      ),
-    ).rejects.toThrow(UserAbortError)
+        ),
+      ).rejects.toThrow(UserAbortError)
+      expect(shutdown.aborted).toBe(true)
+    } finally {
+      shutdown.dispose()
+    }
   })
 
   test("without a dashboard or TTY the original error propagates", async () => {
@@ -1274,6 +1290,79 @@ describe("waitForPhaseGate", () => {
     expect(calls.prompts).toHaveLength(2)
     expect(calls.prompts[0]).toMatchObject({ kind: "failure", canRetry: true, iterations: 0 })
     expect(calls.prompts[1]).toMatchObject({ kind: "interactive", canRetry: false, iterations: 1 })
+  })
+
+  test("a failed session open keeps the gate in failure mode, with retry still available", async () => {
+    const { calls, progress } = gateProgress(["iterate", "abort"])
+    const { events, permissions } = trackedPermissions()
+
+    await expect(
+      waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "failure", canRetry: true }, {
+        openWindow: async () => {
+          throw new Error("no window backend")
+        },
+      }),
+    ).rejects.toBeInstanceOf(UserAbortError)
+
+    expect(events).toEqual([])
+    expect(calls.prompts.map((prompt) => ({ kind: prompt.kind, canRetry: prompt.canRetry }))).toEqual([
+      { kind: "failure", canRetry: true },
+      { kind: "failure", canRetry: true },
+    ])
+  })
+
+  test("a missing session keeps the failure gate from unlocking continue", async () => {
+    const { calls, progress } = gateProgress(["iterate", "abort"])
+    const { events, permissions } = trackedPermissions()
+
+    await expect(
+      waitForPhaseGate("implementer", "/repo", undefined, { serverUrl: "http://127.0.0.1:1", permissions }, progress, { kind: "failure", canRetry: true }),
+    ).rejects.toBeInstanceOf(UserAbortError)
+
+    expect(events).toEqual([])
+    expect(calls.prompts.map((prompt) => prompt.kind)).toEqual(["failure", "failure"])
+  })
+
+  test("a Claude Code failure reopens its transcript through the Claude CLI", async () => {
+    const { calls, progress } = gateProgress(["iterate", "continue"])
+    const opened: unknown[] = []
+
+    await waitForPhaseGate("security", "/repo", "claude-session", { serverUrl: "http://127.0.0.1:1" }, progress, {
+      kind: "failure",
+      canRetry: true,
+      runner: "claude-code",
+      runDir: "/run",
+    }, {
+      openWindow: async () => {
+        throw new Error("OpenCode opener should not be used for Claude")
+      },
+      openClaudeWindow: async (input) => {
+        opened.push(input)
+        return "terminal"
+      },
+    })
+
+    expect(opened).toEqual([{ targetDir: "/repo", sessionID: "claude-session", runDir: "/run" }])
+    expect(calls.prompts.map((prompt) => prompt.kind)).toEqual(["failure", "interactive"])
+  })
+
+  test("a run-wide shutdown resolves a dashboard gate without waiting for input", async () => {
+    const controller = new AbortController()
+    const { events, permissions } = trackedPermissions()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: () => new Promise<HumanReviewAction>(() => {}),
+    }
+
+    const waiting = waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+      kind: "interactive",
+      canRetry: false,
+      signal: controller.signal,
+    })
+    controller.abort(new UserAbortError("test shutdown"))
+
+    await expect(waiting).rejects.toThrow("test shutdown")
+    expect(events).toEqual(["pause", "resume"])
   })
 
   test("without a dashboard gate or TTY the wait is unavailable", async () => {
