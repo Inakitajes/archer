@@ -599,6 +599,7 @@ export async function run(options: RunOptions) {
       autoAccept,
       judgeModel,
       terminalInput,
+      serverUrl: opencode.url,
       ...(advisorNeeds.agents.size > 0 ? { advisorCheckpoint: advisors.checkpoint } : {}),
     })
 

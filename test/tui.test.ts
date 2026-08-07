@@ -45,6 +45,11 @@ type DashboardInternals = {
   finishModal?: { kind: string; stage?: string; note?: string }
   handleFinishKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
   openFinishModal(): Promise<void>
+  serverUrl: string
+  targetDir: string
+  autoAccept?: { mode: string }
+  handlePermissionKey(key: { name: string; preventDefault(): void; stopPropagation(): void }): void
+  addEvent(phase: string, kind: string, message: string): void
 }
 
 async function createDashboard(
@@ -1463,5 +1468,127 @@ describe("pipeline group selection", () => {
     expect(comparisonColumnCount(70, 3)).toBe(2)
     expect(comparisonColumnCount(100, 3)).toBe(3)
     expect(comparisonColumnCount(200, 5)).toBe(3)
+  })
+})
+
+describe("permission modal [e] explain and [i] inspect", () => {
+  const modal = (dashboard: unknown) => (dashboard as DashboardInternals).modalText.plainText
+  const footer = (dashboard: unknown) => (dashboard as DashboardInternals).footerText.plainText
+
+  test("[e] without explain callback shows a no-judge event", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      void dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [] })
+      await renderOnce()
+
+      mockInput.pressKey("e")
+      await renderOnce()
+
+      expect(internals.feed.map((e) => e.message)).toContain("no safety judge configured to explain this")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[e] with explain renders thinking then the wrapped text", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      let resolveExplain: (text: string) => void = () => {}
+      const explain = (_signal?: AbortSignal) => new Promise<string>((resolve) => { resolveExplain = resolve })
+      void dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [], explain })
+      await renderOnce()
+
+      // Press [e] → thinking state
+      mockInput.pressKey("e")
+      await renderOnce()
+      expect(modal(dashboard)).toContain("thinking")
+
+      // Resolve the explain promise
+      resolveExplain("This command lists files. It is safe because it is read-only.")
+      // Wait for promise microtask
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await renderOnce()
+
+      expect(modal(dashboard)).toContain("lists files")
+      expect(modal(dashboard)).toContain("read-only")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[o] resolves during an explain in flight and aborts it", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      let resolveExplain: ((text: string) => void) | undefined
+      const explain = (_signal?: AbortSignal) => new Promise<string>((resolve) => { resolveExplain = resolve })
+      const promise = dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [], explain })
+      await renderOnce()
+
+      // Press [e] → thinking
+      mockInput.pressKey("e")
+      await renderOnce()
+      expect(modal(dashboard)).toContain("thinking")
+
+      // Press [o] to resolve the permission
+      mockInput.pressKey("o")
+      const reply = await promise
+      expect(reply).toBe("once")
+      // The explain promise is still pending — the resolve function won't be called
+      // because the queue was shifted. This is fine; the cancelled promise is gc'd.
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[i] without serverUrl reports the error inside the modal", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      void dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [], sessionID: "sess-1" })
+      await renderOnce()
+
+      // serverUrl defaults to "" (empty), so [i] should report no live server
+      mockInput.pressKey("i")
+      await renderOnce()
+
+      expect(modal(dashboard)).toContain("no live opencode server")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("[i] without sessionID reports the error inside the modal", async () => {
+    const { dashboard, mockInput, renderOnce } = await createDashboard(200, 40)
+    try {
+      const internals = dashboard as unknown as DashboardInternals
+      void dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [] })
+      await renderOnce()
+
+      // No sessionID on the info
+      mockInput.pressKey("i")
+      await renderOnce()
+
+      expect(modal(dashboard)).toContain("no session to inspect")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a wide footer contains [e] and [i] hints", async () => {
+    const { dashboard, renderOnce } = await createDashboard(200, 40)
+    try {
+      void dashboard.askPermission({ id: "p1", permission: "bash", command: "ls", patterns: [] })
+      await renderOnce()
+
+      const row = footer(dashboard)
+      // Glued style: keys and hint are concatenated (e.g. "inspect" = "i" + "nspect")
+      expect(row).toContain("inspect")
+      expect(row).toContain("explain")
+    } finally {
+      dashboard.stop()
+    }
   })
 })

@@ -24,6 +24,7 @@ export type JudgeInput = {
 }
 
 const defaultTimeoutMs = 20_000
+const defaultExplainTimeoutMs = 45_000
 
 /**
  * The judge runs OUTSIDE the agentic loop: a single stateless prompt with every
@@ -50,9 +51,36 @@ const judgeSystemPrompt = [
   '{"safe": boolean, "reason": "<short explanation, <=140 chars>"}',
 ].join("\n")
 
-export async function judgeCommand(client: OpencodeClient, input: JudgeInput): Promise<SafetyVerdict> {
+/**
+ * System prompt for the deep-explain mode: two short paragraphs asking the judge
+ * to describe what the command does and why it is risky, in plain prose.
+ */
+const explainSystemPrompt = [
+  "You are a safety judge explaining a permission request to a human. Describe what the command",
+  "actually does and what makes it risky. Be specific: mention the concrete risk (data loss,",
+  "exfiltration, credential exposure, destructive side effect) and what would make it safe or not.",
+  "",
+  "Keep your answer to at most 120 words. Use plain text, no markdown, no code fences.",
+].join("\n")
+
+/**
+ * Shared setup/teardown for a judge session: creates a throwaway session, sends
+ * a prompt, and collects the text response. The session is always deleted
+ * (best-effort) in the finally block. Throws on error or timeout.
+ */
+async function runJudgeSession(
+  client: OpencodeClient,
+  input: {
+    directory: string
+    model: { providerID: string; modelID: string }
+    system: string
+    text: string
+    signal?: AbortSignal
+    timeoutMs: number
+  },
+): Promise<string> {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(new Error("safety judge timed out")), input.timeoutMs ?? defaultTimeoutMs)
+  const timeout = setTimeout(() => controller.abort(new Error("safety judge timed out")), input.timeoutMs)
   const onParentAbort = () => controller.abort(input.signal?.reason)
   if (input.signal) {
     if (input.signal.aborted) controller.abort(input.signal.reason)
@@ -73,30 +101,19 @@ export async function judgeCommand(client: OpencodeClient, input: JudgeInput): P
         sessionID,
         directory: input.directory,
         model: input.model,
-        system: judgeSystemPrompt,
+        system: input.system,
         // Every tool off: the judge classifies, it never executes.
         tools: { read: false, write: false, edit: false, bash: false, webfetch: false, todoread: false, todowrite: false },
-        parts: [{ type: "text", text: renderRequest(input.request) }],
+        parts: [{ type: "text", text: input.text }],
       },
       { signal: controller.signal },
     )
     if (response.error || !response.data) throw new Error("safety judge returned no answer")
 
-    const text = collectText(response.data.parts)
-    const verdict = parseVerdict(text)
-    if (!verdict) {
-      log.warn(`[safety-judge] unparseable verdict, escalating: ${truncate(text, 160)}`)
-      return { safe: false, reason: "could not read the safety verdict" }
-    }
-    return verdict
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    log.warn(`[safety-judge] evaluation failed, escalating: ${message}`)
-    return { safe: false, reason: `safety check failed (${message})` }
+    return collectText(response.data.parts)
   } finally {
     clearTimeout(timeout)
     input.signal?.removeEventListener("abort", onParentAbort)
-    // Throwaway session; the run workspace is ephemeral, so deletion is best-effort.
     if (sessionID) {
       try {
         await client.session.delete({ sessionID, directory: input.directory })
@@ -107,13 +124,66 @@ export async function judgeCommand(client: OpencodeClient, input: JudgeInput): P
   }
 }
 
-function renderRequest(request: JudgeRequest): string {
+export async function judgeCommand(client: OpencodeClient, input: JudgeInput): Promise<SafetyVerdict> {
+  try {
+    const text = await runJudgeSession(client, {
+      directory: input.directory,
+      model: input.model,
+      system: judgeSystemPrompt,
+      text: renderRequest(input.request),
+      signal: input.signal,
+      timeoutMs: input.timeoutMs ?? defaultTimeoutMs,
+    })
+    const verdict = parseVerdict(text)
+    if (!verdict) {
+      log.warn(`[safety-judge] unparseable verdict, escalating: ${truncate(text, 160)}`)
+      return { safe: false, reason: "could not read the safety verdict" }
+    }
+    return verdict
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    log.warn(`[safety-judge] evaluation failed, escalating: ${message}`)
+    return { safe: false, reason: `safety check failed (${message})` }
+  }
+}
+
+export type ExplainInput = JudgeInput & {
+  /** La razón del veredicto que escaló la petición, cuando smart mode produjo una. */
+  verdictReason?: string
+}
+
+/**
+ * Asks the judge for a prose explanation of the permission request and its risk.
+ * Unlike `judgeCommand`, this is not fail-closed: on error or timeout it returns
+ * a human-readable fallback string instead of throwing.
+ */
+export async function explainCommand(client: OpencodeClient, input: ExplainInput): Promise<string> {
+  try {
+    const text = await runJudgeSession(client, {
+      directory: input.directory,
+      model: input.model,
+      system: explainSystemPrompt,
+      text: renderRequest(input.request, input.verdictReason),
+      signal: input.signal,
+      timeoutMs: input.timeoutMs ?? defaultExplainTimeoutMs,
+    })
+    return text || "the judge returned an empty explanation"
+  } catch (error) {
+    if (error instanceof Error && error.message === "safety judge timed out") {
+      return "the judge could not explain it (timed out)"
+    }
+    return `the judge could not explain it (${error instanceof Error ? error.message : String(error)})`
+  }
+}
+
+function renderRequest(request: JudgeRequest, verdictReason?: string): string {
   const lines = [`category: ${request.permission}`]
   if (request.command) lines.push(`command: ${request.command}`)
   if (request.target) lines.push(`target: ${request.target}`)
   if (request.patterns && request.patterns.length > 0) lines.push(`patterns: ${request.patterns.join(", ")}`)
   if (request.description) lines.push(`description: ${request.description}`)
   lines.push("", "Is it safe to auto-approve this without human review?")
+  if (verdictReason) lines.push("", `The safety judge previously escalated this request with this reason: ${verdictReason}`)
   return lines.join("\n")
 }
 

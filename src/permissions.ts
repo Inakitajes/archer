@@ -5,7 +5,7 @@ import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 import { getSessionEventHub } from "./event-hub"
 import { log } from "./log"
 import { noopProgress, type AutoAccept, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "./progress"
-import { judgeCommand } from "./safety-judge"
+import { explainCommand, judgeCommand } from "./safety-judge"
 import { createTerminalInput, type TerminalInput } from "./terminal-input"
 
 type PermissionRequest = {
@@ -68,6 +68,8 @@ export type StartGateOptions = {
   advisorCheckpoint?: AdvisorCheckpoint
   /** Serializes terminal input with the phase gate so a --no-tui parallel run never opens two readlines on stdin. */
   terminalInput?: TerminalInput
+  /** The opencode server URL for [i] inspect to attach to. Absent in readline fallback on non-macOS. */
+  serverUrl?: string
 }
 
 export function startPermissionGate(options: StartGateOptions): PermissionGate {
@@ -97,7 +99,7 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
     if (handled.has(request.id)) return
     handled.add(request.id)
     queue(() =>
-      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal, options.advisorCheckpoint, terminalInput),
+      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal, options.advisorCheckpoint, terminalInput, options.serverUrl),
     )
   })
 
@@ -136,6 +138,7 @@ async function handleRequest(
   signal?: AbortSignal,
   advisorCheckpoint?: AdvisorCheckpoint,
   terminalInput: TerminalInput = createTerminalInput(),
+  serverUrl?: string,
 ) {
   const summary = describeRequest(request)
 
@@ -170,6 +173,7 @@ async function handleRequest(
   // loop. A "safe" verdict auto-allows; anything else (incl. judge failure,
   // which is fail-closed) drops through to the normal human prompt below.
   let judgeReason: string | undefined
+  let verdictReason: string | undefined
   if (autoAccept?.mode === "smart" && judgeModel) {
     progress.message(`evaluating safety: ${summary}`)
     const verdict = await judgeCommand(client, { request: promptInfo(request), model: judgeModel, directory, signal })
@@ -181,6 +185,7 @@ async function handleRequest(
     }
     log.info(`[permission] smart auto-accept escalating to user: ${summary} — ${verdict.reason}`)
     judgeReason = `flagged by safety judge: ${verdict.reason}`
+    verdictReason = verdict.reason
   }
 
   if (!interactive) {
@@ -195,7 +200,7 @@ async function handleRequest(
   // race a phase-gate readline for the same stdin in a --no-tui parallel run.
   const ask = progress.askPermission?.bind(progress)
   if (ask) {
-    const answer = await ask(promptInfo(request, judgeReason))
+    const answer = await ask(promptInfoForUser(request, judgeReason, verdictReason, judgeModel, client, directory, signal))
     log.info(`[permission] replied ${answer} for ${request.permission}`)
     await reply(client, request.id, directory, answer, answer === "reject" ? "rejected by user" : undefined)
     return
@@ -207,11 +212,46 @@ async function handleRequest(
       log.section("permission request")
       stdout.write(formatRequest(request, judgeReason))
       for (;;) {
-        const raw = (await prompt.ask("approve? [o]nce, [a]lways, [r]eject > ")).trim().toLowerCase()
+        const raw = (await prompt.ask("approve? [o]nce, [a]lways, [r]eject, [e]xplain, [i]nspect > ")).trim().toLowerCase()
         if (raw === "o" || raw === "once" || raw === "y" || raw === "yes") return "once" as Reply
         if (raw === "a" || raw === "always") return "always" as Reply
         if (raw === "r" || raw === "reject" || raw === "n" || raw === "no") return "reject" as Reply
-        stdout.write("Choose o, a, or r.\n")
+        if (raw === "e" || raw === "explain") {
+          if (judgeModel) {
+            try {
+              const explanation = await explainCommand(client, {
+                request: promptInfo(request),
+                model: judgeModel,
+                directory,
+                signal: AbortSignal.any([signal ?? new AbortController().signal, new AbortController().signal]),
+                verdictReason,
+              })
+              stdout.write(`\n${explanation}\n\n`)
+            } catch {
+              stdout.write("\nthe judge could not explain it\n\n")
+            }
+          } else {
+            stdout.write("\nno safety judge configured to explain this\n\n")
+          }
+          continue
+        }
+        if (raw === "i" || raw === "inspect") {
+          if (serverUrl && request.sessionID) {
+            try {
+              const { openOpencodeSessionWindow } = await import("./opencode")
+              await openOpencodeSessionWindow({ url: serverUrl, targetDir: directory, sessionID: request.sessionID })
+              stdout.write(`\nopened session in new window\n\n`)
+            } catch (error) {
+              stdout.write(`\ncouldn't open session: ${error instanceof Error ? error.message : String(error)}\n\n`)
+            }
+          } else if (!serverUrl) {
+            stdout.write("\nno live opencode server to attach to\n\n")
+          } else {
+            stdout.write("\nthis request has no session to inspect\n\n")
+          }
+          continue
+        }
+        stdout.write("Choose o, a, r, e, or i.\n")
       }
     } finally {
       progress.resume()
@@ -232,6 +272,37 @@ function promptInfo(request: PermissionRequest, judgeReason?: string): Permissio
     sessionID: request.sessionID,
     ...(judgeReason ? { judgeReason } : {}),
   }
+}
+
+/**
+ * Builds the `PermissionPromptInfo` for the user-facing prompt (TUI or readline).
+ * This is the same as `promptInfo` but adds the `explain` callback when a judge
+ * model is available. `promptInfo` itself stays free of callbacks because it is
+ * also the `JudgeRequest` that feeds `judgeCommand`.
+ */
+function promptInfoForUser(
+  request: PermissionRequest,
+  judgeReason?: string,
+  verdictReason?: string,
+  judgeModel?: { providerID: string; modelID: string },
+  client?: OpencodeClient,
+  directory?: string,
+  signal?: AbortSignal,
+): PermissionPromptInfo {
+  const info = promptInfo(request, judgeReason)
+  if (judgeModel && client && directory) {
+    info.explain = (explainSignal?: AbortSignal) => {
+      const combined = signal && explainSignal ? AbortSignal.any([signal, explainSignal]) : (signal ?? explainSignal)
+      return explainCommand(client, {
+        request: promptInfo(request),
+        model: judgeModel,
+        directory,
+        signal: combined,
+        verdictReason,
+      })
+    }
+  }
+  return info
 }
 
 async function reply(client: OpencodeClient, requestID: string, directory: string, choice: Reply, message?: string) {

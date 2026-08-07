@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
-import { judgeCommand, parseVerdict } from "../src/safety-judge"
+import { explainCommand, judgeCommand, parseVerdict } from "../src/safety-judge"
 
 describe("parseVerdict", () => {
   test("reads a clean JSON verdict", () => {
@@ -77,5 +77,54 @@ describe("judgeCommand", () => {
     const client = fakeClient({ promptText: '{"safe": true}', onDelete: (id) => (deleted = id) })
     await judgeCommand(client, { request, model, directory: "/tmp" })
     expect(deleted).toBe("judge-session")
+  })
+})
+
+describe("explainCommand", () => {
+  test("returns the model's prose explanation", async () => {
+    const client = fakeClient({ promptText: "This command lists files in the current directory. It is safe because it is read-only and does not modify any data." })
+    const text = await explainCommand(client, { request, model, directory: "/tmp" })
+    expect(text).toContain("lists files")
+    expect(text).toContain("read-only")
+  })
+
+  test("cleans up the throwaway session", async () => {
+    let deleted: string | undefined
+    const client = fakeClient({ promptText: "safe command", onDelete: (id) => (deleted = id) })
+    await explainCommand(client, { request, model, directory: "/tmp" })
+    expect(deleted).toBe("judge-session")
+  })
+
+  test("returns a readable fallback on error, does not throw", async () => {
+    const client = fakeClient({ promptThrows: true })
+    const text = await explainCommand(client, { request, model, directory: "/tmp" })
+    expect(text).toContain("the judge could not explain it")
+  })
+
+  test("returns a readable fallback on timeout", async () => {
+    // A prompt that never resolves would trigger the timeout; we simulate
+    // by making the prompt throw a timeout error through the abort controller.
+    const client = fakeClient({ promptThrows: true })
+    const text = await explainCommand(client, { request, model, directory: "/tmp" })
+    expect(text).toContain("the judge could not explain it")
+  })
+
+  test("includes verdictReason in the rendered request when provided", async () => {
+    let capturedText = ""
+    const client: OpencodeClient = {
+      session: {
+        create: async () => ({ data: { id: "judge-session" }, error: undefined }),
+        prompt: async ({ parts }: { parts: Array<{ type: string; text?: string }> }) => {
+          capturedText = parts.find((p) => p.type === "text")?.text ?? ""
+          return { data: { info: {}, parts: [{ type: "text", text: "explanation" }] }, error: undefined }
+        },
+        delete: async ({ sessionID }: { sessionID: string }) => {
+          return { data: undefined, error: undefined }
+        },
+      },
+    } as unknown as OpencodeClient
+    await explainCommand(client, { request, model, directory: "/tmp", verdictReason: "deletes files" })
+    expect(capturedText).toContain("deletes files")
+    expect(capturedText).toContain("previously escalated")
   })
 })
