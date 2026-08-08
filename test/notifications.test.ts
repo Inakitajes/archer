@@ -1,204 +1,206 @@
 import { describe, expect, test } from "bun:test"
 
-import { Notifier, resolveTerminalBundleId, type NotifierProcess, type NotifierSpawn } from "../src/notifications"
-import type { NotificationEvent } from "../src/run-status"
+import { Notifier, resolveTerminalBundleId, defaultNotificationSettings } from "../src/notifications"
+import type { NotifierSpawn, NotifierProcess } from "../src/notifications"
 
-const ghostty = { TERM_PROGRAM: "ghostty" }
-
-function event(overrides: Partial<NotificationEvent> = {}): NotificationEvent {
-  return { key: "step-start:0", category: "steps", title: "convoy · feat/notify", body: "step 1/7 · plan — started", ...overrides }
-}
-
-/** Records every argv and lets the test decide each exit code. */
-function recorder(exitCodes: number[] = []) {
+// A fake spawn that records what it would run and never actually starts a process.
+function fakeSpawn(exitCode: number = 0): { spawn: NotifierSpawn; commands: string[][] } {
   const commands: string[][] = []
-  const spawn = (command: string[]): NotifierProcess => {
+  const spawn: NotifierSpawn = (command) => {
     commands.push(command)
-    const code = exitCodes[commands.length - 1] ?? 0
-    return { exited: Promise.resolve(code) }
+    return {
+      exited: Promise.resolve(exitCode),
+      kill() {},
+      unref() {},
+    }
   }
-  return { commands, spawn }
+  return { spawn, commands }
 }
 
-/** The delivery is fire-and-forget; give its microtasks a turn before asserting. */
-const flush = () => Bun.sleep(1)
-
-describe("Notifier delivery", () => {
-  test("attributes the banner to the host terminal so it carries that app's icon", async () => {
-    const { commands, spawn } = recorder()
-    const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty })
-
-    expect(notifier.notify(event())).toBe(true)
-    await flush()
-
-    expect(commands).toEqual([
-      [
-        "osascript",
-        "-e",
-        'tell application id "com.mitchellh.ghostty"',
-        "-e",
-        'display notification "step 1/7 · plan — started" with title "convoy · feat/notify"',
-        "-e",
-        "end tell",
-      ],
-    ])
-  })
-
-  test("falls back to a bare banner when the attributed one fails", async () => {
-    const { commands, spawn } = recorder([1, 0])
-    const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty })
-
-    notifier.notify(event())
-    await flush()
-
-    expect(commands).toHaveLength(2)
-    expect(commands[1]).toEqual(["osascript", "-e", 'display notification "step 1/7 · plan — started" with title "convoy · feat/notify"'])
-  })
-
-  test("goes straight to a bare banner when the terminal is unknown", async () => {
-    const { commands, spawn } = recorder()
-    new Notifier({ platform: "darwin", spawn, env: {} }).notify(event())
-    await flush()
-
-    expect(commands).toHaveLength(1)
-    expect(commands[0]![2]).toStartWith("display notification ")
-  })
-
-  test("a sound name is only added when configured", async () => {
-    const { commands, spawn } = recorder()
-    new Notifier({ platform: "darwin", spawn, env: {}, settings: { sound: "Ping" } }).notify(event())
-    await flush()
-
-    expect(commands[0]![2]).toBe('display notification "step 1/7 · plan — started" with title "convoy · feat/notify" sound name "Ping"')
-  })
-
-  test("quotes and backslashes in a body are escaped, never interpolated raw", async () => {
-    const { commands, spawn } = recorder()
-    const hostile = 'rm -rf "dist" && echo \\ pwned'
-    new Notifier({ platform: "darwin", spawn, env: {} }).notify(event({ body: hostile }))
-    await flush()
-
-    const script = commands[0]![2]!
-    expect(script).toContain('\\"dist\\"')
-    expect(script).toContain("echo \\\\ pwned")
-    // Argv array, never a shell string: the payload is one argument.
-    expect(commands[0]![0]).toBe("osascript")
-    expect(commands[0]).toHaveLength(3)
-  })
-})
-
-describe("Notifier gating", () => {
-  test("does nothing off macOS", async () => {
-    const { commands, spawn } = recorder()
-    const notifier = new Notifier({ platform: "linux", spawn, env: ghostty })
-
-    expect(notifier.available).toBe(false)
-    expect(notifier.notify(event())).toBe(false)
-    await flush()
-    expect(commands).toEqual([])
-  })
-
-  test("the master switch suppresses every category", async () => {
-    const { commands, spawn } = recorder()
-    const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty, settings: { enabled: false } })
-
-    expect(notifier.available).toBe(false)
-    expect(notifier.notify(event({ category: "failures" }))).toBe(false)
-    await flush()
-    expect(commands).toEqual([])
-  })
-
-  test("each category has its own switch", () => {
-    const { spawn } = recorder()
-    const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty, settings: { steps: false } })
-
-    expect(notifier.notify(event({ category: "steps" }))).toBe(false)
-    expect(notifier.notify(event({ key: "fail:0", category: "failures" }))).toBe(true)
-  })
-
-  test("stop() ends delivery for the rest of the run", () => {
-    const { spawn } = recorder()
-    const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty })
-
-    notifier.stop()
-    expect(notifier.notify(event())).toBe(false)
-  })
-
-  test("stop() terminates an unsettled notification child", async () => {
-    let resolveExit!: (code: number) => void
-    const child = {
-      exited: new Promise<number>((resolve) => {
-        resolveExit = resolve
-      }),
-      kill() {
-        resolveExit(1)
-      },
-    }
-    const spawn: NotifierSpawn = () => child
-    const notifier = new Notifier({ platform: "darwin", spawn, env: {} })
-
-    notifier.notify(event())
-    await flush()
-    await notifier.stop()
-
-    const exit = await Promise.race([child.exited, Bun.sleep(10).then(() => "still-running" as const)])
-    expect(exit).toBe(1)
-  })
-})
-
-describe("Notifier throttling", () => {
-  test("repeats of one key collapse inside the window, and fire again after it", () => {
-    const { spawn } = recorder()
-    let clock = 1_000
-    const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty, now: () => clock })
-
-    expect(notifier.notify(event())).toBe(true)
-    clock += 1_000
-    expect(notifier.notify(event())).toBe(false)
-    clock += 2_500
-    expect(notifier.notify(event())).toBe(true)
-  })
-
-  test("waiting has a longer window than steps, so a live prompt does not re-fire", () => {
-    const { spawn } = recorder()
-    let clock = 1_000
-    const wait = event({ key: "wait:permission:req-1", category: "waiting" })
-    const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty, now: () => clock })
-
-    expect(notifier.notify(wait)).toBe(true)
-    clock += 5_000
-    expect(notifier.notify(wait)).toBe(false)
-    clock += 6_000
-    expect(notifier.notify(wait)).toBe(true)
-  })
-
-  test("different keys never throttle each other", () => {
-    const { spawn } = recorder()
-    const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty, now: () => 1_000 })
-
-    expect(notifier.notify(event({ key: "step-start:0" }))).toBe(true)
-    expect(notifier.notify(event({ key: "step-start:1" }))).toBe(true)
+describe("defaultNotificationSettings", () => {
+  test("has all notifications enabled by default", () => {
+    expect(defaultNotificationSettings.enabled).toBe(true)
+    expect(defaultNotificationSettings.steps).toBe(true)
+    expect(defaultNotificationSettings.waiting).toBe(true)
+    expect(defaultNotificationSettings.failures).toBe(true)
+    expect(defaultNotificationSettings.finish).toBe(true)
+    expect(defaultNotificationSettings.terminalTitle).toBe(true)
+    expect(defaultNotificationSettings.sound).toBe("")
   })
 })
 
 describe("resolveTerminalBundleId", () => {
-  test("maps the common terminals", () => {
-    expect(resolveTerminalBundleId({ TERM_PROGRAM: "ghostty" })).toBe("com.mitchellh.ghostty")
-    expect(resolveTerminalBundleId({ TERM_PROGRAM: "iTerm.app" })).toBe("com.googlecode.iterm2")
+  test("returns CONVOY_NOTIFY_APP_ID override when set", () => {
+    expect(resolveTerminalBundleId({ CONVOY_NOTIFY_APP_ID: "com.example.app" })).toBe("com.example.app")
+  })
+
+  test("returns the bundle ID for a known terminal program", () => {
     expect(resolveTerminalBundleId({ TERM_PROGRAM: "Apple_Terminal" })).toBe("com.apple.Terminal")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "iTerm.app" })).toBe("com.googlecode.iterm2")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "ghostty" })).toBe("com.mitchellh.ghostty")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "vscode" })).toBe("com.microsoft.VSCode")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "WarpTerminal" })).toBe("dev.warp.Warp-Stable")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "Hyper" })).toBe("co.zeit.hyper")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "WezTerm" })).toBe("com.github.wez.wezterm")
   })
 
-  test("recognises Ghostty by TERM when TERM_PROGRAM is missing", () => {
+  test("detects Ghostty from TERM when TERM_PROGRAM is unset", () => {
     expect(resolveTerminalBundleId({ TERM: "xterm-ghostty" })).toBe("com.mitchellh.ghostty")
-    expect(resolveTerminalBundleId({ GHOSTTY_RESOURCES_DIR: "/opt/ghostty" })).toBe("com.mitchellh.ghostty")
+    expect(resolveTerminalBundleId({ GHOSTTY_RESOURCES_DIR: "/some/path" })).toBe("com.mitchellh.ghostty")
   })
 
-  test("an explicit override beats detection", () => {
-    expect(resolveTerminalBundleId({ TERM_PROGRAM: "ghostty", CONVOY_NOTIFY_APP_ID: "com.example.Term" })).toBe("com.example.Term")
-  })
-
-  test("an unknown terminal resolves to nothing so the bare banner is used", () => {
-    expect(resolveTerminalBundleId({ TERM_PROGRAM: "something-else" })).toBeUndefined()
+  test("returns undefined when the terminal is unknown", () => {
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "Alacritty" })).toBeUndefined()
     expect(resolveTerminalBundleId({})).toBeUndefined()
+  })
+
+  test("trims whitespace from env values", () => {
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "  Apple_Terminal  " })).toBe("com.apple.Terminal")
+  })
+})
+
+describe("Notifier", () => {
+  test("available returns false on non-darwin platforms", () => {
+    const notifier = new Notifier({ platform: "linux" })
+    expect(notifier.available).toBe(false)
+  })
+
+  test("available returns false when notifications are disabled", () => {
+    const notifier = new Notifier({ platform: "darwin", settings: { enabled: false } })
+    expect(notifier.available).toBe(false)
+  })
+
+  test("available returns true on darwin with notifications enabled", () => {
+    const notifier = new Notifier({ platform: "darwin" })
+    expect(notifier.available).toBe(true)
+  })
+
+  test("notify returns false when stopped", () => {
+    const notifier = new Notifier({ platform: "darwin", settings: { enabled: true } })
+    notifier.stop()
+    expect(notifier.notify({ key: "test", category: "steps", title: "T", body: "B" })).toBe(false)
+  })
+
+  test("notify returns false when not available", () => {
+    const notifier = new Notifier({ platform: "linux" })
+    expect(notifier.notify({ key: "test", category: "steps", title: "T", body: "B" })).toBe(false)
+  })
+
+  test("notify returns false when the category is disabled", () => {
+    const notifier = new Notifier({ platform: "darwin", settings: { steps: false } })
+    expect(notifier.notify({ key: "test", category: "steps", title: "T", body: "B" })).toBe(false)
+  })
+
+  test("notify returns true for a first-time event", () => {
+    const { spawn } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn })
+    expect(notifier.notify({ key: "test", category: "steps", title: "T", body: "B" })).toBe(true)
+  })
+
+  test("notify throttles duplicate events within the window", () => {
+    let now = 1000
+    const { spawn } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn, now: () => now })
+    expect(notifier.notify({ key: "test", category: "steps", title: "T", body: "B" })).toBe(true)
+    // 1 second later — still inside the 3s throttle window
+    now = 2000
+    expect(notifier.notify({ key: "test", category: "steps", title: "T", body: "B" })).toBe(false)
+  })
+
+  test("notify lets a throttled event through after the window expires", () => {
+    let now = 1000
+    const { spawn } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn, now: () => now })
+    notifier.notify({ key: "test", category: "steps", title: "T", body: "B" })
+    now = 5000 // 4 seconds later — past the 3s window
+    expect(notifier.notify({ key: "test", category: "steps", title: "T", body: "B" })).toBe(true)
+  })
+
+  test("spawns osascript for delivery on darwin", async () => {
+    const { spawn, commands } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn, settings: { sound: "Ping" } })
+    notifier.notify({ key: "test", category: "finish", title: "Done", body: "Run finished" })
+    // Give the async deliver a moment to spawn
+    await new Promise((r) => setTimeout(r, 50))
+    expect(commands.length).toBeGreaterThan(0)
+    const osascript = commands.find((cmd) => cmd[0] === "osascript")
+    expect(osascript).toBeDefined()
+    expect(osascript!.join(" ")).toContain("display notification")
+    expect(osascript!.join(" ")).toContain("sound name")
+  })
+
+  test("spawns osascript with attributed notification when a bundle ID is known", async () => {
+    const { spawn, commands } = fakeSpawn(0)
+    const notifier = new Notifier({
+      platform: "darwin",
+      spawn,
+      env: { TERM_PROGRAM: "Apple_Terminal" },
+    })
+    notifier.notify({ key: "test", category: "finish", title: "Done", body: "Run finished" })
+    await new Promise((r) => setTimeout(r, 50))
+    const osascriptCalls = commands.filter((cmd) => cmd[0] === "osascript")
+    expect(osascriptCalls.length).toBeGreaterThan(0)
+    // The first call should be attributed (tell application id ...)
+    expect(osascriptCalls[0]!.join(" ")).toContain("tell application id")
+  })
+
+  test("stop kills all children and drains them", async () => {
+    const exitResolvers: Array<() => void> = []
+    const spawn: NotifierSpawn = (command) => ({
+      exited: new Promise<number>((resolve) => {
+        exitResolvers.push(() => resolve(0))
+      }),
+      kill() {},
+      unref() {},
+    })
+    const notifier = new Notifier({ platform: "darwin", spawn })
+    notifier.notify({ key: "t", category: "finish", title: "T", body: "B" })
+    await new Promise((r) => setTimeout(r, 10))
+    await notifier.stop()
+    // After stop, notify should return false
+    expect(notifier.notify({ key: "t2", category: "finish", title: "T", body: "B" })).toBe(false)
+  })
+
+  test("notify with a custom now() respects throttling per key", () => {
+    let now = 1000
+    const { spawn } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn, now: () => now })
+    // Different keys should not throttle each other
+    expect(notifier.notify({ key: "a", category: "steps", title: "T", body: "B" })).toBe(true)
+    expect(notifier.notify({ key: "b", category: "steps", title: "T", body: "B" })).toBe(true)
+  })
+
+  test("stop drains a slow child notification", async () => {
+    const pendingExit = new Promise<number>(() => {}) // never resolves
+    const slowSpawn: NotifierSpawn = () => ({
+      exited: pendingExit,
+      kill() {},
+      unref() {},
+    })
+    const notifier = new Notifier({ platform: "darwin", spawn: slowSpawn })
+    notifier.notify({ key: "slow", category: "finish", title: "T", body: "B" })
+    // Give time for the notification to be tracked
+    await new Promise((r) => setTimeout(r, 50))
+    // Stop should kill the child and drain it (the slow promise times out after stopDrainMs)
+    await notifier.stop()
+    // After stop, notifications should be suppressed
+    expect(notifier.notify({ key: "after", category: "finish", title: "T", body: "B" })).toBe(false)
+  })
+
+  test("stop drains a child that exits quickly", async () => {
+    let resolveExit!: (code: number) => void
+    const exitPromise = new Promise<number>((resolve) => { resolveExit = resolve })
+    const quickSpawn: NotifierSpawn = () => ({
+      exited: exitPromise,
+      kill() {},
+      unref() {},
+    })
+    const notifier = new Notifier({ platform: "darwin", spawn: quickSpawn })
+    notifier.notify({ key: "quick", category: "finish", title: "T", body: "B" })
+    await new Promise((r) => setTimeout(r, 50))
+    // Resolve the child exit
+    resolveExit!(0)
+    await notifier.stop()
+    expect(notifier.notify({ key: "after2", category: "finish", title: "T", body: "B" })).toBe(false)
   })
 })

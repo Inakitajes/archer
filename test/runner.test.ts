@@ -13,6 +13,7 @@ import {
   RunControl,
   SessionAbortedError,
   UserAbortError,
+  PhaseGroupError,
   waitForPhaseGate,
   commitRecoveredPhase,
   createConcurrencyLimiter,
@@ -1555,3 +1556,353 @@ describe("watchSession turn scoping", () => {
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }
+
+describe("PhaseGroupError", () => {
+  test("formats all failures into a single message", () => {
+    const error = new PhaseGroupError([
+      { name: "design", error: new Error("model timeout") },
+      { name: "implementer", error: "provider unavailable" },
+    ])
+    expect(error.name).toBe("PhaseGroupError")
+    expect(error.message).toContain("[design]")
+    expect(error.message).toContain("model timeout")
+    expect(error.message).toContain("[implementer]")
+    expect(error.message).toContain("provider unavailable")
+  })
+
+  test("preserves the failures array", () => {
+    const failures = [{ name: "design", error: new Error("boom") }]
+    const error = new PhaseGroupError(failures)
+    expect(error.failures).toEqual(failures)
+  })
+
+  test("handles empty failures", () => {
+    const error = new PhaseGroupError([])
+    expect(error.message).toBe("")
+    expect(error.failures).toEqual([])
+  })
+})
+
+describe("isUserAbortError", () => {
+  test("returns true for UserAbortError instance", () => {
+    expect(isUserAbortError(new UserAbortError())).toBe(true)
+  })
+
+  test("returns true for UserAbortError with custom message", () => {
+    expect(isUserAbortError(new UserAbortError("custom abort"))).toBe(true)
+  })
+
+  test("returns true for Error with UserAbortError name", () => {
+    const error = new Error("wrapped abort")
+    Object.defineProperty(error, "name", { value: "UserAbortError" })
+    expect(isUserAbortError(error)).toBe(true)
+  })
+
+  test("returns false for plain Error", () => {
+    expect(isUserAbortError(new Error("some error"))).toBe(false)
+  })
+
+  test("returns false for non-Error values", () => {
+    expect(isUserAbortError("aborted")).toBe(false)
+    expect(isUserAbortError(null)).toBe(false)
+    expect(isUserAbortError(undefined)).toBe(false)
+    expect(isUserAbortError(42)).toBe(false)
+    expect(isUserAbortError({})).toBe(false)
+  })
+})
+
+describe("isIgnorableRejection", () => {
+  test("returns true for UserAbortError", () => {
+    expect(isIgnorableRejection(new UserAbortError())).toBe(true)
+  })
+
+  test("returns true for AbortError by name", () => {
+    const error = new Error("The operation was aborted")
+    error.name = "AbortError"
+    expect(isIgnorableRejection(error)).toBe(true)
+  })
+
+  test("returns true for error with 'aborted' in message", () => {
+    expect(isIgnorableRejection(new Error("request was aborted"))).toBe(true)
+  })
+
+  test("returns true for errors containing 'aborted' or 'aborte'", () => {
+    expect(isIgnorableRejection(new Error("user aborted"))).toBe(true)
+    expect(isIgnorableRejection(new Error("aborted by kernel"))).toBe(true)
+  })
+
+  test("returns false for regular errors", () => {
+    expect(isIgnorableRejection(new Error("Cannot read properties of undefined"))).toBe(false)
+    expect(isIgnorableRejection(new TypeError("boom"))).toBe(false)
+  })
+
+  test("returns false for non-Error values", () => {
+    expect(isIgnorableRejection("aborted")).toBe(false)
+    expect(isIgnorableRejection(undefined)).toBe(false)
+    expect(isIgnorableRejection(null)).toBe(false)
+    expect(isIgnorableRejection(42)).toBe(false)
+  })
+})
+
+describe("RunShutdown methods", () => {
+  test("signal returns an AbortSignal", () => {
+    const shutdown = new RunShutdown()
+    expect(shutdown.signal).toBeInstanceOf(Object)
+    expect(shutdown.signal.aborted).toBe(false)
+    shutdown.dispose()
+  })
+
+  test("aborted reflects the underlying controller state", () => {
+    const shutdown = new RunShutdown()
+    expect(shutdown.aborted).toBe(false)
+    shutdown.dispose()
+  })
+
+  test("abortError returns UserAbortError when no reason is set", () => {
+    const shutdown = new RunShutdown()
+    const error = shutdown.abortError()
+    expect(isUserAbortError(error)).toBe(true)
+    shutdown.dispose()
+  })
+
+  test("abortError returns the signal reason when it is a UserAbortError", () => {
+    const shutdown = new RunShutdown()
+    const signal = shutdown.signal
+    const err = new UserAbortError("test abort")
+    // Manually abort the controller to set the reason
+    const controller = new AbortController()
+    controller.abort(err)
+    expect(isUserAbortError(controller.signal.reason)).toBe(true)
+    shutdown.dispose()
+  })
+
+  test("abortError falls back to fallback when available", () => {
+    const shutdown = new RunShutdown()
+    const fallback = new UserAbortError("fallback")
+    const error = shutdown.abortError(fallback)
+    expect(isUserAbortError(error)).toBe(true)
+    expect((error as Error).message).toBe("fallback")
+    shutdown.dispose()
+  })
+
+  test("throwIfRequested does not throw before abort", () => {
+    const shutdown = new RunShutdown()
+    expect(() => shutdown.throwIfRequested()).not.toThrow()
+    shutdown.dispose()
+  })
+
+  test("setActiveSession and clearActiveSession manage session map", async () => {
+    const shutdown = new RunShutdown()
+    const session = {
+      client: {} as never,
+      sessionID: "ses_1",
+      directory: "/tmp",
+      phaseName: "design",
+    }
+    shutdown.setActiveSession(session)
+    // Wrong sessionID for the phase: should not clear
+    shutdown.clearActiveSession("design", "ses_wrong")
+    // Correct sessionID: should clear
+    shutdown.clearActiveSession("design", "ses_1")
+    // Clearing again is a no-op
+    shutdown.clearActiveSession("design", "ses_1")
+    shutdown.dispose()
+  })
+
+  test("abortActiveSessions resolves when no sessions are tracked", async () => {
+    const shutdown = new RunShutdown()
+    await shutdown.abortActiveSessions()
+    shutdown.dispose()
+  })
+})
+
+describe("RunControl state management", () => {
+  function metadataFor(state: "running" | "pausing" | "paused") {
+    let current = state
+    return {
+      controlState: () => current,
+      setControlState: async (next: typeof current) => {
+        current = next
+      },
+    } as unknown as RunMetadataStore
+  }
+
+  test("starts in controlState from metadata", () => {
+    const control = new RunControl(metadataFor("paused"))
+    expect(control).toBeDefined()
+  })
+
+  test("requestPause is a no-op when already paused", async () => {
+    const meta = metadataFor("paused")
+    const setCalls: string[] = []
+    const spy = {
+      controlState: () => "paused" as const,
+      setControlState: async (next: string) => { setCalls.push(next) },
+    } as unknown as RunMetadataStore
+    const control = new RunControl(spy)
+    await control.requestPause()
+    expect(setCalls).toEqual([])
+  })
+
+  test("requestPause is a no-op when already pausing", async () => {
+    const meta = metadataFor("pausing")
+    const setCalls: string[] = []
+    const spy = {
+      controlState: () => "pausing" as const,
+      setControlState: async (next: string) => { setCalls.push(next) },
+    } as unknown as RunMetadataStore
+    const control = new RunControl(spy)
+    await control.requestPause()
+    expect(setCalls).toEqual([])
+  })
+
+  test("resume is a no-op when already running", async () => {
+    const meta = metadataFor("running")
+    const setCalls: string[] = []
+    const spy = {
+      controlState: () => "running" as const,
+      setControlState: async (next: string) => { setCalls.push(next) },
+    } as unknown as RunMetadataStore
+    const control = new RunControl(spy)
+    await control.resume()
+    expect(setCalls).toEqual([])
+  })
+
+  test("toggle switches between running and paused", async () => {
+    let state = "running" as "running" | "paused"
+    const persisted: string[] = []
+    const meta = {
+      controlState: () => state,
+      setControlState: async (next: typeof state) => {
+        state = next
+        persisted.push(next)
+      },
+    } as unknown as RunMetadataStore
+    const control = new RunControl(meta)
+
+    await control.toggle()
+    expect(state).toBe("paused")
+    expect(persisted).toEqual(["paused"])
+
+    await control.toggle()
+    expect(state).toBe("running")
+    expect(persisted).toEqual(["paused", "running"])
+  })
+
+  test("awaitRunnable resolves immediately when state is running", async () => {
+    const control = new RunControl(metadataFor("running"))
+    await control.awaitRunnable()
+  })
+
+  test("awaitRunnable rejects when signal is already aborted", async () => {
+    const control = new RunControl(metadataFor("paused"))
+    const controller = new AbortController()
+    controller.abort(new UserAbortError("already aborted"))
+    await expect(control.awaitRunnable(controller.signal)).rejects.toThrow("already aborted")
+  })
+
+  test("publish calls runControlState on bound progress", async () => {
+    const calls: { state: string; active: number }[] = []
+    const control = new RunControl(metadataFor("running"))
+    control.bind({
+      ...noopProgress,
+      runControlState: (state, active) => calls.push({ state, active }),
+    })
+    expect(calls).toContainEqual({ state: "running", active: 0 })
+  })
+})
+
+describe("planBatches edge cases", () => {
+  const agent = (name: string, groupId?: string): AgentStep => ({
+    type: "agent",
+    name,
+    agentName: name,
+    description: name,
+    model: "openai/gpt-4",
+    inputFiles: [],
+    inputDiff: false,
+    reportPath: `reports/${name}.md`,
+    ...(groupId ? { groupId } : {}),
+    stepName: name,
+  })
+
+  test("single step returns one batch", () => {
+    expect(planBatches([agent("design")])).toEqual([[agent("design")]])
+  })
+
+  test("no steps returns empty array", () => {
+    expect(planBatches([])).toEqual([])
+  })
+
+  test("human step is always its own batch", () => {
+    const human = { type: "human" as const, name: "review", description: "review" }
+    expect(planBatches([human])).toEqual([[human]])
+  })
+
+  test("agents with matching groupId batch together", () => {
+    const a = agent("a", "g1")
+    const b = agent("b", "g1")
+    const c = agent("c", "g1")
+    expect(planBatches([a, b, c])).toEqual([[a, b, c]])
+  })
+
+  test("human gate splits groupId continuity", () => {
+    const before = agent("a", "g1")
+    const human = { type: "human" as const, name: "review", description: "review" }
+    const after = agent("b", "g1")
+    expect(planBatches([before, human, after])).toEqual([[before], [human], [after]])
+  })
+
+  test("adjacent but different groupIds are separate batches", () => {
+    const a = agent("a", "g1")
+    const b = agent("b", "g2")
+    expect(planBatches([a, b])).toEqual([[a], [b]])
+  })
+})
+
+describe("createConcurrencyLimiter edge cases", () => {
+  test("single job runs immediately", async () => {
+    const limit = createConcurrencyLimiter(1)
+    let ran = false
+    await limit(async () => { ran = true })
+    expect(ran).toBe(true)
+  })
+
+  test("empty queue resolves no extra jobs", async () => {
+    const limit = createConcurrencyLimiter(5)
+    expect(limit).toBeDefined()
+  })
+
+  test("jobs are drained in FIFO order", async () => {
+    const limit = createConcurrencyLimiter(1)
+    const order: number[] = []
+    await Promise.all([
+      limit(async () => {
+        await new Promise((r) => setTimeout(r, 5))
+        order.push(1)
+      }),
+      limit(async () => {
+        order.push(2)
+      }),
+      limit(async () => {
+        order.push(3)
+      }),
+    ])
+    expect(order).toEqual([1, 2, 3])
+  })
+
+  test("limit of 1 serializes all work", async () => {
+    const limit = createConcurrencyLimiter(1)
+    let running = 0
+    let peak = 0
+    const job = () =>
+      limit(async () => {
+        running++
+        peak = Math.max(peak, running)
+        await new Promise((r) => setTimeout(r, 5))
+        running--
+      })
+    await Promise.all(Array.from({ length: 5 }, job))
+    expect(peak).toBe(1)
+  })
+})

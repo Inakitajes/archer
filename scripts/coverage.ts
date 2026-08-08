@@ -39,8 +39,8 @@ function parseTextCoverage(output: string): CoverageTotals {
     throw new Error("Could not parse coverage summary from test output")
   }
   return {
-    funcPct: Number.parseFloat(match[1]),
-    linePct: Number.parseFloat(match[2]),
+    linePct: Number.parseFloat(match[1]),
+    funcPct: Number.parseFloat(match[2]),
   }
 }
 

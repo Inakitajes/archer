@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test, mock } from "bun:test"
 
 import { preflightTargets, validatePreflightTargets } from "../src/preflight-validation"
 import { preflightRunPlan } from "../src/preflight"
@@ -75,6 +75,10 @@ function catalog(input: { providerID?: string; connected?: boolean; modelID?: st
   }
 }
 
+function noopDiscover() {
+  return Promise.resolve(catalog())
+}
+
 describe("OpenCode run-plan preflight", () => {
   test("collects OpenCode steps, smart judge, and branch namer targets — never Claude Code", () => {
     const reviewed = plan()
@@ -102,8 +106,6 @@ describe("OpenCode run-plan preflight", () => {
         target: "vercel/anthropic/claude-haiku-4.5",
       },
     }
-    // A worktree run has nothing extra to preflight: the branch was named in
-    // the launcher, so no naming call is left once the plan is confirmed.
     reviewed.target = { ...reviewed.target, worktree: true, branch: "feat/add-onboarding" }
 
     expect(preflightTargets(reviewed).map((target) => target.target)).toEqual([
@@ -137,6 +139,85 @@ describe("OpenCode run-plan preflight", () => {
     expect(discoveredDirectory).toBe("/repo")
   })
 
+  test("returns early when the plan has no preflight targets", async () => {
+    const reviewed = plan()
+    reviewed.pipeline.steps = []
+    let discoverCalled = false
+
+    await preflightRunPlan(reviewed, async () => {
+      discoverCalled = true
+      return catalog()
+    })
+
+    expect(discoverCalled).toBe(false)
+  })
+
+  test("returns early when the plan only has claude-code steps", async () => {
+    const reviewed = plan()
+    reviewed.pipeline.steps[0] = {
+      ...reviewed.pipeline.steps[0],
+      runner: "claude-code",
+      model: "opus",
+      resolvedModel: undefined,
+    } as typeof reviewed.pipeline.steps[0]
+    let discoverCalled = false
+
+    await preflightRunPlan(reviewed, async () => {
+      discoverCalled = true
+      return catalog()
+    })
+
+    expect(discoverCalled).toBe(false)
+  })
+
+  test("throws when a provider is not connected", async () => {
+    const reviewed = plan()
+
+    await expect(preflightRunPlan(reviewed, async () => catalog({ connected: false }))).rejects.toThrow(
+      "Missing provider credentials",
+    )
+  })
+
+  test("throws when a model is not found in the catalog", async () => {
+    const reviewed = plan()
+
+    await expect(
+      preflightRunPlan(reviewed, async () => catalog({ modelID: "some-other-model" })),
+    ).rejects.toThrow("Model unavailable")
+  })
+
+  test("throws when a variant is not found in the catalog", async () => {
+    const reviewed = directOpenAIPlan()
+
+    await expect(
+      preflightRunPlan(
+        reviewed,
+        async () => catalog({ providerID: "openai", modelID: "gpt-5.6-terra", variants: ["high"] }),
+      ),
+    ).rejects.toThrow("Model unavailable")
+  })
+
+  test("throws when the discover function rejects", async () => {
+    const reviewed = plan()
+
+    await expect(
+      preflightRunPlan(reviewed, async () => {
+        throw new Error("network error")
+      }),
+    ).rejects.toThrow("network error")
+  })
+
+  test("throws when the catalog is missing the provider entry entirely", async () => {
+    const reviewed = directOpenAIPlan()
+
+    await expect(
+      preflightRunPlan(reviewed, async () => ({
+        all: [],
+        connected: [],
+      })),
+    ).rejects.toThrow("Model unavailable")
+  })
+
   test("reports Vercel authentication guidance when it is not connected", () => {
     expect(() => validatePreflightTargets(preflightTargets(plan()), catalog({ connected: false }))).toThrow(
       "Missing provider credentials: vercel",
@@ -149,7 +230,7 @@ describe("OpenCode run-plan preflight", () => {
   test("reports unavailable variants from the exact classic model catalog", () => {
     expect(() =>
       validatePreflightTargets(preflightTargets(directOpenAIPlan()), catalog({ providerID: "openai", modelID: "gpt-5.6-terra", variants: ["high"] })),
-    ).toThrow("Model unavailable through As configured")
+    ).toThrow("Model unavailable")
   })
 
   test("reports the logical and exact physical target when a model is unavailable", () => {
@@ -159,5 +240,40 @@ describe("OpenCode run-plan preflight", () => {
     expect(() => validatePreflightTargets(targets, withoutTarget)).toThrow("Model unavailable through Vercel AI Gateway")
     expect(() => validatePreflightTargets(targets, withoutTarget)).toThrow("logical: openai/gpt-5.6-sol")
     expect(() => validatePreflightTargets(targets, withoutTarget)).toThrow("target:  vercel/openai/gpt-5.6-sol")
+  })
+})
+
+describe("withinPreflightTimeout edge cases (through preflightRunPlan)", () => {
+  test("rejects immediately when AbortSignal.timeout fires (race condition)", async () => {
+    const reviewed = plan()
+    const originalTimeout = AbortSignal.timeout
+    const abortedSignal = AbortSignal.abort()
+    AbortSignal.timeout = mock(() => abortedSignal) as unknown as typeof AbortSignal.timeout
+    try {
+      await expect(
+        preflightRunPlan(reviewed, async () => {
+          await new Promise(() => {})
+          return catalog()
+        }),
+      ).rejects.toThrow("OpenCode preflight timed out")
+    } finally {
+      AbortSignal.timeout = originalTimeout
+    }
+  })
+
+  test("resolves with valid discover", async () => {
+    const reviewed = plan()
+    const discover = mock(() => Promise.resolve(catalog()))
+    await expect(preflightRunPlan(reviewed, discover)).resolves.toBeUndefined()
+    expect(discover).toHaveBeenCalled()
+  })
+
+  test("rejects when discover promise rejects", async () => {
+    const reviewed = plan()
+    await expect(
+      preflightRunPlan(reviewed, async () => {
+        throw new Error("discovery failure")
+      }),
+    ).rejects.toThrow("discovery failure")
   })
 })

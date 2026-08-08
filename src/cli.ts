@@ -470,7 +470,7 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
 
 type ParsedInitArgs = InitOptions & { help?: boolean }
 
-function parseInitArgs(argv: string[]): ParsedInitArgs {
+export function parseInitArgs(argv: string[]): ParsedInitArgs {
   const parsed: ParsedInitArgs = {
     targetDir: process.cwd(),
     global: false,
@@ -611,7 +611,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
 // run should get its own worktree, but on a branch you're already where you
 // want the work. The launcher applies the same default itself, so an interactive
 // run reaches this with parsed.worktree already set.
-async function resolveWorktreeOption(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<boolean> {
+export async function resolveWorktreeOption(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<boolean> {
   const explicit = parsed.worktree ?? defaults.worktree
   if (explicit !== undefined) return explicit
   const auto = await resolveWorktreeDefault(parsed.targetDir)
@@ -621,7 +621,7 @@ async function resolveWorktreeOption(parsed: ParsedArgs, defaults: ConvoyDefault
 
 // Base source: flag > config defaults.baseRef > auto-detection (never persisted).
 // An explicit base that doesn't exist stays a hard error in ensureRepoReady.
-async function resolveBaseRef(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<string> {
+export async function resolveBaseRef(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<string> {
   const explicit = parsed.baseRef ?? defaults.baseRef
   if (explicit) return explicit
   const detected = await detectBaseRef(parsed.baseDetectionDir ?? parsed.targetDir)
@@ -784,13 +784,13 @@ export function parseArgs(argv: string[]): ParsedArgs {
   return parsed
 }
 
-function splitFlag(raw: string) {
+export function splitFlag(raw: string) {
   const index = raw.indexOf("=")
   if (index === -1) return { flag: raw, value: undefined }
   return { flag: raw.slice(0, index), value: raw.slice(index + 1) }
 }
 
-function listValue(value: string) {
+export function listValue(value: string) {
   return value
     .split(",")
     .map((item) => item.trim())
@@ -904,7 +904,7 @@ Options:
 `
 }
 
-function writeUpdateResult(result: UpdateResult) {
+export function writeUpdateResult(result: UpdateResult) {
   switch (result.status) {
     case "source-install":
       process.stdout.write(`${result.message}\n`)

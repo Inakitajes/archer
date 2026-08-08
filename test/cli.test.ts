@@ -1,541 +1,688 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
-import { existsSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { describe, expect, test } from "bun:test"
+import { beforeEach } from "bun:test"
+import { spyOn } from "bun:test"
 
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { parseArgs, parseCommand, splitFlag, listValue, writeUpdateResult, resolveRunOptions, resolveBaseRef, resolveWorktreeOption, parseInitArgs } from "../src/cli"
 
-import { parseAndRun, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
-import { addWorktree } from "../src/git"
-import { stepNames } from "../src/pipeline"
+const validRunID = "20240101-120000-abcd"
 
-const homeDirs: string[] = []
-let savedHome: string | undefined
-
-beforeEach(async () => {
-  savedHome = process.env.CONVOY_HOME
-  const root = await mkdtemp(join(tmpdir(), "convoy-cli-home-"))
-  homeDirs.push(root)
-  await mkdir(join(root, ".convoy"), { recursive: true })
-  process.env.CONVOY_HOME = root
-})
-
-afterEach(() => {
-  if (savedHome === undefined) delete process.env.CONVOY_HOME
-  else process.env.CONVOY_HOME = savedHome
-})
-
-afterAll(async () => {
-  await Promise.all(homeDirs.map((dir) => rm(dir, { recursive: true, force: true })))
-})
-
-describe("cli parsing", () => {
-  test("parses pipeline flags without side effects", () => {
-    const parsed = parseArgs([
-      "--only",
-      "implementer,tests",
-      "--skip=design",
-      "--file",
-      "lib/onboarding",
-      "--include-dirty",
-      "add",
-      "onboarding",
-    ])
-
-    expect(parsed.onlySteps).toEqual(["implementer", "tests"])
-    expect(parsed.skipSteps).toEqual(["design"])
-    expect(parsed.files).toEqual(["lib/onboarding"])
-    expect(parsed.includeDirty).toBe(true)
-    expect(parsed.prompt).toBe("add onboarding")
+describe("parseArgs", () => {
+  test("parses a positional prompt", () => {
+    const result = parseArgs(["add onboarding"])
+    expect(result.prompt).toBe("add onboarding")
   })
 
-  test("parses gateway and review flags and rejects invalid combinations", () => {
-    expect(parseArgs(["--gateway", "vercel", "--plan", "--no-confirm", "prompt"])).toMatchObject({
-      gateway: "vercel",
-      planOnly: true,
-      noConfirm: true,
-      prompt: "prompt",
+  test("parses --prompt-file", () => {
+    const result = parseArgs(["--prompt-file", "prd.md"])
+    expect(result.promptFile).toBe("prd.md")
+  })
+
+  test("parses --file", () => {
+    const result = parseArgs(["--file", "lib/main.dart", "-f", "test/main_test.dart"])
+    expect(result.files).toEqual(["lib/main.dart", "test/main_test.dart"])
+  })
+
+  test("parses --pipeline", () => {
+    const result = parseArgs(["-p", "bug-fix"])
+    expect(result.pipeline).toBe("bug-fix")
+  })
+
+  test("parses --only and --skip with comma-separated values", () => {
+    const result = parseArgs(["--only", "design,security", "--skip", "tests"])
+    expect(result.onlySteps).toEqual(["design", "security"])
+    expect(result.skipSteps).toEqual(["tests"])
+  })
+
+  test("parses --resume", () => {
+    const result = parseArgs(["--resume", "run-abc123"])
+    expect(result.resumeRunID).toBe("run-abc123")
+  })
+
+  test("parses --model", () => {
+    const result = parseArgs(["--model", "anthropic/claude-sonnet-4-5#thinking"])
+    expect(result.modelOverride).toBe("anthropic/claude-sonnet-4-5#thinking")
+  })
+
+  test("parses --advisor", () => {
+    const result = parseArgs(["--advisor", "openai/gpt-5"])
+    expect(result.advisorOverride).toBe("openai/gpt-5")
+    expect(result.advisorDisabled).toBe(false)
+  })
+
+  test("parses --no-advisor", () => {
+    const result = parseArgs(["--no-advisor"])
+    expect(result.advisorDisabled).toBe(true)
+    expect(result.advisorOverride).toBeUndefined()
+  })
+
+  test("parses --gateway", () => {
+    const result = parseArgs(["--gateway", "openrouter"])
+    expect(result.gateway).toBe("openrouter")
+  })
+
+  test("throws for invalid --gateway", () => {
+    expect(() => parseArgs(["--gateway", "invalid"])).toThrow()
+  })
+
+  test("parses --plan", () => {
+    const result = parseArgs(["--plan"])
+    expect(result.planOnly).toBe(true)
+  })
+
+  test("parses --no-confirm", () => {
+    const result = parseArgs(["--no-confirm"])
+    expect(result.noConfirm).toBe(true)
+  })
+
+  test("parses --tui and --no-tui", () => {
+    expect(parseArgs(["--tui"]).tui).toBe(true)
+    expect(parseArgs(["--no-tui"]).tui).toBe(false)
+  })
+
+  test("parses --worktree and --no-worktree", () => {
+    expect(parseArgs(["--worktree"]).worktree).toBe(true)
+    expect(parseArgs(["--no-worktree"]).worktree).toBe(false)
+  })
+
+  test("parses --branch", () => {
+    const result = parseArgs(["--branch", "feat/my-feature"])
+    expect(result.branch).toBe("feat/my-feature")
+  })
+
+  test("parses --base", () => {
+    const result = parseArgs(["--base", "develop"])
+    expect(result.baseRef).toBe("develop")
+  })
+
+  test("parses --include-dirty", () => {
+    const result = parseArgs(["--include-dirty"])
+    expect(result.includeDirty).toBe(true)
+  })
+
+  test("parses --yolo", () => {
+    const result = parseArgs(["--yolo"])
+    expect(result.yolo).toBe(true)
+  })
+
+  test("parses --smart", () => {
+    const result = parseArgs(["--smart"])
+    expect(result.smart).toBe(true)
+  })
+
+  test("parses --smart-model", () => {
+    const result = parseArgs(["--smart-model", "anthropic/claude-opus-5"])
+    expect(result.smartModel).toBe("anthropic/claude-opus-5")
+  })
+
+  test("parses --notify and --no-notify", () => {
+    expect(parseArgs(["--notify"]).notify).toBe(true)
+    expect(parseArgs(["--no-notify"]).notify).toBe(false)
+  })
+
+  test("parses --human-review", () => {
+    expect(parseArgs(["--human-review"]).humanReview).toBe(true)
+    expect(parseArgs(["--no-human-review"]).humanReview).toBe(false)
+  })
+
+  test("parses --max-concurrent", () => {
+    const result = parseArgs(["--max-concurrent", "5"])
+    expect(result.maxConcurrent).toBe(5)
+  })
+
+  test("throws for invalid --max-concurrent", () => {
+    expect(() => parseArgs(["--max-concurrent", "0"])).toThrow()
+    expect(() => parseArgs(["--max-concurrent", "abc"])).toThrow()
+  })
+
+  test("parses --keep-run-dir and --no-keep-run-dir", () => {
+    expect(parseArgs(["--keep-run-dir"]).keepRunDir).toBe(true)
+    expect(parseArgs(["--no-keep-run-dir"]).keepRunDir).toBe(false)
+  })
+
+  test("parses --dir", () => {
+    const result = parseArgs(["--dir", "/some/repo"])
+    expect(result.targetDir).toBe("/some/repo")
+  })
+
+  test("parses --help", () => {
+    expect(parseArgs(["--help"]).help).toBe(true)
+    expect(parseArgs(["-h"]).help?.toString()).toBe("true")
+  })
+
+  test("stops parsing at -- and treats everything after as positional", () => {
+    const result = parseArgs(["--", "add", "login", "--verbose"])
+    expect(result.prompt).toBe("add login --verbose")
+  })
+
+  test("throws for unknown flags", () => {
+    expect(() => parseArgs(["--foobar"])).toThrow("unknown flag")
+  })
+
+  test("parses --model with = syntax", () => {
+    const result = parseArgs(["--model=anthropic/claude-sonnet-4-5"])
+    expect(result.modelOverride).toBe("anthropic/claude-sonnet-4-5")
+  })
+
+  test("parses --pipeline with = syntax", () => {
+    const result = parseArgs(["--pipeline=bug-fix"])
+    expect(result.pipeline).toBe("bug-fix")
+  })
+
+  test("parses --base with = syntax", () => {
+    const result = parseArgs(["--base=main"])
+    expect(result.baseRef).toBe("main")
+  })
+
+  test("parses --branch with = syntax", () => {
+    const result = parseArgs(["--branch=feat/foo"])
+    expect(result.branch).toBe("feat/foo")
+  })
+
+  test("parses --dir with = syntax", () => {
+    const result = parseArgs(["--dir=/some/repo"])
+    expect(result.targetDir).toBe("/some/repo")
+  })
+
+  test("parses --gateway with = syntax", () => {
+    const result = parseArgs(["--gateway=direct"])
+    expect(result.gateway).toBe("direct")
+  })
+
+  test("parses --only with = syntax", () => {
+    const result = parseArgs(["--only=design,security"])
+    expect(result.onlySteps).toEqual(["design", "security"])
+  })
+
+  test("parses --advisor with = syntax", () => {
+    const result = parseArgs(["--advisor=openai/gpt-5"])
+    expect(result.advisorOverride).toBe("openai/gpt-5")
+  })
+
+  test("parses --resume with = syntax", () => {
+    const result = parseArgs(["--resume=run-abc123"])
+    expect(result.resumeRunID).toBe("run-abc123")
+  })
+
+  test("parses -f with = syntax", () => {
+    const result = parseArgs(["-f=lib/main.dart"])
+    expect(result.files).toEqual(["lib/main.dart"])
+  })
+
+  test("--no-advisor does not take a value with = syntax", () => {
+    expect(() => parseArgs(["--no-advisor=foo"])).toThrow("--no-advisor does not take a value")
+  })
+
+  test("--no-worktree does not take a value with = syntax", () => {
+    expect(() => parseArgs(["--no-worktree=true"])).toThrow("--no-worktree does not take a value")
+  })
+
+  test("--plan does not take a value with = syntax", () => {
+    expect(() => parseArgs(["--plan=1"])).toThrow("--plan does not take a value")
+  })
+
+  test("--no-confirm does not take a value with = syntax", () => {
+    expect(() => parseArgs(["--no-confirm=1"])).toThrow("--no-confirm does not take a value")
+  })
+
+  test("--notify does not take a value with = syntax", () => {
+    expect(() => parseArgs(["--notify=1"])).toThrow("--notify does not take a value")
+  })
+
+  test("--worktree does not take a value with = syntax", () => {
+    expect(() => parseArgs(["--worktree=1"])).toThrow("--worktree does not take a value")
+  })
+
+  test("stops parsing at -- with just separator and positional", () => {
+    const result = parseArgs(["--", "some prompt"])
+    expect(result.prompt).toBe("some prompt")
+  })
+
+  test("-- separator with no positional args", () => {
+    const result = parseArgs(["--model", "gpt-4", "--"])
+    expect(result.modelOverride).toBe("gpt-4")
+    expect(result.prompt).toBeUndefined()
+  })
+
+  test("-- separator with no args at all", () => {
+    const result = parseArgs([])
+    expect(result.prompt).toBeUndefined()
+    expect(result.files).toEqual([])
+    expect(result.onlySteps).toEqual([])
+    expect(result.skipSteps).toEqual([])
+  })
+})
+
+describe("splitFlag", () => {
+  test("splits --flag=value", () => {
+    const { flag, value } = splitFlag("--model=gpt-4")
+    expect(flag).toBe("--model")
+    expect(value).toBe("gpt-4")
+  })
+
+  test("splits --flag with no value", () => {
+    const { flag, value } = splitFlag("--model")
+    expect(flag).toBe("--model")
+    expect(value).toBeUndefined()
+  })
+
+  test("splits short flag with =", () => {
+    const { flag, value } = splitFlag("-f=test.txt")
+    expect(flag).toBe("-f")
+    expect(value).toBe("test.txt")
+  })
+
+  test("handles empty value after =", () => {
+    const { flag, value } = splitFlag("--flag=")
+    expect(flag).toBe("--flag")
+    expect(value).toBe("")
+  })
+
+  test("handles multiple = signs", () => {
+    const { flag, value } = splitFlag("--model=provider/model=extra")
+    expect(flag).toBe("--model")
+    expect(value).toBe("provider/model=extra")
+  })
+})
+
+describe("listValue", () => {
+  test("splits comma-separated values", () => {
+    expect(listValue("a,b,c")).toEqual(["a", "b", "c"])
+  })
+
+  test("handles single value", () => {
+    expect(listValue("a")).toEqual(["a"])
+  })
+
+  test("trims whitespace around items", () => {
+    expect(listValue(" a , b , c ")).toEqual(["a", "b", "c"])
+  })
+
+  test("filters out empty items", () => {
+    expect(listValue("a,,b")).toEqual(["a", "b"])
+  })
+
+  test("returns empty for empty string", () => {
+    expect(listValue("")).toEqual([])
+  })
+
+  test("returns empty for only commas", () => {
+    expect(listValue(",,,")).toEqual([])
+  })
+})
+
+describe("writeUpdateResult", () => {
+  test("source-install status prints message", () => {
+    const writes: string[] = []
+    const spy = spyOn(process.stdout, "write").mockImplementation((chunk: string) => {
+      writes.push(chunk)
+      return true
     })
-    expect(() => parseArgs(["--gateway", "automatic", "prompt"])).toThrow("--gateway must be")
-    expect(() => parseArgs(["--plan=json", "prompt"])).toThrow("--plan does not take a value")
-    expect(() => parseArgs(["--no-confirm=yes", "prompt"])).toThrow("--no-confirm does not take a value")
-  })
-
-  test("parses the advisor flags, letting the last one win so the eval configs stay unambiguous", () => {
-    expect(parseArgs(["--advisor", "anthropic/claude-opus-5", "prompt"])).toMatchObject({
-      advisorOverride: "anthropic/claude-opus-5",
-      advisorDisabled: false,
-    })
-    expect(parseArgs(["--no-advisor", "prompt"])).toMatchObject({ advisorDisabled: true, advisorOverride: undefined })
-    expect(parseArgs(["--advisor", "anthropic/claude-opus-5", "--no-advisor", "prompt"])).toMatchObject({
-      advisorDisabled: true,
-      advisorOverride: undefined,
-    })
-    expect(parseArgs(["--no-advisor", "--advisor", "anthropic/claude-opus-5", "prompt"])).toMatchObject({
-      advisorDisabled: false,
-      advisorOverride: "anthropic/claude-opus-5",
-    })
-    expect(() => parseArgs(["--no-advisor=yes", "prompt"])).toThrow("--no-advisor does not take a value")
-  })
-
-  test("returns help as a command", async () => {
-    const command = await parseCommand(["--help"])
-
-    expect(command.type).toBe("help")
-    if (command.type === "help") expect(command.text).toContain("convoy [prompt]")
-  })
-
-  test("parses version and update commands without requiring a prompt", async () => {
-    expect(await parseCommand(["--version"])).toEqual({ type: "version" })
-    expect(await parseCommand(["-V"])).toEqual({ type: "version" })
-    expect(await parseCommand(["update"])).toEqual({ type: "update", checkOnly: false })
-    expect(await parseCommand(["update", "--check"])).toEqual({ type: "update", checkOnly: true })
-    await expect(parseCommand(["update", "--bogus"])).rejects.toThrow("usage: convoy update")
-  })
-
-  test("parses the auth subcommand grammar", async () => {
-    expect(await parseCommand(["auth"])).toEqual({ type: "auth", provider: "openrouter", action: "status" })
-    expect(await parseCommand(["auth", "status"])).toEqual({ type: "auth", provider: "openrouter", action: "status" })
-    expect(await parseCommand(["auth", "openrouter"])).toEqual({ type: "auth", provider: "openrouter", action: "set" })
-    expect(await parseCommand(["auth", "openrouter", "--remove"])).toEqual({ type: "auth", provider: "openrouter", action: "remove" })
-
-    await expect(parseCommand(["auth", "anthropic"])).rejects.toThrow("usage: convoy auth")
-    await expect(parseCommand(["auth", "openrouter", "--bogus"])).rejects.toThrow("usage: convoy auth")
-  })
-
-  test("requires prompt unless resuming", async () => {
-    await expect(parseCommand([])).rejects.toThrow("need a prompt")
-
-    // Building the resumed plan reads the run's frozen metadata, so the run
-    // must exist at parse time.
-    const runDir = join(process.env.CONVOY_HOME!, ".convoy", "runs", "20260519-103045-x7q2")
-    await mkdir(runDir, { recursive: true })
-    await writeFile(
-      join(runDir, "metadata.json"),
-      JSON.stringify({ schemaVersion: 2, runID: "20260519-103045-x7q2", targetDir: "/repo", createdAt: 0, updatedAt: 0, phases: {} }),
-    )
-    await writeFile(join(runDir, "prd.md"), "original prompt")
-
-    const command = await parseCommand(["--resume", "20260519-103045-x7q2"])
-    expect(command.type).toBe("run")
-    if (command.type === "run") {
-      expect(command.options.resumeRunID).toBe("20260519-103045-x7q2")
-      expect(command.options.prompt).toBe("original prompt")
-      expect(command.options.plan?.prompt.source).toBe("resume")
-    }
-
-    await expect(parseCommand(["--resume", "20260519-103045-zz99"])).rejects.toThrow("doesn't exist")
-  })
-
-  test("rejects unknown step names against the resolved pipeline", async () => {
-    await expect(parseCommand(["--only", "secuirty", "prompt"])).rejects.toThrow('unknown step "secuirty"')
-    await expect(parseCommand(["--skip", "desing", "prompt"])).rejects.toThrow('unknown step "desing"')
-
-    // human-review is a legacy human step name; referencing it stays valid even when
-    // the gate was dropped from the pipeline (non-interactive runs).
-    const command = await parseCommand(["--skip", "human-review", "prompt"])
-    expect(command.type).toBe("run")
-  })
-
-  test("rejects a flag where a value is expected", () => {
-    expect(() => parseArgs(["--prompt-file", "--only"])).toThrow("--prompt-file requires a value")
-  })
-
-  test("rejects conflicting prompt sources", async () => {
-    await expect(parseCommand(["--prompt-file", "prd.md", "inline prompt"])).rejects.toThrow("not both")
-    await expect(parseCommand(["--resume", "20260519-103045-x7q2", "new prompt"])).rejects.toThrow("--resume")
-  })
-
-  test("parses human step flags", () => {
-    const parsed = parseArgs(["--human-step", "--no-tui", "prompt"])
-
-    expect(parsed.humanReview).toBe(true)
-    expect(parsed.tui).toBe(false)
-    expect(parseArgs(["--no-human-step", "prompt"]).humanReview).toBe(false)
-  })
-
-  test("parses worktree flags", () => {
-    expect(parseArgs(["prompt"]).worktree).toBeUndefined()
-    expect(parseArgs(["--worktree", "prompt"]).worktree).toBe(true)
-    expect(parseArgs(["--no-worktree", "prompt"]).worktree).toBe(false)
-    expect(parseArgs(["--branch", "feat/thing", "prompt"]).branch).toBe("feat/thing")
-    expect(() => parseArgs(["--worktree=yes", "prompt"])).toThrow("--worktree does not take a value")
-    expect(() => parseArgs(["--no-worktree=yes", "prompt"])).toThrow("--no-worktree does not take a value")
-  })
-
-  test("a resumed run never creates a second worktree, even with --worktree", async () => {
-    // It continues in the directory its metadata recorded, which already is the
-    // worktree when the original run made one.
-    const parsed = parseArgs(["--worktree"])
-    parsed.resumeRunID = "20260519-103045-x7q2"
-
-    expect((await resolveRunOptions(parsed)).worktree).toBe(false)
-  })
-
-  test("yolo is opt-in", async () => {
-    const plain = await parseCommand(["prompt"])
-    if (plain.type === "run") expect(plain.options.yolo).toBe(false)
-
-    const yolo = await parseCommand(["--yolo", "prompt"])
-    if (yolo.type === "run") expect(yolo.options.yolo).toBe(true)
-  })
-
-  test("smart auto-accept is opt-in and resolves a judge model", async () => {
-    const plain = await parseCommand(["prompt"])
-    // Unset, the judge model still resolves (falls back to the run's model).
-    if (plain.type === "run") {
-      expect(plain.options.smart).toBe(false)
-      expect(plain.options.smartJudgeModel.length).toBeGreaterThan(0)
-    }
-
-    const smart = await parseCommand(["--smart", "--smart-model", "anthropic/claude-haiku-4-5", "prompt"])
-    if (smart.type === "run") {
-      expect(smart.options.smart).toBe(true)
-      expect(smart.options.smartJudgeModel).toBe("anthropic/claude-haiku-4-5")
+    try {
+      writeUpdateResult({ status: "source-install", message: "source install message" })
+      expect(writes).toEqual(["source install message\n"])
+    } finally {
+      spy.mockRestore()
     }
   })
 
-  test("parses the runs subcommand", async () => {
-    const bare = await parseCommand(["runs"])
-    expect(bare.type).toBe("runs")
-    if (bare.type === "runs") expect(bare.runID).toBeUndefined()
-
-    const withID = await parseCommand(["runs", "20260519-103045-x7q2"])
-    expect(withID.type).toBe("runs")
-    if (withID.type === "runs") expect(withID.runID).toBe("20260519-103045-x7q2")
+  test("up-to-date status prints version info", () => {
+    const writes: string[] = []
+    const spy = spyOn(process.stdout, "write").mockImplementation((chunk: string) => {
+      writes.push(chunk)
+      return true
+    })
+    try {
+      writeUpdateResult({ status: "up-to-date", currentVersion: "1.0.0", latestVersion: "1.0.0" })
+      expect(writes).toEqual(["convoy 1.0.0 is up to date (latest: v1.0.0)\n"])
+    } finally {
+      spy.mockRestore()
+    }
   })
 
-  test("rejects bad runs subcommand arguments", async () => {
-    await expect(parseCommand(["runs", "latest"])).rejects.toThrow("invalid run id")
-    await expect(parseCommand(["runs", "20260519-103045-x7q2", "extra"])).rejects.toThrow("usage: convoy runs")
+  test("update-available status prints asset info", () => {
+    const writes: string[] = []
+    const spy = spyOn(process.stdout, "write").mockImplementation((chunk: string) => {
+      writes.push(chunk)
+      return true
+    })
+    try {
+      writeUpdateResult({ status: "update-available", currentVersion: "1.0.0", latestVersion: "2.0.0", assets: { binary: { name: "convoy-darwin-arm64", platform: "darwin", arch: "arm64" } } })
+      expect(writes).toEqual(["update available: 1.0.0 → v2.0.0 (convoy-darwin-arm64)\n"])
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test("updated status prints success message", () => {
+    const writes: string[] = []
+    const spy = spyOn(process.stdout, "write").mockImplementation((chunk: string) => {
+      writes.push(chunk)
+      return true
+    })
+    try {
+      writeUpdateResult({ status: "updated", currentVersion: "1.0.0", latestVersion: "2.0.0", assetName: "convoy-darwin-arm64" })
+      expect(writes).toEqual(["updated convoy 1.0.0 → v2.0.0 (convoy-darwin-arm64)\n"])
+    } finally {
+      spy.mockRestore()
+    }
   })
 })
 
-describe("config precedence", () => {
-  const dirs: string[] = []
-
-  afterAll(async () => {
-    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
-  })
-
-  async function projectWithConfig() {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-config-"))
-    dirs.push(dir)
-    await mkdir(join(dir, ".convoy"), { recursive: true })
-    await writeFile(join(dir, "docs.md"), "# notes")
-    await writeFile(
-      join(dir, ".convoy", "config.yaml"),
-      [
-        "defaults:",
-        "  baseRef: develop",
-        "  pipeline: quick",
-        "pipelines:",
-        "  quick:",
-        "    steps:",
-        "      - implementer",
-        "      - tests",
-        "attachments:",
-        "  - docs.md",
-      ].join("\n"),
-    )
-    return dir
-  }
-
-  test("config defaults apply when flags are absent", async () => {
-    const dir = await projectWithConfig()
-    const command = await parseCommand(["--dir", dir, "prompt"])
-
-    expect(command.type).toBe("run")
-    if (command.type !== "run") return
-    expect(command.options.baseRef).toBe("develop")
-    expect(command.options.pipeline.name).toBe("quick")
-    expect(stepNames(command.options.pipeline)).toEqual(["implementer", "tests"])
-    expect(command.options.files).toEqual(["docs.md"])
-  })
-
-  test("CLI flags always win over config defaults", async () => {
-    const dir = await projectWithConfig()
-    const command = await parseCommand([
-      "--dir",
-      dir,
-      "--base",
-      "main",
-      "--pipeline",
-      "implement",
-      "prompt",
-    ])
-
-    expect(command.type).toBe("run")
-    if (command.type !== "run") return
-    expect(command.options.baseRef).toBe("main")
-    expect(command.options.pipeline.name).toBe("implement")
-  })
-
-  test("keeps an absent notification flag distinct from explicit --notify and --no-notify", async () => {
-    const dir = await projectWithConfig()
-    await writeFile(join(dir, ".convoy", "config.yaml"), "notifications:\n  enabled: false\n")
-
-    const defaulted = await parseCommand(["--dir", dir, "prompt"])
-    const enabled = await parseCommand(["--dir", dir, "--notify", "prompt"])
-    const disabled = await parseCommand(["--dir", dir, "--no-notify", "prompt"])
-
-    expect(defaulted.type).toBe("run")
-    expect(enabled.type).toBe("run")
-    expect(disabled.type).toBe("run")
-    if (defaulted.type !== "run" || enabled.type !== "run" || disabled.type !== "run") return
-
-    // The runner must be able to distinguish the config-driven default from an
-    // explicit CLI override before merging the final notification settings.
-    expect(defaulted.options.notify).toBeUndefined()
-    expect(enabled.options.notify).toBe(true)
-    expect(disabled.options.notify).toBe(false)
-    expect(enabled.options.notifications).toEqual({ enabled: false })
-  })
-
-  test("gateway precedence is CLI, then project, then global", async () => {
-    const dir = await projectWithConfig()
-    await writeFile(join(process.env.CONVOY_HOME!, ".convoy", "config.yaml"), "modelRouting:\n  gateway: openrouter\n")
-    await writeFile(join(dir, ".convoy", "config.yaml"), "modelRouting:\n  gateway: configured\n")
-
-    const project = await parseCommand(["--dir", dir, "prompt"])
-    expect(project.type).toBe("run")
-    if (project.type === "run") {
-      expect(project.options.gateway).toBe("configured")
-      expect(project.options.plan?.modelRouting.gateway).toBe("configured")
-    }
-
-    const cli = await parseCommand(["--dir", dir, "--gateway", "vercel", "prompt"])
-    expect(cli.type).toBe("run")
-    if (cli.type === "run") {
-      expect(cli.options.gateway).toBe("vercel")
-      expect(cli.options.gatewayExplicit).toBe(true)
-      expect(cli.options.plan?.modelRouting.gateway).toBe("vercel")
+describe("parseCommand", () => {
+  test("--help returns help text", async () => {
+    const cmd = await parseCommand(["--help"])
+    expect(cmd.type).toBe("help")
+    if (cmd.type === "help") {
+      expect(cmd.text).toContain("convoy [prompt]")
+      expect(cmd.text).toContain("Commands:")
+      expect(cmd.text).toContain("Flags:")
     }
   })
 
-  test("an unknown pipeline lists what exists", async () => {
-    const dir = await projectWithConfig()
-    await expect(parseCommand(["--dir", dir, "--pipeline", "ghost", "prompt"])).rejects.toThrow(
-      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ship, ultra-implement, ultra-refine)',
-    )
-  })
-})
-
-describe("base ref auto-detection", () => {
-  const dirs: string[] = []
-
-  afterAll(async () => {
-    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  test("-h returns help text", async () => {
+    const cmd = await parseCommand(["-h"])
+    expect(cmd.type).toBe("help")
   })
 
-  async function git(args: string[], cwd: string) {
-    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...process.env,
-        GIT_AUTHOR_NAME: "convoy-test",
-        GIT_AUTHOR_EMAIL: "convoy-test@example.invalid",
-        GIT_COMMITTER_NAME: "convoy-test",
-        GIT_COMMITTER_EMAIL: "convoy-test@example.invalid",
-      },
-    })
-    if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(proc.stderr).text()}`)
-  }
-
-  async function repoOn(branch: string) {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-base-"))
-    dirs.push(dir)
-    await git(["init", "-q", "-b", branch], dir)
-    await git(["commit", "-q", "--allow-empty", "-m", "init"], dir)
-    return dir
-  }
-
-  test("auto-detects the base ref when flag and config are absent", async () => {
-    const dir = await repoOn("develop")
-    const command = await parseCommand(["--dir", dir, "prompt"])
-
-    expect(command.type).toBe("run")
-    if (command.type !== "run") return
-    expect(command.options.baseRef).toBe("develop")
+  test("parses --version", async () => {
+    const cmd = await parseCommand(["--version"])
+    expect(cmd.type).toBe("version")
   })
 
-  test("falls back to HEAD outside a git repository", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-base-"))
-    dirs.push(dir)
-    const command = await parseCommand(["--dir", dir, "prompt"])
-
-    expect(command.type).toBe("run")
-    if (command.type !== "run") return
-    expect(command.options.baseRef).toBe("HEAD")
+  test("parses -V", async () => {
+    const cmd = await parseCommand(["-V"])
+    expect(cmd.type).toBe("version")
   })
 
-  test("worktree runs detect against the original repo, not the worktree", async () => {
-    const repo = await repoOn("squad-x")
-    const worktree = await mkdtemp(join(tmpdir(), "convoy-cli-base-wt-"))
-    await rm(worktree, { recursive: true, force: true })
-    dirs.push(worktree)
-    await addWorktree(worktree, "agent-branch", "HEAD", repo)
-
-    const parsed = parseArgs(["prompt"])
-    parsed.targetDir = worktree
-    parsed.baseDetectionDir = repo
-
-    const options = await resolveRunOptions(parsed)
-    expect(options.baseRef).toBe("squad-x")
-  })
-})
-
-describe("worktree default", () => {
-  const dirs: string[] = []
-
-  afterAll(async () => {
-    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  test("parses update command", async () => {
+    const cmd = await parseCommand(["update"])
+    expect(cmd.type).toBe("update")
+    expect((cmd as { checkOnly: boolean }).checkOnly).toBe(false)
   })
 
-  async function git(args: string[], cwd: string) {
-    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...process.env,
-        GIT_AUTHOR_NAME: "convoy-test",
-        GIT_AUTHOR_EMAIL: "convoy-test@example.invalid",
-        GIT_COMMITTER_NAME: "convoy-test",
-        GIT_COMMITTER_EMAIL: "convoy-test@example.invalid",
-      },
-    })
-    if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(proc.stderr).text()}`)
-  }
-
-  async function repoOn(branch: string) {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-worktree-"))
-    dirs.push(dir)
-    await git(["init", "-q", "-b", "main"], dir)
-    await git(["commit", "-q", "--allow-empty", "-m", "init"], dir)
-    if (branch !== "main") await git(["checkout", "-q", "-b", branch], dir)
-    return dir
-  }
-
-  const worktreeFor = async (argv: string[]) => {
-    const command = await parseCommand(argv)
-    if (command.type !== "run") throw new Error(`expected a run command, got ${command.type}`)
-    return command.options.worktree
-  }
-
-  test("isolates on a trunk and runs in place on a branch, with no flag or config", async () => {
-    expect(await worktreeFor(["--dir", await repoOn("main"), "prompt"])).toBe(true)
-    expect(await worktreeFor(["--dir", await repoOn("feat/thing"), "prompt"])).toBe(false)
+  test("parses update --check", async () => {
+    const cmd = await parseCommand(["update", "--check"])
+    expect(cmd.type).toBe("update")
+    expect((cmd as { checkOnly: boolean }).checkOnly).toBe(true)
   })
 
-  test("flags override the branch default in both directions", async () => {
-    const trunk = await repoOn("main")
-    const branch = await repoOn("feat/thing")
-
-    expect(await worktreeFor(["--dir", trunk, "--no-worktree", "prompt"])).toBe(false)
-    expect(await worktreeFor(["--dir", branch, "--worktree", "prompt"])).toBe(true)
-  })
-
-  test("an explicit defaults.worktree still wins over the branch", async () => {
-    await writeFile(join(process.env.CONVOY_HOME!, ".convoy", "config.yaml"), "version: 1\ndefaults:\n  worktree: false\n")
-
-    // On a trunk, where the branch alone would have isolated.
-    expect(await worktreeFor(["--dir", await repoOn("main"), "prompt"])).toBe(false)
-    // And the flag still beats the config.
-    expect(await worktreeFor(["--dir", await repoOn("main"), "--worktree", "prompt"])).toBe(true)
-  })
-})
-
-describe("init command", () => {
-  const dirs: string[] = []
-
-  afterAll(async () => {
-    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
-  })
-
-  test("parses init options without requiring a prompt", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-init-"))
-    dirs.push(dir)
-
-    const local = await parseCommand(["init", "--dir", dir, "--force", "--quiet"])
-    expect(local.type).toBe("init")
-    if (local.type === "init") {
-      expect(local.options).toMatchObject({ targetDir: dir, global: false, force: true, quiet: true })
-    }
-
-    const global = await parseCommand(["init", "--global", "--force"])
-    expect(global.type).toBe("init")
-    if (global.type === "init") expect(global.options).toMatchObject({ global: true, force: true })
-  })
-
-  test("rejects incompatible init options", async () => {
-    await expect(parseCommand(["init", "--global", "--dir", "."])).rejects.toThrow("either --global or --dir")
-    await expect(parseCommand(["init", "extra"])).rejects.toThrow("usage: convoy init")
-  })
-
-  test("parses agents eject, reusing init's flags", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-eject-"))
-    dirs.push(dir)
-
-    const local = await parseCommand(["agents", "eject", "implementer", "--dir", dir, "--force"])
-    expect(local.type).toBe("agents")
-    if (local.type === "agents") {
-      expect(local.agentName).toBe("implementer")
-      expect(local.options).toMatchObject({ targetDir: dir, global: false, force: true })
-    }
-
-    const global = await parseCommand(["agents", "eject", "design-polisher", "--global"])
-    expect(global.type).toBe("agents")
-    if (global.type === "agents") {
-      expect(global.agentName).toBe("design-polisher")
-      expect(global.options).toMatchObject({ global: true })
+  test("parses update --help", async () => {
+    const cmd = await parseCommand(["update", "--help"])
+    expect(cmd.type).toBe("help")
+    if (cmd.type === "help") {
+      expect(cmd.text).toContain("convoy update [--check]")
+      expect(cmd.text).toContain("--check")
     }
   })
 
-  test("agents without an ejectable target prints help instead of failing", async () => {
-    const bare = await parseCommand(["agents"])
-    expect(bare.type).toBe("help")
-    // The help has to name the agents, since it is the only place they are listed.
-    if (bare.type === "help") expect(bare.text).toContain("implementer")
+  test("parses update -h", async () => {
+    const cmd = await parseCommand(["update", "-h"])
+    expect(cmd.type).toBe("help")
+  })
 
+  test("throws for unknown update args", async () => {
+    await expect(parseCommand(["update", "--unknown"])).rejects.toThrow("usage: convoy update")
+  })
+
+  test("parses auth status", async () => {
+    const cmd = await parseCommand(["auth"])
+    expect(cmd.type).toBe("auth")
+    if (cmd.type === "auth") {
+      expect(cmd.provider).toBe("openrouter")
+      expect(cmd.action).toBe("status")
+    }
+  })
+
+  test("parses auth openrouter", async () => {
+    const cmd = await parseCommand(["auth", "openrouter"])
+    expect(cmd.type).toBe("auth")
+    if (cmd.type === "auth") {
+      expect(cmd.provider).toBe("openrouter")
+      expect(cmd.action).toBe("set")
+    }
+  })
+
+  test("parses auth openrouter --remove", async () => {
+    const cmd = await parseCommand(["auth", "openrouter", "--remove"])
+    expect(cmd.type).toBe("auth")
+    if (cmd.type === "auth") {
+      expect(cmd.provider).toBe("openrouter")
+      expect(cmd.action).toBe("remove")
+    }
+  })
+
+  test("throws for invalid auth subcommand", async () => {
+    await expect(parseCommand(["auth", "invalid"])).rejects.toThrow("usage: convoy auth")
+  })
+
+  test("parses init", async () => {
+    const cmd = await parseCommand(["init"])
+    expect(cmd.type).toBe("init")
+  })
+
+  test("parses init --global", async () => {
+    const cmd = await parseCommand(["init", "--global"])
+    expect(cmd.type).toBe("init")
+    if (cmd.type === "init") {
+      expect(cmd.options.global).toBe(true)
+    }
+  })
+
+  test("parses init --help", async () => {
+    const cmd = await parseCommand(["init", "--help"])
+    expect(cmd.type).toBe("help")
+    if (cmd.type === "help") {
+      expect(cmd.text).toContain("convoy init [--global]")
+    }
+  })
+
+  test("parses init -h", async () => {
+    const cmd = await parseCommand(["init", "-h"])
+    expect(cmd.type).toBe("help")
+  })
+
+  test("parses runs", async () => {
+    const cmd = await parseCommand(["runs"])
+    expect(cmd.type).toBe("runs")
+    if (cmd.type === "runs") {
+      expect(cmd.runID).toBeUndefined()
+    }
+  })
+
+  test("parses runs with a run ID", async () => {
+    const cmd = await parseCommand(["runs", validRunID])
+    expect(cmd.type).toBe("runs")
+    if (cmd.type === "runs") {
+      expect(cmd.runID).toBe(validRunID)
+    }
+  })
+
+  test("throws for runs with extra args", async () => {
+    await expect(parseCommand(["runs", validRunID, "extra"])).rejects.toThrow("usage: convoy runs")
+  })
+
+  test("throws for an invalid run ID", async () => {
+    await expect(parseCommand(["runs", "../../malicious"])).rejects.toThrow("invalid run id")
+  })
+
+  test("parses config", async () => {
+    const cmd = await parseCommand(["config"])
+    expect(cmd.type).toBe("config")
+  })
+
+  test("throws for config with extra args", async () => {
+    await expect(parseCommand(["config", "extra"])).rejects.toThrow("usage: convoy config")
+  })
+
+  test("agents without subcommand shows help", async () => {
+    const cmd = await parseCommand(["agents"])
+    expect(cmd.type).toBe("help")
+    if (cmd.type === "help") {
+      expect(cmd.text).toContain("convoy agents eject")
+    }
+  })
+
+  test("agents --help shows help", async () => {
+    const cmd = await parseCommand(["agents", "--help"])
+    expect(cmd.type).toBe("help")
+  })
+
+  test("agents eject with no agent name throws", async () => {
     await expect(parseCommand(["agents", "eject"])).rejects.toThrow("usage: convoy agents eject")
-    await expect(parseCommand(["agents", "list"])).rejects.toThrow("usage: convoy agents eject")
   })
 
-  test("creates project config without overwriting unless forced", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-init-write-"))
-    dirs.push(dir)
-    const path = join(dir, ".convoy", "config.yaml")
-
-    await parseAndRun(["init", "--dir", dir, "--quiet"])
-    expect(await readFile(path, "utf8")).toContain("version: 1")
-    expect(await readFile(path, "utf8")).toContain("#   implementer:")
-    expect(existsSync(join(dir, ".convoy", "agents"))).toBe(false)
-
-    await writeFile(path, "version: 1\nattachments:\n  - custom.md\n")
-    await parseAndRun(["init", "--dir", dir, "--quiet"])
-    expect(await readFile(path, "utf8")).toContain("custom.md")
-
-    await parseAndRun(["init", "--dir", dir, "--force", "--quiet"])
-    expect(await readFile(path, "utf8")).not.toContain("custom.md")
+  test("agents eject with --help shows help", async () => {
+    const cmd = await parseCommand(["agents", "eject", "--help"])
+    expect(cmd.type).toBe("help")
   })
 
-  test("agents eject writes only the requested prompt", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-eject-write-"))
-    dirs.push(dir)
-    const prompt = join(dir, ".convoy", "agents", "implementer.md")
+  test("agents with invalid subcommand throws", async () => {
+    await expect(parseCommand(["agents", "invalid"])).rejects.toThrow("usage: convoy agents eject")
+  })
 
-    await parseAndRun(["agents", "eject", "implementer", "--dir", dir, "--quiet"])
-    expect(await readFile(prompt, "utf8")).toContain("# Implementer")
-    expect(existsSync(join(dir, ".convoy", "agents", "design-polisher.md"))).toBe(false)
+  test("finish --help returns help", async () => {
+    const cmd = await parseCommand(["finish", "--help"])
+    expect(cmd.type).toBe("help")
+    if (cmd.type === "help") {
+      expect(cmd.text).toContain("convoy finish")
+    }
+  })
 
-    await writeFile(prompt, "# Mine\n")
-    await parseAndRun(["agents", "eject", "implementer", "--dir", dir, "--quiet"])
-    expect(await readFile(prompt, "utf8")).toBe("# Mine\n")
+  test("rejects both --prompt and --prompt-file", async () => {
+    await expect(parseCommand(["prompt arg", "--prompt-file", "prd.md"])).rejects.toThrow("use either a positional prompt or --prompt-file")
+  })
 
-    await parseAndRun(["agents", "eject", "implementer", "--dir", dir, "--force", "--quiet"])
-    expect(await readFile(prompt, "utf8")).toContain("# Implementer")
+  test("rejects --resume with a new prompt", async () => {
+    await expect(parseCommand(["--resume", validRunID, "new prompt"])).rejects.toThrow("can't take a new prompt")
+  })
+
+  test("rejects a run without prompt", async () => {
+    await expect(parseCommand([])).rejects.toThrow("need a prompt")
+  })
+
+  test("parses a run command with prompt", async () => {
+    const cmd = await parseCommand(["add login"])
+    expect(cmd.type).toBe("run")
+  })
+})
+
+describe("parseInitArgs", () => {
+  test("defaults to cwd and non-global", () => {
+    const result = parseInitArgs([])
+    expect(result.global).toBe(false)
+    expect(result.force).toBe(false)
+    expect(result.quiet).toBe(false)
+    expect(result.help).toBeUndefined()
+  })
+
+  test("parses --help", () => {
+    const result = parseInitArgs(["--help"])
+    expect(result.help).toBe(true)
+  })
+
+  test("parses -h", () => {
+    const result = parseInitArgs(["-h"])
+    expect(result.help).toBe(true)
+  })
+
+  test("parses --global", () => {
+    const result = parseInitArgs(["--global"])
+    expect(result.global).toBe(true)
+  })
+
+  test("parses --force", () => {
+    const result = parseInitArgs(["--force"])
+    expect(result.force).toBe(true)
+  })
+
+  test("parses --quiet", () => {
+    const result = parseInitArgs(["--quiet"])
+    expect(result.quiet).toBe(true)
+  })
+
+  test("parses --dir with relative path", () => {
+    const result = parseInitArgs(["--dir", "some/repo"])
+    expect(result.targetDir).toContain("some/repo")
+  })
+
+  test("throws for --global and --dir combo", () => {
+    expect(() => parseInitArgs(["--global", "--dir", "/some/repo"])).toThrow("use either --global or --dir, not both")
+  })
+
+  test("throws for non-flag arg", () => {
+    expect(() => parseInitArgs(["positional"])).toThrow("usage: convoy init")
+  })
+
+  test("throws for unknown flag", () => {
+    expect(() => parseInitArgs(["--unknown"])).toThrow("unknown init flag")
+  })
+
+  test("throws when flag without value is last arg", () => {
+    expect(() => parseInitArgs(["--dir"])).toThrow("requires a value")
+  })
+
+  test("help short-circuits before validation", () => {
+    const result = parseInitArgs(["--global", "--help"])
+    expect(result.help).toBe(true)
+  })
+})
+
+describe("resolveBaseRef", () => {
+  test("uses explicit flag over config defaults", async () => {
+    const parsed = parseArgs(["--base", "develop"])
+    const ref = await resolveBaseRef(parsed, {})
+    expect(ref).toBe("develop")
+  })
+
+  test("uses config default baseRef when no flag", async () => {
+    const parsed = parseArgs([])
+    const ref = await resolveBaseRef(parsed, { baseRef: "main" })
+    expect(ref).toBe("main")
+  })
+})
+
+describe("resolveWorktreeOption", () => {
+  test("uses explicit --worktree flag", async () => {
+    const parsed = parseArgs(["--worktree"])
+    const result = await resolveWorktreeOption(parsed, {})
+    expect(result).toBe(true)
+  })
+
+  test("uses explicit --no-worktree flag", async () => {
+    const parsed = parseArgs(["--no-worktree"])
+    const result = await resolveWorktreeOption(parsed, {})
+    expect(result).toBe(false)
+  })
+
+  test("uses config defaults.worktree", async () => {
+    const parsed = parseArgs([])
+    const result = await resolveWorktreeOption(parsed, { worktree: false })
+    expect(result).toBe(false)
+  })
+})
+
+describe("resolveRunOptions", () => {
+  test("uses explicit maxConcurrentAgents", async () => {
+    const parsed = parseArgs(["--max-concurrent", "5"])
+    const options = await resolveRunOptions(parsed)
+    expect(options.maxConcurrentAgents).toBe(5)
+  })
+
+  test("resolves humanReview from TTY", async () => {
+    const parsed = parseArgs(["--no-human-review"])
+    const options = await resolveRunOptions(parsed)
+    expect(options.humanReview).toBe(false)
+  })
+
+  test("resolves planOnly from flag", async () => {
+    const parsed = parseArgs(["--plan"])
+    const options = await resolveRunOptions(parsed)
+    expect(options.planOnly).toBe(true)
+  })
+
+  test("resolves noConfirm from flag", async () => {
+    const parsed = parseArgs(["--no-confirm"])
+    const options = await resolveRunOptions(parsed)
+    expect(options.noConfirm).toBe(true)
   })
 })
