@@ -5,6 +5,13 @@
 <p align="center"><em>An orchestration harness for multi-model agent pipelines.</em></p>
 
 <p align="center">
+  <a href="https://github.com/Inakitajes/convoy/actions/workflows/ci.yml"><img src="https://github.com/Inakitajes/convoy/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="./assets/coverage.svg"><img src="assets/coverage.svg" alt="coverage"></a>
+  <img src="https://img.shields.io/github/v/release/Inakitajes/convoy?include_prereleases&label=release" alt="release">
+  <img src="https://img.shields.io/github/license/Inakitajes/convoy" alt="license">
+</p>
+
+<p align="center">
   <img src="assets/screenshot.jpeg" alt="convoy running a pipeline with six parallel agents" width="920">
 </p>
 

@@ -1,5 +1,6 @@
 node_modules/
 convoy
 dist/
+coverage/
 .*.bun-build
 .DS_Store

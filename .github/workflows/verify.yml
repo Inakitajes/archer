@@ -42,8 +42,16 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Test
-        run: bun test
+      - name: Test with coverage
+        run: bun test --coverage --coverage-dir=coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v5.0.0
+        if: always()
+        with:
+          name: coverage-${{ matrix.os }}
+          path: coverage/
+          retention-days: 7
 
       - name: Build local binary
         run: bun run build

@@ -10,8 +10,12 @@
     "dev": "bun run src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:coverage": "bun run scripts/coverage.ts",
+    "test:coverage:check": "bun run scripts/coverage.ts --check",
+    "coverage:badge": "bun run scripts/coverage.ts --badge",
     "build": "bun run scripts/build.ts",
-    "build:release": "bun run scripts/build.ts --release"
+    "build:release": "bun run scripts/build.ts --release",
+    "release": "bun run scripts/release.ts"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.4",
