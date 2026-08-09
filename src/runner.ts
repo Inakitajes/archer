@@ -895,7 +895,7 @@ export async function commitRecoveredPhase(
   await metadata.flush()
 }
 
-export function recoveryReport(phaseName: string) {
+function recoveryReport(phaseName: string) {
   return [
     "# Recovered uncommitted changes",
     "",
@@ -1099,7 +1099,7 @@ const defaultPhaseGateDeps: Required<PhaseGateDeps> = {
 export type PhaseGateOutcome = "continue" | "retry" | "unavailable"
 
 /** The [c]/[o]/[a] keys a human gate answers with, per mode. */
-export function gateAllowedActions(kind: "interactive" | "failure", canRetry: boolean): readonly HumanReviewAction[] {
+function gateAllowedActions(kind: "interactive" | "failure", canRetry: boolean): readonly HumanReviewAction[] {
   if (kind === "interactive") return ["continue", "iterate", "abort"]
   return canRetry ? ["retry", "iterate", "abort"] : ["iterate", "abort"]
 }
@@ -1201,7 +1201,7 @@ export async function waitForPhaseGate(
 }
 
 /** Resolves a dashboard/readline action unless a run-wide shutdown arrives first. */
-export function awaitActionOrAbort<T>(action: Promise<T>, signal?: AbortSignal): Promise<T> {
+function awaitActionOrAbort<T>(action: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return action
   if (signal.aborted) return Promise.reject(signal.reason ?? new UserAbortError())
   return new Promise<T>((resolve, reject) => {
@@ -1664,12 +1664,12 @@ async function applyCompletionCheckpoint(
 }
 
 /** The phase already produced a durable deliverable; a failed review turn must not discard it. */
-export function keepCompletedPhase(phaseName: string, first: SessionResult, reason: string): SessionResult {
+function keepCompletedPhase(phaseName: string, first: SessionResult, reason: string): SessionResult {
   log.warn(`[${phaseName}] advisor review turn failed, keeping the completed phase: ${reason}`)
   return first
 }
 
-export function completionFollowUp(phase: AgentStep, advice: string): string {
+function completionFollowUp(phase: AgentStep, advice: string): string {
   const protocol = phase.readOnly
     ? `If this changes your findings, reply with your COMPLETE corrected report and nothing else — it replaces what you just produced. If it changes nothing, reply with exactly \`${noChangesReply}\`.`
     : `If this identifies real work, do it now and then say what you changed. If it changes nothing, say so briefly and stop.`
@@ -1924,7 +1924,7 @@ async function abortSessionQuietly(client: OpencodeClient, sessionID: string, di
   }
 }
 
-export function sleep(ms: number, signal?: AbortSignal) {
+function sleep(ms: number, signal?: AbortSignal) {
   return new Promise<void>((resolve) => {
     if (signal?.aborted) {
       resolve()
@@ -1940,7 +1940,7 @@ export function sleep(ms: number, signal?: AbortSignal) {
   })
 }
 
-export function payloadType(payload: unknown) {
+function payloadType(payload: unknown) {
   if (!payload || typeof payload !== "object") return ""
   const type = (payload as { type?: unknown }).type
   if (typeof type === "string") return type === "sync" ? String((payload as { name?: unknown }).name ?? "").replace(/\.1$/, "") : type
@@ -1965,12 +1965,12 @@ export function newActivityState(): ActivityState {
   }
 }
 
-export function activity(kind: ActivityKind, message: string, stepUsage?: ProgressStepUsage): SessionSignal {
+function activity(kind: ActivityKind, message: string, stepUsage?: ProgressStepUsage): SessionSignal {
   return { type: "activity", kind, message, stepUsage }
 }
 
 // Heartbeats refresh the live status line but never land in the activity feed.
-export function pulse(kind: ActivityKind, message: string): SessionSignal {
+function pulse(kind: ActivityKind, message: string): SessionSignal {
   return { type: "activity", kind, message, pulse: true }
 }
 
@@ -2118,7 +2118,7 @@ export function describeMessageChunk(payload: unknown, state?: ActivityState): P
   }
 }
 
-export function rememberMessagePartChannel(properties: Record<string, unknown>, state: ActivityState | undefined) {
+function rememberMessagePartChannel(properties: Record<string, unknown>, state: ActivityState | undefined) {
   if (!state) return
   const part = properties.part
   if (!part || typeof part !== "object") return
@@ -2128,11 +2128,11 @@ export function rememberMessagePartChannel(properties: Record<string, unknown>, 
   else if (candidate.type === "text") state.messagePartChannels.set(candidate.id, "response")
 }
 
-export function rawString(value: unknown): string {
+function rawString(value: unknown): string {
   return typeof value === "string" ? value : ""
 }
 
-export function describeSessionStatus(value: unknown): SessionSignal | undefined {
+function describeSessionStatus(value: unknown): SessionSignal | undefined {
   if (!value || typeof value !== "object") return undefined
   const status = value as { type?: unknown; attempt?: unknown; message?: unknown }
   if (status.type === "busy") return pulse("info", "provider busy")
@@ -2143,7 +2143,7 @@ export function describeSessionStatus(value: unknown): SessionSignal | undefined
   return undefined
 }
 
-export function todosFromEvent(value: unknown): ProgressTodo[] {
+function todosFromEvent(value: unknown): ProgressTodo[] {
   if (!Array.isArray(value)) return []
   return value.flatMap((item) => {
     if (!item || typeof item !== "object") return []
@@ -2153,7 +2153,7 @@ export function todosFromEvent(value: unknown): ProgressTodo[] {
   })
 }
 
-export function diffSummaryFromEvent(value: unknown): ProgressDiffSummary {
+function diffSummaryFromEvent(value: unknown): ProgressDiffSummary {
   if (!Array.isArray(value)) return { files: 0, additions: 0, deletions: 0 }
   let additions = 0
   let deletions = 0
@@ -2166,12 +2166,12 @@ export function diffSummaryFromEvent(value: unknown): ProgressDiffSummary {
   return { files: value.length, additions, deletions }
 }
 
-export function formatCharCount(value: number) {
+function formatCharCount(value: number) {
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`
   return String(value)
 }
 
-export function formatModelFromEvent(value: unknown) {
+function formatModelFromEvent(value: unknown) {
   if (!value || typeof value !== "object") return "selected model"
   const model = value as { providerID?: unknown; id?: unknown; variant?: unknown }
   const provider = typeof model.providerID === "string" ? model.providerID : "provider"
@@ -2180,7 +2180,7 @@ export function formatModelFromEvent(value: unknown) {
   return `${provider}/${id}${variant}`
 }
 
-export function formatCost(properties: Record<string, unknown>) {
+function formatCost(properties: Record<string, unknown>) {
   const tokens = tokensFromValue(properties.tokens)
   const cost = typeof properties.cost === "number" ? `, $${properties.cost.toFixed(4)}` : ""
   if (!tokens) return cost
@@ -2188,7 +2188,7 @@ export function formatCost(properties: Record<string, unknown>) {
   return `, tokens ${tokens.input}/${tokens.output}${reasoning}${cost}`
 }
 
-export function stepUsageFromEvent(payload: unknown, properties: Record<string, unknown>, model: string): ProgressStepUsage | undefined {
+function stepUsageFromEvent(payload: unknown, properties: Record<string, unknown>, model: string): ProgressStepUsage | undefined {
   const usage = usageFromRecord(properties)
   if (!usage) return undefined
   return {
@@ -2248,14 +2248,14 @@ function combinedAssistantUsage(infos: AssistantMessage[], sessionID: string): P
   return { cost, tokens, sessionID, model }
 }
 
-export function usageFromRecord(values: Record<string, unknown>): ProgressUsage | undefined {
+function usageFromRecord(values: Record<string, unknown>): ProgressUsage | undefined {
   const cost = typeof values.cost === "number" && Number.isFinite(values.cost) ? values.cost : undefined
   const tokens = tokensFromValue(values.tokens)
   if (cost === undefined && !tokens) return undefined
   return { cost, tokens }
 }
 
-export function payloadID(payload: unknown) {
+function payloadID(payload: unknown) {
   if (!payload || typeof payload !== "object") return undefined
   const id = (payload as { id?: unknown }).id
   return typeof id === "string" ? id : undefined
@@ -2268,7 +2268,7 @@ function formatUsageForLog(usage: ProgressUsage) {
   return `${cost}, ${tokens}${model}`
 }
 
-export function describeToolCall(properties: Record<string, unknown>) {
+function describeToolCall(properties: Record<string, unknown>) {
   const tool = pickString(properties, ["tool"]) || "tool"
   const input = properties.input && typeof properties.input === "object" ? (properties.input as Record<string, unknown>) : {}
   const target = pickString(input, ["command", "cmd", "filePath", "path", "pattern", "query", "url", "description"])
@@ -2294,7 +2294,7 @@ function formatEventError(value: unknown) {
   return String((value as { name?: unknown; type?: unknown }).name ?? (value as { type?: unknown }).type ?? "unknown error")
 }
 
-export function pickString(values: Record<string, unknown>, keys: string[]) {
+function pickString(values: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
     const value = values[key]
     if (typeof value === "string" && value.length > 0) return truncate(value, 220)
@@ -2534,4 +2534,29 @@ function formatSdkError(error: unknown): string {
   }
   if (typeof error === "object" && error && "name" in error) return String((error as { name?: unknown }).name)
   return String(error)
+}
+
+export const __testing = {
+  activity,
+  awaitActionOrAbort,
+  completionFollowUp,
+  describeSessionStatus,
+  describeToolCall,
+  diffSummaryFromEvent,
+  formatCharCount,
+  formatCost,
+  formatModelFromEvent,
+  gateAllowedActions,
+  keepCompletedPhase,
+  payloadID,
+  payloadType,
+  pickString,
+  pulse,
+  rawString,
+  recoveryReport,
+  rememberMessagePartChannel,
+  sleep,
+  stepUsageFromEvent,
+  todosFromEvent,
+  usageFromRecord,
 }

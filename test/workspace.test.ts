@@ -1,6 +1,15 @@
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
 import { describe, expect, test } from "bun:test"
 
-import { isValidRunID, convoyRoot, convoyHome, globalConfigPath, globalAgentsDir, runsRoot, opencodeConfigDir } from "../src/workspace"
+import { createWorkspace, isValidRunID, convoyRoot, convoyHome, globalConfigPath, globalAgentsDir, runsRoot, opencodeConfigDir, runDir } from "../src/workspace"
+
+function restoreEnv(name: string, value: string | undefined) {
+  if (value === undefined) delete process.env[name]
+  else process.env[name] = value
+}
 
 describe("isValidRunID", () => {
   test("accepts a valid run ID", () => {
@@ -25,7 +34,7 @@ describe("convoyRoot", () => {
       expect(root.length).toBeGreaterThan(0)
       expect(root).not.toContain(".convoy")
     } finally {
-      if (original) process.env.CONVOY_HOME = original
+      restoreEnv("CONVOY_HOME", original)
     }
   })
 
@@ -35,8 +44,7 @@ describe("convoyRoot", () => {
     try {
       expect(convoyRoot()).toBe("/custom/convoy")
     } finally {
-      if (original) process.env.CONVOY_HOME = original
-      else delete process.env.CONVOY_HOME
+      restoreEnv("CONVOY_HOME", original)
     }
   })
 })
@@ -48,8 +56,7 @@ describe("convoyHome", () => {
     try {
       expect(convoyHome()).toBe("/tmp/.convoy")
     } finally {
-      if (original) process.env.CONVOY_HOME = original
-      else delete process.env.CONVOY_HOME
+      restoreEnv("CONVOY_HOME", original)
     }
   })
 })
@@ -88,7 +95,25 @@ describe("opencodeConfigDir", () => {
 
 describe("runDir", () => {
   test("throws for an invalid run ID", () => {
-    const { runDir } = require("../src/workspace") as { runDir: (id: string) => string }
     expect(() => runDir("invalid")).toThrow("invalid run id")
+  })
+})
+
+describe("workspace permissions", () => {
+  test("creates private run directories and prompt files", async () => {
+    if (process.platform === "win32") return
+    const root = await mkdtemp(join(tmpdir(), "convoy-private-workspace-"))
+    const previousHome = process.env.CONVOY_HOME
+    process.env.CONVOY_HOME = root
+
+    try {
+      const workspace = await createWorkspace("confidential prompt")
+      expect((await stat(workspace.dir)).mode & 0o777).toBe(0o700)
+      expect((await stat(join(workspace.dir, "prd.md"))).mode & 0o777).toBe(0o600)
+      expect(await readFile(join(workspace.dir, "prd.md"), "utf8")).toBe("confidential prompt")
+    } finally {
+      restoreEnv("CONVOY_HOME", previousHome)
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

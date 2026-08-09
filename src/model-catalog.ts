@@ -21,6 +21,21 @@ const modelsDevUrl = "https://models.dev/api.json"
 
 let cached: ModelChoice[] | undefined
 
+type ModelCatalogDeps = {
+  startOpencode?: (
+    config: Parameters<typeof startOpencode>[0],
+    signal: AbortSignal,
+  ) => Promise<{
+    client: {
+      provider: {
+        list(input: { directory: string }): Promise<{ error?: unknown; data?: { all: Provider[]; connected: string[] } }>
+      }
+    }
+    close(): void
+  }>
+  fetch?: (url: string, init: { signal: AbortSignal }) => Promise<Pick<Response, "ok" | "status" | "json">>
+}
+
 /**
  * The models offered in the picker: first the OpenCode SDK (filtered to the
  * user's connected providers, with variants expanded), falling back to the full
@@ -28,20 +43,29 @@ let cached: ModelChoice[] | undefined
  * if both fail, since the picker always also accepts free-typed text. Cached
  * per process once a non-empty list is obtained.
  */
-export async function listModels(targetDir: string): Promise<ModelChoice[]> {
-  if (cached) return cached
+export async function listModels(targetDir: string, deps?: ModelCatalogDeps): Promise<ModelChoice[]> {
+  if (!deps && cached) return cached
 
-  const fromSdk = await safe(() => listModelsFromSdk(targetDir), "opencode SDK")
-  if (fromSdk && fromSdk.length > 0) return (cached = fromSdk)
+  const start = deps?.startOpencode ?? startOpencode
+  const fetchCatalog = deps?.fetch ?? fetch
 
-  const fromDev = await safe(() => fetchModelsDev(), "models.dev")
-  if (fromDev && fromDev.length > 0) return (cached = fromDev)
+  const fromSdk = await safe(() => listModelsFromSdk(targetDir, start), "opencode SDK")
+  if (fromSdk && fromSdk.length > 0) {
+    if (!deps) cached = fromSdk
+    return fromSdk
+  }
+
+  const fromDev = await safe(() => fetchModelsDevWith(fetchCatalog), "models.dev")
+  if (fromDev && fromDev.length > 0) {
+    if (!deps) cached = fromDev
+    return fromDev
+  }
 
   return []
 }
 
-async function listModelsFromSdk(targetDir: string): Promise<ModelChoice[]> {
-  const handle = await startOpencode({}, AbortSignal.timeout(catalogTimeoutMs))
+async function listModelsFromSdk(targetDir: string, start: NonNullable<ModelCatalogDeps["startOpencode"]>): Promise<ModelChoice[]> {
+  const handle = await start({}, AbortSignal.timeout(catalogTimeoutMs))
   try {
     const result = await handle.client.provider.list({ directory: targetDir })
     if (result.error || !result.data) throw new Error("opencode returned an error listing providers/models")
@@ -94,7 +118,11 @@ type ModelsDevProvider = { models?: Record<string, ModelsDevModel> }
 
 /** Fallback catalog from models.dev. No variants and no enabled-provider filter; the full public list. */
 export async function fetchModelsDev(): Promise<ModelChoice[]> {
-  const response = await fetch(modelsDevUrl, { signal: AbortSignal.timeout(catalogTimeoutMs) })
+  return fetchModelsDevWith(fetch)
+}
+
+async function fetchModelsDevWith(fetchCatalog: NonNullable<ModelCatalogDeps["fetch"]>): Promise<ModelChoice[]> {
+  const response = await fetchCatalog(modelsDevUrl, { signal: AbortSignal.timeout(catalogTimeoutMs) })
   if (!response.ok) throw new Error(`models.dev returned ${response.status}`)
   const data = (await response.json()) as Record<string, ModelsDevProvider>
   return parseModelsDev(data)

@@ -59,6 +59,12 @@ const maxBodyLines = 6
 const commitTypes = ["feat", "fix", "refactor", "perf", "docs", "test", "chore", "build", "ci"] as const
 const defaultCommitType = "feat"
 
+type CommitMessageDeps = {
+  startOpencode: typeof startOpencode
+}
+
+const defaultCommitMessageDeps: CommitMessageDeps = { startOpencode }
+
 /** Same reasoning as the branch namer: a bare `system` string leaves opencode's chatty coding persona in charge. */
 function writerOpencodeConfig(): Config {
   const agent: AgentConfig = {
@@ -105,10 +111,13 @@ function writerOpencodeConfig(): Config {
  * from the branch name and the step commits, so `finish` always has something
  * to show.
  */
-export async function proposeCommitMessage(input: CommitMessageInput): Promise<CommitMessageProposal> {
+export async function proposeCommitMessage(
+  input: CommitMessageInput,
+  deps: CommitMessageDeps = defaultCommitMessageDeps,
+): Promise<CommitMessageProposal> {
   let error: string | undefined
   try {
-    const handle = await startOpencode(writerOpencodeConfig(), AbortSignal.timeout(commitMessageTimeoutMs))
+    const handle = await deps.startOpencode(writerOpencodeConfig(), AbortSignal.timeout(commitMessageTimeoutMs))
     try {
       const reply = await askForCommitMessage(handle.client, { ...input, model: input.model ?? defaultCommitMessageModel })
       const message = readCommitMessage(reply)

@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { formatRunDate, formatRunDateLong, pad2, RunsBrowser, truncatePath, wheelDelta } from "../src/runs-tui"
+import { __testing } from "../src/runs-tui"
 import type { RunEntry } from "../src/runs"
+
+const { formatRunDate, formatRunDateLong, pad2, RunsBrowser, truncatePath, wheelDelta } = __testing
 
 // Helper: extract plain text from StyledText chunks
 function plainText(st: { chunks: Array<{ text: string }> }): string {

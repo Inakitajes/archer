@@ -1,10 +1,13 @@
-import { describe, expect, test, mock } from "bun:test"
-import { mkdir } from "node:fs/promises"
+import { describe, expect, test } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-import { readRunMetadata, openRunMetadata, recordProgress } from "../src/metadata"
+import { readRunMetadata, openRunMetadata, recordProgress, type RunMetadataStore } from "../src/metadata"
+import type { RepoSnapshot } from "../src/git"
 import type { Pipeline, AgentStep, HumanStep } from "../src/types"
 import type { Workspace } from "../src/workspace"
-import type { ProgressPhaseSnapshot, ProgressStepUsage, ProgressUsage } from "../src/progress"
+import type { ProgressUI } from "../src/progress"
 import type { AdvisorEvent } from "../src/advisor-events"
 
 function validAgentStep(name: string): AgentStep {
@@ -28,12 +31,25 @@ function validPipeline(steps: (AgentStep | HumanStep)[]): Pipeline {
 }
 
 async function withDir(name: string): Promise<{ dir: string; ws: Workspace; cleanup: () => Promise<void> }> {
-  const dir = `/tmp/convoy-test-meta-${name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-  await mkdir(dir, { recursive: true })
+  const dir = await mkdtemp(join(tmpdir(), `convoy-test-meta-${name}-`))
   return {
     dir,
     ws: { dir, runID: "run-test" },
-    cleanup: async () => { await Bun.$`rm -rf ${dir}`.nothrow() },
+    cleanup: () => rm(dir, { recursive: true, force: true }),
+  }
+}
+
+function advisorRequestedEvent(id: string): AdvisorEvent {
+  return {
+    id,
+    type: "advisor.requested",
+    timestamp: new Date(0).toISOString(),
+    callId: `call-${id}`,
+    phase: "design",
+    attempt: 1,
+    trigger: "completion",
+    budget: { used: 1, max: 3 },
+    model: "anthropic/claude-opus-4",
   }
 }
 
@@ -365,6 +381,7 @@ describe("openRunMetadata", () => {
     try {
       expect(store.snapshot("nonexistent")).toBeUndefined()
     } finally {
+      await store.flush()
       await cleanup()
     }
   })
@@ -447,7 +464,7 @@ describe("openRunMetadata", () => {
     const { dir, ws, cleanup } = await withDir("adv")
     const store = await openRunMetadata(ws, "/target", validPipeline([validAgentStep("design")]))
     try {
-      const evt1: AdvisorEvent = { id: "evt-1", type: "decision", timestamp: Date.now(), content: "first" } as AdvisorEvent
+      const evt1 = advisorRequestedEvent("evt-1")
       store.phaseAdvisorEvent("design", evt1)
       await store.flush()
       let raw = await readRunMetadata(`${dir}/metadata.json`)
@@ -458,12 +475,12 @@ describe("openRunMetadata", () => {
       raw = await readRunMetadata(`${dir}/metadata.json`)
       expect(raw!.phases.design?.advisorEvents).toHaveLength(1)
 
-      const evt2: AdvisorEvent = { id: "evt-2", type: "decision", timestamp: Date.now(), content: "second" } as AdvisorEvent
+      const evt2 = advisorRequestedEvent("evt-2")
       store.phaseAdvisorEvent("design", evt2)
       await store.flush()
       raw = await readRunMetadata(`${dir}/metadata.json`)
       expect(raw!.phases.design?.advisorEvents).toHaveLength(2)
-      expect(raw!.phases.design?.advisor).toBeDefined()
+      expect(raw!.phases.design?.advisor?.attempted).toBe(2)
     } finally {
       await cleanup()
     }
@@ -562,7 +579,10 @@ describe("openRunMetadata", () => {
 
   test("assertSafePipelineArtifacts: rejects unknown step type", async () => {
     const { ws, cleanup } = await withDir("err4")
-    const bad = validPipeline([{ ...validAgentStep("design"), type: "invalid" }] as unknown as Pipeline)
+    const bad = {
+      name: "test-pipeline",
+      steps: [{ ...validAgentStep("design"), type: "invalid" }],
+    } as unknown as Pipeline
     await expect(openRunMetadata(ws, "/target", bad)).rejects.toThrow("unknown step type")
     await cleanup()
   })
@@ -582,6 +602,7 @@ describe("openRunMetadata", () => {
     try {
       expect(store).toBeDefined()
     } finally {
+      await store.flush()
       await cleanup()
     }
   })
@@ -594,6 +615,7 @@ describe("openRunMetadata", () => {
     try {
       expect(store).toBeDefined()
     } finally {
+      await store.flush()
       await cleanup()
     }
   })
@@ -606,6 +628,7 @@ describe("openRunMetadata", () => {
       expect(store).toBeDefined()
       expect(store.phaseStatus("review")).toBeUndefined()
     } finally {
+      await store.flush()
       await cleanup()
     }
   })
@@ -615,7 +638,7 @@ describe("openRunMetadata", () => {
     const store = await openRunMetadata(ws, "/target", validPipeline([validAgentStep("design")]))
     try {
       expect(store.repositoryBaseline("design")).toBeUndefined()
-      const baseline = { commit: "abc123", files: ["f1.ts"] } as any
+      const baseline: RepoSnapshot = { head: "abc123", ref: "refs/heads/main" }
       await store.phaseRepositoryBaseline("design", baseline)
       expect(store.repositoryBaseline("design")).toEqual(baseline)
       const raw = await readRunMetadata(`${dir}/metadata.json`)
@@ -631,13 +654,14 @@ describe("openRunMetadata", () => {
     try {
       expect(store.phaseStatus("nonexistent")).toBeUndefined()
     } finally {
+      await store.flush()
       await cleanup()
     }
   })
 })
 
 describe("recordProgress", () => {
-  function makeFakeUI(calls: string[]) {
+  function makeFakeUI(calls: string[]): ProgressUI {
     return {
       start: (runID: string, ..._: unknown[]) => { calls.push(`start(${runID})`) },
       serverReady: (url: string) => { calls.push(`serverReady(${url})`) },
@@ -660,12 +684,12 @@ describe("recordProgress", () => {
       suspend: () => { calls.push("suspend()") },
       resume: () => { calls.push("resume()") },
       stop: () => { calls.push("stop()") },
-    } as Record<string, unknown>
+    }
   }
 
-  function makeMockStore(storeCalls: string[]) {
+  function makeMockStore(storeCalls: string[]): RunMetadataStore {
     return {
-      pipeline: {} as never,
+      pipeline: validPipeline([]),
       snapshot: () => undefined,
       phaseStatus: () => undefined,
       serverStarted: (url: string) => { storeCalls.push(`serverStarted(${url})`) },
@@ -689,7 +713,7 @@ describe("recordProgress", () => {
     const storeCalls: string[] = []
     const fakeUI = makeFakeUI(calls)
     const mockStore = makeMockStore(storeCalls)
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     recorder.start("run-1", "/repo", "/run-dir")
     expect(calls).toContain("start(run-1)")
@@ -703,7 +727,7 @@ describe("recordProgress", () => {
     const calls: string[] = []
     const fakeUI = makeFakeUI(calls)
     const mockStore = makeMockStore([])
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     recorder.phaseRunning("design")
     expect(calls).toContain("phaseRunning(design)")
@@ -711,7 +735,7 @@ describe("recordProgress", () => {
     recorder.phaseAttempt("design", { attempt: 1 })
     expect(calls).toContain("phaseAttempt(design)")
 
-    recorder.phaseMessage("design", "hello")
+    recorder.phaseMessage("design", { channel: "response", text: "hello" })
     expect(calls).toContain("phaseMessage(design)")
 
     recorder.phaseActivity("design", "tool called", "tool", true)
@@ -723,7 +747,7 @@ describe("recordProgress", () => {
     recorder.phaseDiff("design", { files: 3, additions: 10, deletions: 2 })
     expect(calls).toContain("phaseDiff(design)")
 
-    recorder.phaseRestored("design", { status: "completed" } as ProgressPhaseSnapshot)
+    recorder.phaseRestored("design", { status: "completed" })
     expect(calls).toContain("phaseRestored(design)")
   })
 
@@ -732,17 +756,17 @@ describe("recordProgress", () => {
     const storeCalls: string[] = []
     const fakeUI = makeFakeUI(calls)
     const mockStore = makeMockStore(storeCalls)
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
-    recorder.phaseStepUsage("design", { cost: 0.5 } as ProgressStepUsage)
+    recorder.phaseStepUsage("design", { cost: 0.5 })
     expect(calls).toContain("phaseStepUsage(design)")
     expect(storeCalls).toContain("phaseStepUsage(design)")
 
-    recorder.phaseUsageTotal("design", { cost: 5.0 } as ProgressUsage)
+    recorder.phaseUsageTotal("design", { cost: 5.0 })
     expect(calls).toContain("phaseUsageTotal(design)")
     expect(storeCalls).toContain("phaseUsageTotal(design)")
 
-    recorder.phaseAdvisorEvent("design", { id: "evt-1" } as AdvisorEvent)
+    recorder.phaseAdvisorEvent("design", advisorRequestedEvent("evt-1"))
     expect(calls).toContain("phaseAdvisorEvent(design)")
     expect(storeCalls).toContain("phaseAdvisorEvent(design)")
   })
@@ -752,7 +776,7 @@ describe("recordProgress", () => {
     const storeCalls: string[] = []
     const fakeUI = makeFakeUI(calls)
     const mockStore = makeMockStore(storeCalls)
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     await recorder.phaseCompleted("design")
     expect(calls).toContain("phaseCompleted(design)")
@@ -771,7 +795,7 @@ describe("recordProgress", () => {
     const calls: string[] = []
     const fakeUI = makeFakeUI(calls)
     const mockStore = makeMockStore([])
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     recorder.suspend()
     expect(calls).toContain("suspend()")
@@ -787,13 +811,13 @@ describe("recordProgress", () => {
     const calls: string[] = []
     let boundThis: unknown = null
     const fakeUI = makeFakeUI(calls)
-    fakeUI.askPermission = function (this: unknown, ..._: unknown[]) { boundThis = this; return "once" as const }
+    fakeUI.askPermission = async function (this: ProgressUI) { boundThis = this; return "once" }
     const mockStore = makeMockStore([])
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     expect(typeof recorder.askPermission).toBe("function")
     if (recorder.askPermission) {
-      const result = recorder.askPermission({} as any)
+      const result = await recorder.askPermission({ id: "permission-1", permission: "read", patterns: ["src/**"] })
       expect(result).toBe("once")
       expect(boundThis).toBe(fakeUI)
     }
@@ -803,14 +827,15 @@ describe("recordProgress", () => {
     const calls: string[] = []
     const fakeUI = makeFakeUI(calls)
     let callArgs: unknown[] = []
-    fakeUI.askHumanReview = function (...args: unknown[]) { callArgs = args; return { action: "edit" } as any }
+    fakeUI.askHumanReview = async function (...args: unknown[]) { callArgs = args; return "iterate" }
     const mockStore = makeMockStore([])
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     expect(typeof recorder.askHumanReview).toBe("function")
     if (recorder.askHumanReview) {
-      const result = recorder.askHumanReview("detail" as any)
-      expect(result).toEqual({ action: "edit" })
+      const result = await recorder.askHumanReview({ stepName: "design", iterations: 0 })
+      expect(result).toBe("iterate")
+      expect(callArgs).toEqual([{ stepName: "design", iterations: 0 }])
     }
   })
 
@@ -820,11 +845,11 @@ describe("recordProgress", () => {
     let resolved: unknown = null
     fakeUI.runFinished = function (outcome: unknown) { resolved = outcome; return Promise.resolve() }
     const mockStore = makeMockStore([])
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     expect(typeof recorder.runFinished).toBe("function")
     if (recorder.runFinished) {
-      await recorder.runFinished({ status: "completed", runDir: "/tmp" } as any)
+      await recorder.runFinished({ status: "completed", runDir: "/tmp" })
       expect(resolved).toEqual({ status: "completed", runDir: "/tmp" })
     }
   })
@@ -835,12 +860,12 @@ describe("recordProgress", () => {
     let state: unknown = null
     fakeUI.keepAwakeState = function (s: unknown) { state = s }
     const mockStore = makeMockStore([])
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     expect(typeof recorder.keepAwakeState).toBe("function")
     if (recorder.keepAwakeState) {
-      recorder.keepAwakeState("active")
-      expect(state).toBe("active")
+      recorder.keepAwakeState({ status: "on", detail: "test" })
+      expect(state).toEqual({ status: "on", detail: "test" })
     }
   })
 
@@ -849,32 +874,32 @@ describe("recordProgress", () => {
     const fakeUI = makeFakeUI(calls)
     fakeUI.isInteractiveTakeover = function () { return true }
     const mockStore = makeMockStore([])
-    const recorder = recordProgress(fakeUI as never, mockStore as never)
+    const recorder = recordProgress(fakeUI, mockStore)
 
     expect(typeof recorder.isInteractiveTakeover).toBe("function")
     if (recorder.isInteractiveTakeover) {
-      expect(recorder.isInteractiveTakeover()).toBe(true)
+      expect(recorder.isInteractiveTakeover("design")).toBe(true)
     }
   })
 
   test("runStatus is bound when present", async () => {
     const fakeUI = makeFakeUI([])
     fakeUI.runStatus = function () {}
-    const recorder = recordProgress(fakeUI as never, makeMockStore([]) as never)
+    const recorder = recordProgress(fakeUI, makeMockStore([]))
     expect(typeof recorder.runStatus).toBe("function")
   })
 
   test("runControlState is bound when present", async () => {
     const fakeUI = makeFakeUI([])
     fakeUI.runControlState = function () {}
-    const recorder = recordProgress(fakeUI as never, makeMockStore([]) as never)
+    const recorder = recordProgress(fakeUI, makeMockStore([]))
     expect(typeof recorder.runControlState).toBe("function")
   })
 
   test("keepRunDirRequested is bound when present", async () => {
     const fakeUI = makeFakeUI([])
     fakeUI.keepRunDirRequested = function () { return false }
-    const recorder = recordProgress(fakeUI as never, makeMockStore([]) as never)
+    const recorder = recordProgress(fakeUI, makeMockStore([]))
     expect(typeof recorder.keepRunDirRequested).toBe("function")
     if (recorder.keepRunDirRequested) {
       expect(recorder.keepRunDirRequested()).toBe(false)
@@ -883,7 +908,7 @@ describe("recordProgress", () => {
 
   test("optional methods are absent when UI lacks them", async () => {
     const fakeUI = makeFakeUI([])
-    const recorder = recordProgress(fakeUI as never, makeMockStore([]) as never)
+    const recorder = recordProgress(fakeUI, makeMockStore([]))
     expect(recorder.askPermission).toBeUndefined()
     expect(recorder.askHumanReview).toBeUndefined()
     expect(recorder.runFinished).toBeUndefined()

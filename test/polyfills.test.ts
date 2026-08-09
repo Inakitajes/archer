@@ -1,77 +1,40 @@
 import { describe, expect, test } from "bun:test"
 
 describe("polyfills", () => {
-  test("module imports without error", async () => {
-    const mod = await import("../src/polyfills")
-    expect(mod).toBeDefined()
-  })
+  test("installs and exercises the fallback when the native stream is absent", async () => {
+    const native = Object.getOwnPropertyDescriptor(globalThis, "TextDecoderStream")
+    Reflect.deleteProperty(globalThis, "TextDecoderStream")
 
-  test("TextDecoderStream exists after importing polyfills", async () => {
-    await import("../src/polyfills")
-    expect(typeof globalThis.TextDecoderStream).toBe("function")
-  })
+    try {
+      const fallbackModule = "../src/polyfills?fallback-test"
+      await import(fallbackModule)
 
-  test("TextDecoderStream decodes multi-chunk streams", async () => {
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode("Hel"))
-        controller.enqueue(new TextEncoder().encode("lo "))
-        controller.enqueue(new TextEncoder().encode("World"))
-        controller.close()
-      },
-    })
+      const Decoder = globalThis.TextDecoderStream as unknown as new (
+        label?: string,
+        options?: TextDecoderOptions,
+      ) => TransformStream<Uint8Array, string> & {
+        encoding: string
+        fatal: boolean
+        ignoreBOM: boolean
+      }
+      const decoder = new Decoder("utf-8", { fatal: true, ignoreBOM: true })
+      const bytes = new TextEncoder().encode("A€")
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes.slice(0, 2))
+          controller.enqueue(new Uint8Array())
+          controller.enqueue(bytes.slice(2))
+          controller.close()
+        },
+      })
 
-    const decoder = new (globalThis.TextDecoderStream as new () => TransformStream<Uint8Array, string>)()
-    const reader = stream.pipeThrough(decoder).getReader()
-    let result = ""
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
-      result += value!
+      expect(await new Response(stream.pipeThrough(decoder)).text()).toBe("A€")
+      expect(decoder.encoding).toBe("utf-8")
+      expect(decoder.fatal).toBe(true)
+      expect(decoder.ignoreBOM).toBe(true)
+    } finally {
+      if (native) Object.defineProperty(globalThis, "TextDecoderStream", native)
+      else Reflect.deleteProperty(globalThis, "TextDecoderStream")
     }
-    expect(result).toBe("Hello World")
-  })
-
-  test("TextDecoderStream exposes encoding, fatal, and ignoreBOM properties", () => {
-    const decoder = new (globalThis.TextDecoderStream as new () => TransformStream<Uint8Array, string>)()
-    const d = decoder as unknown as { encoding: string; fatal: boolean; ignoreBOM: boolean }
-    expect(d.encoding).toBe("utf-8")
-    expect(d.fatal).toBe(false)
-    expect(d.ignoreBOM).toBe(false)
-  })
-
-  test("TextDecoderStream flush outputs remaining data", async () => {
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]))
-        controller.close()
-      },
-    })
-
-    const decoder = new (globalThis.TextDecoderStream as new () => TransformStream<Uint8Array, string>)()
-    const reader = stream.pipeThrough(decoder).getReader()
-    const { value } = await reader.read()
-    expect(value).toBe("Hello")
-  })
-
-  test("TextDecoderStream handles empty chunks", async () => {
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array([]))
-        controller.enqueue(new TextEncoder().encode("abc"))
-        controller.close()
-      },
-    })
-
-    const decoder = new (globalThis.TextDecoderStream as new () => TransformStream<Uint8Array, string>)()
-    const reader = stream.pipeThrough(decoder).getReader()
-    const { value } = await reader.read()
-    expect(value).toBe("abc")
-  })
-
-  test("TextDecoderStream with UTF-16LE encoding", () => {
-    const decoder = new (globalThis.TextDecoderStream as new (label?: string) => TransformStream<Uint8Array, string>)("utf-16le")
-    const d = decoder as unknown as { encoding: string }
-    expect(d.encoding).toBe("utf-16le")
   })
 })

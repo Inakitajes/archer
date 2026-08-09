@@ -540,7 +540,7 @@ export function findSuspiciousStagedFiles(porcelain: string): string[] {
 
 // git C-quotes paths with spaces or non-ASCII bytes; the secret patterns must
 // match the decoded name, not the escaped one ("\303\251" would never match).
-export function unquotePorcelainPath(path: string) {
+function unquotePorcelainPath(path: string) {
   if (!(path.startsWith('"') && path.endsWith('"'))) return path
   const escapes: Record<string, string> = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", '"': '"' }
   return path.slice(1, -1).replace(/\\(?:([abfnrtv\\"])|([0-7]{1,3}))/g, (_, esc: string | undefined, octal: string | undefined) => {
@@ -574,6 +574,6 @@ async function assertRepoRoot(cwd: string, rootPath: string) {
   }
 }
 
-export function isSafeInitialBranch(value: string) {
+function isSafeInitialBranch(value: string) {
   return value !== "HEAD" && !value.startsWith("-") && !/[~^:?*[\\\s]/.test(value) && !value.includes("..")
 }

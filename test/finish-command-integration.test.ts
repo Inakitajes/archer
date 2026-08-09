@@ -1,99 +1,113 @@
-/**
- * Integration tests for finish-command.ts that need mock.module.
- * Kept separate so mock.module doesn't leak into other test files.
- */
-import { describe, expect, mock, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
+import { rm } from "node:fs/promises"
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs"
+import { execFileSync } from "node:child_process"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-async function setupRepo(): Promise<string> {
-  const { mkdtempSync } = await import("node:fs")
-  const { writeFileSync, mkdirSync } = await import("node:fs")
-  const { tmpdir } = await import("node:os")
-  const { join } = await import("node:path")
-  const { execSync } = await import("node:child_process")
+import { runFinishCommand } from "../src/finish-command"
+import { resolveSquashRange, type FinishContext, type FinishPreparation } from "../src/finish"
 
-  const tmp = mkdtempSync(join(tmpdir(), "convoy-finish-cmd-"))
-
-  mkdirSync(join(tmp, ".convoy"), { recursive: true })
-  writeFileSync(join(tmp, ".convoy/config.yaml"), "defaults:\n  baseRef: main\n")
-
-  execSync("git init -b main", { cwd: tmp })
-  execSync("git config user.email test@test.com", { cwd: tmp })
-  execSync("git config user.name Tester", { cwd: tmp })
-  execSync("git add -A", { cwd: tmp })
-  execSync("git commit -m 'chore: initial' --author='User <user@test.com>'", { cwd: tmp })
-  execSync("git checkout -b feat/test-login", { cwd: tmp })
-  execSync("git commit --allow-empty -m 'feat: add login (1/2)' --author='Convoy <convoy@local>'", { cwd: tmp })
-  execSync("git commit --allow-empty -m 'fix: typo (2/2)' --author='Convoy <convoy@local>'", { cwd: tmp })
-
-  return tmp
+function git(args: string[], cwd: string): string {
+  return execFileSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" }).trim()
 }
 
+function setupRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), "convoy-finish-cmd-"))
+  mkdirSync(join(dir, ".convoy"), { recursive: true })
+  writeFileSync(join(dir, ".convoy/config.yaml"), "defaults:\n  baseRef: main\n")
+
+  git(["init", "-q", "-b", "main"], dir)
+  git(["config", "user.email", "test@test.com"], dir)
+  git(["config", "user.name", "Tester"], dir)
+  git(["add", "-A"], dir)
+  git(["commit", "-q", "-m", "chore: initial", "--author=User <user@test.com>"], dir)
+  git(["checkout", "-q", "-b", "feat/test-login"], dir)
+  git(["commit", "-q", "--allow-empty", "-m", "feat: add login (1/2)", "--author=Convoy <convoy@local>"], dir)
+  git(["commit", "-q", "--allow-empty", "-m", "fix: typo (2/2)", "--author=Convoy <convoy@local>"], dir)
+  return dir
+}
+
+async function prepareTestFinish(context: FinishContext): Promise<FinishPreparation> {
+  const range = await resolveSquashRange(context.cwd, context.baseRef)
+  if (!range.ok) return range
+  const { ok: _ok, ...plan } = range
+  return {
+    ok: true,
+    plan,
+    message: { type: "feat", subject: "add login", body: ["Convoy commit message"] },
+    messageSource: "template",
+  }
+}
+
+const deps = { prepareFinish: prepareTestFinish }
+
 describe("runFinishCommand integration with git", () => {
-  test("--dry-run prints the plan and exits without modifying the repo", async () => {
-    const tmp = await setupRepo()
-    const { execSync } = require("node:child_process") as typeof import("node:child_process")
-
-    // Mock the commit-message module so proposeCommitMessage doesn't try
-    // to connect to a real opencode server
-    mock.module("../src/commit-message", () => ({
-      formatCommitMessage: (msg: { subject: string; body: string[] }) =>
-        `${msg.subject}\n\n${msg.body.map((l: string) => `- ${l}`).join("\n")}`,
-      proposeCommitMessage: () =>
-        Promise.resolve({
-          message: { subject: "feat: add login (1/2)", body: ["Convoy commit message"] },
-          source: "template" as const,
-        }),
-    }))
-
-    const { runFinishCommand } = await import("../src/finish-command")
+  test("reports an already-finished branch as a successful no-op", async () => {
+    const dir = setupRepo()
+    const beforeHead = git(["rev-parse", "HEAD"], dir)
     const writes: string[] = []
-    const origWrite = process.stdout.write.bind(process.stdout)
-    process.stdout.write = ((chunk: string) => {
+    const stdout = spyOn(process.stdout, "write").mockImplementation((chunk: string) => {
       writes.push(chunk)
       return true
-    }) as typeof process.stdout.write
+    })
 
     try {
-      await runFinishCommand({ targetDir: tmp, dryRun: true, baseRef: "main" })
-      const allOutput = writes.join("")
-      expect(allOutput).toContain("--dry-run: nothing was changed")
-      expect(allOutput).toContain("feat:")
-      expect(allOutput).toContain("2 convoy commits")
+      await runFinishCommand({ targetDir: dir, baseRef: "main" }, {
+        prepareFinish: async () => ({ ok: false, reason: "no-commits", message: "nothing to finish" }),
+      })
+
+      expect(writes.join("")).toContain("nothing to finish")
+      expect(git(["rev-parse", "HEAD"], dir)).toBe(beforeHead)
     } finally {
-      process.stdout.write = origWrite
-      execSync("rm -rf " + tmp)
+      stdout.mockRestore()
+      await rm(dir, { recursive: true, force: true })
     }
   })
 
-  test("non-interactive without --yes prints hint", async () => {
-    const tmp = await setupRepo()
-    const { execSync } = require("node:child_process") as typeof import("node:child_process")
-
-    mock.module("../src/commit-message", () => ({
-      formatCommitMessage: (msg: { subject: string; body: string[] }) =>
-        `${msg.subject}\n\n${msg.body.map((l: string) => `- ${l}`).join("\n")}`,
-      proposeCommitMessage: () =>
-        Promise.resolve({
-          message: { subject: "feat: add login (1/2)", body: ["Convoy commit message"] },
-          source: "template" as const,
-        }),
-    }))
-
-    const { runFinishCommand } = await import("../src/finish-command")
+  test("--dry-run prints the plan without changing HEAD or status", async () => {
+    const dir = setupRepo()
+    const beforeHead = git(["rev-parse", "HEAD"], dir)
+    const beforeStatus = git(["status", "--porcelain=v1", "--untracked-files=all"], dir)
     const writes: string[] = []
-    const origWrite = process.stdout.write.bind(process.stdout)
-    process.stdout.write = ((chunk: string) => {
+    const stdout = spyOn(process.stdout, "write").mockImplementation((chunk: string) => {
       writes.push(chunk)
       return true
-    }) as typeof process.stdout.write
+    })
 
     try {
-      await runFinishCommand({ targetDir: tmp })
-      const allOutput = writes.join("")
-      expect(allOutput).toContain("not an interactive terminal")
+      await runFinishCommand({ targetDir: dir, dryRun: true, baseRef: "main" }, deps)
+
+      expect(writes.join("")).toContain("--dry-run: nothing was changed")
+      expect(writes.join("")).toContain("feat: add login")
+      expect(writes.join("")).toContain("2 convoy commits")
+      expect(git(["rev-parse", "HEAD"], dir)).toBe(beforeHead)
+      expect(git(["status", "--porcelain=v1", "--untracked-files=all"], dir)).toBe(beforeStatus)
     } finally {
-      process.stdout.write = origWrite
-      execSync("rm -rf " + tmp)
+      stdout.mockRestore()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("non-interactive execution without --yes leaves the repository unchanged", async () => {
+    const dir = setupRepo()
+    const beforeHead = git(["rev-parse", "HEAD"], dir)
+    const beforeStatus = git(["status", "--porcelain=v1", "--untracked-files=all"], dir)
+    const writes: string[] = []
+    const stdout = spyOn(process.stdout, "write").mockImplementation((chunk: string) => {
+      writes.push(chunk)
+      return true
+    })
+
+    try {
+      await runFinishCommand({ targetDir: dir, baseRef: "main" }, deps)
+
+      expect(writes.join("")).toContain("not an interactive terminal")
+      expect(git(["rev-parse", "HEAD"], dir)).toBe(beforeHead)
+      expect(git(["status", "--porcelain=v1", "--untracked-files=all"], dir)).toBe(beforeStatus)
+    } finally {
+      stdout.mockRestore()
+      await rm(dir, { recursive: true, force: true })
     }
   })
 })

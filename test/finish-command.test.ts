@@ -137,13 +137,3 @@ describe("runFinishCommand (through exported internals)", () => {
     expect(opts.dryRun).toBe(true)
   })
 })
-
-describe("indent", () => {
-  test("indents every line with two spaces", () => {
-    const { indent } = require("../src/finish-command") as typeof import("../src/finish-command")
-    expect(indent("hello")).toBe("  hello")
-    expect(indent("line1\nline2")).toBe("  line1\n  line2")
-    expect(indent("")).toBe("  ")
-    expect(indent("a\nb\nc")).toBe("  a\n  b\n  c")
-  })
-})

@@ -2,9 +2,23 @@ import { describe, expect, test } from "bun:test"
 import { beforeEach } from "bun:test"
 import { spyOn } from "bun:test"
 
-import { parseArgs, parseCommand, splitFlag, listValue, writeUpdateResult, resolveRunOptions, resolveBaseRef, resolveWorktreeOption, parseInitArgs } from "../src/cli"
+import { __testing, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
+
+const { listValue, parseInitArgs, resolveBaseRef, resolveWorktreeOption, splitFlag, writeUpdateResult } = __testing
 
 const validRunID = "20240101-120000-abcd"
+
+const release = {
+  tagName: "v2.0.0",
+  version: { major: 2, minor: 0, patch: 0, prerelease: [] },
+  publishedAt: "2026-01-01T00:00:00Z",
+  assets: [],
+}
+
+const assets = {
+  binary: { name: "convoy-darwin-arm64", browserDownloadUrl: "https://github.com/Inakitajes/convoy/releases/download/v2.0.0/convoy-darwin-arm64" },
+  checksumFile: { name: "SHA256SUMS", browserDownloadUrl: "https://github.com/Inakitajes/convoy/releases/download/v2.0.0/SHA256SUMS" },
+}
 
 describe("parseArgs", () => {
   test("parses a positional prompt", () => {
@@ -332,7 +346,7 @@ describe("writeUpdateResult", () => {
       return true
     })
     try {
-      writeUpdateResult({ status: "up-to-date", currentVersion: "1.0.0", latestVersion: "1.0.0" })
+      writeUpdateResult({ status: "up-to-date", currentVersion: "1.0.0", latestVersion: "1.0.0", release, assets })
       expect(writes).toEqual(["convoy 1.0.0 is up to date (latest: v1.0.0)\n"])
     } finally {
       spy.mockRestore()
@@ -346,7 +360,7 @@ describe("writeUpdateResult", () => {
       return true
     })
     try {
-      writeUpdateResult({ status: "update-available", currentVersion: "1.0.0", latestVersion: "2.0.0", assets: { binary: { name: "convoy-darwin-arm64", platform: "darwin", arch: "arm64" } } })
+      writeUpdateResult({ status: "update-available", currentVersion: "1.0.0", latestVersion: "2.0.0", release, assets })
       expect(writes).toEqual(["update available: 1.0.0 → v2.0.0 (convoy-darwin-arm64)\n"])
     } finally {
       spy.mockRestore()

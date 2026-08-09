@@ -56,7 +56,7 @@ export async function browseRunsTui(runs: RunEntry[], initialIndex: number): Pro
   return new RunsBrowser(renderer, runs, initialIndex).result
 }
 
-export class RunsBrowser {
+class RunsBrowser {
   readonly result: Promise<RunsResolution>
 
   private resolveResult!: (resolution: RunsResolution) => void
@@ -635,29 +635,29 @@ export class RunsBrowser {
 
 // The run ID's timestamp is authoritative; createdAt only covers runs whose
 // metadata survived.
-export function runDate(run: RunEntry): Date | undefined {
+function runDate(run: RunEntry): Date | undefined {
   const match = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(run.runID)
   if (match) return new Date(+match[1]!, +match[2]! - 1, +match[3]!, +match[4]!, +match[5]!, +match[6]!)
   if (run.createdAt) return new Date(run.createdAt)
   return undefined
 }
 
-export function formatRunDate(run: RunEntry): string {
+function formatRunDate(run: RunEntry): string {
   const date = runDate(run)
   if (!date) return "—"
   return `${date.getDate()} ${months[date.getMonth()]} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
 }
 
-export function formatRunDateLong(date: Date): string {
+function formatRunDateLong(date: Date): string {
   return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}, ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
 }
 
-export function pad2(value: number) {
+function pad2(value: number) {
   return value.toString().padStart(2, "0")
 }
 
 // Paths overflow on the left so the project/run name stays readable.
-export function truncatePath(value: string, max: number) {
+function truncatePath(value: string, max: number) {
   if (value.length <= max) return value
   return `…${value.slice(-(Math.max(1, max - 1)))}`
 }
@@ -670,9 +670,18 @@ type WheelEvent = {
   stopPropagation(): void
 }
 
-export function wheelDelta(event: WheelEvent): number {
+function wheelDelta(event: WheelEvent): number {
   const scroll = event.scroll
   if (!scroll || (scroll.direction !== "up" && scroll.direction !== "down")) return 0
   const magnitude = Math.max(1, Math.round(scroll.delta || 1))
   return scroll.direction === "up" ? -magnitude : magnitude
+}
+
+export const __testing = {
+  formatRunDate,
+  formatRunDateLong,
+  pad2,
+  RunsBrowser,
+  truncatePath,
+  wheelDelta,
 }

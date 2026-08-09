@@ -204,7 +204,7 @@ export class LiveAttach {
 }
 
 /** Merge the authoritative append-only journal over metadata's convenience projection. */
-export async function reconcileAdvisorJournal(metadata: RunMetadata, runDir: string) {
+async function reconcileAdvisorJournal(metadata: RunMetadata, runDir: string) {
   const advisorEvents = await readAdvisorEvents(runDir)
   for (const name of new Set(advisorEvents.map((event) => event.phase))) {
     const events = advisorEvents.filter((event) => event.phase === name)
@@ -216,7 +216,7 @@ export async function reconcileAdvisorJournal(metadata: RunMetadata, runDir: str
 
 // Replays every non-pending phase from metadata as a restored phase. A stale
 // "running" (a run interrupted mid-phase) reads as failed — it didn't finish.
-export function replayHistory(tui: ProgressUI, metadata: RunMetadata) {
+function replayHistory(tui: ProgressUI, metadata: RunMetadata) {
   for (const [name, phase] of Object.entries(metadata.phases)) {
     if (phase.sessionID) tui.phaseSession(name, phase.sessionID)
     if (phase.status === "pending") continue
@@ -225,7 +225,7 @@ export function replayHistory(tui: ProgressUI, metadata: RunMetadata) {
   }
 }
 
-export function snapshotOf(phase: PhaseMetadata, status: ProgressPhaseSnapshot["status"]): ProgressPhaseSnapshot {
+function snapshotOf(phase: PhaseMetadata, status: ProgressPhaseSnapshot["status"]): ProgressPhaseSnapshot {
   return {
     status,
     sessionID: phase.sessionID,
@@ -240,8 +240,15 @@ export function snapshotOf(phase: PhaseMetadata, status: ProgressPhaseSnapshot["
 
 // A clean run (every phase completed or skipped) reads as completed; anything
 // else — a failure or an interruption — reads as failed on the finish screen.
-export function overallStatus(metadata: RunMetadata): "completed" | "failed" {
+function overallStatus(metadata: RunMetadata): "completed" | "failed" {
   const statuses = Object.values(metadata.phases).map((phase) => phase.status)
   const allDone = statuses.length > 0 && statuses.every((status) => status === "completed" || status === "skipped")
   return allDone ? "completed" : "failed"
+}
+
+export const __testing = {
+  overallStatus,
+  reconcileAdvisorJournal,
+  replayHistory,
+  snapshotOf,
 }

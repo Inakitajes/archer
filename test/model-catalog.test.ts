@@ -77,8 +77,8 @@ describe("toModelChoices", () => {
     expect(gpt4o?.contextK).toBe(128)
   })
 
-  test("deduplicates models with same value", () => {
-    const choices = toModelChoices(sampleProviders as any, ["openai", "openai"])
+  test("deduplicates repeated provider/model entries", () => {
+    const choices = toModelChoices([sampleProviders[0], sampleProviders[0]] as any, ["openai"])
     const gpt4os = choices.filter((c) => c.value === "openai/gpt-4o")
     expect(gpt4os.length).toBe(1)
   })

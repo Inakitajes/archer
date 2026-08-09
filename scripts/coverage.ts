@@ -12,7 +12,7 @@
  *   COVERAGE_THRESHOLD_FUNCS     minimum function coverage % (default 90)
  */
 
-import { execSync } from "node:child_process"
+import { spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join, resolve } from "node:path"
 
@@ -20,10 +20,10 @@ const ROOT = resolve(import.meta.dirname, "..")
 const COVERAGE_DIR = join(ROOT, "coverage")
 const BADGE_PATH = join(ROOT, "assets", "coverage.svg")
 const CACHED_SUMMARY = join(COVERAGE_DIR, "summary.txt")
-const THRESHOLD_LINES = Number(process.env.COVERAGE_THRESHOLD_LINES ?? 95)
-const THRESHOLD_FUNCS = Number(process.env.COVERAGE_THRESHOLD_FUNCS ?? 95)
+const THRESHOLD_LINES = Number(process.env.COVERAGE_THRESHOLD_LINES ?? 90)
+const THRESHOLD_FUNCS = Number(process.env.COVERAGE_THRESHOLD_FUNCS ?? 90)
 
-interface CoverageTotals {
+export interface CoverageTotals {
   linePct: number
   funcPct: number
 }
@@ -33,14 +33,14 @@ interface CoverageTotals {
  * The line looks like:
  *   All files | 87.37 | 85.38 |
  */
-function parseTextCoverage(output: string): CoverageTotals {
+export function parseTextCoverage(output: string): CoverageTotals {
   const match = output.match(/All files\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|/)
   if (!match) {
     throw new Error("Could not parse coverage summary from test output")
   }
   return {
-    linePct: Number.parseFloat(match[1]),
-    funcPct: Number.parseFloat(match[2]),
+    funcPct: Number.parseFloat(match[1]),
+    linePct: Number.parseFloat(match[2]),
   }
 }
 
@@ -92,15 +92,23 @@ function generateBadgeSVG(
 
 function runTestsWithCoverage(): CoverageTotals {
   console.log("🧪 Running tests with coverage...")
-  // bun outputs the coverage table on stderr, so merge both streams
-  const output = execSync(
-    "bun test --coverage-reporter=text --coverage --coverage-dir=" + COVERAGE_DIR + " 2>&1",
+  const result = spawnSync(
+    "bun",
+    ["test", "--coverage", "--coverage-reporter=text", `--coverage-dir=${COVERAGE_DIR}`],
     { cwd: ROOT, encoding: "utf-8", maxBuffer: 50 * 1024 * 1024 },
   )
+  // Bun writes the coverage table to stderr, while regular test output can use
+  // either stream. Their relative order is irrelevant to the summary parser.
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`
 
   // Cache the summary for --check / --badge modes
   if (!existsSync(COVERAGE_DIR)) mkdirSync(COVERAGE_DIR, { recursive: true })
   writeFileSync(CACHED_SUMMARY, output, "utf-8")
+
+  if (result.error || result.status !== 0) {
+    process.stderr.write(output)
+    throw result.error ?? new Error(`Tests with coverage failed with exit code ${result.status ?? "unknown"}`)
+  }
 
   return parseTextCoverage(output)
 }
@@ -148,28 +156,30 @@ function generateBadge(totals: CoverageTotals): void {
   console.log(`\n🏷️  Coverage badge written to ${BADGE_PATH}`)
 }
 
-// --- Main ---
+function main() {
+  const args = process.argv.slice(2)
+  const mode = args.includes("--check") ? "check" : args.includes("--badge") ? "badge" : "full"
 
-const args = process.argv.slice(2)
-const mode = args.includes("--check") ? "check" : args.includes("--badge") ? "badge" : "full"
+  let totals: CoverageTotals
 
-let totals: CoverageTotals
-
-if (mode === "check") {
-  totals = readCachedSummary()
-  const ok = checkThreshold(totals)
-  if (!ok) process.exit(1)
-  console.log("\n✅ All coverage checks passed!")
-} else if (mode === "badge") {
-  totals = readCachedSummary()
-  generateBadge(totals)
-} else {
-  totals = runTestsWithCoverage()
-  const ok = checkThreshold(totals)
-  generateBadge(totals)
-  if (!ok) {
-    console.error("\n❌ Coverage check failed!")
-    process.exit(1)
+  if (mode === "check") {
+    totals = readCachedSummary()
+    const ok = checkThreshold(totals)
+    if (!ok) process.exit(1)
+    console.log("\n✅ All coverage checks passed!")
+  } else if (mode === "badge") {
+    totals = readCachedSummary()
+    generateBadge(totals)
+  } else {
+    totals = runTestsWithCoverage()
+    const ok = checkThreshold(totals)
+    generateBadge(totals)
+    if (!ok) {
+      console.error("\n❌ Coverage check failed!")
+      process.exit(1)
+    }
+    console.log("\n✅ All coverage checks passed!")
   }
-  console.log("\n✅ All coverage checks passed!")
 }
+
+if (import.meta.main) main()

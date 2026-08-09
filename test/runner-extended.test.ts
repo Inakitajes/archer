@@ -1,12 +1,24 @@
 import { describe, expect, test } from "bun:test"
+import type { AssistantMessage, TextPart } from "@opencode-ai/sdk/v2"
 
 import {
-  activity,
-  awaitActionOrAbort,
-  completionFollowUp,
+  __testing,
   createConcurrencyLimiter,
   defaultMaxConcurrentAgents,
   describeMessageChunk,
+  isIgnorableRejection,
+  isUserAbortError,
+  newActivityState,
+  noChangesReply,
+  planBatches,
+  UserAbortError,
+} from "../src/runner"
+import type { AgentStep } from "../src/types"
+
+const {
+  activity,
+  awaitActionOrAbort,
+  completionFollowUp,
   describeSessionStatus,
   describeToolCall,
   diffSummaryFromEvent,
@@ -14,15 +26,10 @@ import {
   formatCost,
   formatModelFromEvent,
   gateAllowedActions,
-  isIgnorableRejection,
-  isUserAbortError,
   keepCompletedPhase,
-  newActivityState,
-  noChangesReply,
   payloadID,
   payloadType,
   pickString,
-  planBatches,
   pulse,
   rawString,
   recoveryReport,
@@ -31,9 +38,49 @@ import {
   stepUsageFromEvent,
   todosFromEvent,
   usageFromRecord,
-  UserAbortError,
-} from "../src/runner"
-import { payloadProperties } from "../src/event-hub"
+} = __testing
+
+function agentStep(name: string, groupId = name): AgentStep {
+  return {
+    type: "agent",
+    name,
+    stepName: name,
+    groupId,
+    agentName: name,
+    description: "",
+    model: "openai/gpt-4",
+    inputFiles: [],
+    inputDiff: false,
+    reportPath: `reports/${name}.md`,
+  }
+}
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+function sessionResult() {
+  const info: AssistantMessage = {
+    id: "msg-1",
+    sessionID: "ses-1",
+    role: "assistant",
+    time: { created: 1, completed: 2 },
+    parentID: "msg-user",
+    modelID: "gpt-4",
+    providerID: "openai",
+    mode: "primary",
+    agent: "default",
+    path: { cwd: "/repo", root: "/repo" },
+    cost: 0.1,
+    tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+  }
+  const parts: TextPart[] = [{ id: "part-1", sessionID: "ses-1", messageID: info.id, type: "text", text: "done" }]
+  return { info, parts, assistantInfos: [info] }
+}
 
 // ---------------------------------------------------------------------------
 // UserAbortError & isUserAbortError & isIgnorableRejection
@@ -99,9 +146,9 @@ describe("isIgnorableRejection", () => {
 describe("planBatches", () => {
   test("groups sequential steps with same groupId", () => {
     const steps = [
-      { type: "agent" as const, name: "a1", stepName: "a1", groupId: "g1", agentName: "a1", description: "", model: "gpt-4", inputFiles: [], inputDiff: false, reportPath: "a1.md" },
-      { type: "agent" as const, name: "a2", stepName: "a2", groupId: "g1", agentName: "a2", description: "", model: "gpt-4", inputFiles: [], inputDiff: false, reportPath: "a2.md" },
-      { type: "agent" as const, name: "b1", stepName: "b1", groupId: undefined, agentName: "b1", description: "", model: "gpt-4", inputFiles: [], inputDiff: false, reportPath: "b1.md" },
+      agentStep("a1", "g1"),
+      agentStep("a2", "g1"),
+      agentStep("b1", "g2"),
     ]
     const batches = planBatches(steps)
     expect(batches.length).toBe(2)
@@ -111,8 +158,8 @@ describe("planBatches", () => {
 
   test("puts human steps in their own batch", () => {
     const steps = [
-      { type: "human" as const, name: "gate", stepName: "gate", description: "", inputFiles: [], inputDiff: false, reportPath: "gate.md" },
-      { type: "agent" as const, name: "impl", stepName: "impl", groupId: "g1", agentName: "impl", description: "", model: "gpt-4", inputFiles: [], inputDiff: false, reportPath: "impl.md" },
+      { type: "human" as const, name: "gate", description: "" },
+      agentStep("impl", "g1"),
     ]
     const batches = planBatches(steps)
     expect(batches.length).toBe(2)
@@ -133,18 +180,26 @@ describe("defaultMaxConcurrentAgents", () => {
 describe("createConcurrencyLimiter", () => {
   test("queues waiters when limit is reached", async () => {
     const limiter = createConcurrencyLimiter(2)
+    const release = deferred()
     let running = 0
     let maxRunning = 0
-    const track = async () => {
+    const started: number[] = []
+    const track = async (id: number) => {
       await limiter(async () => {
         running++
         maxRunning = Math.max(maxRunning, running)
-        await new Promise((r) => setTimeout(r, 10))
+        started.push(id)
+        await release.promise
         running--
       })
     }
-    await Promise.all([track(), track(), track(), track()])
-    expect(maxRunning).toBeLessThanOrEqual(2)
+    const jobs = [track(1), track(2), track(3), track(4)]
+    expect(started).toEqual([1, 2])
+    expect(running).toBe(2)
+    release.resolve()
+    await Promise.all(jobs)
+    expect(maxRunning).toBe(2)
+    expect(started).toEqual([1, 2, 3, 4])
   })
 })
 
@@ -154,20 +209,20 @@ describe("createConcurrencyLimiter", () => {
 
 describe("keepCompletedPhase", () => {
   test("returns the first result with a warning", () => {
-    const result = { type: "success" as const, assistantText: "done", cost: 0.1 }
+    const result = sessionResult()
     expect(keepCompletedPhase("design", result, "model unavailable")).toBe(result)
   })
 })
 
 describe("completionFollowUp", () => {
   test("returns read-only protocol for read-only steps", () => {
-    const advice = completionFollowUp({ readOnly: true } as AgentStep, "Check the report")
+    const advice = completionFollowUp({ ...agentStep("audit"), readOnly: true }, "Check the report")
     expect(advice).toContain("COMPLETE corrected report")
     expect(advice).toContain(noChangesReply)
   })
 
   test("returns writable protocol for writable steps", () => {
-    const advice = completionFollowUp({ readOnly: false } as AgentStep, "Fix the bug")
+    const advice = completionFollowUp(agentStep("build"), "Fix the bug")
     expect(advice).toContain("do it now")
     expect(advice).not.toContain(noChangesReply)
   })
@@ -209,18 +264,27 @@ describe("gateAllowedActions", () => {
 // ---------------------------------------------------------------------------
 
 describe("sleep", () => {
-  test("resolves after the specified time", async () => {
-    const start = Date.now()
-    await sleep(5)
-    expect(Date.now() - start).toBeGreaterThanOrEqual(4)
+  test("resolves through its timer", async () => {
+    await sleep(0)
   })
 
   test("resolves immediately when signal is already aborted", async () => {
     const controller = new AbortController()
     controller.abort()
-    const start = Date.now()
     await sleep(1000, controller.signal)
-    expect(Date.now() - start).toBeLessThan(100)
+  })
+
+  test("remains pending until its signal aborts", async () => {
+    const controller = new AbortController()
+    let settled = false
+    const sleeping = sleep(60_000, controller.signal).then(() => {
+      settled = true
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    controller.abort()
+    await sleeping
+    expect(settled).toBe(true)
   })
 })
 
@@ -297,7 +361,7 @@ describe("describeSessionStatus", () => {
 
   test("returns activity for retry status", () => {
     const signal = describeSessionStatus({ type: "retry", attempt: 2, message: "rate limited" })
-    expect(signal).toMatchObject({ type: "activity", kind: "retry", message: expect.stringContaining("rate limited") as any })
+    expect(signal).toMatchObject({ type: "activity", kind: "retry", message: expect.stringContaining("rate limited") })
   })
 
   test("returns undefined for unknown status", () => {
@@ -317,7 +381,7 @@ describe("describeMessageChunk", () => {
       newActivityState(),
     )
     expect(msg).toBeDefined()
-    expect(msg).toMatchObject({ channel: "response", text: "hello" } as any)
+    expect(msg).toMatchObject({ channel: "response", text: "hello" })
   })
 
   test("returns undefined for non-text field", () => {
@@ -329,25 +393,25 @@ describe("describeMessageChunk", () => {
     state.reasoningPart = 1
     const msg = describeMessageChunk({ type: "session.next.reasoning.delta", properties: { delta: "I think..." } }, state)
     expect(msg).toBeDefined()
-    expect(msg).toMatchObject({ channel: "reasoning", text: "I think..." } as any)
+    expect(msg).toMatchObject({ channel: "reasoning", text: "I think..." })
   })
 
   test("handles session.next.text.delta", () => {
     const msg = describeMessageChunk({ type: "session.next.text.delta", properties: { delta: "Hello" } }, newActivityState())
     expect(msg).toBeDefined()
-    expect(msg).toMatchObject({ channel: "response", text: "Hello" } as any)
+    expect(msg).toMatchObject({ channel: "response", text: "Hello" })
   })
 
   test("handles session.next.tool.called", () => {
     const msg = describeMessageChunk({ type: "session.next.tool.called", properties: { tool: "Read", input: { file_path: "/test.js" } } })
     expect(msg).toBeDefined()
-    expect(msg).toMatchObject({ channel: "tool" } as any)
+    expect(msg).toMatchObject({ channel: "tool" })
   })
 
   test("handles session.next.shell.started", () => {
     const msg = describeMessageChunk({ type: "session.next.shell.started", properties: { command: "npm test" } })
     expect(msg).toBeDefined()
-    expect(msg).toMatchObject({ channel: "bash", text: "npm test" } as any)
+    expect(msg).toMatchObject({ channel: "bash", text: "npm test" })
   })
 
   test("returns undefined for unknown type", () => {

@@ -22,9 +22,12 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  if (origHome) process.env.CONVOY_HOME = origHome
-  else delete process.env.CONVOY_HOME
-  await rm(tempRoot, { recursive: true, force: true })
+  try {
+    if (origHome === undefined) delete process.env.CONVOY_HOME
+    else process.env.CONVOY_HOME = origHome
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true })
+  }
 })
 
 describe("createWorkspace", () => {

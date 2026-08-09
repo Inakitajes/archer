@@ -1,241 +1,171 @@
-import { describe, expect, test, mock } from "bun:test"
+import { describe, expect, test } from "bun:test"
 
-/**
- * Each test imports model-catalog with a unique query parameter to force
- * fresh module evaluation (avoiding the module-level `cached` variable).
- */
+import { listModels } from "../src/model-catalog"
+import type { Provider } from "@opencode-ai/sdk/v2"
 
-function successSdkHandle() {
-  return Promise.resolve({
-    client: {
-      provider: {
-        list: () =>
-          Promise.resolve({
-            error: undefined,
-            data: {
-              all: [
-                {
-                  id: "anthropic",
-                  models: {
-                    "claude-sonnet-4-5": {
-                      id: "claude-sonnet-4-5",
-                      name: "Claude Sonnet 4.5",
-                      providerID: "anthropic",
-                      status: "active",
-                      limit: { context: 200_000 },
-                      capabilities: {},
-                      variants: {},
-                    },
-                  },
-                },
-              ],
-              connected: ["anthropic"],
-            },
-          }),
+type CatalogDeps = NonNullable<Parameters<typeof listModels>[1]>
+type SdkScenario = "success" | "empty" | "error" | "reject" | "list-reject"
+type FetchScenario = "success" | "empty" | "non-ok" | "reject"
+
+const provider = {
+  id: "anthropic",
+  name: "Anthropic",
+  source: "config",
+  env: [],
+  options: {},
+  models: {
+    "claude-sonnet-4-5": {
+      id: "claude-sonnet-4-5",
+      name: "Claude Sonnet 4.5",
+      providerID: "anthropic",
+      api: { id: "claude-sonnet-4-5", url: "https://api.anthropic.test", npm: "@ai-sdk/anthropic" },
+      status: "active",
+      limit: { context: 200_000, output: 8_192 },
+      capabilities: {
+        temperature: true,
+        reasoning: true,
+        attachment: true,
+        toolcall: true,
+        input: { text: true, audio: false, image: true, video: false, pdf: true },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: false,
       },
+      cost: { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } },
+      options: {},
+      headers: {},
+      release_date: "2025-09-29",
+      variants: {},
     },
-    close: () => {},
-    url: "http://localhost:0",
-  })
+  },
+} satisfies Provider
+
+function createHarness(sdk: SdkScenario, fallback: FetchScenario) {
+  const calls = {
+    start: 0,
+    list: 0,
+    close: 0,
+    fetch: 0,
+    directories: [] as string[],
+    sdkSignals: [] as AbortSignal[],
+    fetchSignals: [] as AbortSignal[],
+  }
+
+  const deps: CatalogDeps = {
+    async startOpencode(_config, signal) {
+      calls.start++
+      calls.sdkSignals.push(signal)
+      if (sdk === "reject") throw new Error("SDK unavailable")
+
+      return {
+        client: {
+          provider: {
+            async list({ directory }) {
+              calls.list++
+              calls.directories.push(directory)
+              if (sdk === "list-reject") throw new Error("provider request failed")
+              if (sdk === "error") return { error: new Error("provider list error") }
+              if (sdk === "empty") return { data: { all: [], connected: [] } }
+              return { data: { all: [provider], connected: ["anthropic"] } }
+            },
+          },
+        },
+        close() {
+          calls.close++
+        },
+      }
+    },
+    async fetch(url, { signal }) {
+      calls.fetch++
+      calls.fetchSignals.push(signal)
+      expect(url).toBe("https://models.dev/api.json")
+      if (fallback === "reject") throw new Error("network failure")
+      if (fallback === "non-ok") return new Response(null, { status: 500 })
+      if (fallback === "empty") return Response.json({})
+      return Response.json({ fallback: { models: { "model-1": { name: "Fallback Model" } } } })
+    },
+  }
+
+  return { calls, deps }
 }
 
-function emptySdkHandle() {
-  return Promise.resolve({
-    client: {
-      provider: {
-        list: () =>
-          Promise.resolve({
-            error: undefined,
-            data: { all: [], connected: [] },
-          }),
+describe("listModels SDK catalog", () => {
+  test("returns connected SDK models, forwards the directory, and closes the handle", async () => {
+    const { calls, deps } = createHarness("success", "empty")
+
+    const choices = await listModels("/test/repo", deps)
+
+    expect(choices).toEqual([
+      {
+        value: "anthropic/claude-sonnet-4-5",
+        label: "Claude Sonnet 4.5",
+        providerID: "anthropic",
+        contextK: 200,
       },
-    },
-    close: () => {},
-    url: "http://localhost:0",
-  })
-}
-
-function errorSdkHandle() {
-  return Promise.resolve({
-    client: {
-      provider: {
-        list: () =>
-          Promise.resolve({
-            error: new Error("provider list error"),
-            data: undefined,
-          }),
-      },
-    },
-    close: () => {},
-    url: "http://localhost:0",
-  })
-}
-
-let counter = 0
-const freshMod = () => import(`../src/model-catalog?list-test-${counter++}`)
-
-describe("listModels SDK failure → fallback to models.dev", () => {
-  test("falls back to models.dev when SDK rejects", async () => {
-    mock.module("../src/opencode", () => ({
-      startOpencode: () => Promise.reject(new Error("SDK unavailable")),
-    }))
-
-    let fetchCalled = false
-    globalThis.fetch = mock(() => {
-      fetchCalled = true
-      return Promise.resolve({
-        ok: true,
-        json: () =>
-          Promise.resolve({
-            fallback: {
-              models: {
-                "model-1": { name: "Fallback Model" },
-              },
-            },
-          }),
-      })
-    }) as unknown as typeof fetch
-
-    const { listModels } = await freshMod()
-    const choices = await listModels("/test")
-    expect(fetchCalled).toBe(true)
-    expect(choices).toHaveLength(1)
-    expect(choices[0]!.value).toBe("fallback/model-1")
+    ])
+    expect(calls.directories).toEqual(["/test/repo"])
+    expect(calls.close).toBe(1)
+    expect(calls.fetch).toBe(0)
+    expect(calls.sdkSignals[0]).toBeInstanceOf(AbortSignal)
   })
 
-  test("SDK returns empty list → falls back to models.dev", async () => {
-    mock.module("../src/opencode", () => ({
-      startOpencode: () => emptySdkHandle(),
-    }))
+  test("does not read or populate the process cache when custom dependencies are supplied", async () => {
+    const { calls, deps } = createHarness("success", "empty")
 
-    let fetchCalled = false
-    globalThis.fetch = mock(() => {
-      fetchCalled = true
-      return Promise.resolve({
-        ok: true,
-        json: () =>
-          Promise.resolve({
-            test: {
-              models: {
-                "m1": { name: "Model 1" },
-              },
-            },
-          }),
-      })
-    }) as unknown as typeof fetch
+    const first = await listModels("/first", deps)
+    const second = await listModels("/second", deps)
 
-    const { listModels } = await freshMod()
-    const choices = await listModels("/test")
-    expect(fetchCalled).toBe(true)
-    expect(choices).toHaveLength(1)
-    expect(choices[0]!.value).toBe("test/m1")
-  })
-
-  test("SDK result has error → falls back to models.dev", async () => {
-    mock.module("../src/opencode", () => ({
-      startOpencode: () => errorSdkHandle(),
-    }))
-
-    let fetchCalled = false
-    globalThis.fetch = mock(() => {
-      fetchCalled = true
-      return Promise.resolve({
-        ok: true,
-        json: () =>
-          Promise.resolve({
-            test: {
-              models: {
-                "m1": { name: "Fallback Model" },
-              },
-            },
-          }),
-      })
-    }) as unknown as typeof fetch
-
-    const { listModels } = await freshMod()
-    const choices = await listModels("/test")
-    expect(fetchCalled).toBe(true)
-    expect(choices).toHaveLength(1)
-    expect(choices[0]!.value).toBe("test/m1")
+    expect(second).not.toBe(first)
+    expect(calls.start).toBe(2)
+    expect(calls.list).toBe(2)
+    expect(calls.close).toBe(2)
+    expect(calls.directories).toEqual(["/first", "/second"])
   })
 })
 
-describe("listModels both sources fail", () => {
-  test("both SDK and models.dev reject → returns empty array", async () => {
-    mock.module("../src/opencode", () => ({
-      startOpencode: () => Promise.reject(new Error("SDK error")),
-    }))
+describe("listModels fallback", () => {
+  test("falls back to models.dev when starting the SDK rejects", async () => {
+    const { calls, deps } = createHarness("reject", "success")
 
-    globalThis.fetch = mock(() =>
-      Promise.reject(new Error("network failure")),
-    ) as unknown as typeof fetch
-
-    const { listModels } = await freshMod()
-    const choices = await listModels("/test")
-    expect(choices).toEqual([])
+    expect((await listModels("/test", deps)).map((choice) => choice.value)).toEqual(["fallback/model-1"])
+    expect(calls).toMatchObject({ start: 1, list: 0, close: 0, fetch: 1 })
+    expect(calls.fetchSignals[0]).toBeInstanceOf(AbortSignal)
   })
 
-  test("SDK fails and models.dev returns non-ok → returns empty array", async () => {
-    mock.module("../src/opencode", () => ({
-      startOpencode: () => Promise.reject(new Error("SDK error")),
-    }))
+  test("falls back when the SDK returns no models", async () => {
+    const { calls, deps } = createHarness("empty", "success")
 
-    globalThis.fetch = mock(() =>
-      Promise.resolve({
-        ok: false,
-        status: 500,
-      }),
-    ) as unknown as typeof fetch
-
-    const { listModels } = await freshMod()
-    const choices = await listModels("/test")
-    expect(choices).toEqual([])
+    expect((await listModels("/test", deps)).map((choice) => choice.value)).toEqual(["fallback/model-1"])
+    expect(calls).toMatchObject({ close: 1, fetch: 1 })
   })
 
-  test("SDK fails and models.dev returns empty → returns empty array", async () => {
-    mock.module("../src/opencode", () => ({
-      startOpencode: () => Promise.reject(new Error("SDK error")),
-    }))
+  test("falls back and closes the handle when the SDK returns an error", async () => {
+    const { calls, deps } = createHarness("error", "success")
 
-    globalThis.fetch = mock(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({}),
-      }),
-    ) as unknown as typeof fetch
+    expect((await listModels("/test", deps)).map((choice) => choice.value)).toEqual(["fallback/model-1"])
+    expect(calls).toMatchObject({ close: 1, fetch: 1 })
+  })
 
-    const { listModels } = await freshMod()
-    const choices = await listModels("/test")
-    expect(choices).toEqual([])
+  test("falls back and closes the handle when listing providers rejects", async () => {
+    const { calls, deps } = createHarness("list-reject", "success")
+
+    expect((await listModels("/test", deps)).map((choice) => choice.value)).toEqual(["fallback/model-1"])
+    expect(calls).toMatchObject({ list: 1, close: 1, fetch: 1 })
   })
 })
 
-describe("listModels caching", () => {
-  test("returns cached value on second call", async () => {
-    let sdkCallCount = 0
+describe("listModels source failures", () => {
+  test("returns an empty array when both sources reject", async () => {
+    const { deps } = createHarness("reject", "reject")
+    expect(await listModels("/test", deps)).toEqual([])
+  })
 
-    mock.module("../src/opencode", () => ({
-      startOpencode: () => {
-        sdkCallCount++
-        return successSdkHandle()
-      },
-    }))
+  test("returns an empty array when models.dev returns non-ok", async () => {
+    const { deps } = createHarness("reject", "non-ok")
+    expect(await listModels("/test", deps)).toEqual([])
+  })
 
-    globalThis.fetch = mock(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({}),
-      }),
-    ) as unknown as typeof fetch
-
-    const { listModels } = await freshMod()
-
-    const first = await listModels("/test")
-    expect(first.length).toBeGreaterThan(0)
-    expect(sdkCallCount).toBe(1)
-
-    const second = await listModels("/test")
-    expect(second).toBe(first)
-    expect(sdkCallCount).toBe(1)
+  test("returns an empty array when models.dev has no models", async () => {
+    const { deps } = createHarness("reject", "empty")
+    expect(await listModels("/test", deps)).toEqual([])
   })
 })

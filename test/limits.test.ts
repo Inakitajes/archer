@@ -1,4 +1,4 @@
-import { describe, expect, test, mock, afterEach } from "bun:test"
+import { describe, expect, test, afterEach } from "bun:test"
 
 import { parseCodexUsage, jwtExpMs, parseOpenRouterCredits, parseOpenRouterKey, openRouterKeyFrom, limitsPollMs, startLimitsPoller } from "../src/limits"
 
@@ -339,7 +339,10 @@ describe("startLimitsPoller with mocked fetch", () => {
   })
 
   test("does not crash when fetch throws", () => {
-    globalThis.fetch = mock(() => { throw new Error("network error") })
+    globalThis.fetch = Object.assign(
+      () => { throw new Error("network error") },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
 
     const snapshots: unknown[] = []
     const stop = startLimitsPoller((snap) => { snapshots.push(snap) }, 10_000)
@@ -371,7 +374,8 @@ describe("openRouterKeySources", () => {
       const result = await openRouterKeySources()
       expect(result.env).toBe(true)
     } finally {
-      process.env.OPENROUTER_API_KEY = original
+      if (original === undefined) delete process.env.OPENROUTER_API_KEY
+      else process.env.OPENROUTER_API_KEY = original
     }
   })
 
@@ -383,7 +387,8 @@ describe("openRouterKeySources", () => {
       const result = await openRouterKeySources()
       expect(result.env).toBe(false)
     } finally {
-      process.env.OPENROUTER_API_KEY = original
+      if (original === undefined) delete process.env.OPENROUTER_API_KEY
+      else process.env.OPENROUTER_API_KEY = original
     }
   })
 })

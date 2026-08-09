@@ -1,11 +1,124 @@
 import { describe, expect, test } from "bun:test"
+import type { Config, OpencodeClient } from "@opencode-ai/sdk/v2"
 
 import {
   commitMessagePrompt,
   formatCommitMessage,
+  proposeCommitMessage,
   readCommitMessage,
   templateCommitMessage,
+  type CommitMessageInput,
 } from "../src/commit-message"
+
+type ProposalDeps = NonNullable<Parameters<typeof proposeCommitMessage>[1]>
+
+const proposalInput: CommitMessageInput = {
+  targetDir: "/repo",
+  branch: "feat/add-login",
+  prompt: "# Add login",
+  commits: ["convoy(implementer): wire authentication"],
+}
+
+function createProposalHarness(reply: string | Error) {
+  const calls = {
+    configs: [] as Config[],
+    startSignals: [] as Array<AbortSignal | undefined>,
+    creates: [] as unknown[],
+    prompts: [] as unknown[],
+    deletes: [] as unknown[],
+    close: 0,
+  }
+  const client = {
+    session: {
+      async create(input: unknown) {
+        calls.creates.push(input)
+        return { data: { id: "session-1" } }
+      },
+      async prompt(input: unknown) {
+        calls.prompts.push(input)
+        if (reply instanceof Error) throw reply
+        return { data: { parts: [{ type: "text", text: reply }] } }
+      },
+      async delete(input: unknown) {
+        calls.deletes.push(input)
+        return { data: true }
+      },
+    },
+  } as unknown as OpencodeClient
+  const deps: ProposalDeps = {
+    async startOpencode(config, signal) {
+      calls.configs.push(config)
+      calls.startSignals.push(signal)
+      return {
+        client,
+        url: "http://localhost:0",
+        close() {
+          calls.close++
+        },
+      }
+    },
+  }
+  return { calls, deps }
+}
+
+describe("proposeCommitMessage", () => {
+  test("returns the model proposal through a read-only writer session", async () => {
+    const { calls, deps } = createProposalHarness(
+      '{"type":"feat","scope":"auth","subject":"add login","body":["wire authentication"]}',
+    )
+
+    const proposal = await proposeCommitMessage(proposalInput, deps)
+
+    expect(proposal).toEqual({
+      source: "model",
+      message: { type: "feat", scope: "auth", subject: "add login", body: ["wire authentication"] },
+    })
+    expect(calls.startSignals[0]).toBeInstanceOf(AbortSignal)
+    expect(calls.configs[0]).toMatchObject({
+      permission: { question: "deny" },
+      agent: {
+        "convoy-commit-writer": {
+          mode: "primary",
+          temperature: 0,
+          tools: { read: true, list: true, glob: true, grep: true, webfetch: false, write: false, edit: false, bash: false, task: false },
+          permission: { read: "allow", list: "allow", glob: "allow", grep: "allow", webfetch: "deny", edit: "deny", bash: "deny", task: "deny", question: "deny" },
+        },
+      },
+    })
+    expect(calls.creates).toEqual([{ directory: "/repo", title: "convoy commit writer" }])
+    expect(calls.prompts[0]).toMatchObject({
+      sessionID: "session-1",
+      directory: "/repo",
+      model: { providerID: "anthropic", modelID: "claude-haiku-4-5" },
+      agent: "convoy-commit-writer",
+      tools: { read: true, list: true, glob: true, grep: true, webfetch: false, write: false, edit: false, bash: false },
+    })
+    expect(calls.deletes).toEqual([{ sessionID: "session-1", directory: "/repo" }])
+    expect(calls.close).toBe(1)
+  })
+
+  test("uses the deterministic template when the writer response is not parseable", async () => {
+    const { calls, deps } = createProposalHarness("I could not determine a commit message")
+
+    const proposal = await proposeCommitMessage(proposalInput, deps)
+
+    expect(proposal.source).toBe("template")
+    expect(proposal.message).toEqual({ type: "feat", subject: "Add login", body: ["wire authentication"] })
+    expect(proposal.error).toContain("no usable message")
+    expect(calls.deletes).toHaveLength(1)
+    expect(calls.close).toBe(1)
+  })
+
+  test("uses the deterministic template and closes the handle when the writer errors", async () => {
+    const { calls, deps } = createProposalHarness(new Error("model unavailable"))
+
+    const proposal = await proposeCommitMessage(proposalInput, deps)
+
+    expect(proposal).toMatchObject({ source: "template", error: "model unavailable" })
+    expect(calls.deletes).toHaveLength(1)
+    expect(calls.close).toBe(1)
+  })
+})
 
 describe("readCommitMessage", () => {
   test("reads the JSON contract from the last line of a reply that narrated first", () => {

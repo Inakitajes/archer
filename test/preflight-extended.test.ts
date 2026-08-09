@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { preflightRunPlan } from "../src/preflight"
-import { preflightTargets, validatePreflightTargets } from "../src/preflight-validation"
-import type { RunPlan, ResolvedModel } from "../src/types"
+import { preflightTargets } from "../src/preflight-validation"
+import type { ResolvedModel } from "../src/model-routing"
+import type { RunPlan } from "../src/types"
 
 function basePlan(): RunPlan {
   return {
@@ -39,7 +40,7 @@ function basePlan(): RunPlan {
   }
 }
 
-function catalog(overrides?: Partial<{
+async function catalog(overrides?: Partial<{
   providerID: string
   modelID: string
   variants: string[]
@@ -149,7 +150,7 @@ describe("preflightRunPlan", () => {
 
   test("validates smartJudge targets if present", async () => {
     const plan = basePlan()
-plan.smartJudge = {
+    plan.smartJudge = {
       model: {
         configured: "anthropic/claude-haiku",
         logical: "anthropic/claude-haiku",
@@ -160,7 +161,7 @@ plan.smartJudge = {
       } as ResolvedModel,
     }
     await expect(
-      preflightRunPlan(plan, () => ({
+      preflightRunPlan(plan, async () => ({
         all: [
           { id: "openai", models: { "gpt-5": { variants: {} } } },
           { id: "anthropic", models: { "claude-haiku": { variants: {} } } },
@@ -183,7 +184,7 @@ plan.smartJudge = {
       } as ResolvedModel,
     }
     await expect(
-      preflightRunPlan(plan, () => ({
+      preflightRunPlan(plan, async () => ({
         all: [
           { id: "openai", models: { "gpt-5": { variants: {} } } },
         ],

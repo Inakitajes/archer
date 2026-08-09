@@ -1,4 +1,7 @@
-import { describe, expect, test, mock, spyOn, beforeEach, afterEach, beforeAll, afterAll } from "bun:test"
+import { describe, expect, test, spyOn, beforeEach, afterEach } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import {
   shellQuote,
@@ -14,6 +17,49 @@ import {
 } from "../src/opencode"
 
 import type { OpencodeHandle } from "../src/opencode"
+
+const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")
+const originalTerminal = process.env.CONVOY_TERMINAL
+const originalPath = process.env.PATH
+const originalSpawn = Bun.spawn
+const originalWhich = Bun.which
+
+function restoreEnv(name: string, value: string | undefined) {
+  if (value === undefined) delete process.env[name]
+  else process.env[name] = value
+}
+
+function setPlatform(value: NodeJS.Platform) {
+  Object.defineProperty(process, "platform", { value, configurable: true })
+}
+
+type SpawnMock = {
+  (...args: unknown[]): unknown
+  mock: { calls: Array<[string[], ...unknown[]]> }
+  mockRestore(): void
+}
+
+function mockSpawnResult(exitCode = 0, stderr = ""): SpawnMock {
+  const spawn = spyOn(Bun, "spawn")
+  spawn.mockImplementation((() => ({
+    exited: Promise.resolve(exitCode),
+    stderr: new ReadableStream({
+      start(controller) {
+        if (stderr) controller.enqueue(Buffer.from(stderr))
+        controller.close()
+      },
+    }),
+  })) as unknown as typeof Bun.spawn)
+  return spawn as unknown as SpawnMock
+}
+
+afterEach(() => {
+  if (originalPlatformDescriptor) Object.defineProperty(process, "platform", originalPlatformDescriptor)
+  restoreEnv("CONVOY_TERMINAL", originalTerminal)
+  restoreEnv("PATH", originalPath)
+  Bun.spawn = originalSpawn
+  Bun.which = originalWhich
+})
 
 describe("shellQuote", () => {
   test("wraps a simple string in single quotes", () => {
@@ -58,6 +104,23 @@ describe("shellQuote", () => {
 })
 
 describe("sessionShellCommand", () => {
+  test("does not launch the command when changing directory fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "convoy-session-command-"))
+    const marker = join(root, "launched")
+    const command = sessionShellCommand(`touch ${shellQuote(marker)}`, join(root, "missing"), "/usr/bin:/bin")
+
+    try {
+      expect(command).toContain(" && cd ")
+      expect(command).toContain(" && touch ")
+
+      const child = Bun.spawn(["sh", "-c", command], { stdout: "ignore", stderr: "ignore" })
+      expect(await child.exited).not.toBe(0)
+      expect(await Bun.file(marker).exists()).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("builds a command with PATH and cwd", () => {
     const cmd = sessionShellCommand("opencode /repo", "/repo", "/usr/bin:/bin")
     expect(cmd).toContain("export PATH='/usr/bin:/bin':$PATH")
@@ -105,7 +168,7 @@ describe("sessionShellCommand", () => {
       const cmd = sessionShellCommand("opencode")
       expect(cmd).toContain("export PATH='/custom/path':$PATH")
     } finally {
-      process.env.PATH = originalPath
+      restoreEnv("PATH", originalPath)
     }
   })
 
@@ -155,32 +218,18 @@ describe("iterateSessionShellCommand", () => {
 describe("openSessionCommand", () => {
   const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")?.value
   const originalTerminal = process.env.CONVOY_TERMINAL
-  const originalWhich = Bun.which
 
   beforeEach(() => {
+    setPlatform("darwin")
     process.env.CONVOY_TERMINAL = "terminal"
   })
 
   afterEach(() => {
-    process.env.CONVOY_TERMINAL = originalTerminal
-  })
-
-  afterAll(() => {
-    if (originalPlatform !== undefined) {
-      Object.defineProperty(process, "platform", { value: originalPlatform })
-    }
-    Bun.which = originalWhich
+    restoreEnv("CONVOY_TERMINAL", originalTerminal)
   })
 
   test("opens in Terminal.app when CONVOY_TERMINAL=terminal", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openSessionCommand("echo hello", "/tmp")
@@ -194,24 +243,17 @@ describe("openSessionCommand", () => {
   })
 
   test("throws when process.platform is not darwin", async () => {
-    Object.defineProperty(process, "platform", { value: "linux" })
+    setPlatform("linux")
 
     try {
       await expect(openSessionCommand("echo hello")).rejects.toThrow("macOS only")
     } finally {
-      Object.defineProperty(process, "platform", { value: originalPlatform })
+      setPlatform(originalPlatform)
     }
   })
 
   test("includes cwd in the shell command when provided", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openSessionCommand("opencode /repo --prompt hello", "/my repo")
@@ -224,14 +266,7 @@ describe("openSessionCommand", () => {
   })
 
   test("does not include cd when cwd is undefined", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openSessionCommand("opencode /repo")
@@ -244,15 +279,7 @@ describe("openSessionCommand", () => {
   })
 
   test("propagates errors from Bun.spawn", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(1),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.enqueue(Buffer.from("command not found"))
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult(1, "command not found")
 
     try {
       await expect(openSessionCommand("false")).rejects.toThrow("command not found")
@@ -267,23 +294,17 @@ describe("openOpencodeSessionWindow", () => {
   const originalWhich = Bun.which
 
   beforeEach(() => {
+    setPlatform("darwin")
     process.env.CONVOY_TERMINAL = "terminal"
   })
 
   afterEach(() => {
-    process.env.CONVOY_TERMINAL = originalTerminal
+    restoreEnv("CONVOY_TERMINAL", originalTerminal)
     Bun.which = originalWhich
   })
 
   test("returns 'terminal' backend after opening", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       const backend = await openOpencodeSessionWindow({
@@ -298,14 +319,7 @@ describe("openOpencodeSessionWindow", () => {
   })
 
   test("shell-quoted osascript contains attach, url, dir, and session", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openOpencodeSessionWindow({
@@ -325,14 +339,7 @@ describe("openOpencodeSessionWindow", () => {
 
   test("uses Ghostty when CONVOY_TERMINAL=ghostty", async () => {
     process.env.CONVOY_TERMINAL = "ghostty"
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       const backend = await openOpencodeSessionWindow({
@@ -352,15 +359,7 @@ describe("openOpencodeSessionWindow", () => {
 
   test("re-throws error when forced ghostty fails", async () => {
     process.env.CONVOY_TERMINAL = "ghostty"
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(1),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.enqueue(Buffer.from("Ghostty not found"))
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult(1, "Ghostty not found")
 
     try {
       await expect(
@@ -381,23 +380,17 @@ describe("openInteractiveOpencodeWindow", () => {
   const originalWhich = Bun.which
 
   beforeEach(() => {
+    setPlatform("darwin")
     process.env.CONVOY_TERMINAL = "terminal"
   })
 
   afterEach(() => {
-    process.env.CONVOY_TERMINAL = originalTerminal
+    restoreEnv("CONVOY_TERMINAL", originalTerminal)
     Bun.which = originalWhich
   })
 
   test("uses --continue flag instead of --session", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openInteractiveOpencodeWindow({
@@ -414,14 +407,7 @@ describe("openInteractiveOpencodeWindow", () => {
   })
 
   test("returns 'terminal' backend", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       const backend = await openInteractiveOpencodeWindow({
@@ -440,23 +426,17 @@ describe("openStoredSessionWindow", () => {
   const originalWhich = Bun.which
 
   beforeEach(() => {
+    setPlatform("darwin")
     process.env.CONVOY_TERMINAL = "terminal"
   })
 
   afterEach(() => {
-    process.env.CONVOY_TERMINAL = originalTerminal
+    restoreEnv("CONVOY_TERMINAL", originalTerminal)
     Bun.which = originalWhich
   })
 
   test("does not include attach or url", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openStoredSessionWindow({
@@ -473,14 +453,7 @@ describe("openStoredSessionWindow", () => {
   })
 
   test("passes the target dir and session ID", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openStoredSessionWindow({
@@ -502,23 +475,17 @@ describe("openIterateOpencodeWindow", () => {
   const originalWhich = Bun.which
 
   beforeEach(() => {
+    setPlatform("darwin")
     process.env.CONVOY_TERMINAL = "terminal"
   })
 
   afterEach(() => {
-    process.env.CONVOY_TERMINAL = originalTerminal
+    restoreEnv("CONVOY_TERMINAL", originalTerminal)
     Bun.which = originalWhich
   })
 
   test("passes --prompt with the given prompt", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openIterateOpencodeWindow({
@@ -534,14 +501,7 @@ describe("openIterateOpencodeWindow", () => {
   })
 
   test("includes cwd setup for the target directory", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       await openIterateOpencodeWindow({
@@ -557,14 +517,7 @@ describe("openIterateOpencodeWindow", () => {
   })
 
   test("returns 'terminal' backend", async () => {
-    const mockSpawn = spyOn(Bun, "spawn").mockImplementation((_cmd: string[]) => ({
-      exited: Promise.resolve(0),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }))
+    const mockSpawn = mockSpawnResult()
 
     try {
       const backend = await openIterateOpencodeWindow({
@@ -598,13 +551,37 @@ describe("connectOpencode", () => {
 })
 
 describe("startOpencode", () => {
-  test("returns an OpencodeHandle with client, url, and close when started", async () => {
-    const handle: OpencodeHandle = await startOpencode({} as any)
-    expect(handle).toBeTruthy()
-    expect(handle.client).toBeTruthy()
-    expect(typeof handle.url).toBe("string")
-    expect(handle.url.length).toBeGreaterThan(0)
-    expect(typeof handle.close).toBe("function")
+  test("returns the SDK client and closes the injected server", async () => {
+    const client = { session: {} } as unknown as OpencodeHandle["client"]
+    let closed = false
+    let serverOptions: Record<string, unknown> | undefined
+    let clientOptions: Record<string, unknown> | undefined
+
+    const handle: OpencodeHandle = await startOpencode({}, undefined, {
+      createServer: async (options) => {
+        if (!options) throw new Error("expected server options")
+        serverOptions = options as unknown as Record<string, unknown>
+        return {
+          url: `http://127.0.0.1:${options.port}`,
+          close() {
+            closed = true
+          },
+        }
+      },
+      createClient: (options) => {
+        clientOptions = options as unknown as Record<string, unknown>
+        return client
+      },
+    })
+
+    expect(handle.client).toBe(client)
+    expect(handle.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+    expect(serverOptions).toMatchObject({ hostname: "127.0.0.1", timeout: 30_000, config: {} })
+    expect(serverOptions?.port).toBeGreaterThan(0)
+    expect(clientOptions?.baseUrl).toBe(handle.url)
+    expect(typeof clientOptions?.fetch).toBe("function")
+
     handle.close()
+    expect(closed).toBe(true)
   })
 })

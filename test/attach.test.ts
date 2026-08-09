@@ -3,18 +3,41 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+import { aggregateAdvisorEvents, type AdvisorEvent } from "../src/advisor-events"
 import type { PhaseMetadata, RunMetadata } from "../src/metadata"
 import type { ProgressPhaseSnapshot, ProgressUI } from "../src/progress"
 
-import {
-  LiveAttach,
-  overallStatus,
-  replayHistory,
-  snapshotOf,
-  reconcileAdvisorJournal,
-} from "../src/attach"
+import { __testing, LiveAttach } from "../src/attach"
+
+const { overallStatus, reconcileAdvisorJournal, replayHistory, snapshotOf } = __testing
 
 const recoveryDirs: string[] = []
+
+function runMetadata(phases: Record<string, PhaseMetadata>): RunMetadata {
+  return {
+    schemaVersion: 3,
+    runID: "run-test",
+    targetDir: "/repo",
+    createdAt: 1,
+    updatedAt: 1,
+    control: { state: "running" },
+    phases,
+  }
+}
+
+function advisorRequestedEvent(id = "evt-1", phase = "design"): AdvisorEvent {
+  return {
+    id,
+    type: "advisor.requested",
+    timestamp: new Date(0).toISOString(),
+    callId: `call-${id}`,
+    phase,
+    attempt: 1,
+    trigger: "completion",
+    budget: { used: 1, max: 3 },
+    model: "anthropic/claude-opus-4",
+  }
+}
 
 afterAll(async () => {
   await Promise.all(recoveryDirs.map((dir) => rm(dir, { recursive: true, force: true })))
@@ -31,7 +54,6 @@ function noopTui(): ProgressUI {
     start: () => {},
     stop: () => {},
     serverReady: () => {},
-    bindStatusTracker: () => {},
     phaseSession: () => {},
     phaseStarted: () => {},
     phaseAttempt: () => {},
@@ -57,10 +79,10 @@ function noopTui(): ProgressUI {
 }
 
 describe("overallStatus", () => {
-  function metaWith(statuses: Record<string, string>): RunMetadata {
+  function metaWith(statuses: Record<string, PhaseMetadata["status"]>): RunMetadata {
     const phases: Record<string, PhaseMetadata> = {}
-    for (const [name, status] of Object.entries(statuses)) phases[name] = { status } as PhaseMetadata
-    return { phases } as RunMetadata
+    for (const [name, status] of Object.entries(statuses)) phases[name] = { status }
+    return runMetadata(phases)
   }
 
   test("returns completed when all phases complete", () => {
@@ -84,27 +106,27 @@ describe("overallStatus", () => {
   })
 
   test("returns failed for empty phases", () => {
-    expect(overallStatus({ phases: {} } as RunMetadata)).toBe("failed")
+    expect(overallStatus(runMetadata({}))).toBe("failed")
   })
 })
 
 describe("snapshotOf", () => {
   test("builds correct snapshot from phase metadata", () => {
-    const phase = {
-      status: "completed" as const,
+    const phase: PhaseMetadata = {
+      status: "completed",
       sessionID: "ses_1",
       durationMs: 5000,
       cost: 0.05,
-      tokens: { input: 1000, output: 500 },
+      tokens: { input: 1000, output: 500, reasoning: 100, cacheRead: 50, cacheWrite: 25, total: 1675 },
       model: "openai/gpt-4",
-    } as PhaseMetadata
+    }
     const result = snapshotOf(phase, "completed")
     expect(result).toEqual({
       status: "completed",
       sessionID: "ses_1",
       durationMs: 5000,
       cost: 0.05,
-      tokens: { input: 1000, output: 500 },
+      tokens: { input: 1000, output: 500, reasoning: 100, cacheRead: 50, cacheWrite: 25, total: 1675 },
       model: "openai/gpt-4",
       advisor: undefined,
       advisorEvents: undefined,
@@ -112,7 +134,7 @@ describe("snapshotOf", () => {
   })
 
   test("handles minimal metadata", () => {
-    const phase = { status: "completed" as const } as PhaseMetadata
+    const phase: PhaseMetadata = { status: "completed" }
     const result = snapshotOf(phase, "completed")
     expect(result.status).toBe("completed")
     expect(result.sessionID).toBeUndefined()
@@ -121,18 +143,16 @@ describe("snapshotOf", () => {
   })
 
   test("includes advisor data when present", () => {
-    const phase = {
-      status: "completed" as const,
-      advisor: { calls: 2, cost: 0.01 },
-      advisorEvents: [{ type: "advisor.requested" as const, trigger: "completion" as const }],
-    } as PhaseMetadata
+    const advisorEvents = [advisorRequestedEvent()]
+    const advisor = aggregateAdvisorEvents(advisorEvents)
+    const phase: PhaseMetadata = { status: "completed", advisor, advisorEvents }
     const result = snapshotOf(phase, "completed")
-    expect(result.advisor).toEqual({ calls: 2, cost: 0.01 })
-    expect(result.advisorEvents).toEqual([{ type: "advisor.requested", trigger: "completion" }])
+    expect(result.advisor).toEqual(advisor)
+    expect(result.advisorEvents).toEqual(advisorEvents)
   })
 
   test("treats running status as failed in snapshot", () => {
-    const phase = { status: "running" as const } as PhaseMetadata
+    const phase: PhaseMetadata = { status: "running" }
     const result = snapshotOf(phase, "failed")
     expect(result.status).toBe("failed")
   })
@@ -160,12 +180,10 @@ describe("replayHistory", () => {
   })
 
   test("replays completed phases as restored", () => {
-    const metadata = {
-      phases: {
-        design: { status: "completed", sessionID: "ses_1" } as PhaseMetadata,
-        implementer: { status: "completed" } as PhaseMetadata,
-      },
-    } as RunMetadata
+    const metadata = runMetadata({
+      design: { status: "completed", sessionID: "ses_1" },
+      implementer: { status: "completed" },
+    })
     replayHistory(tui(), metadata)
     expect(sessions).toEqual(["design"])
     expect(restored.map((r) => r.name).sort()).toEqual(["design", "implementer"])
@@ -173,28 +191,22 @@ describe("replayHistory", () => {
   })
 
   test("skips pending phases", () => {
-    const metadata = {
-      phases: {
-        design: { status: "pending" } as PhaseMetadata,
-        implementer: { status: "completed" } as PhaseMetadata,
-      },
-    } as RunMetadata
+    const metadata = runMetadata({
+      design: { status: "pending" },
+      implementer: { status: "completed" },
+    })
     replayHistory(tui(), metadata)
     expect(restored.map((r) => r.name)).toEqual(["implementer"])
   })
 
   test("treats running status as failed", () => {
-    const metadata = {
-      phases: {
-        design: { status: "running" } as PhaseMetadata,
-      },
-    } as RunMetadata
+    const metadata = runMetadata({ design: { status: "running" } })
     replayHistory(tui(), metadata)
     expect(restored[0].snapshot.status).toBe("failed")
   })
 
   test("handles empty phases", () => {
-    replayHistory(tui(), { phases: {} } as RunMetadata)
+    replayHistory(tui(), runMetadata({}))
     expect(restored).toEqual([])
   })
 })
@@ -209,22 +221,22 @@ describe("reconcileAdvisorJournal", () => {
 
   test("merges advisor events into metadata phases", async () => {
     const dir = await runDirWithJournal([
-      { id: "1", phase: "design", type: "advisor.requested", trigger: "completion" },
+      advisorRequestedEvent("1", "design"),
     ])
-    const metadata = { phases: { design: { status: "completed" } } } as unknown as RunMetadata
+    const metadata = runMetadata({ design: { status: "completed" } })
 
     await reconcileAdvisorJournal(metadata, dir)
-    expect((metadata.phases["design"] as PhaseMetadata).advisorEvents).toHaveLength(1)
-    expect(((metadata.phases["design"] as PhaseMetadata).advisorEvents as unknown[])[0]).toMatchObject({
+    expect(metadata.phases["design"]?.advisorEvents).toHaveLength(1)
+    expect(metadata.phases["design"]?.advisorEvents?.[0]).toMatchObject({
       type: "advisor.requested",
     })
   })
 
   test("creates phase entry if missing from metadata", async () => {
     const dir = await runDirWithJournal([
-      { id: "1", phase: "unknown-phase", type: "advisor.requested", trigger: "completion" },
+      advisorRequestedEvent("1", "unknown-phase"),
     ])
-    const metadata = { phases: {} } as unknown as RunMetadata
+    const metadata = runMetadata({})
 
     await reconcileAdvisorJournal(metadata, dir)
     expect(metadata.phases["unknown-phase"]).toBeDefined()
@@ -233,7 +245,7 @@ describe("reconcileAdvisorJournal", () => {
 
   test("handles empty journal", async () => {
     const dir = await runDirWithJournal([])
-    const metadata = { phases: {} } as unknown as RunMetadata
+    const metadata = runMetadata({})
     await reconcileAdvisorJournal(metadata, dir)
     expect(metadata.phases).toEqual({})
   })

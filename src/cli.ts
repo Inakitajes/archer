@@ -470,7 +470,7 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
 
 type ParsedInitArgs = InitOptions & { help?: boolean }
 
-export function parseInitArgs(argv: string[]): ParsedInitArgs {
+function parseInitArgs(argv: string[]): ParsedInitArgs {
   const parsed: ParsedInitArgs = {
     targetDir: process.cwd(),
     global: false,
@@ -611,7 +611,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
 // run should get its own worktree, but on a branch you're already where you
 // want the work. The launcher applies the same default itself, so an interactive
 // run reaches this with parsed.worktree already set.
-export async function resolveWorktreeOption(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<boolean> {
+async function resolveWorktreeOption(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<boolean> {
   const explicit = parsed.worktree ?? defaults.worktree
   if (explicit !== undefined) return explicit
   const auto = await resolveWorktreeDefault(parsed.targetDir)
@@ -621,7 +621,7 @@ export async function resolveWorktreeOption(parsed: ParsedArgs, defaults: Convoy
 
 // Base source: flag > config defaults.baseRef > auto-detection (never persisted).
 // An explicit base that doesn't exist stays a hard error in ensureRepoReady.
-export async function resolveBaseRef(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<string> {
+async function resolveBaseRef(parsed: ParsedArgs, defaults: ConvoyDefaults): Promise<string> {
   const explicit = parsed.baseRef ?? defaults.baseRef
   if (explicit) return explicit
   const detected = await detectBaseRef(parsed.baseDetectionDir ?? parsed.targetDir)
@@ -784,20 +784,20 @@ export function parseArgs(argv: string[]): ParsedArgs {
   return parsed
 }
 
-export function splitFlag(raw: string) {
+function splitFlag(raw: string) {
   const index = raw.indexOf("=")
   if (index === -1) return { flag: raw, value: undefined }
   return { flag: raw.slice(0, index), value: raw.slice(index + 1) }
 }
 
-export function listValue(value: string) {
+function listValue(value: string) {
   return value
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean)
 }
 
-export function help() {
+function help() {
   return `convoy [prompt]
 
 Sequential OpenCode agent pipeline for implementing features.
@@ -891,7 +891,7 @@ Config keys:
 `
 }
 
-export function updateHelp() {
+function updateHelp() {
   return `convoy update [--check]
 
 Check the latest stable GitHub Release for a binary matching this platform.
@@ -904,7 +904,7 @@ Options:
 `
 }
 
-export function writeUpdateResult(result: UpdateResult) {
+function writeUpdateResult(result: UpdateResult) {
   switch (result.status) {
     case "source-install":
       process.stdout.write(`${result.message}\n`)
@@ -920,7 +920,7 @@ export function writeUpdateResult(result: UpdateResult) {
   }
 }
 
-export function initHelp() {
+function initHelp() {
   return `convoy init [--global] [--force] [--dir <path>]
 
 Create Convoy's default config file. An existing config is not overwritten unless --force is set.
@@ -937,7 +937,7 @@ Options:
 `
 }
 
-export function agentsHelp() {
+function agentsHelp() {
   return `convoy agents eject <agent> [--global] [--force] [--dir <path>]
 
 Copy one built-in agent prompt to agents/<agent>.md so you can edit it.
@@ -960,4 +960,13 @@ ${builtInAgents
   .map((name) => `  ${name}`)
   .join("\n")}
 `
+}
+
+export const __testing = {
+  listValue,
+  parseInitArgs,
+  resolveBaseRef,
+  resolveWorktreeOption,
+  splitFlag,
+  writeUpdateResult,
 }

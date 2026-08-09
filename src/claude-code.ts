@@ -151,20 +151,20 @@ export function describeClaudeEvent(event: unknown, state: ClaudeStreamState): C
   return []
 }
 
-export function eventType(event: unknown): string {
+function eventType(event: unknown): string {
   if (!event || typeof event !== "object") return ""
   const type = (event as Record<string, unknown>).type
   return typeof type === "string" ? type : ""
 }
 
-export function deltaOf(event: unknown): Record<string, unknown> | undefined {
+function deltaOf(event: unknown): Record<string, unknown> | undefined {
   if (!event || typeof event !== "object") return undefined
   const delta = (event as Record<string, unknown>).delta
   if (!delta || typeof delta !== "object") return undefined
   return delta as Record<string, unknown>
 }
 
-export function toolUseBlocks(message: unknown): { name: string; detail: string }[] {
+function toolUseBlocks(message: unknown): { name: string; detail: string }[] {
   if (!message || typeof message !== "object") return []
   const content = (message as Record<string, unknown>).content
   if (!Array.isArray(content)) return []
@@ -179,7 +179,7 @@ export function toolUseBlocks(message: unknown): { name: string; detail: string 
 }
 
 /** One short human-readable argument for the log line: path, pattern, or truncated JSON. */
-export function toolDetail(input: unknown): string {
+function toolDetail(input: unknown): string {
   if (!input || typeof input !== "object") return ""
   const record = input as Record<string, unknown>
   for (const key of ["file_path", "path", "pattern", "query", "url", "command"]) {
@@ -201,16 +201,16 @@ export function claudeTokens(value: unknown): ProgressTokens | undefined {
   return { input, output, reasoning: 0, cacheRead, cacheWrite, total: input + output + cacheRead + cacheWrite }
 }
 
-export function numberToken(value: unknown): number {
+function numberToken(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0
 }
 
-export function formatCharCount(value: number) {
+function formatCharCount(value: number) {
   if (value < 1000) return String(value)
   return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}k`
 }
 
-export function truncate(value: string, max: number) {
+function truncate(value: string, max: number) {
   const singleLine = value.replace(/\s+/g, " ").trim()
   if (singleLine.length <= max) return singleLine
   return `${singleLine.slice(0, Math.max(0, max - 3))}...`
@@ -276,7 +276,7 @@ export function claudeReadableDirectories(
   return [runDir, ...new Set(externalDirectories)]
 }
 
-export function attachmentPaths(attachments: readonly FilePartInput[]): { path: string; filename?: string; isDirectory: boolean }[] {
+function attachmentPaths(attachments: readonly FilePartInput[]): { path: string; filename?: string; isDirectory: boolean }[] {
   const paths: { path: string; filename?: string; isDirectory: boolean }[] = []
   for (const part of attachments) {
     try {
@@ -292,7 +292,7 @@ export function attachmentPaths(attachments: readonly FilePartInput[]): { path: 
   return paths
 }
 
-export function isWithin(path: string, root: string): boolean {
+function isWithin(path: string, root: string): boolean {
   const pathFromRoot = relative(root, path)
   return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))
 }
@@ -474,7 +474,7 @@ async function writeClaudeSystemPrompt(workspace: Workspace, phase: AgentStep, a
 }
 
 /** Synthesized read-only variants ("agent__ro") share the base agent's prompt file. */
-export function baseAgentName(agentName: string): string {
+function baseAgentName(agentName: string): string {
   return agentName.endsWith("__ro") ? agentName.slice(0, -"__ro".length) : agentName
 }
 
@@ -575,6 +575,6 @@ async function readClaudeSessionDirectories(runDir: string, sessionID: string): 
   return parsed
 }
 
-export function claudeSessionDirectoriesPath(runDir: string, sessionID: string): string {
+function claudeSessionDirectoriesPath(runDir: string, sessionID: string): string {
   return join(runDir, "logs", `claude-${encodeURIComponent(sessionID)}-directories.json`)
 }

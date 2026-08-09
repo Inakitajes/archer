@@ -77,11 +77,7 @@ describe("renderRunPlan", () => {
       {
         type: "human",
         name: "review-gate",
-        stepName: "review-gate",
         description: "Manual review",
-        inputFiles: [],
-        inputDiff: true,
-        reportPath: "reports/review-gate.md",
       },
     ]
     const output = renderRunPlan(plan, false)
@@ -103,7 +99,7 @@ describe("renderRunPlan", () => {
 
   test("renders attachments and permissions count", () => {
     const plan = samplePlan()
-    plan.attachments = [{ name: "screenshot.png", mime: "image/png", path: "/tmp/screenshot.png" }]
+    plan.attachments = ["/tmp/screenshot.png"]
     plan.permissions = "interactive"
     const output = renderRunPlan(plan, false)
     expect(output).toContain("interactive permissions")
@@ -139,9 +135,10 @@ describe("renderRunPlan", () => {
   test("renders resume gateway override when present", () => {
     const plan = samplePlan()
     plan.resume = {
+      runID: "run-previous",
       gatewayOverride: {
-        original: { gateway: "vercel" },
-        pending: { gateway: "configured" },
+        original: "configured",
+        pending: "configured",
       },
     }
     const output = renderRunPlan(plan, false)
@@ -200,6 +197,29 @@ describe("renderRunPlan", () => {
     }
     const output = renderRunPlan(plan, false)
     expect(output).not.toContain("Advisor:")
+  })
+
+  test("sanitizes hostile plan fields while preserving prompt line breaks", () => {
+    const plan = samplePlan()
+    plan.prompt = { source: "inline", text: "First \u001b[31mred\u001b[0m\nSecond\u0000\tcolumn" }
+    plan.target.directory = "/repo\u001b[2J\nforged\u0007\tpath"
+    plan.target.baseRef = "main\nforged-ref\u001b[0m"
+    plan.pipeline.name = "implement\nforged-pipeline\u0000"
+    plan.hooks.pre = [{ command: "printf ok\nforged-hook\u001b[31m", continueOnError: false }]
+    const step = plan.pipeline.steps[0]
+    if (step?.type === "agent") step.name = "build\nforged-step\u0001\u001b[32m"
+
+    const output = renderRunPlan(plan, false, { fullPrompt: true })
+
+    expect(output).toContain("  First red")
+    expect(output).toContain("  Second column")
+    expect(output).toContain("Target: /repo forged path")
+    expect(output).toContain("Diff base: main forged-ref")
+    expect(output).toContain("Pipeline: implement forged-pipeline")
+    expect(output).toContain("1. build forged-step · OpenCode · writable")
+    expect(output).toContain("pre: printf ok forged-hook")
+    expect(output).not.toMatch(/[\u001b\u0000\u0001\u0007\t]/)
+    expect(output).not.toContain("\nforged-")
   })
 })
 

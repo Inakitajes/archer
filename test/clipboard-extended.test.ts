@@ -118,12 +118,18 @@ describe("copyReportToClipboard edge cases", () => {
   })
 
   test("copies via native runNativeClipboard when pbcopy is available on darwin", async () => {
+    let invocation: { command: string[]; text: string } | undefined
     const result = await copyReportToClipboard("hello world", () => false, {
       platform: "darwin",
       env: {},
       which: () => "/usr/bin/pbcopy",
+      runNative: async (command, text) => {
+        invocation = { command, text }
+        return true
+      },
     })
     expect(result).toBe("copied-native")
+    expect(invocation).toEqual({ command: ["pbcopy"], text: "hello world" })
   })
 
   test("copies via OSC52 when env is set remotely and native is missing", async () => {

@@ -43,6 +43,14 @@ import type { Workspace } from "../src/workspace"
 
 const recoveryDirs: string[] = []
 
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 test("defaults concurrent agent groups to 30 sessions", () => {
   expect(defaultMaxConcurrentAgents).toBe(30)
 })
@@ -288,7 +296,7 @@ describe("runner helpers", () => {
   })
 
   test("restores on resume only when the phase didn't fail", async () => {
-    const phase = { name: "design", reportPath: "reports/design.md" } as AgentStep
+    const phase = agentStep("design")
 
     const workspaceWith = async (report: boolean) => {
       const dir = await mkdtemp(join(tmpdir(), "convoy-resume-"))
@@ -360,11 +368,13 @@ describe("RunControl", () => {
   test("waits for an active batch before pausing and resumes its checkpoint", async () => {
     let state = "running" as "running" | "pausing" | "paused"
     const persisted: string[] = []
+    const paused = deferred()
     const metadata = {
       controlState: () => state,
       setControlState: async (next: typeof state) => {
         state = next
         persisted.push(next)
+        if (next === "paused") paused.resolve()
       },
     } as unknown as RunMetadataStore
     const published: string[] = []
@@ -376,7 +386,7 @@ describe("RunControl", () => {
     expect(state).toBe("pausing")
     let passed = false
     const checkpoint = control.checkpointAfterBatch().then(() => { passed = true })
-    await Bun.sleep(0)
+    await paused.promise
     expect(state).toBe("paused")
     expect(passed).toBeFalse()
     await control.resume()
@@ -828,17 +838,23 @@ describe("RunShutdown multi-session tracking", () => {
 })
 
 describe("createGitLock", () => {
-  test("serializes concurrent jobs in enqueue order, regardless of individual duration", async () => {
+  test("serializes concurrent jobs in enqueue order", async () => {
     const gitLock = createGitLock()
     const order: number[] = []
-    const job = (id: number, delayMs: number) =>
-      gitLock(async () => {
-        await new Promise((resolve) => setTimeout(resolve, delayMs))
-        order.push(id)
-      })
+    const releaseFirst = deferred()
+    const firstStarted = deferred()
+    const first = gitLock(async () => {
+      order.push(1)
+      firstStarted.resolve()
+      await releaseFirst.promise
+    })
+    const second = gitLock(async () => { order.push(2) })
+    const third = gitLock(async () => { order.push(3) })
 
-    // Job 1 is slowest but enqueued first; it must still finish before 2 and 3 start.
-    await Promise.all([job(1, 30), job(2, 10), job(3, 0)])
+    await firstStarted.promise
+    expect(order).toEqual([1])
+    releaseFirst.resolve()
+    await Promise.all([first, second, third])
     expect(order).toEqual([1, 2, 3])
   })
 
@@ -863,6 +879,7 @@ describe("createGitLock", () => {
 describe("createConcurrencyLimiter", () => {
   test("never runs more than `limit` jobs at once and drains the rest", async () => {
     const limit = createConcurrencyLimiter(2)
+    const release = deferred()
     let active = 0
     let peak = 0
     let completed = 0
@@ -870,12 +887,15 @@ describe("createConcurrencyLimiter", () => {
       limit(async () => {
         active++
         peak = Math.max(peak, active)
-        await new Promise((resolve) => setTimeout(resolve, 5))
+        await release.promise
         active--
         completed++
       })
 
-    await Promise.all(Array.from({ length: 6 }, job))
+    const jobs = Array.from({ length: 6 }, job)
+    expect(active).toBe(2)
+    release.resolve()
+    await Promise.all(jobs)
     expect(peak).toBe(2)
     expect(completed).toBe(6)
     expect(active).toBe(0)
@@ -883,17 +903,21 @@ describe("createConcurrencyLimiter", () => {
 
   test("a group at or below the limit runs fully in parallel (no throttling)", async () => {
     const limit = createConcurrencyLimiter(8)
+    const release = deferred()
     let active = 0
     let peak = 0
     const job = () =>
       limit(async () => {
         active++
         peak = Math.max(peak, active)
-        await new Promise((resolve) => setTimeout(resolve, 5))
+        await release.promise
         active--
       })
 
-    await Promise.all(Array.from({ length: 6 }, job))
+    const jobs = Array.from({ length: 6 }, job)
+    expect(active).toBe(6)
+    release.resolve()
+    await Promise.all(jobs)
     expect(peak).toBe(6)
   })
 
@@ -1475,9 +1499,17 @@ describe("watchSession turn scoping", () => {
 
   function idleClient(messages: unknown[]) {
     let release!: () => void
+    const verificationFinished = deferred()
     const idled = new Promise<void>((resolve) => {
       release = resolve
     })
+    const responseData = {
+      filter(predicate: (message: unknown, index: number, values: unknown[]) => boolean) {
+        const filtered = messages.filter(predicate)
+        verificationFinished.resolve()
+        return filtered
+      },
+    }
     async function* stream() {
       // One idle event, then hold the stream open the way a live server does.
       yield { type: "session.idle", properties: { sessionID: "ses_1" } }
@@ -1488,10 +1520,11 @@ describe("watchSession turn scoping", () => {
       client: {
         event: { subscribe: async () => ({ stream: stream() }) },
         session: {
-          messages: async () => ({ data: messages }),
+          messages: async () => ({ data: responseData }),
           status: async () => ({ data: {} }),
         },
       } as never,
+      verificationFinished: verificationFinished.promise,
     }
   }
 
@@ -1535,7 +1568,7 @@ describe("watchSession turn scoping", () => {
   test("waits for the follow-up turn instead of resolving on the previous one", async () => {
     // Only the first turn exists: the anchored watcher has nothing of its own
     // yet, and resolving here would report an empty turn as a finished one.
-    const { client, close } = idleClient([assistantMessage("msg_1", 0.1, "first report")])
+    const { client, close, verificationFinished } = idleClient([assistantMessage("msg_1", 0.1, "first report")])
     const watcher = watchSession(client, {
       directory: "/repo",
       phaseName: "build",
@@ -1545,17 +1578,17 @@ describe("watchSession turn scoping", () => {
       sinceMessageID: "msg_1",
     })
 
-    const settled = await Promise.race([watcher.result.then(() => "settled"), sleep(50).then(() => "pending")])
+    await verificationFinished
+    const settled = await Promise.race([
+      watcher.result.then(() => "settled", () => "settled"),
+      Promise.resolve("pending"),
+    ])
 
     expect(settled).toBe("pending")
     close()
     await watcher.stop()
   })
 })
-
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms))
-}
 
 describe("PhaseGroupError", () => {
   test("formats all failures into a single message", () => {
@@ -1813,7 +1846,7 @@ describe("RunControl state management", () => {
 })
 
 describe("planBatches edge cases", () => {
-  const agent = (name: string, groupId?: string): AgentStep => ({
+  const agent = (name: string, groupId = `g-${name}`): AgentStep => ({
     type: "agent",
     name,
     agentName: name,
@@ -1822,7 +1855,7 @@ describe("planBatches edge cases", () => {
     inputFiles: [],
     inputDiff: false,
     reportPath: `reports/${name}.md`,
-    ...(groupId ? { groupId } : {}),
+    groupId,
     stepName: name,
   })
 
@@ -1876,10 +1909,13 @@ describe("createConcurrencyLimiter edge cases", () => {
   test("jobs are drained in FIFO order", async () => {
     const limit = createConcurrencyLimiter(1)
     const order: number[] = []
-    await Promise.all([
+    const releaseFirst = deferred()
+    const firstStarted = deferred()
+    const jobs = [
       limit(async () => {
-        await new Promise((r) => setTimeout(r, 5))
         order.push(1)
+        firstStarted.resolve()
+        await releaseFirst.promise
       }),
       limit(async () => {
         order.push(2)
@@ -1887,22 +1923,30 @@ describe("createConcurrencyLimiter edge cases", () => {
       limit(async () => {
         order.push(3)
       }),
-    ])
+    ]
+    await firstStarted.promise
+    expect(order).toEqual([1])
+    releaseFirst.resolve()
+    await Promise.all(jobs)
     expect(order).toEqual([1, 2, 3])
   })
 
   test("limit of 1 serializes all work", async () => {
     const limit = createConcurrencyLimiter(1)
+    const release = deferred()
     let running = 0
     let peak = 0
     const job = () =>
       limit(async () => {
         running++
         peak = Math.max(peak, running)
-        await new Promise((r) => setTimeout(r, 5))
+        await release.promise
         running--
       })
-    await Promise.all(Array.from({ length: 5 }, job))
+    const jobs = Array.from({ length: 5 }, job)
+    expect(running).toBe(1)
+    release.resolve()
+    await Promise.all(jobs)
     expect(peak).toBe(1)
   })
 })

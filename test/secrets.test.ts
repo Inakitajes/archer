@@ -1,6 +1,14 @@
-import { describe, expect, test, mock } from "bun:test"
+import { afterEach, describe, expect, test, mock } from "bun:test"
 
 import { keychainAvailable } from "../src/secrets"
+
+const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")
+const originalSpawn = Bun.spawn
+
+afterEach(() => {
+  if (originalPlatformDescriptor) Object.defineProperty(process, "platform", originalPlatformDescriptor)
+  Bun.spawn = originalSpawn
+})
 
 describe("keychainAvailable", () => {
   test("returns true on darwin", () => {
@@ -80,21 +88,21 @@ describe("keychain operations on darwin (mocked Bun.spawn)", () => {
   }
 
   function mockSpawnSuccess(stdoutText = "my-secret\n") {
-    return mock(() => ({
+    return mock((_cmd: string[]) => ({
       exited: Promise.resolve(0),
       stdout: makeReadableStream(stdoutText),
     }))
   }
 
   function mockSpawnFailure() {
-    return mock(() => ({
+    return mock((_cmd: string[]) => ({
       exited: Promise.resolve(1),
       stdout: makeReadableStream(""),
     }))
   }
 
   function mockSpawnCatch() {
-    return mock(() => {
+    return mock((_cmd: string[]) => {
       throw new Error("ENOENT")
     })
   }
