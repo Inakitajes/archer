@@ -676,3 +676,12 @@ function wheelDelta(event: WheelEvent): number {
   const magnitude = Math.max(1, Math.round(scroll.delta || 1))
   return scroll.direction === "up" ? -magnitude : magnitude
 }
+
+export const __testing = {
+  formatRunDate,
+  formatRunDateLong,
+  pad2,
+  RunsBrowser,
+  truncatePath,
+  wheelDelta,
+}

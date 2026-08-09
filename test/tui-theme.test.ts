@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import type { CliRenderer } from "@opentui/core"
-import { displayWidth, fmtCountdown, hintsRow, moreHintsMarker, padBetween, paletteForMode, paletteForTerminal, raw, terminalBackgroundHex, truncate, wrapLines, type Hint, type OverflowHint } from "../src/tui-theme"
+import { displayWidth, formatAgo, formatCount, formatElapsed, formatMoney, formatTime, fmtCountdown, hintsRow, moreHintsMarker, padBetween, paletteForMode, paletteForTerminal, projectName, raw, shortID, shortPath, shortUrl, spinnerFrame, terminalBackgroundHex, truncate, wrapLines, type Hint, type OverflowHint } from "../src/tui-theme"
 
 // terminalBackgroundHex reaches into opentui internals; the adapter must read a
 // real reply but degrade to undefined (→ static palettes) on any shape change.
@@ -268,5 +268,210 @@ describe("hintsRow", () => {
         expect(displayWidth(marked(width)), `width ${width}`).toBeLessThanOrEqual(width)
       }
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// paletteForMode
+// ---------------------------------------------------------------------------
+
+describe("paletteForMode", () => {
+  test("returns dark palette for dark mode", () => {
+    const p = paletteForMode("dark")
+    expect(p.accent).toBe("#7AA2F7")
+  })
+
+  test("returns light palette for light mode", () => {
+    const p = paletteForMode("light")
+    expect(p.accent).toBe("#2E7DE9")
+  })
+
+  test("returns neutral palette for null/undefined", () => {
+    expect(paletteForMode(null).accent).toBe("#4F9CF9")
+    expect(paletteForMode(undefined).accent).toBe("#4F9CF9")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// spinnerFrame
+// ---------------------------------------------------------------------------
+
+describe("spinnerFrame", () => {
+  test("rotates through frames based on time", () => {
+    expect(spinnerFrame(0)).toBe("⠋")
+    expect(spinnerFrame(150)).toBe("⠙")
+  })
+
+  test("wraps around after 10 frames", () => {
+    expect(spinnerFrame(0)).toBe(spinnerFrame(1000))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// formatMoney, formatCount, formatElapsed, formatAgo, fmtCountdown, formatTime
+// ---------------------------------------------------------------------------
+
+describe("formatMoney", () => {
+  test("formats cost to 2 decimal places", () => {
+    expect(formatMoney(0)).toBe("$0.00")
+    expect(formatMoney(0.05)).toBe("$0.05")
+    expect(formatMoney(1.5)).toBe("$1.50")
+    expect(formatMoney(123.456)).toBe("$123.46")
+  })
+})
+
+describe("formatCount", () => {
+  test("returns raw number below 1000", () => {
+    expect(formatCount(0)).toBe("0")
+    expect(formatCount(500)).toBe("500")
+  })
+
+  test("formats thousands with k", () => {
+    expect(formatCount(1500)).toBe("1.5k")
+    expect(formatCount(999_999)).toBe("1000.0k")
+  })
+
+  test("formats millions with m", () => {
+    expect(formatCount(1_000_000)).toBe("1.0m")
+    expect(formatCount(2_500_000)).toBe("2.5m")
+  })
+})
+
+describe("formatElapsed", () => {
+  test("formats milliseconds as m:ss", () => {
+    expect(formatElapsed(0)).toBe("0:00")
+    expect(formatElapsed(5000)).toBe("0:05")
+    expect(formatElapsed(65_000)).toBe("1:05")
+  })
+})
+
+describe("formatAgo", () => {
+  test("returns 'now' for <= 1 second", () => {
+    expect(formatAgo(0)).toBe("now")
+    expect(formatAgo(1000)).toBe("now")
+  })
+
+  test("returns seconds for < 60s", () => {
+    expect(formatAgo(30_000)).toBe("30s ago")
+  })
+
+  test("returns minutes and seconds for >= 60s", () => {
+    expect(formatAgo(60_000)).toBe("1m 0s ago")
+    expect(formatAgo(90_000)).toBe("1m 30s ago")
+  })
+})
+
+describe("fmtCountdown", () => {
+  test("returns 0m when resetsAt is in the past", () => {
+    expect(fmtCountdown(0, Date.now())).toBe("0m")
+  })
+})
+
+describe("formatTime", () => {
+  test("formats a timestamp as HH:MM:SS", () => {
+    const date = new Date(2025, 0, 15, 14, 30, 0)
+    expect(formatTime(date.getTime())).toBe("14:30:00")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// shortID, shortUrl, projectName, shortPath, truncate
+// ---------------------------------------------------------------------------
+
+describe("shortID", () => {
+  test("returns short IDs unchanged", () => {
+    expect(shortID("abc123")).toBe("abc123")
+    expect(shortID("123456789012")).toBe("123456789012")
+  })
+
+  test("truncates long IDs with ellipsis", () => {
+    const result = shortID("abcdef1234567890abcd")
+    expect(result).toBe("abcdef1…abcd")
+    expect(result.length).toBe(12)
+  })
+})
+
+describe("shortUrl", () => {
+  test("strips protocol prefix", () => {
+    expect(shortUrl("https://example.com/path")).toBe("example.com/path")
+  })
+})
+
+describe("projectName", () => {
+  test("returns last path segment", () => {
+    expect(projectName("/home/user/project")).toBe("project")
+  })
+
+  test("returns ellipsis for empty string", () => {
+    expect(projectName("")).toBe("…")
+  })
+})
+
+describe("shortPath", () => {
+  test("returns ellipsis for empty string", () => {
+    expect(shortPath("", 50)).toBe("…")
+  })
+
+  test("replaces home with ~", () => {
+    const home = process.env.HOME
+    if (home) {
+      expect(shortPath(`${home}/project`, 100)).toBe("~/project")
+    }
+  })
+
+  test("truncates from the left when too long", () => {
+    const result = shortPath("/a/very/long/path/that/exceeds/max", 20)
+    expect(result.length).toBe(20)
+    expect(result.startsWith("…")).toBe(true)
+  })
+})
+
+describe("truncate", () => {
+  test("returns short strings unchanged", () => {
+    expect(truncate("hello", 10)).toBe("hello")
+  })
+
+  test("collapses whitespace", () => {
+    expect(truncate("  hello   world  ", 50)).toBe("hello world")
+  })
+
+  test("adds ellipsis for long strings", () => {
+    const result = truncate("hello world this is a test", 10)
+    expect(result).toBe("hello wor…")
+  })
+
+  test("returns empty for max <= 0", () => {
+    expect(truncate("hello", 0)).toBe("")
+    expect(truncate("hello", -1)).toBe("")
+  })
+
+  test("returns ellipsis for max === 1", () => {
+    expect(truncate("hello", 1)).toBe("…")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// wrapLines
+// ---------------------------------------------------------------------------
+
+describe("wrapLines", () => {
+  test("wraps a long line at the specified width", () => {
+    const result = wrapLines(["hello world foo bar"], 10)
+    expect(result.length).toBeGreaterThanOrEqual(2)
+    expect(result.every((line) => displayWidth(line) <= 10)).toBe(true)
+  })
+
+  test("handles short lines without wrapping", () => {
+    expect(wrapLines(["hello"], 10)).toEqual(["hello"])
+  })
+
+  test("handles empty array", () => {
+    expect(wrapLines([], 10)).toEqual([])
+  })
+
+  test("wraps each line independently", () => {
+    const result = wrapLines(["short", "a much longer line that needs wrapping"], 15)
+    expect(result[0]).toBe("short")
+    expect(result.length).toBeGreaterThanOrEqual(2)
   })
 })

@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test"
 
-import { Notifier, resolveTerminalBundleId, type NotifierProcess, type NotifierSpawn } from "../src/notifications"
+import {
+  Notifier,
+  defaultNotificationSettings,
+  resolveTerminalBundleId,
+  type NotifierProcess,
+  type NotifierSpawn,
+} from "../src/notifications"
 import type { NotificationEvent } from "../src/run-status"
 
 const ghostty = { TERM_PROGRAM: "ghostty" }
@@ -9,27 +15,40 @@ function event(overrides: Partial<NotificationEvent> = {}): NotificationEvent {
   return { key: "step-start:0", category: "steps", title: "convoy · feat/notify", body: "step 1/7 · plan — started", ...overrides }
 }
 
-/** Records every argv and lets the test decide each exit code. */
+/** Records exact argv and exposes a deterministic barrier for asynchronous fallback delivery. */
 function recorder(exitCodes: number[] = []) {
   const commands: string[][] = []
-  const spawn = (command: string[]): NotifierProcess => {
+  const waiters: Array<{ count: number; resolve: () => void }> = []
+  const spawn: NotifierSpawn = (command) => {
     commands.push(command)
     const code = exitCodes[commands.length - 1] ?? 0
+    for (let index = waiters.length - 1; index >= 0; index--) {
+      const waiter = waiters[index]!
+      if (commands.length < waiter.count) continue
+      waiters.splice(index, 1)
+      waiter.resolve()
+    }
     return { exited: Promise.resolve(code) }
   }
-  return { commands, spawn }
+  const waitForCommands = async (count: number) => {
+    if (commands.length < count) await new Promise<void>((resolve) => waiters.push({ count, resolve }))
+    // The command is recorded synchronously inside spawn. Let the promise
+    // returned by `exited` and Notifier's tracking/fallback continuations drain
+    // too, without a wall-clock sleep.
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+  }
+  return { commands, spawn, waitForCommands }
 }
 
-/** The delivery is fire-and-forget; give its microtasks a turn before asserting. */
-const flush = () => Bun.sleep(1)
-
 describe("Notifier delivery", () => {
-  test("attributes the banner to the host terminal so it carries that app's icon", async () => {
-    const { commands, spawn } = recorder()
+  test("attributes the banner to the host terminal with exact argv", async () => {
+    const { commands, spawn, waitForCommands } = recorder()
     const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty })
 
     expect(notifier.notify(event())).toBe(true)
-    await flush()
+    await waitForCommands(1)
 
     expect(commands).toEqual([
       [
@@ -45,66 +64,68 @@ describe("Notifier delivery", () => {
   })
 
   test("falls back to a bare banner when the attributed one fails", async () => {
-    const { commands, spawn } = recorder([1, 0])
+    const { commands, spawn, waitForCommands } = recorder([1, 0])
     const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty })
 
     notifier.notify(event())
-    await flush()
+    await waitForCommands(2)
 
     expect(commands).toHaveLength(2)
     expect(commands[1]).toEqual(["osascript", "-e", 'display notification "step 1/7 · plan — started" with title "convoy · feat/notify"'])
   })
 
   test("goes straight to a bare banner when the terminal is unknown", async () => {
-    const { commands, spawn } = recorder()
+    const { commands, spawn, waitForCommands } = recorder()
     new Notifier({ platform: "darwin", spawn, env: {} }).notify(event())
-    await flush()
+    await waitForCommands(1)
 
-    expect(commands).toHaveLength(1)
-    expect(commands[0]![2]).toStartWith("display notification ")
+    expect(commands).toEqual([
+      ["osascript", "-e", 'display notification "step 1/7 · plan — started" with title "convoy · feat/notify"'],
+    ])
   })
 
-  test("a sound name is only added when configured", async () => {
-    const { commands, spawn } = recorder()
+  test("adds a sound name only when configured", async () => {
+    const { commands, spawn, waitForCommands } = recorder()
     new Notifier({ platform: "darwin", spawn, env: {}, settings: { sound: "Ping" } }).notify(event())
-    await flush()
+    await waitForCommands(1)
 
-    expect(commands[0]![2]).toBe('display notification "step 1/7 · plan — started" with title "convoy · feat/notify" sound name "Ping"')
+    expect(commands[0]).toEqual([
+      "osascript",
+      "-e",
+      'display notification "step 1/7 · plan — started" with title "convoy · feat/notify" sound name "Ping"',
+    ])
   })
 
-  test("quotes and backslashes in a body are escaped, never interpolated raw", async () => {
-    const { commands, spawn } = recorder()
+  test("escapes hostile quotes and backslashes inside one argv element", async () => {
+    const { commands, spawn, waitForCommands } = recorder()
     const hostile = 'rm -rf "dist" && echo \\ pwned'
     new Notifier({ platform: "darwin", spawn, env: {} }).notify(event({ body: hostile }))
-    await flush()
+    await waitForCommands(1)
 
-    const script = commands[0]![2]!
-    expect(script).toContain('\\"dist\\"')
-    expect(script).toContain("echo \\\\ pwned")
-    // Argv array, never a shell string: the payload is one argument.
-    expect(commands[0]![0]).toBe("osascript")
-    expect(commands[0]).toHaveLength(3)
+    expect(commands[0]).toEqual([
+      "osascript",
+      "-e",
+      'display notification "rm -rf \\"dist\\" && echo \\\\ pwned" with title "convoy · feat/notify"',
+    ])
   })
 })
 
 describe("Notifier gating", () => {
-  test("does nothing off macOS", async () => {
+  test("does nothing off macOS", () => {
     const { commands, spawn } = recorder()
     const notifier = new Notifier({ platform: "linux", spawn, env: ghostty })
 
     expect(notifier.available).toBe(false)
     expect(notifier.notify(event())).toBe(false)
-    await flush()
     expect(commands).toEqual([])
   })
 
-  test("the master switch suppresses every category", async () => {
+  test("the master switch suppresses every category", () => {
     const { commands, spawn } = recorder()
     const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty, settings: { enabled: false } })
 
     expect(notifier.available).toBe(false)
     expect(notifier.notify(event({ category: "failures" }))).toBe(false)
-    await flush()
     expect(commands).toEqual([])
   })
 
@@ -116,21 +137,23 @@ describe("Notifier gating", () => {
     expect(notifier.notify(event({ key: "fail:0", category: "failures" }))).toBe(true)
   })
 
-  test("stop() ends delivery for the rest of the run", () => {
+  test("stop ends delivery for the rest of the run", async () => {
     const { spawn } = recorder()
     const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty })
 
-    notifier.stop()
+    await notifier.stop()
     expect(notifier.notify(event())).toBe(false)
   })
 
-  test("stop() terminates an unsettled notification child", async () => {
+  test("stop kills and drains an unsettled notification child", async () => {
     let resolveExit!: (code: number) => void
-    const child = {
+    let kills = 0
+    const child: NotifierProcess = {
       exited: new Promise<number>((resolve) => {
         resolveExit = resolve
       }),
       kill() {
+        kills++
         resolveExit(1)
       },
     }
@@ -138,16 +161,15 @@ describe("Notifier gating", () => {
     const notifier = new Notifier({ platform: "darwin", spawn, env: {} })
 
     notifier.notify(event())
-    await flush()
     await notifier.stop()
 
-    const exit = await Promise.race([child.exited, Bun.sleep(10).then(() => "still-running" as const)])
-    expect(exit).toBe(1)
+    expect(kills).toBe(1)
+    expect(await child.exited).toBe(1)
   })
 })
 
 describe("Notifier throttling", () => {
-  test("repeats of one key collapse inside the window, and fire again after it", () => {
+  test("repeats of one key collapse inside the window and fire after it", () => {
     const { spawn } = recorder()
     let clock = 1_000
     const notifier = new Notifier({ platform: "darwin", spawn, env: ghostty, now: () => clock })
@@ -159,7 +181,7 @@ describe("Notifier throttling", () => {
     expect(notifier.notify(event())).toBe(true)
   })
 
-  test("waiting has a longer window than steps, so a live prompt does not re-fire", () => {
+  test("waiting has a longer window than steps", () => {
     const { spawn } = recorder()
     let clock = 1_000
     const wait = event({ key: "wait:permission:req-1", category: "waiting" })
@@ -181,14 +203,27 @@ describe("Notifier throttling", () => {
   })
 })
 
-describe("resolveTerminalBundleId", () => {
-  test("maps the common terminals", () => {
-    expect(resolveTerminalBundleId({ TERM_PROGRAM: "ghostty" })).toBe("com.mitchellh.ghostty")
-    expect(resolveTerminalBundleId({ TERM_PROGRAM: "iTerm.app" })).toBe("com.googlecode.iterm2")
-    expect(resolveTerminalBundleId({ TERM_PROGRAM: "Apple_Terminal" })).toBe("com.apple.Terminal")
+describe("notification settings and terminal detection", () => {
+  test("defaults enable every category without a sound", () => {
+    expect(defaultNotificationSettings).toEqual({
+      enabled: true,
+      steps: true,
+      waiting: true,
+      failures: true,
+      finish: true,
+      terminalTitle: true,
+      sound: "",
+    })
   })
 
-  test("recognises Ghostty by TERM when TERM_PROGRAM is missing", () => {
+  test("maps common terminals and trims their names", () => {
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "ghostty" })).toBe("com.mitchellh.ghostty")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "iTerm.app" })).toBe("com.googlecode.iterm2")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "  Apple_Terminal  " })).toBe("com.apple.Terminal")
+    expect(resolveTerminalBundleId({ TERM_PROGRAM: "WezTerm" })).toBe("com.github.wez.wezterm")
+  })
+
+  test("recognizes Ghostty without TERM_PROGRAM", () => {
     expect(resolveTerminalBundleId({ TERM: "xterm-ghostty" })).toBe("com.mitchellh.ghostty")
     expect(resolveTerminalBundleId({ GHOSTTY_RESOURCES_DIR: "/opt/ghostty" })).toBe("com.mitchellh.ghostty")
   })
@@ -197,7 +232,7 @@ describe("resolveTerminalBundleId", () => {
     expect(resolveTerminalBundleId({ TERM_PROGRAM: "ghostty", CONVOY_NOTIFY_APP_ID: "com.example.Term" })).toBe("com.example.Term")
   })
 
-  test("an unknown terminal resolves to nothing so the bare banner is used", () => {
+  test("an unknown terminal resolves to nothing", () => {
     expect(resolveTerminalBundleId({ TERM_PROGRAM: "something-else" })).toBeUndefined()
     expect(resolveTerminalBundleId({})).toBeUndefined()
   })

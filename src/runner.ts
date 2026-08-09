@@ -2535,3 +2535,28 @@ function formatSdkError(error: unknown): string {
   if (typeof error === "object" && error && "name" in error) return String((error as { name?: unknown }).name)
   return String(error)
 }
+
+export const __testing = {
+  activity,
+  awaitActionOrAbort,
+  completionFollowUp,
+  describeSessionStatus,
+  describeToolCall,
+  diffSummaryFromEvent,
+  formatCharCount,
+  formatCost,
+  formatModelFromEvent,
+  gateAllowedActions,
+  keepCompletedPhase,
+  payloadID,
+  payloadType,
+  pickString,
+  pulse,
+  rawString,
+  recoveryReport,
+  rememberMessagePartChannel,
+  sleep,
+  stepUsageFromEvent,
+  todosFromEvent,
+  usageFromRecord,
+}

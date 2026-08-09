@@ -26,16 +26,22 @@ export type FinishOptions = {
   help?: boolean
 }
 
+type FinishCommandDeps = {
+  prepareFinish: typeof prepareFinish
+}
+
+const defaultFinishCommandDeps: FinishCommandDeps = { prepareFinish }
+
 /**
  * Collapses a run's convoy commits into one conventional commit authored and
  * signed by the user. The non-interactive counterpart of the dashboard's [f].
  */
-export async function runFinishCommand(options: FinishOptions) {
+export async function runFinishCommand(options: FinishOptions, deps: FinishCommandDeps = defaultFinishCommandDeps) {
   const cwd = await resolveFinishDir(options)
   const config = await loadMergedConvoyConfig(cwd)
   const baseRef = await resolveFinishBase(cwd, options.baseRef ?? config?.defaults.baseRef)
 
-  const prepared = await prepareFinish({
+  const prepared = await deps.prepareFinish({
     cwd,
     baseRef,
     ...(config?.defaults.commitMessageModel ? { commitMessageModel: config.defaults.commitMessageModel } : {}),

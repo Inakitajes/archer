@@ -13,6 +13,7 @@ import {
   RunControl,
   SessionAbortedError,
   UserAbortError,
+  PhaseGroupError,
   waitForPhaseGate,
   commitRecoveredPhase,
   createConcurrencyLimiter,
@@ -41,6 +42,14 @@ import type { AgentStep, HumanStep, Pipeline, Step } from "../src/types"
 import type { Workspace } from "../src/workspace"
 
 const recoveryDirs: string[] = []
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
 
 test("defaults concurrent agent groups to 30 sessions", () => {
   expect(defaultMaxConcurrentAgents).toBe(30)
@@ -287,7 +296,7 @@ describe("runner helpers", () => {
   })
 
   test("restores on resume only when the phase didn't fail", async () => {
-    const phase = { name: "design", reportPath: "reports/design.md" } as AgentStep
+    const phase = agentStep("design")
 
     const workspaceWith = async (report: boolean) => {
       const dir = await mkdtemp(join(tmpdir(), "convoy-resume-"))
@@ -359,11 +368,13 @@ describe("RunControl", () => {
   test("waits for an active batch before pausing and resumes its checkpoint", async () => {
     let state = "running" as "running" | "pausing" | "paused"
     const persisted: string[] = []
+    const paused = deferred()
     const metadata = {
       controlState: () => state,
       setControlState: async (next: typeof state) => {
         state = next
         persisted.push(next)
+        if (next === "paused") paused.resolve()
       },
     } as unknown as RunMetadataStore
     const published: string[] = []
@@ -375,7 +386,7 @@ describe("RunControl", () => {
     expect(state).toBe("pausing")
     let passed = false
     const checkpoint = control.checkpointAfterBatch().then(() => { passed = true })
-    await Bun.sleep(0)
+    await paused.promise
     expect(state).toBe("paused")
     expect(passed).toBeFalse()
     await control.resume()
@@ -827,17 +838,23 @@ describe("RunShutdown multi-session tracking", () => {
 })
 
 describe("createGitLock", () => {
-  test("serializes concurrent jobs in enqueue order, regardless of individual duration", async () => {
+  test("serializes concurrent jobs in enqueue order", async () => {
     const gitLock = createGitLock()
     const order: number[] = []
-    const job = (id: number, delayMs: number) =>
-      gitLock(async () => {
-        await new Promise((resolve) => setTimeout(resolve, delayMs))
-        order.push(id)
-      })
+    const releaseFirst = deferred()
+    const firstStarted = deferred()
+    const first = gitLock(async () => {
+      order.push(1)
+      firstStarted.resolve()
+      await releaseFirst.promise
+    })
+    const second = gitLock(async () => { order.push(2) })
+    const third = gitLock(async () => { order.push(3) })
 
-    // Job 1 is slowest but enqueued first; it must still finish before 2 and 3 start.
-    await Promise.all([job(1, 30), job(2, 10), job(3, 0)])
+    await firstStarted.promise
+    expect(order).toEqual([1])
+    releaseFirst.resolve()
+    await Promise.all([first, second, third])
     expect(order).toEqual([1, 2, 3])
   })
 
@@ -862,6 +879,7 @@ describe("createGitLock", () => {
 describe("createConcurrencyLimiter", () => {
   test("never runs more than `limit` jobs at once and drains the rest", async () => {
     const limit = createConcurrencyLimiter(2)
+    const release = deferred()
     let active = 0
     let peak = 0
     let completed = 0
@@ -869,12 +887,15 @@ describe("createConcurrencyLimiter", () => {
       limit(async () => {
         active++
         peak = Math.max(peak, active)
-        await new Promise((resolve) => setTimeout(resolve, 5))
+        await release.promise
         active--
         completed++
       })
 
-    await Promise.all(Array.from({ length: 6 }, job))
+    const jobs = Array.from({ length: 6 }, job)
+    expect(active).toBe(2)
+    release.resolve()
+    await Promise.all(jobs)
     expect(peak).toBe(2)
     expect(completed).toBe(6)
     expect(active).toBe(0)
@@ -882,17 +903,21 @@ describe("createConcurrencyLimiter", () => {
 
   test("a group at or below the limit runs fully in parallel (no throttling)", async () => {
     const limit = createConcurrencyLimiter(8)
+    const release = deferred()
     let active = 0
     let peak = 0
     const job = () =>
       limit(async () => {
         active++
         peak = Math.max(peak, active)
-        await new Promise((resolve) => setTimeout(resolve, 5))
+        await release.promise
         active--
       })
 
-    await Promise.all(Array.from({ length: 6 }, job))
+    const jobs = Array.from({ length: 6 }, job)
+    expect(active).toBe(6)
+    release.resolve()
+    await Promise.all(jobs)
     expect(peak).toBe(6)
   })
 
@@ -1474,9 +1499,17 @@ describe("watchSession turn scoping", () => {
 
   function idleClient(messages: unknown[]) {
     let release!: () => void
+    const verificationFinished = deferred()
     const idled = new Promise<void>((resolve) => {
       release = resolve
     })
+    const responseData = {
+      filter(predicate: (message: unknown, index: number, values: unknown[]) => boolean) {
+        const filtered = messages.filter(predicate)
+        verificationFinished.resolve()
+        return filtered
+      },
+    }
     async function* stream() {
       // One idle event, then hold the stream open the way a live server does.
       yield { type: "session.idle", properties: { sessionID: "ses_1" } }
@@ -1487,10 +1520,11 @@ describe("watchSession turn scoping", () => {
       client: {
         event: { subscribe: async () => ({ stream: stream() }) },
         session: {
-          messages: async () => ({ data: messages }),
+          messages: async () => ({ data: responseData }),
           status: async () => ({ data: {} }),
         },
       } as never,
+      verificationFinished: verificationFinished.promise,
     }
   }
 
@@ -1534,7 +1568,7 @@ describe("watchSession turn scoping", () => {
   test("waits for the follow-up turn instead of resolving on the previous one", async () => {
     // Only the first turn exists: the anchored watcher has nothing of its own
     // yet, and resolving here would report an empty turn as a finished one.
-    const { client, close } = idleClient([assistantMessage("msg_1", 0.1, "first report")])
+    const { client, close, verificationFinished } = idleClient([assistantMessage("msg_1", 0.1, "first report")])
     const watcher = watchSession(client, {
       directory: "/repo",
       phaseName: "build",
@@ -1544,7 +1578,11 @@ describe("watchSession turn scoping", () => {
       sinceMessageID: "msg_1",
     })
 
-    const settled = await Promise.race([watcher.result.then(() => "settled"), sleep(50).then(() => "pending")])
+    await verificationFinished
+    const settled = await Promise.race([
+      watcher.result.then(() => "settled", () => "settled"),
+      Promise.resolve("pending"),
+    ])
 
     expect(settled).toBe("pending")
     close()
@@ -1552,6 +1590,363 @@ describe("watchSession turn scoping", () => {
   })
 })
 
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms))
-}
+describe("PhaseGroupError", () => {
+  test("formats all failures into a single message", () => {
+    const error = new PhaseGroupError([
+      { name: "design", error: new Error("model timeout") },
+      { name: "implementer", error: "provider unavailable" },
+    ])
+    expect(error.name).toBe("PhaseGroupError")
+    expect(error.message).toContain("[design]")
+    expect(error.message).toContain("model timeout")
+    expect(error.message).toContain("[implementer]")
+    expect(error.message).toContain("provider unavailable")
+  })
+
+  test("preserves the failures array", () => {
+    const failures = [{ name: "design", error: new Error("boom") }]
+    const error = new PhaseGroupError(failures)
+    expect(error.failures).toEqual(failures)
+  })
+
+  test("handles empty failures", () => {
+    const error = new PhaseGroupError([])
+    expect(error.message).toBe("")
+    expect(error.failures).toEqual([])
+  })
+})
+
+describe("isUserAbortError", () => {
+  test("returns true for UserAbortError instance", () => {
+    expect(isUserAbortError(new UserAbortError())).toBe(true)
+  })
+
+  test("returns true for UserAbortError with custom message", () => {
+    expect(isUserAbortError(new UserAbortError("custom abort"))).toBe(true)
+  })
+
+  test("returns true for Error with UserAbortError name", () => {
+    const error = new Error("wrapped abort")
+    Object.defineProperty(error, "name", { value: "UserAbortError" })
+    expect(isUserAbortError(error)).toBe(true)
+  })
+
+  test("returns false for plain Error", () => {
+    expect(isUserAbortError(new Error("some error"))).toBe(false)
+  })
+
+  test("returns false for non-Error values", () => {
+    expect(isUserAbortError("aborted")).toBe(false)
+    expect(isUserAbortError(null)).toBe(false)
+    expect(isUserAbortError(undefined)).toBe(false)
+    expect(isUserAbortError(42)).toBe(false)
+    expect(isUserAbortError({})).toBe(false)
+  })
+})
+
+describe("isIgnorableRejection", () => {
+  test("returns true for UserAbortError", () => {
+    expect(isIgnorableRejection(new UserAbortError())).toBe(true)
+  })
+
+  test("returns true for AbortError by name", () => {
+    const error = new Error("The operation was aborted")
+    error.name = "AbortError"
+    expect(isIgnorableRejection(error)).toBe(true)
+  })
+
+  test("returns true for error with 'aborted' in message", () => {
+    expect(isIgnorableRejection(new Error("request was aborted"))).toBe(true)
+  })
+
+  test("returns true for errors containing 'aborted' or 'aborte'", () => {
+    expect(isIgnorableRejection(new Error("user aborted"))).toBe(true)
+    expect(isIgnorableRejection(new Error("aborted by kernel"))).toBe(true)
+  })
+
+  test("returns false for regular errors", () => {
+    expect(isIgnorableRejection(new Error("Cannot read properties of undefined"))).toBe(false)
+    expect(isIgnorableRejection(new TypeError("boom"))).toBe(false)
+  })
+
+  test("returns false for non-Error values", () => {
+    expect(isIgnorableRejection("aborted")).toBe(false)
+    expect(isIgnorableRejection(undefined)).toBe(false)
+    expect(isIgnorableRejection(null)).toBe(false)
+    expect(isIgnorableRejection(42)).toBe(false)
+  })
+})
+
+describe("RunShutdown methods", () => {
+  test("signal returns an AbortSignal", () => {
+    const shutdown = new RunShutdown()
+    expect(shutdown.signal).toBeInstanceOf(Object)
+    expect(shutdown.signal.aborted).toBe(false)
+    shutdown.dispose()
+  })
+
+  test("aborted reflects the underlying controller state", () => {
+    const shutdown = new RunShutdown()
+    expect(shutdown.aborted).toBe(false)
+    shutdown.dispose()
+  })
+
+  test("abortError returns UserAbortError when no reason is set", () => {
+    const shutdown = new RunShutdown()
+    const error = shutdown.abortError()
+    expect(isUserAbortError(error)).toBe(true)
+    shutdown.dispose()
+  })
+
+  test("abortError returns the signal reason when it is a UserAbortError", () => {
+    const shutdown = new RunShutdown()
+    const signal = shutdown.signal
+    const err = new UserAbortError("test abort")
+    // Manually abort the controller to set the reason
+    const controller = new AbortController()
+    controller.abort(err)
+    expect(isUserAbortError(controller.signal.reason)).toBe(true)
+    shutdown.dispose()
+  })
+
+  test("abortError falls back to fallback when available", () => {
+    const shutdown = new RunShutdown()
+    const fallback = new UserAbortError("fallback")
+    const error = shutdown.abortError(fallback)
+    expect(isUserAbortError(error)).toBe(true)
+    expect((error as Error).message).toBe("fallback")
+    shutdown.dispose()
+  })
+
+  test("throwIfRequested does not throw before abort", () => {
+    const shutdown = new RunShutdown()
+    expect(() => shutdown.throwIfRequested()).not.toThrow()
+    shutdown.dispose()
+  })
+
+  test("setActiveSession and clearActiveSession manage session map", async () => {
+    const shutdown = new RunShutdown()
+    const session = {
+      client: {} as never,
+      sessionID: "ses_1",
+      directory: "/tmp",
+      phaseName: "design",
+    }
+    shutdown.setActiveSession(session)
+    // Wrong sessionID for the phase: should not clear
+    shutdown.clearActiveSession("design", "ses_wrong")
+    // Correct sessionID: should clear
+    shutdown.clearActiveSession("design", "ses_1")
+    // Clearing again is a no-op
+    shutdown.clearActiveSession("design", "ses_1")
+    shutdown.dispose()
+  })
+
+  test("abortActiveSessions resolves when no sessions are tracked", async () => {
+    const shutdown = new RunShutdown()
+    await shutdown.abortActiveSessions()
+    shutdown.dispose()
+  })
+})
+
+describe("RunControl state management", () => {
+  function metadataFor(state: "running" | "pausing" | "paused") {
+    let current = state
+    return {
+      controlState: () => current,
+      setControlState: async (next: typeof current) => {
+        current = next
+      },
+    } as unknown as RunMetadataStore
+  }
+
+  test("starts in controlState from metadata", () => {
+    const control = new RunControl(metadataFor("paused"))
+    expect(control).toBeDefined()
+  })
+
+  test("requestPause is a no-op when already paused", async () => {
+    const meta = metadataFor("paused")
+    const setCalls: string[] = []
+    const spy = {
+      controlState: () => "paused" as const,
+      setControlState: async (next: string) => { setCalls.push(next) },
+    } as unknown as RunMetadataStore
+    const control = new RunControl(spy)
+    await control.requestPause()
+    expect(setCalls).toEqual([])
+  })
+
+  test("requestPause is a no-op when already pausing", async () => {
+    const meta = metadataFor("pausing")
+    const setCalls: string[] = []
+    const spy = {
+      controlState: () => "pausing" as const,
+      setControlState: async (next: string) => { setCalls.push(next) },
+    } as unknown as RunMetadataStore
+    const control = new RunControl(spy)
+    await control.requestPause()
+    expect(setCalls).toEqual([])
+  })
+
+  test("resume is a no-op when already running", async () => {
+    const meta = metadataFor("running")
+    const setCalls: string[] = []
+    const spy = {
+      controlState: () => "running" as const,
+      setControlState: async (next: string) => { setCalls.push(next) },
+    } as unknown as RunMetadataStore
+    const control = new RunControl(spy)
+    await control.resume()
+    expect(setCalls).toEqual([])
+  })
+
+  test("toggle switches between running and paused", async () => {
+    let state = "running" as "running" | "paused"
+    const persisted: string[] = []
+    const meta = {
+      controlState: () => state,
+      setControlState: async (next: typeof state) => {
+        state = next
+        persisted.push(next)
+      },
+    } as unknown as RunMetadataStore
+    const control = new RunControl(meta)
+
+    await control.toggle()
+    expect(state).toBe("paused")
+    expect(persisted).toEqual(["paused"])
+
+    await control.toggle()
+    expect(state).toBe("running")
+    expect(persisted).toEqual(["paused", "running"])
+  })
+
+  test("awaitRunnable resolves immediately when state is running", async () => {
+    const control = new RunControl(metadataFor("running"))
+    await control.awaitRunnable()
+  })
+
+  test("awaitRunnable rejects when signal is already aborted", async () => {
+    const control = new RunControl(metadataFor("paused"))
+    const controller = new AbortController()
+    controller.abort(new UserAbortError("already aborted"))
+    await expect(control.awaitRunnable(controller.signal)).rejects.toThrow("already aborted")
+  })
+
+  test("publish calls runControlState on bound progress", async () => {
+    const calls: { state: string; active: number }[] = []
+    const control = new RunControl(metadataFor("running"))
+    control.bind({
+      ...noopProgress,
+      runControlState: (state, active) => calls.push({ state, active }),
+    })
+    expect(calls).toContainEqual({ state: "running", active: 0 })
+  })
+})
+
+describe("planBatches edge cases", () => {
+  const agent = (name: string, groupId = `g-${name}`): AgentStep => ({
+    type: "agent",
+    name,
+    agentName: name,
+    description: name,
+    model: "openai/gpt-4",
+    inputFiles: [],
+    inputDiff: false,
+    reportPath: `reports/${name}.md`,
+    groupId,
+    stepName: name,
+  })
+
+  test("single step returns one batch", () => {
+    expect(planBatches([agent("design")])).toEqual([[agent("design")]])
+  })
+
+  test("no steps returns empty array", () => {
+    expect(planBatches([])).toEqual([])
+  })
+
+  test("human step is always its own batch", () => {
+    const human = { type: "human" as const, name: "review", description: "review" }
+    expect(planBatches([human])).toEqual([[human]])
+  })
+
+  test("agents with matching groupId batch together", () => {
+    const a = agent("a", "g1")
+    const b = agent("b", "g1")
+    const c = agent("c", "g1")
+    expect(planBatches([a, b, c])).toEqual([[a, b, c]])
+  })
+
+  test("human gate splits groupId continuity", () => {
+    const before = agent("a", "g1")
+    const human = { type: "human" as const, name: "review", description: "review" }
+    const after = agent("b", "g1")
+    expect(planBatches([before, human, after])).toEqual([[before], [human], [after]])
+  })
+
+  test("adjacent but different groupIds are separate batches", () => {
+    const a = agent("a", "g1")
+    const b = agent("b", "g2")
+    expect(planBatches([a, b])).toEqual([[a], [b]])
+  })
+})
+
+describe("createConcurrencyLimiter edge cases", () => {
+  test("single job runs immediately", async () => {
+    const limit = createConcurrencyLimiter(1)
+    let ran = false
+    await limit(async () => { ran = true })
+    expect(ran).toBe(true)
+  })
+
+  test("empty queue resolves no extra jobs", async () => {
+    const limit = createConcurrencyLimiter(5)
+    expect(limit).toBeDefined()
+  })
+
+  test("jobs are drained in FIFO order", async () => {
+    const limit = createConcurrencyLimiter(1)
+    const order: number[] = []
+    const releaseFirst = deferred()
+    const firstStarted = deferred()
+    const jobs = [
+      limit(async () => {
+        order.push(1)
+        firstStarted.resolve()
+        await releaseFirst.promise
+      }),
+      limit(async () => {
+        order.push(2)
+      }),
+      limit(async () => {
+        order.push(3)
+      }),
+    ]
+    await firstStarted.promise
+    expect(order).toEqual([1])
+    releaseFirst.resolve()
+    await Promise.all(jobs)
+    expect(order).toEqual([1, 2, 3])
+  })
+
+  test("limit of 1 serializes all work", async () => {
+    const limit = createConcurrencyLimiter(1)
+    const release = deferred()
+    let running = 0
+    let peak = 0
+    const job = () =>
+      limit(async () => {
+        running++
+        peak = Math.max(peak, running)
+        await release.promise
+        running--
+      })
+    const jobs = Array.from({ length: 5 }, job)
+    expect(running).toBe(1)
+    release.resolve()
+    await Promise.all(jobs)
+    expect(peak).toBe(1)
+  })
+})

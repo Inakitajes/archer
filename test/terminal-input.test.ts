@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { createTerminalInput } from "../src/terminal-input"
+import { createTerminalInput, TerminalInterrupt } from "../src/terminal-input"
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -11,6 +11,21 @@ function deferred<T>() {
   })
   return { promise, resolve, reject }
 }
+
+describe("TerminalInterrupt", () => {
+  test("is an Error with the correct name", () => {
+    const err = new TerminalInterrupt()
+    expect(err).toBeInstanceOf(Error)
+    expect(err.name).toBe("TerminalInterrupt")
+    expect(err.message).toBe("terminal interrupt")
+  })
+
+  test("can be caught with instanceof", () => {
+    const err = new TerminalInterrupt()
+    expect(err instanceof Error).toBe(true)
+    expect(err instanceof TerminalInterrupt).toBe(true)
+  })
+})
 
 describe("createTerminalInput", () => {
   test("hands the block a prompt handle", async () => {
@@ -86,5 +101,21 @@ describe("createTerminalInput", () => {
     const later = input.withInput(async () => "later-result")
     await expect(input.withInput(async () => "first-result")).resolves.toBe("first-result")
     expect(await later).toBe("later-result")
+  })
+
+  test("multiple successes in sequence", async () => {
+    const input = createTerminalInput()
+    const r1 = await input.withInput(async () => "first")
+    const r2 = await input.withInput(async () => "second")
+    const r3 = await input.withInput(async () => "third")
+    expect(r1).toBe("first")
+    expect(r2).toBe("second")
+    expect(r3).toBe("third")
+  })
+
+  test("prompt.ask is a function that returns a promise", () => {
+    const input = createTerminalInput()
+    const prompt = input.withInput(async (ask) => ask)
+    expect(typeof (prompt as unknown as Promise<{ ask: unknown }>).then).toBe("function")
   })
 })

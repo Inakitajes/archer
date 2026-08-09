@@ -133,7 +133,11 @@ type CodexAuth = {
  * CLI poll the same file, so before writing we re-read it and skip the
  * persist if someone else already rotated past us.
  */
-async function refreshCodexIfNeeded(auth: CodexAuth, authPath: string): Promise<{ token: string; authError?: string }> {
+export async function refreshCodexIfNeeded(
+  auth: CodexAuth,
+  authPath: string,
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<{ token: string; authError?: string }> {
   const token = auth.tokens!.access_token!
   const refreshToken = auth.tokens?.refresh_token
   const expMs = jwtExpMs(token)
@@ -141,7 +145,7 @@ async function refreshCodexIfNeeded(auth: CodexAuth, authPath: string): Promise<
 
   let res: Response
   try {
-    res = await fetch(tokenUrl, {
+    res = await fetcher(tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

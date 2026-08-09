@@ -52,6 +52,18 @@ describe("step addressing", () => {
     expect(collapseStep({ agent: "patterns" })).toBe("patterns")
     expect(collapseStep({ agent: "patterns", diff: false })).toEqual({ agent: "patterns", diff: false })
   })
+
+  test("asStepObject returns a copy, not the original", () => {
+    const spec: AgentStepSpec = { agent: "test", model: "a/b" }
+    const obj = asStepObject(spec)
+    expect(obj).toEqual(spec)
+    expect(obj).not.toBe(spec)
+  })
+
+  test("collapseStep keeps object when it has more than agent", () => {
+    expect(collapseStep({ agent: "x", model: "a/b" })).toEqual({ agent: "x", model: "a/b" })
+    expect(collapseStep({ agent: "x", name: "test" })).toEqual({ agent: "x", name: "test" })
+  })
 })
 
 describe("parallel group editing", () => {
@@ -81,6 +93,10 @@ describe("parallel group editing", () => {
     expect(list).toHaveLength(3)
   })
 
+  test("wrapInParallel returns undefined for out-of-bounds index", () => {
+    expect(wrapInParallel(["implementer"], 5)).toBeUndefined()
+  })
+
   test("ejectMember re-inserts the member right after its group", () => {
     const list = steps()
     expect(ejectMember(list, 1, 0)).toBe(2)
@@ -94,6 +110,11 @@ describe("parallel group editing", () => {
     expect(list).toEqual(["implementer", "patterns"])
   })
 
+  test("ejectMember returns undefined for invalid index", () => {
+    const list: StepSpec[] = ["implementer"]
+    expect(ejectMember(list, 0, 0)).toBeUndefined()
+  })
+
   test("dissolveParallel splices members back as sequential steps", () => {
     const list = steps()
     expect(dissolveParallel(list, 1)).toBe(1)
@@ -104,6 +125,11 @@ describe("parallel group editing", () => {
       { type: "human" },
       "review-report",
     ])
+  })
+
+  test("dissolveParallel returns undefined for non-parallel step", () => {
+    const list: StepSpec[] = ["implementer"]
+    expect(dissolveParallel(list, 0)).toBeUndefined()
   })
 
   test("addParallelMember appends to the group", () => {
@@ -123,6 +149,12 @@ describe("parallel group editing", () => {
     expect(list).toEqual([])
   })
 
+  test("deleteAt with member does nothing on non-parallel", () => {
+    const list: StepSpec[] = ["implementer"]
+    deleteAt(list, 0, 0)
+    expect(list).toEqual(["implementer"])
+  })
+
   test("moveMember reorders within the group and stops at its edges", () => {
     const list = steps()
     expect(moveMember(list, 1, 0, 1)).toBe(1)
@@ -131,9 +163,18 @@ describe("parallel group editing", () => {
     expect(moveMember(list, 1, 0, -1)).toBeUndefined()
   })
 
+  test("moveMember returns undefined for non-parallel step", () => {
+    expect(moveMember(["implementer"], 0, 0, 1)).toBeUndefined()
+  })
+
   test("agentStepCount counts members individually and skips human gates", () => {
     expect(agentStepCount(steps())).toBe(4)
     expect(agentStepCount([{ type: "human" }, "human-review"])).toBe(0)
+  })
+
+  test("agentStepCount handles parallel groups with human gates inside", () => {
+    const list: StepSpec[] = [{ parallel: ["implementer", "human-review"] }]
+    expect(agentStepCount(list)).toBe(1)
   })
 
   test("isHumanStep covers object gates and the legacy human-review forms", () => {
@@ -165,6 +206,13 @@ describe("multi-model selection", () => {
     const applied = applyModelsSelection({ agent: "x", model: "a/b", models: ["a/b", "c/d"] } as AgentStepSpec, ["e/f", "g/h"])
     expect(applied.model).toBeUndefined()
     expect(applied.models).toEqual(["e/f", "g/h"])
+  })
+
+  test("copies the spec rather than mutating in place", () => {
+    const spec: AgentStepSpec = { agent: "x", model: "a/b" }
+    const result = applyModelsSelection(spec, ["c/d"])
+    expect(spec.model).toBe("a/b")
+    expect(result.model).toBe("c/d")
   })
 })
 
@@ -209,7 +257,48 @@ describe("runner selection", () => {
 
   test("preserves a configured full Claude model ID when the picker opens", () => {
     const state = claudeModelPickerState("claude-opus-4-8")
-    expect(state.options[state.index]?.value).toBe("claude-opus-4-8")
+    expect(state.options.findIndex((choice) => choice.value === "claude-opus-4-8")).toBeGreaterThan(0)
+  })
+})
+
+describe("claudeModelPickerState", () => {
+  test("returns clearOption as first entry when current is undefined", () => {
+    const state = claudeModelPickerState(undefined)
+    expect(state.options[0]).toEqual({ value: "", label: "inherit — clear override", providerID: "" })
+    expect(state.index).toBe(0)
+  })
+
+  test("includes claude-code aliases after clearOption", () => {
+    const state = claudeModelPickerState(undefined)
+    expect(state.options.length).toBeGreaterThan(1)
+    const aliasOptions = state.options.slice(1)
+    for (const option of aliasOptions) {
+      expect(option.providerID).toBe("claude-code")
+    }
+  })
+
+  test("finds the current value in options and sets index", () => {
+    const state = claudeModelPickerState("sonnet")
+    expect(state.index).toBeGreaterThan(0)
+    expect(state.options[state.index]!.value).toBe("sonnet")
+  })
+
+  test("appends current value to options when it is not one of the aliases", () => {
+    const state = claudeModelPickerState("claude-opus-4-8")
+    expect(state.options[state.options.length - 1]!.value).toBe("claude-opus-4-8")
+    expect(state.options[state.options.length - 1]!.label).toBe("Claude claude-opus-4-8 · current")
+  })
+
+  test("does not duplicate current value when it matches an alias", () => {
+    const state = claudeModelPickerState("sonnet")
+    const lastOption = state.options[state.options.length - 1]!
+    expect(lastOption.value).not.toBe("sonnet")
+    expect(lastOption.label).not.toContain("· current")
+  })
+
+  test("sets index to 0 when current is empty string", () => {
+    const state = claudeModelPickerState("")
+    expect(state.index).toBe(0)
   })
 })
 
@@ -218,8 +307,11 @@ describe("reports helpers", () => {
     const list = steps()
     expect(priorStepNames(list, 0)).toEqual([])
     expect(priorStepNames(list, 1)).toEqual(["scope"])
-    // A member of the group at index 1 sees the same names as the group itself.
     expect(priorStepNames(list, 3)).toEqual(["scope", "bug-auditor", "security"])
+  })
+
+  test("priorStepNames with an empty list", () => {
+    expect(priorStepNames([], 0)).toEqual([])
   })
 
   test("stepValueSummary shows the fan-out count and explicitly set fields", () => {
@@ -235,5 +327,13 @@ describe("reports helpers", () => {
     expect(stepValueSummary({ agent: "x", model: "a/b", advisor: false })).toBe("a/b · no advisor")
     expect(stepValueSummary({ agent: "x", model: "a/b" })).toBe("a/b")
     expect(stepValueSummary({ agent: "x", model: "a/b", advisor: "c/d", advisorMaxCalls: 2 })).toBe("a/b · advisor c/d · advisor×2")
+  })
+
+  test("stepValueSummary handles reports as a string", () => {
+    expect(stepValueSummary({ agent: "x", reports: "all" })).toBe("(inherits) · reports all")
+  })
+
+  test("stepValueSummary handles diff on", () => {
+    expect(stepValueSummary({ agent: "x", diff: true })).toBe("(inherits) · diff on")
   })
 })

@@ -152,3 +152,193 @@ describe("run liveness detection", () => {
     }
   })
 })
+
+describe("statusSummary (pure function exercised through listRuns)", () => {
+  test("lists all expected run IDs", async () => {
+    const runs = await listRuns(root)
+    const ids = runs.map(r => r.runID)
+    expect(ids).toContain("20260610-120000-bbbb")
+    expect(ids).toContain("20260601-090000-aaaa")
+  })
+
+  test("creates and finds a new run", async () => {
+    const runID = "20260612-000000-debg"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" }, phases: { x: { status: "completed" } },
+    }))
+    const { readFile } = await import("node:fs/promises")
+    const content = await readFile(join(dir, "metadata.json"), "utf8")
+    expect(content).toContain("schemaVersion")
+    const runs = await listRuns(root)
+    const found = runs.find(r => r.runID === runID)
+    expect(found).toBeDefined()
+    expect(found!.statusKind).toBe("completed")
+  })
+
+  test("no metadata → {label: '-', kind: 'unknown'}", async () => {
+    const dir = join(root, "20260601-090000-aaaa")
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === "20260601-090000-aaaa")!
+    expect(run.status).toBe("-")
+    expect(run.statusKind).toBe("unknown")
+  })
+
+  test("empty phases → status 'empty' kind 'empty'", async () => {
+    const runID = "20260612-010000-empt"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "# Empty phases\n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" }, phases: {},
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.status).toBe("empty")
+    expect(run!.statusKind).toBe("empty")
+  })
+
+  test("all completed → status 'completed' kind 'completed'", async () => {
+    const runID = "20260612-020000-comp"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "# All completed\n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" },
+      phases: { a: { status: "completed" }, b: { status: "completed" } },
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.status).toBe("completed")
+    expect(run!.statusKind).toBe("completed")
+  })
+
+  test("all completed/skipped → status 'completed' kind 'completed'", async () => {
+    const runID = "20260612-030000-skip"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "# With skipped\n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" },
+      phases: { a: { status: "completed" }, b: { status: "skipped" } },
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.status).toBe("completed")
+    expect(run!.statusKind).toBe("completed")
+  })
+
+  test("any failed → status 'failed (X/Y ok)' kind 'failed'", async () => {
+    const runID = "20260612-040000-fail"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "# Has failure\n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" },
+      phases: { a: { status: "completed" }, b: { status: "failed" }, c: { status: "completed" } },
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.status).toBe("failed (2/3 ok)")
+    expect(run!.statusKind).toBe("failed")
+  })
+
+  test("some completed, some pending → status 'incomplete (X/Y)' kind 'incomplete'", async () => {
+    const runID = "20260612-050000-pend"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "# Incomplete\n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" },
+      phases: { a: { status: "completed" }, b: { status: "pending" } },
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.status).toBe("incomplete (1/2)")
+    expect(run!.statusKind).toBe("incomplete")
+  })
+})
+
+describe("runTitle (pure function exercised through listRuns)", () => {
+  test("returns '(no prd)' when prd.md does not exist", async () => {
+    const runID = "20260612-060000-nopr"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" }, phases: { a: { status: "completed" } },
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.title).toBe("(no prd)")
+  })
+
+  test("returns '(empty prd)' when prd.md has no non-whitespace content", async () => {
+    const runID = "20260612-070000-empt"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "   \n\n#   \n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" }, phases: { a: { status: "completed" } },
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.title).toBe("(empty prd)")
+  })
+
+  test("returns first non-empty heading line from prd.md", async () => {
+    const runID = "20260612-080000-head"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "\n\n##  \n# My Feature Title\n\ndetails\n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" }, phases: { a: { status: "completed" } },
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.title).toBe("My Feature Title")
+  })
+
+  test("truncates long headings to 60 chars", async () => {
+    const longHeading = "# " + "a very long heading that definitely exceeds the sixty character truncation limit in the runs module"
+    const runID = "20260612-090000-long"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), longHeading + "\n")
+    await writeFile(join(dir, "metadata.json"), JSON.stringify({
+      schemaVersion: 3, runID, targetDir: "/tmp", createdAt: 1, updatedAt: 2,
+      control: { state: "running" }, phases: { a: { status: "completed" } },
+    }))
+
+    const runs = await listRuns(root)
+    const run = runs.find((r) => r.runID === runID)
+    expect(run).toBeDefined()
+    expect(run!.title.length).toBeLessThanOrEqual(63)
+    expect(run!.title.endsWith("...")).toBe(true)
+  })
+})

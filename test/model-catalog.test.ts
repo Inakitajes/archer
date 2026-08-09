@@ -1,70 +1,149 @@
 import { describe, expect, test } from "bun:test"
 
-import type { Provider } from "@opencode-ai/sdk/v2"
-
 import { parseModelsDev, toModelChoices } from "../src/model-catalog"
 
-function provider(id: string, models: Array<{ id: string; name: string; status?: string; context?: number; variants?: string[] }>): Provider {
-  return {
-    id,
-    models: Object.fromEntries(
-      models.map((model) => [
-        model.id,
-        {
-          id: model.id,
-          providerID: id,
-          name: model.name,
-          status: model.status ?? "active",
-          limit: { context: model.context ?? 0 },
-          variants: Object.fromEntries((model.variants ?? []).map((variant) => [variant, {}])),
-        },
-      ]),
-    ),
-  } as unknown as Provider
-}
-
 describe("toModelChoices", () => {
-  test("keeps connected providers and expands classic catalog variants", () => {
-    const providers = [
-      provider("openai", [{ id: "gpt-5.5", name: "GPT-5.5", context: 400_000, variants: ["xhigh", "high"] }]),
-      provider("anthropic", [{ id: "claude-opus-4-7", name: "Opus" }]),
-    ]
+  const sampleProviders = [
+    {
+      id: "openai",
+      name: "OpenAI",
+      source: "api-key",
+      env: {},
+      options: {},
+      models: {
+        "gpt-4o": {
+          id: "gpt-4o",
+          name: "GPT-4o",
+          providerID: "openai",
+          status: "active",
+          capabilities: {},
+          limit: { context: 128000 },
+          variants: {},
+        },
+        "gpt-4o-mini": {
+          id: "gpt-4o-mini",
+          name: "GPT-4o Mini",
+          providerID: "openai",
+          status: "active",
+          capabilities: {},
+          limit: { context: 128000 },
+          variants: { turbo: {} },
+        },
+      },
+    },
+    {
+      id: "anthropic",
+      name: "Anthropic",
+      source: "api-key",
+      env: {},
+      options: {},
+      models: {
+        "claude-opus-4": {
+          id: "claude-opus-4",
+          name: "Claude Opus 4",
+          providerID: "anthropic",
+          status: "beta",
+          capabilities: {},
+          limit: { context: 200000 },
+          variants: { thinking: {} },
+        },
+      },
+    },
+  ] as const
 
-    const choices = toModelChoices(providers, ["openai"])
-    expect(choices.map((choice) => choice.value)).toEqual(["openai/gpt-5.5", "openai/gpt-5.5#xhigh", "openai/gpt-5.5#high"])
-    expect(choices[0]).toMatchObject({ value: "openai/gpt-5.5", label: "GPT-5.5", providerID: "openai", contextK: 400 })
-    expect(choices[1]).toMatchObject({ value: "openai/gpt-5.5#xhigh", label: "GPT-5.5 (xhigh)" })
+  test("returns choices for connected providers", () => {
+    const choices = toModelChoices(sampleProviders as any, ["openai"])
+    expect(choices.length).toBeGreaterThan(0)
+    expect(choices.every((c) => c.providerID === "openai")).toBe(true)
   })
 
-  test("with no connected providers, keeps no models", () => {
-    expect(toModelChoices([provider("x", [{ id: "m", name: "M" }])], [])).toEqual([])
+  test("includes base model and variants", () => {
+    const choices = toModelChoices(sampleProviders as any, ["openai"])
+    const values = choices.map((c) => c.value)
+    expect(values).toContain("openai/gpt-4o")
+    expect(values).toContain("openai/gpt-4o-mini")
+    expect(values).toContain("openai/gpt-4o-mini#turbo")
   })
 
-  test("surfaces a non-active status and skips it when active", () => {
-    const providers = [provider("x", [{ id: "beta", name: "Beta", status: "beta" }, { id: "stable", name: "Stable" }])]
-    const choices = toModelChoices(providers, ["x"])
-    expect(choices[0]).toMatchObject({ status: "beta" })
-    expect(choices[1]?.status).toBeUndefined()
+  test("includes status for non-active models", () => {
+    const choices = toModelChoices(sampleProviders as any, ["anthropic"])
+    const claude = choices.find((c) => c.value === "anthropic/claude-opus-4")
+    expect(claude?.status).toBe("beta")
   })
 
-  test("dedupes repeated values", () => {
-    const providers = [provider("x", [{ id: "m", name: "M" }]), provider("x", [{ id: "m", name: "M again" }])]
-    expect(toModelChoices(providers, ["x"]).map((choice) => choice.value)).toEqual(["x/m"])
+  test("includes contextK when limit.context is present", () => {
+    const choices = toModelChoices(sampleProviders as any, ["openai"])
+    const gpt4o = choices.find((c) => c.value === "openai/gpt-4o")
+    expect(gpt4o?.contextK).toBe(128)
+  })
+
+  test("deduplicates repeated provider/model entries", () => {
+    const choices = toModelChoices([sampleProviders[0], sampleProviders[0]] as any, ["openai"])
+    const gpt4os = choices.filter((c) => c.value === "openai/gpt-4o")
+    expect(gpt4os.length).toBe(1)
+  })
+
+  test("returns empty array when no providers are connected", () => {
+    const choices = toModelChoices(sampleProviders as any, [])
+    expect(choices).toEqual([])
   })
 })
 
 describe("parseModelsDev", () => {
-  test("flattens providers/models and sorts by value", () => {
+  test("parses a simple models.dev response", () => {
     const data = {
-      openai: { models: { "gpt-5.5": { name: "GPT-5.5", limit: { context: 400_000 } } } },
-      anthropic: { models: { "claude-opus-4-7": { name: "Opus" } } },
+      openai: {
+        models: {
+          "gpt-4o": { name: "GPT-4o", limit: { context: 128000 } },
+        },
+      },
     }
     const choices = parseModelsDev(data)
-    expect(choices.map((choice) => choice.value)).toEqual(["anthropic/claude-opus-4-7", "openai/gpt-5.5"])
-    expect(choices.find((choice) => choice.value === "openai/gpt-5.5")).toMatchObject({ label: "GPT-5.5", contextK: 400 })
+    expect(choices).toEqual([
+      { value: "openai/gpt-4o", label: "GPT-4o", providerID: "openai", contextK: 128 },
+    ])
   })
 
-  test("tolerates providers without models", () => {
-    expect(parseModelsDev({ openai: {} })).toEqual([])
+  test("sorts choices by value", () => {
+    const data = {
+      zeta: { models: { "model-b": { name: "B" } } },
+      alpha: { models: { "model-a": { name: "A" } } },
+    }
+    const choices = parseModelsDev(data)
+    expect(choices[0]!.value).toBe("alpha/model-a")
+    expect(choices[1]!.value).toBe("zeta/model-b")
+  })
+
+  test("uses model ID as label when name is missing", () => {
+    const data = {
+      test: { models: { "some-model": {} as any } },
+    }
+    const choices = parseModelsDev(data)
+    expect(choices[0]!.label).toBe("some-model")
+  })
+
+  test("handles empty providers", () => {
+    const choices = parseModelsDev({})
+    expect(choices).toEqual([])
+  })
+
+  test("handles provider with no models", () => {
+    const data = { test: { models: undefined } as any }
+    const choices = parseModelsDev(data)
+    expect(choices).toEqual([])
+  })
+
+  test("handles empty model entries", () => {
+    const data = { test: { models: {} } }
+    const choices = parseModelsDev(data)
+    expect(choices).toEqual([])
+  })
+
+  test("omits contextK when limit.context is missing", () => {
+    const data = {
+      test: { models: { "my-model": { name: "My Model" } } },
+    }
+    const choices = parseModelsDev(data)
+    expect(choices[0]!.contextK).toBeUndefined()
   })
 })

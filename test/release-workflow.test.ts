@@ -55,7 +55,7 @@ describe("pull-request CI workflow", () => {
     expect(verify).toContain("bun install --frozen-lockfile --os='*' --cpu='*'")
     expect(verify).toContain("for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do")
     expect(verify).toContain("bun run typecheck")
-    expect(verify).toContain("bun test --coverage")
+    expect(verify).toContain("run: bun run test:coverage")
     expect(verify).toContain("bun run build")
   })
 })

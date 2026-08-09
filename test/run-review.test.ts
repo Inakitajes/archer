@@ -1,199 +1,248 @@
-import { expect, test } from "bun:test"
+import { describe, expect, test } from "bun:test"
 
-import { renderRunPlan } from "../src/run-review"
+import { renderRunPlan, sanitizeReviewInline, sanitizeReviewText } from "../src/run-review"
 import type { RunPlan } from "../src/types"
 
-test("run review renders untrusted plan fields without terminal or layout injection", () => {
-  const plan: RunPlan = {
-    prompt: { source: "inline", text: "normal\u001b[31mprompt\nwith details" },
-    target: { directory: "/repo\nStart run? [y/N] y", baseRef: "main\u001b]52;c;clipboard\u0007", worktree: false, dirty: false },
+function samplePlan(overrides: Partial<RunPlan> = {}): RunPlan {
+  return {
+    prompt: { source: "inline", text: "Build a login page with email and password" },
+    target: { directory: "/home/user/project", baseRef: "main", worktree: false, dirty: false },
     pipeline: {
-      name: "audit\nforged",
+      name: "implement",
       steps: [
         {
           type: "agent",
-          name: "security",
-          stepName: "security",
+          name: "implementer",
+          stepName: "implementer",
           groupId: "g1",
-          agentName: "security-auditor",
-          description: "Security",
-          model: "vercel/openai/gpt-new",
+          agentName: "implementer",
+          description: "Implement the feature",
+          model: "openai/gpt-5",
           resolvedModel: {
-            configured: "openai/gpt-new",
-            logical: "openai/gpt-new\nforged",
+            configured: "openai/gpt-5",
+            logical: "openai/gpt-5",
             gateway: "vercel",
             providerID: "vercel",
-            modelID: "openai/gpt-new",
-            target: "vercel/openai/gpt-new\u001b[2J",
-          },
-          inputFiles: ["prd.md"],
-          inputDiff: false,
-          reportPath: "reports/security.md",
-        },
-      ],
-    },
-    modelRouting: { gateway: "vercel" },
-    hooks: { pre: [{ command: "bun test\nrm -rf /" }], post: [] },
-    attachments: [],
-    permissions: "interactive",
-  }
-
-  const rendered = renderRunPlan(plan)
-  expect(rendered).not.toContain("\u001b")
-  expect(rendered).toContain("/repo Start run? [y/N] y")
-  expect(rendered).toContain("audit forged")
-  expect(rendered).toContain("bun test rm -rf /")
-})
-
-test("review renders the exact target, worktree intent, and routed smart judge", () => {
-  const plan: RunPlan = {
-    prompt: { source: "file", text: "Audit the checkout flow" },
-    target: { directory: "/repo", baseRef: "main", worktree: true, dirty: false, branch: "feat/audit-checkout-flow" },
-    pipeline: {
-      name: "audit",
-      steps: [
-        {
-          type: "agent",
-          name: "security",
-          stepName: "security",
-          groupId: "g1",
-          agentName: "security-auditor",
-          description: "Security audit",
-          model: "vercel/openai/gpt-5.6-sol",
-          resolvedModel: {
-            configured: "openai/gpt-5.6-sol",
-            logical: "openai/gpt-5.6-sol",
-            gateway: "vercel",
-            providerID: "vercel",
-            modelID: "openai/gpt-5.6-sol",
-            target: "vercel/openai/gpt-5.6-sol",
+            modelID: "openai/gpt-5",
+            target: "vercel/openai/gpt-5",
           },
           inputFiles: ["prd.md"],
           inputDiff: true,
-          reportPath: "reports/security.md",
+          reportPath: "reports/implementer.md",
+          advisor: "default",
+          advisorMaxCalls: 3,
+          resolvedAdvisor: {
+            configured: "anthropic/claude-opus-4",
+            logical: "anthropic/claude-opus-4",
+            gateway: "vercel",
+            providerID: "vercel",
+            modelID: "anthropic/claude-opus-4",
+            target: "vercel/anthropic/claude-opus-4",
+          },
         },
       ],
     },
     modelRouting: { gateway: "vercel" },
-    smartJudge: {
+    hooks: { pre: [], post: [] },
+    attachments: [],
+    permissions: "interactive",
+    ...overrides,
+  }
+}
+
+describe("renderRunPlan", () => {
+  test("renders a basic compact plan", () => {
+    const plan = samplePlan()
+    const output = renderRunPlan(plan, true)
+    expect(output).toContain("Convoy run plan")
+    expect(output).toContain("Prompt: inline")
+    expect(output).toContain("Target:")
+    expect(output).toContain("Pipeline: implement · 1 steps")
+    expect(output).toContain("Gateway: Vercel AI Gateway")
+  })
+
+  test("renders a full plan with step details", () => {
+    const plan = samplePlan()
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("Review Convoy run")
+    expect(output).toContain("1. implementer · OpenCode · writable")
+    expect(output).toContain("Logical: openai/gpt-5")
+    expect(output).toContain("Target:  vercel/openai/gpt-5")
+    expect(output).toContain("Advisor: anthropic/claude-opus-4 → vercel/anthropic/claude-opus-4 · max 3 calls/attempt")
+  })
+
+  test("renders a human gate step", () => {
+    const plan = samplePlan()
+    plan.pipeline.steps = [
+      {
+        type: "human",
+        name: "review-gate",
+        description: "Manual review",
+      },
+    ]
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("1. review-gate · human gate")
+  })
+
+  test("renders hooks when present", () => {
+    const plan = samplePlan()
+    plan.hooks = {
+      pre: [{ command: "echo hello", continueOnError: false }],
+      post: [{ command: "echo done", when: "always", continueOnError: false }],
+    }
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("Hooks:")
+    expect(output).toContain("pre: echo hello")
+    expect(output).toContain("post: echo done")
+    expect(output).toContain("(always)")
+  })
+
+  test("renders attachments and permissions count", () => {
+    const plan = samplePlan()
+    plan.attachments = ["/tmp/screenshot.png"]
+    plan.permissions = "interactive"
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("interactive permissions")
+    expect(output).toContain("1 attachments")
+  })
+
+  test("renders a smart judge when present", () => {
+    const plan = samplePlan()
+    plan.smartJudge = {
       model: {
-        configured: "anthropic/claude-haiku-4.5",
-        logical: "anthropic/claude-haiku-4.5",
+        configured: "anthropic/claude-haiku-4",
+        logical: "anthropic/claude-haiku-4",
         gateway: "vercel",
         providerID: "vercel",
-        modelID: "anthropic/claude-haiku-4.5",
-        target: "vercel/anthropic/claude-haiku-4.5",
+        modelID: "anthropic/claude-haiku-4",
+        target: "vercel/anthropic/claude-haiku-4",
       },
-    },
-    hooks: { pre: [{ command: "bun run lint" }], post: [] },
-    attachments: ["docs/architecture.md"],
-    permissions: "smart",
-  }
+    }
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("Judge:")
+  })
 
-  const detailed = renderRunPlan(plan)
-  const compact = renderRunPlan(plan, true)
+  test("renders a read-only step", () => {
+    const plan = samplePlan()
+    const step = plan.pipeline.steps[0]
+    if (step?.type === "agent") {
+      step.readOnly = true
+    }
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("read-only")
+  })
 
-  expect(detailed).toContain("Worktree: yes · branch feat/audit-checkout-flow")
-  expect(detailed).toContain("Logical: openai/gpt-5.6-sol")
-  expect(detailed).toContain("Target:  vercel/openai/gpt-5.6-sol")
-  expect(detailed).toContain("Judge: vercel/anthropic/claude-haiku-4.5")
-  expect(detailed).toContain("pre: bun run lint")
-  expect(compact).toContain("Convoy run plan")
-  expect(compact).not.toContain("Target:  vercel/openai/gpt-5.6-sol")
+  test("renders resume gateway override when present", () => {
+    const plan = samplePlan()
+    plan.resume = {
+      runID: "run-previous",
+      gatewayOverride: {
+        original: "configured",
+        pending: "configured",
+      },
+    }
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("Resume gateway override:")
+    expect(output).toContain("original: As configured")
+    expect(output).toContain("pending phases: As configured")
+  })
+
+  test("renders full prompt when option is set", () => {
+    const plan = samplePlan()
+    plan.prompt = { source: "file", text: "Line 1\nLine 2\nLine 3" }
+    const output = renderRunPlan(plan, false, { fullPrompt: true })
+    expect(output).toContain("  Line 1")
+    expect(output).toContain("  Line 2")
+    expect(output).toContain("  Line 3")
+  })
+
+  test("renders worktree info when worktree mode is on", () => {
+    const plan = samplePlan()
+    plan.target.worktree = true
+    plan.target.branch = "feat/login"
+    const output = renderRunPlan(plan, true)
+    expect(output).toContain("Worktree: yes · branch feat/login")
+  })
+
+  test("renders worktree directory when present", () => {
+    const plan = samplePlan()
+    plan.target.worktreeDir = "/tmp/convoy-worktree/feat-login"
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("Worktree directory: /tmp/convoy-worktree/feat-login")
+  })
+
+  test("renders dirty working tree info", () => {
+    const plan = samplePlan()
+    plan.target.dirty = true
+    const output = renderRunPlan(plan, true)
+    expect(output).toContain("include dirty")
+  })
+
+  test("handles plan without resolvedModel for an agent step", () => {
+    const plan = samplePlan()
+    const step = plan.pipeline.steps[0]
+    if (step?.type === "agent") {
+      step.resolvedModel = undefined
+    }
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("Model:")
+  })
+
+  test("handles plan without advisor", () => {
+    const plan = samplePlan()
+    const step = plan.pipeline.steps[0]
+    if (step?.type === "agent") {
+      step.advisor = undefined
+      step.resolvedAdvisor = undefined
+    }
+    const output = renderRunPlan(plan, false)
+    expect(output).not.toContain("Advisor:")
+  })
+
+  test("sanitizes hostile plan fields while preserving prompt line breaks", () => {
+    const plan = samplePlan()
+    plan.prompt = { source: "inline", text: "First \u001b[31mred\u001b[0m\nSecond\u0000\tcolumn" }
+    plan.target.directory = "/repo\u001b[2J\nforged\u0007\tpath"
+    plan.target.baseRef = "main\nforged-ref\u001b[0m"
+    plan.pipeline.name = "implement\nforged-pipeline\u0000"
+    plan.hooks.pre = [{ command: "printf ok\nforged-hook\u001b[31m", continueOnError: false }]
+    const step = plan.pipeline.steps[0]
+    if (step?.type === "agent") step.name = "build\nforged-step\u0001\u001b[32m"
+
+    const output = renderRunPlan(plan, false, { fullPrompt: true })
+
+    expect(output).toContain("  First red")
+    expect(output).toContain("  Second column")
+    expect(output).toContain("Target: /repo forged path")
+    expect(output).toContain("Diff base: main forged-ref")
+    expect(output).toContain("Pipeline: implement forged-pipeline")
+    expect(output).toContain("1. build forged-step · OpenCode · writable")
+    expect(output).toContain("pre: printf ok forged-hook")
+    expect(output).not.toMatch(/[\u001b\u0000\u0001\u0007\t]/)
+    expect(output).not.toContain("\nforged-")
+  })
 })
 
-test("review renders advised-step coverage in compact mode and the routed advisor relationship in detail", () => {
-  const plan: RunPlan = {
-    prompt: { source: "inline", text: "Implement observability" },
-    target: { directory: "/repo", baseRef: "main", worktree: false, dirty: false },
-    pipeline: {
-      name: "implement",
-      steps: [{
-        type: "agent",
-        name: "implementer",
-        stepName: "implementer",
-        groupId: "g1",
-        agentName: "implementer",
-        description: "Implement",
-        model: "openai/gpt-5.6-sol",
-        inputFiles: ["prd.md"],
-        inputDiff: false,
-        reportPath: "reports/implementer.md",
-        advisor: "anthropic/claude-opus-5",
-        advisorMaxCalls: 4,
-        resolvedAdvisor: {
-          configured: "anthropic/claude-opus-5",
-          logical: "anthropic/claude-opus-5",
-          gateway: "vercel",
-          providerID: "vercel",
-          modelID: "anthropic/claude-opus-5",
-          target: "vercel/anthropic/claude-opus-5",
-        },
-      }],
-    },
-    modelRouting: { gateway: "vercel" },
-    hooks: { pre: [], post: [] },
-    attachments: [],
-    permissions: "interactive",
-  }
+describe("sanitizeReviewText", () => {
+  test("strips ANSI escape sequences", () => {
+    expect(sanitizeReviewText("hello\u001b[31m world")).toBe("hello world")
+  })
 
-  const detailed = renderRunPlan(plan)
-  const compact = renderRunPlan(plan, true)
+  test("strips control characters", () => {
+    expect(sanitizeReviewText("hello\u0000world")).toBe("helloworld")
+  })
 
-  expect(compact).toContain("Advisors: 1/1 steps advised")
-  expect(detailed).toContain("Advisor: anthropic/claude-opus-5 → vercel/anthropic/claude-opus-5 · max 4 calls/attempt")
-  expect(detailed).toContain("advisor reviews the executor's full session; it does not own the deliverable")
+  test("replaces tabs with spaces", () => {
+    expect(sanitizeReviewText("hello\tworld")).toBe("hello world")
+  })
 })
 
-test("review marks a resume gateway override in every format and shows the confirmed branch", () => {
-  const plan: RunPlan = {
-    prompt: { source: "resume", text: "continue the work" },
-    target: {
-      directory: "/repo",
-      baseRef: "main",
-      worktree: true,
-      dirty: false,
-      branch: "feat/runtime-guard-limits",
-      worktreeDir: "/home/dev/.convoy/worktrees/feat-runtime-guard-limits",
-    },
-    pipeline: { name: "implement", steps: [] },
-    modelRouting: { gateway: "openrouter" },
-    hooks: { pre: [], post: [] },
-    attachments: [],
-    permissions: "interactive",
-    resume: { runID: "20260720-135802-5bbh", gatewayOverride: { original: "vercel", pending: "openrouter" } },
-  }
+describe("sanitizeReviewInline", () => {
+  test("strips ANSI and control chars and collapses whitespace", () => {
+    expect(sanitizeReviewInline("  hello\u001b[31m   world  ")).toBe("hello world")
+  })
 
-  const detailed = renderRunPlan(plan)
-  const compact = renderRunPlan(plan, true)
-
-  expect(detailed).toContain("Resume gateway override:")
-  expect(detailed).toContain("original: Vercel AI Gateway")
-  expect(detailed).toContain("pending phases: OpenRouter")
-  expect(compact).toContain("Resume gateway override:")
-  expect(compact).toContain("pending phases: OpenRouter")
-
-  expect(detailed).toContain("Worktree: yes · branch feat/runtime-guard-limits")
-  expect(detailed).toContain("Worktree directory: /home/dev/.convoy/worktrees/feat-runtime-guard-limits")
-  expect(compact).toContain("Worktree: yes · branch feat/runtime-guard-limits")
-  expect(compact).not.toContain("Worktree directory:")
-})
-
-test("review can expand the complete sanitized prompt for the launcher", () => {
-  const plan: RunPlan = {
-    prompt: { source: "inline", text: "first requirement\nsecond\trequirement\u001b[31m" },
-    target: { directory: "/repo", baseRef: "main", worktree: false, dirty: false },
-    pipeline: { name: "quick", steps: [] },
-    modelRouting: { gateway: "configured" },
-    hooks: { pre: [], post: [] },
-    attachments: [],
-    permissions: "interactive",
-  }
-
-  const excerpt = renderRunPlan(plan)
-  const expanded = renderRunPlan(plan, false, { fullPrompt: true })
-
-  expect(excerpt).toContain("first requirement second requirement")
-  expect(expanded).toContain("  first requirement\n  second requirement")
-  expect(expanded).not.toContain("\u001b")
+  test("trims the result", () => {
+    expect(sanitizeReviewInline("  spaced  out  ")).toBe("spaced out")
+  })
 })

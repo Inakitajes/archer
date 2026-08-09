@@ -961,3 +961,12 @@ ${builtInAgents
   .join("\n")}
 `
 }
+
+export const __testing = {
+  listValue,
+  parseInitArgs,
+  resolveBaseRef,
+  resolveWorktreeOption,
+  splitFlag,
+  writeUpdateResult,
+}

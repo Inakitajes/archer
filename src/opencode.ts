@@ -14,16 +14,26 @@ export type OpencodeHandle = {
   close(): void
 }
 
-export async function startOpencode(config: Config, signal?: AbortSignal): Promise<OpencodeHandle> {
-  const port = await freePort()
-  const server = await createOpencodeServer({
+type StartOpencodeDeps = {
+  getFreePort(): Promise<number>
+  createServer(options: Parameters<typeof createOpencodeServer>[0]): Promise<{ url: string; close(): void }>
+  createClient(options: Parameters<typeof createOpencodeClient>[0]): OpencodeClient
+}
+
+export async function startOpencode(
+  config: Config,
+  signal?: AbortSignal,
+  deps?: Partial<StartOpencodeDeps>,
+): Promise<OpencodeHandle> {
+  const port = await (deps?.getFreePort ?? freePort)()
+  const server = await (deps?.createServer ?? createOpencodeServer)({
     hostname: "127.0.0.1",
     port,
     timeout: 30_000,
     signal,
     config,
   })
-  const client = createOpencodeClient({ baseUrl: server.url, fetch: fetchWithoutIdleTimeout as typeof fetch })
+  const client = (deps?.createClient ?? createOpencodeClient)({ baseUrl: server.url, fetch: fetchWithoutIdleTimeout as typeof fetch })
 
   return {
     client,
