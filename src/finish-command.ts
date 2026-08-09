@@ -231,7 +231,7 @@ function interactive(): boolean {
   return Boolean(stdin.isTTY && stdout.isTTY)
 }
 
-function indent(value: string) {
+export function indent(value: string) {
   return value
     .split("\n")
     .map((line) => `  ${line}`)

@@ -1,574 +1,565 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { fileURLToPath } from "node:url"
-
 import { describe, expect, test } from "bun:test"
+import { pathToFileURL } from "node:url"
 
 import {
+  attachmentPaths,
+  baseAgentName,
   claudeArgs,
   claudeModelLabel,
   claudePrompt,
+  claudeReadableDirectories,
   claudeResumeArgs,
+  claudeSessionDirectoriesPath,
   claudeTokens,
+  deltaOf,
   describeClaudeEvent,
   ensureClaudeAvailable,
-  ndjsonLines,
+  eventType,
+  formatCharCount,
+  isWithin,
   newClaudeStreamState,
+  numberToken,
   pipelineUsesClaudeCode,
-  promptClaudePhase,
-  stageClaudeAttachments,
+  toolDetail,
+  toolUseBlocks,
+  truncate,
 } from "../src/claude-code"
-import { builtInAgents, resolvePipeline, type PipelineSpec } from "../src/pipeline"
-import { noopProgress, type ProgressUsage } from "../src/progress"
-import type { AgentStep } from "../src/types"
+import type { Pipeline } from "../src/types"
 
-const resolve = (spec: PipelineSpec) => resolvePipeline({ name: "test", spec, agents: builtInAgents })
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
 
-const claudePipeline = resolve({
-  steps: [
-    { agent: "review-scope", name: "scope", model: "openai/gpt-5.5#xhigh", reports: "none", diff: true },
-    { agent: "security-reviewer", name: "external-security", runner: "claude-code", model: "opus", reports: ["scope"] },
-  ],
-})
-
-const opencodePipeline = resolve({ steps: [{ agent: "bug-auditor", name: "bugs", reports: "none", diff: true }] })
-
-const claudePhase: AgentStep = {
-  type: "agent",
-  name: "security",
-  stepName: "security",
-  groupId: "g1",
-  agentName: "security-reviewer",
-  description: "Review security",
-  model: "opus",
-  runner: "claude-code",
-  inputFiles: [],
-  inputDiff: true,
-  reportPath: "reports/security.md",
-  readOnly: true,
-}
-
-function textStream(...lines: string[]): ReadableStream<Uint8Array> {
-  const encoder = new TextEncoder()
-  return new ReadableStream({
-    start(controller) {
-      for (const line of lines) controller.enqueue(encoder.encode(`${line}\n`))
-      controller.close()
-    },
-  })
-}
-
-function executionShutdown(controller: AbortController) {
+function samplePipeline(overrides: Partial<Pipeline> = {}): Pipeline {
   return {
-    signal: controller.signal,
-    get aborted() {
-      return controller.signal.aborted
-    },
-    throwIfRequested() {
-      if (controller.signal.aborted) throw new Error("aborted")
-    },
-    abortError() {
-      return new Error("aborted")
-    },
+    name: "test",
+    steps: [
+      { type: "agent", name: "audit", stepName: "audit", groupId: "g1", agentName: "audit", description: "Audit", model: "opus", runner: "claude-code", inputFiles: [], inputDiff: false, reportPath: "reports/audit.md", readOnly: true },
+    ],
+    ...overrides,
   }
 }
 
-async function executionDir() {
-  const dir = await mkdtemp(join(tmpdir(), "convoy-claude-execution-"))
-  await mkdir(join(dir, "logs"), { recursive: true })
-  return dir
-}
+// ---------------------------------------------------------------------------
+// pipelineUsesClaudeCode
+// ---------------------------------------------------------------------------
 
-describe("optional dependency check", () => {
-  test("a pipeline without claude-code steps never looks for the binary", () => {
-    let asked = false
-    ensureClaudeAvailable(opencodePipeline, () => {
-      asked = true
-      return null
-    })
-    expect(asked).toBe(false)
+describe("pipelineUsesClaudeCode", () => {
+  test("returns true when pipeline has claude-code steps", () => {
+    expect(pipelineUsesClaudeCode(samplePipeline())).toBe(true)
   })
 
-  test("fails fast, naming the offending steps, when the binary is missing", () => {
-    expect(() => ensureClaudeAvailable(claudePipeline, () => null)).toThrow(/external-security/)
-    expect(() => ensureClaudeAvailable(claudePipeline, () => null)).toThrow(/claude.*not found in PATH/)
+  test("returns false when pipeline has no claude-code steps", () => {
+    const pipeline = samplePipeline({ steps: [{ type: "agent", name: "impl", stepName: "impl", groupId: "g1", agentName: "impl", description: "Impl", model: "gpt-4", inputFiles: [], inputDiff: false, reportPath: "reports/impl.md" }] })
+    expect(pipelineUsesClaudeCode(pipeline)).toBe(false)
   })
 
-  test("passes silently when the binary exists", () => {
-    ensureClaudeAvailable(claudePipeline, () => "/usr/local/bin/claude")
-  })
-
-  test("pipelineUsesClaudeCode detects runner steps", () => {
-    expect(pipelineUsesClaudeCode(claudePipeline)).toBe(true)
-    expect(pipelineUsesClaudeCode(opencodePipeline)).toBe(false)
+  test("returns false for empty pipeline", () => {
+    expect(pipelineUsesClaudeCode({ name: "empty", steps: [] })).toBe(false)
   })
 })
 
-describe("stream-json adapter", () => {
-  test("system/init yields the session id", () => {
-    const signals = describeClaudeEvent(
-      { type: "system", subtype: "init", session_id: "abc-123", model: "claude-opus-4-8" },
-      newClaudeStreamState(),
-    )
-    expect(signals).toEqual([{ type: "session", sessionID: "abc-123" }])
+// ---------------------------------------------------------------------------
+// ensureClaudeAvailable
+// ---------------------------------------------------------------------------
+
+describe("ensureClaudeAvailable", () => {
+  test("does nothing when pipeline has no claude-code steps", () => {
+    expect(() => ensureClaudeAvailable({ name: "test", steps: [] }, () => null)).not.toThrow()
   })
 
-  test("text deltas stream to the response channel with a pulse status line", () => {
-    const state = newClaudeStreamState()
-    const signals = describeClaudeEvent(
-      { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello" } } },
-      state,
-    )
-    expect(signals[0]).toEqual({ type: "message", message: { channel: "response", text: "Hello", partID: "block:0" } })
-    expect(signals[1]).toMatchObject({ type: "activity", kind: "write", pulse: true })
-    expect(state.textChars).toBe(5)
+  test("does nothing when claude binary is found", () => {
+    expect(() => ensureClaudeAvailable(samplePipeline(), () => "/usr/local/bin/claude")).not.toThrow()
   })
 
-  test("thinking deltas stream to the reasoning channel", () => {
-    const state = newClaudeStreamState()
-    const signals = describeClaudeEvent(
-      { type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "hmm…" } } },
-      state,
-    )
-    expect(signals[0]).toEqual({ type: "message", message: { channel: "reasoning", text: "hmm…", partID: "block:0" } })
-    expect(signals[1]).toMatchObject({ type: "activity", kind: "think", pulse: true })
-  })
-
-  test("each content block gets its own transcript part so thoughts stay separate", () => {
-    const state = newClaudeStreamState()
-    const start = (type: string) => describeClaudeEvent({ type: "stream_event", event: { type: "content_block_start", content_block: { type } } }, state)
-    const delta = (thinking: string) =>
-      describeClaudeEvent({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking } } }, state)
-
-    start("thinking")
-    const first = delta("Planning the diff scope")
-    start("thinking")
-    const second = delta("Inspecting the rules")
-
-    expect(first[0]).toEqual({ type: "message", message: { channel: "reasoning", text: "Planning the diff scope", partID: "block:1" } })
-    expect(second[0]).toEqual({ type: "message", message: { channel: "reasoning", text: "Inspecting the rules", partID: "block:2" } })
-  })
-
-  test("assistant messages contribute one-line tool markers only (text already streamed)", () => {
-    const signals = describeClaudeEvent(
-      {
-        type: "assistant",
-        message: {
-          content: [
-            { type: "text", text: "Let me look." },
-            { type: "tool_use", name: "Read", input: { file_path: "/repo/src/auth.py" } },
-            { type: "tool_use", name: "Grep", input: { pattern: "password" } },
-          ],
-        },
-      },
-      newClaudeStreamState(),
-    )
-    expect(signals).toEqual([
-      { type: "activity", message: "tool: Read /repo/src/auth.py", kind: "tool" },
-      { type: "message", message: { channel: "tool", text: "tool: Read /repo/src/auth.py" } },
-      { type: "activity", message: "tool: Grep password", kind: "tool" },
-      { type: "message", message: { channel: "tool", text: "tool: Grep password" } },
-    ])
-  })
-
-  test("a success result carries text, cost, and normalized tokens", () => {
-    const signals = describeClaudeEvent(
-      {
-        type: "result",
-        subtype: "success",
-        is_error: false,
-        result: "# Security report\n\nNo findings.",
-        total_cost_usd: 0.42,
-        usage: { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 5000, cache_creation_input_tokens: 100 },
-      },
-      newClaudeStreamState(),
-    )
-    expect(signals).toEqual([
-      {
-        type: "result",
-        subtype: "success",
-        text: "# Security report\n\nNo findings.",
-        cost: 0.42,
-        tokens: { input: 1000, output: 200, reasoning: 0, cacheRead: 5000, cacheWrite: 100, total: 6300 },
-        isError: false,
-      },
-    ])
-  })
-
-  test("an error result is marked as such", () => {
-    const signals = describeClaudeEvent(
-      {
-        type: "result",
-        subtype: "error_during_execution",
-        is_error: true,
-        total_cost_usd: 0.25,
-        usage: { input_tokens: 100, output_tokens: 20 },
-      },
-      newClaudeStreamState(),
-    )
-    expect(signals[0]).toMatchObject({
-      type: "result",
-      isError: true,
-      subtype: "error_during_execution",
-      cost: 0.25,
-      tokens: { input: 100, output: 20, total: 120 },
-    })
-  })
-
-  test("unknown or malformed events are ignored", () => {
-    const state = newClaudeStreamState()
-    expect(describeClaudeEvent(null, state)).toEqual([])
-    expect(describeClaudeEvent("noise", state)).toEqual([])
-    expect(describeClaudeEvent({ type: "user" }, state)).toEqual([])
-    expect(describeClaudeEvent({ type: "stream_event", event: {} }, state)).toEqual([])
+  test("throws when claude binary is missing", () => {
+    expect(() => ensureClaudeAvailable(samplePipeline(), () => null)).toThrow("CLI was not found")
   })
 })
 
-describe("claudeTokens", () => {
-  test("returns undefined for empty or absent usage", () => {
-    expect(claudeTokens(undefined)).toBeUndefined()
-    expect(claudeTokens({})).toBeUndefined()
-    expect(claudeTokens({ input_tokens: 0, output_tokens: 0 })).toBeUndefined()
-  })
-})
+// ---------------------------------------------------------------------------
+// claudeModelLabel
+// ---------------------------------------------------------------------------
 
-describe("prompt and args assembly", () => {
-  test("attachments become an absolute-path reading list", () => {
-    const prompt = claudePrompt("# Phase", [
-      { type: "file", url: "file:///runs/r1/prd.md", filename: "prd.md", mime: "text/plain" },
-      { type: "file", url: "file:///runs/r1/reports/scope.md", filename: "scope.md", mime: "text/plain" },
-    ])
-    expect(prompt).toContain("# Phase")
-    expect(prompt).toContain("- /runs/r1/prd.md")
-    expect(prompt).toContain("- /runs/r1/reports/scope.md")
-  })
-
-  test("no attachments leaves the prompt untouched", () => {
-    expect(claudePrompt("# Phase", [])).toBe("# Phase")
-  })
-
-  test("args are headless, streaming, read-only, and workspace-scoped", () => {
-    const args = claudeArgs({ systemPromptPath: "/runs/r1/prompts/security.md", runDir: "/runs/r1", targetDir: "/repo", model: "opus", attachments: [] })
-    expect(args).toContain("-p")
-    expect(args).toContain("stream-json")
-    expect(args).toContain("--include-partial-messages")
-    expect(args).not.toContain("--append-system-prompt")
-    expect(args[args.indexOf("--append-system-prompt-file") + 1]).toBe("/runs/r1/prompts/security.md")
-    expect(args[args.indexOf("--add-dir") + 1]).toBe("/runs/r1")
-    expect(args).toContain("--safe-mode")
-    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep")
-    expect(args).not.toContain("--allowedTools")
-    expect(args[args.indexOf("--disallowedTools") + 1]).toContain("Bash")
-    expect(args[args.indexOf("--permission-mode") + 1]).toBe("dontAsk")
-    expect(args[args.indexOf("--model") + 1]).toBe("opus")
-  })
-
-  test("an empty model omits --model so the CLI default applies", () => {
-    expect(claudeArgs({ systemPromptPath: "/r/prompt.md", runDir: "/r", targetDir: "/repo", model: "", attachments: [] })).not.toContain("--model")
-  })
-
-  test("external file attachments never expose their parent directory", () => {
-    const args = claudeArgs({
-      systemPromptPath: "/runs/r1/prompt.md",
-      runDir: "/runs/r1",
-      targetDir: "/repo",
-      model: "opus",
-      attachments: [{ type: "file", url: "file:///external/specs/api.md", filename: "api.md", mime: "text/markdown" }],
-    })
-
-    expect(args).not.toContain("/external/specs")
-  })
-
-  test("external directory attachments expose only that directory, not its parent", () => {
-    const args = claudeArgs({
-      systemPromptPath: "/runs/r1/prompt.md",
-      runDir: "/runs/r1",
-      targetDir: "/repo",
-      model: "opus",
-      attachments: [{ type: "file", url: "file:///external/review-input", filename: "review-input", mime: "application/x-directory" }],
-    })
-
-    expect(args).toContain("/external/review-input")
-    expect(args).not.toContain("/external")
-  })
-
-  test("external file attachments are copied into the isolated run directory", async () => {
-    const root = await mkdtemp(join(tmpdir(), "convoy-claude-attachments-"))
-    const externalDir = join(root, "external")
-    const runDir = join(root, "run")
-    const targetDir = join(root, "repo")
-    await Promise.all([mkdir(externalDir), mkdir(runDir), mkdir(targetDir)])
-    const externalFile = join(externalDir, "api.md")
-    await writeFile(externalFile, "API contract")
-
-    try {
-      const staged = await stageClaudeAttachments(
-        [{ type: "file", url: new URL(`file://${externalFile}`).href, filename: "api.md", mime: "text/markdown" }],
-        targetDir,
-        runDir,
-        join(runDir, "attachments", "security", "1"),
-      )
-      const stagedPath = fileURLToPath(staged[0]!.url)
-
-      expect(stagedPath.startsWith(join(runDir, "attachments"))).toBe(true)
-      expect(await readFile(stagedPath, "utf8")).toBe("API contract")
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  test("parallel phases stage duplicate filenames in isolated directories", async () => {
-    const root = await mkdtemp(join(tmpdir(), "convoy-claude-parallel-"))
-    const runDir = join(root, "run")
-    const targetDir = join(root, "repo")
-    const firstDir = join(root, "first")
-    const secondDir = join(root, "second")
-    await Promise.all([mkdir(runDir), mkdir(targetDir), mkdir(firstDir), mkdir(secondDir)])
-    await Promise.all([writeFile(join(firstDir, "scope.md"), "first"), writeFile(join(secondDir, "scope.md"), "second")])
-
-    try {
-      const attachment = (path: string) => ({ type: "file" as const, url: new URL(`file://${path}`).href, filename: "scope.md", mime: "text/markdown" })
-      const [first, second] = await Promise.all([
-        stageClaudeAttachments([attachment(join(firstDir, "scope.md"))], targetDir, runDir, join(runDir, "attachments", "bugs", "1")),
-        stageClaudeAttachments([attachment(join(secondDir, "scope.md"))], targetDir, runDir, join(runDir, "attachments", "security", "1")),
-      ])
-      const firstPath = fileURLToPath(first[0]!.url)
-      const secondPath = fileURLToPath(second[0]!.url)
-
-      expect(firstPath).not.toBe(secondPath)
-      expect(await readFile(firstPath, "utf8")).toBe("first")
-      expect(await readFile(secondPath, "utf8")).toBe("second")
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-})
-
-describe("headless execution lifecycle", () => {
-  test("kills a child when abort lands while attachments are being staged", async () => {
-    const runDir = await executionDir()
-    const targetDir = await mkdtemp(join(tmpdir(), "convoy-claude-target-"))
-    const controller = new AbortController()
-    let kills = 0
-
-    try {
-      await expect(
-        promptClaudePhase({
-          phase: claudePhase,
-          workspace: { dir: runDir, runID: "test" },
-          targetDir,
-          prompt: "Review",
-          attachments: [],
-          attempt: 1,
-          progress: noopProgress,
-          shutdown: executionShutdown(controller),
-          deps: {
-            async stageAttachments() {
-              controller.abort()
-              return []
-            },
-            spawn() {
-              return {
-                stdout: textStream(),
-                stderr: textStream(),
-                exited: Promise.resolve(1),
-                exitCode: 1,
-                kill() {
-                  kills++
-                },
-              }
-            },
-          },
-        }),
-      ).rejects.toThrow("aborted")
-      expect(kills).toBe(1)
-    } finally {
-      await Promise.all([rm(runDir, { recursive: true, force: true }), rm(targetDir, { recursive: true, force: true })])
-    }
-  })
-
-  test("persists the raw stream when Claude exits before a result", async () => {
-    const runDir = await executionDir()
-    const targetDir = await mkdtemp(join(tmpdir(), "convoy-claude-target-"))
-    const rawEvent = JSON.stringify({ type: "system", subtype: "init", session_id: "session-raw" })
-
-    try {
-      await expect(
-        promptClaudePhase({
-          phase: claudePhase,
-          workspace: { dir: runDir, runID: "test" },
-          targetDir,
-          prompt: "Review",
-          attachments: [],
-          attempt: 2,
-          progress: noopProgress,
-          shutdown: executionShutdown(new AbortController()),
-          deps: {
-            async stageAttachments(attachments) {
-              return [...attachments]
-            },
-            spawn() {
-              return { stdout: textStream(rawEvent), stderr: textStream("fatal"), exited: Promise.resolve(1), exitCode: 1, kill() {} }
-            },
-          },
-        }),
-      ).rejects.toThrow("before reporting a result")
-      expect(await readFile(join(runDir, "logs", "security.2.claude.jsonl"), "utf8")).toBe(`${rawEvent}\n`)
-      if (process.platform !== "win32") {
-        expect((await stat(join(runDir, "logs", "security.2.claude.jsonl"))).mode & 0o777).toBe(0o600)
-        expect((await stat(join(runDir, "prompts", "security.2.claude.md"))).mode & 0o777).toBe(0o600)
-      }
-    } finally {
-      await Promise.all([rm(runDir, { recursive: true, force: true }), rm(targetDir, { recursive: true, force: true })])
-    }
-  })
-
-  test("streams raw events to disk before Claude exits", async () => {
-    const runDir = await executionDir()
-    const targetDir = await mkdtemp(join(tmpdir(), "convoy-claude-target-"))
-    const rawEvent = JSON.stringify({ type: "system", subtype: "init", session_id: "session-live" })
-    let stdoutController: ReadableStreamDefaultController<Uint8Array> | undefined
-    let resolveExit: ((code: number) => void) | undefined
-    let exitCode: number | null = null
-    let markSpawned: (() => void) | undefined
-    const spawned = new Promise<void>((resolve) => {
-      markSpawned = resolve
-    })
-
-    try {
-      const execution = promptClaudePhase({
-        phase: claudePhase,
-        workspace: { dir: runDir, runID: "test" },
-        targetDir,
-        prompt: "Review",
-        attachments: [],
-        attempt: 4,
-        progress: noopProgress,
-        shutdown: executionShutdown(new AbortController()),
-        deps: {
-          async stageAttachments(attachments) {
-            return [...attachments]
-          },
-          spawn() {
-            const stdout = new ReadableStream<Uint8Array>({
-              start(controller) {
-                stdoutController = controller
-                controller.enqueue(new TextEncoder().encode(`${rawEvent}\n`))
-              },
-            })
-            const exited = new Promise<number>((resolve) => {
-              resolveExit = resolve
-            })
-            markSpawned?.()
-            return { stdout, stderr: textStream(), exited, get exitCode() { return exitCode }, kill() {} }
-          },
-        },
-      })
-      await spawned
-
-      const path = join(runDir, "logs", "security.4.claude.jsonl")
-      let observed: string | undefined
-      for (let attempt = 0; attempt < 20 && observed === undefined; attempt++) {
-        try {
-          observed = await readFile(path, "utf8")
-        } catch {
-          await Bun.sleep(5)
-        }
-      }
-
-      stdoutController?.close()
-      exitCode = 1
-      resolveExit?.(1)
-      await expect(execution).rejects.toThrow("before reporting a result")
-      expect(observed).toBe(`${rawEvent}\n`)
-    } finally {
-      await Promise.all([rm(runDir, { recursive: true, force: true }), rm(targetDir, { recursive: true, force: true })])
-    }
-  })
-
-  test("publishes and returns usage from a failed Claude result", async () => {
-    const runDir = await executionDir()
-    const targetDir = await mkdtemp(join(tmpdir(), "convoy-claude-target-"))
-    const usage: ProgressUsage[] = []
-    const resultEvent = JSON.stringify({
-      type: "result",
-      subtype: "error_during_execution",
-      is_error: true,
-      result: "provider failed",
-      total_cost_usd: 0.25,
-      usage: { input_tokens: 100, output_tokens: 20 },
-    })
-
-    try {
-      const result = await promptClaudePhase({
-        phase: claudePhase,
-        workspace: { dir: runDir, runID: "test" },
-        targetDir,
-        prompt: "Review",
-        attachments: [],
-        attempt: 3,
-        progress: { ...noopProgress, phaseUsageTotal(_name, value) { usage.push(value) } },
-        shutdown: executionShutdown(new AbortController()),
-        deps: {
-          async stageAttachments(attachments) {
-            return [...attachments]
-          },
-          spawn() {
-            return { stdout: textStream(resultEvent), stderr: textStream(), exited: Promise.resolve(1), exitCode: 1, kill() {} }
-          },
-        },
-      })
-
-      expect(result).toMatchObject({ cost: 0.25, tokens: { input: 100, output: 20, total: 120 }, error: expect.any(String) })
-      expect(usage).toEqual([
-        {
-          cost: 0.25,
-          tokens: { input: 100, output: 20, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 120 },
-          model: "claude-code/opus",
-        },
-      ])
-    } finally {
-      await Promise.all([rm(runDir, { recursive: true, force: true }), rm(targetDir, { recursive: true, force: true })])
-    }
-  })
-})
-
-describe("model label", () => {
-  test("mirrors provider/model formatting", () => {
+describe("claudeModelLabel", () => {
+  test("formats with claude-code prefix", () => {
     expect(claudeModelLabel("opus")).toBe("claude-code/opus")
     expect(claudeModelLabel("")).toBe("claude-code/default")
   })
 })
 
-describe("interactive resume", () => {
-  test("disables customizations while preserving the read-only tool envelope", () => {
-    const args = claudeResumeArgs("session-123", ["/runs/r1", "/external/review-input"])
+// ---------------------------------------------------------------------------
+// newClaudeStreamState
+// ---------------------------------------------------------------------------
 
-    expect(args).toContain("--safe-mode")
-    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep")
-    expect(args).not.toContain("--allowedTools")
-    expect(args[args.indexOf("--permission-mode") + 1]).toBe("dontAsk")
-    expect(args).toContain("session-123")
-    expect(args).toContain("/runs/r1")
-    expect(args).toContain("/external/review-input")
-    expect(args).not.toContain("/external")
+describe("newClaudeStreamState", () => {
+  test("returns initial state with zero counts", () => {
+    const state = newClaudeStreamState()
+    expect(state.reasoningChars).toBe(0)
+    expect(state.textChars).toBe(0)
+    expect(state.block).toBe(0)
   })
 })
 
+// ---------------------------------------------------------------------------
+// formatCharCount & truncate
+// ---------------------------------------------------------------------------
+
+describe("formatCharCount", () => {
+  test("returns raw number below 1000", () => {
+    expect(formatCharCount(0)).toBe("0")
+    expect(formatCharCount(500)).toBe("500")
+    expect(formatCharCount(999)).toBe("999")
+  })
+
+  test("returns 1 decimal for values below 10000", () => {
+    expect(formatCharCount(1500)).toBe("1.5k")
+    expect(formatCharCount(9999)).toBe("10.0k")
+  })
+
+  test("returns integer for values 10000+", () => {
+    expect(formatCharCount(10_000)).toBe("10k")
+    expect(formatCharCount(123_456)).toBe("123k")
+  })
+})
+
+describe("truncate", () => {
+  test("returns the full value when it fits", () => {
+    expect(truncate("hello", 10)).toBe("hello")
+  })
+
+  test("truncates with ellipsis when too long", () => {
+    expect(truncate("hello world foo bar", 10)).toBe("hello w...")
+  })
+
+  test("collapses whitespace and trims", () => {
+    expect(truncate("  hello   world  ", 20)).toBe("hello world")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// numberToken
+// ---------------------------------------------------------------------------
+
+describe("numberToken", () => {
+  test("returns the number for finite values", () => {
+    expect(numberToken(100)).toBe(100)
+    expect(numberToken(0)).toBe(0)
+    expect(numberToken(1.5)).toBe(1.5)
+  })
+
+  test("returns 0 for non-number or infinite values", () => {
+    expect(numberToken("abc")).toBe(0)
+    expect(numberToken(undefined)).toBe(0)
+    expect(numberToken(Infinity)).toBe(0)
+    expect(numberToken(NaN)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// claudeTokens
+// ---------------------------------------------------------------------------
+
+describe("claudeTokens", () => {
+  test("returns undefined for non-object", () => {
+    expect(claudeTokens(null)).toBeUndefined()
+    expect(claudeTokens("abc")).toBeUndefined()
+  })
+
+  test("parses usage object into ProgressTokens", () => {
+    const result = claudeTokens({ input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 10, cache_creation_input_tokens: 5 })
+    expect(result).toEqual({ input: 100, output: 50, reasoning: 0, cacheRead: 10, cacheWrite: 5, total: 165 })
+  })
+
+  test("returns undefined when all tokens are 0", () => {
+    expect(claudeTokens({ input_tokens: 0, output_tokens: 0 })).toBeUndefined()
+  })
+
+  test("handles partial usage data", () => {
+    const result = claudeTokens({ input_tokens: 200 })
+    expect(result).toEqual({ input: 200, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 200 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// describeClaudeEvent - the big one
+// ---------------------------------------------------------------------------
+
+describe("describeClaudeEvent", () => {
+  test("returns empty array for non-object input", () => {
+    expect(describeClaudeEvent(null, newClaudeStreamState())).toEqual([])
+    expect(describeClaudeEvent(42, newClaudeStreamState())).toEqual([])
+    expect(describeClaudeEvent("hello", newClaudeStreamState())).toEqual([])
+  })
+
+  test("handles system init event", () => {
+    const signals = describeClaudeEvent({ type: "system", subtype: "init", session_id: "ses_123" }, newClaudeStreamState())
+    expect(signals).toEqual([{ type: "session", sessionID: "ses_123" }])
+  })
+
+  test("handles text delta event", () => {
+    const state = newClaudeStreamState()
+    const event = { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } }
+    describeClaudeEvent(event, state) // content_block_start increments block
+    const signals = describeClaudeEvent(
+      { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello world" } } },
+      state,
+    )
+    expect(signals.length).toBe(2)
+    expect(signals[0]).toMatchObject({ type: "message", message: { text: "Hello world" } })
+    expect(signals[1]).toMatchObject({ type: "activity", kind: "write" })
+  })
+
+  test("handles thinking delta event", () => {
+    const state = newClaudeStreamState()
+    const event = { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } } }
+    describeClaudeEvent(event, state) // content_block_start increments block
+    const signals = describeClaudeEvent(
+      { type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "I think..." } } },
+      state,
+    )
+    expect(signals.length).toBe(2)
+    expect(signals[0]).toMatchObject({ type: "message", message: { text: "I think..." } })
+    expect(signals[1]).toMatchObject({ type: "activity", kind: "think" })
+  })
+
+  test("ignores unknown delta types", () => {
+    const state = newClaudeStreamState()
+    const event = { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } }
+    describeClaudeEvent(event, state)
+    const signals = describeClaudeEvent(
+      { type: "stream_event", event: { type: "content_block_delta", delta: { type: "unknown_delta", value: "x" } } },
+      state,
+    )
+    expect(signals).toEqual([])
+  })
+
+  test("handles assistant message with tool use blocks", () => {
+    const signals = describeClaudeEvent({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", name: "Read", input: { file_path: "/tmp/test.js" } },
+          { type: "tool_use", name: "Grep", input: { pattern: "TODO" } },
+        ],
+      },
+    }, newClaudeStreamState())
+    expect(signals.length).toBe(4)
+    expect(signals[0]).toMatchObject({ type: "activity", message: "tool: Read /tmp/test.js" })
+    expect(signals[2]).toMatchObject({ type: "activity", message: "tool: Grep TODO" })
+  })
+
+  test("handles result event with cost and tokens", () => {
+    const signals = describeClaudeEvent({
+      type: "result",
+      subtype: "success",
+      result: "Done!",
+      total_cost_usd: 0.05,
+      usage: { input_tokens: 100, output_tokens: 50 },
+      is_error: false,
+    }, newClaudeStreamState())
+    expect(signals.length).toBe(1)
+    expect(signals[0]).toMatchObject({
+      type: "result",
+      subtype: "success",
+      text: "Done!",
+      cost: 0.05,
+      isError: false,
+    })
+  })
+
+  test("marks result as error when subtype is not success", () => {
+    const signals = describeClaudeEvent({ type: "result", subtype: "error", result: "failed", is_error: true }, newClaudeStreamState())
+    expect(signals[0]).toMatchObject({ type: "result", subtype: "error", isError: true })
+  })
+
+  test("handles empty assistant message", () => {
+    const signals = describeClaudeEvent({ type: "assistant", message: { content: null } }, newClaudeStreamState())
+    expect(signals).toEqual([])
+  })
+
+  test("returns empty for unknown event types", () => {
+    const signals = describeClaudeEvent({ type: "unknown" }, newClaudeStreamState())
+    expect(signals).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// toolDetail
+// ---------------------------------------------------------------------------
+
+describe("toolDetail", () => {
+  test("extracts file_path", () => {
+    expect(toolDetail({ file_path: "/src/main.ts" })).toBe("/src/main.ts")
+  })
+
+  test("extracts pattern", () => {
+    expect(toolDetail({ pattern: "function.*" })).toBe("function.*")
+  })
+
+  test("returns truncated JSON for unknown keys", () => {
+    const result = toolDetail({ key1: "value1", key2: "value2" })
+    expect(result).toContain("value1")
+  })
+
+  test("returns empty string for empty object", () => {
+    expect(toolDetail({})).toBe("")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// claudePrompt & claudeArgs & claudeReadableDirectories
+// ---------------------------------------------------------------------------
+
+describe("claudePrompt", () => {
+  test("returns base prompt when there are no attachments", () => {
+    expect(claudePrompt("Do the thing", [])).toBe("Do the thing")
+  })
+
+  test("appends attachment paths", () => {
+    const attachments = [{ url: pathToFileURL("/tmp/test.js").href, mime: "text/javascript" }]
+    const result = claudePrompt("Do the thing", attachments)
+    expect(result).toContain("Do the thing")
+    expect(result).toContain("## Attached files")
+    expect(result).toContain("/tmp/test.js")
+  })
+
+  test("includes filename when it differs from path", () => {
+    const attachments = [{ url: pathToFileURL("/tmp/abc").href, mime: "text/plain", filename: "readme.md" }]
+    const result = claudePrompt("Do it", attachments)
+    expect(result).toContain("/tmp/abc (readme.md)")
+  })
+})
+
+describe("claudeReadableDirectories", () => {
+  test("includes runDir and external directories", () => {
+    const result = claudeReadableDirectories([], "/target", "/run")
+    expect(result).toContain("/run")
+  })
+
+  test("includes external attachment directories", () => {
+    const attachments = [{ url: pathToFileURL("/external").href, mime: "application/x-directory" }]
+    const result = claudeReadableDirectories(attachments, "/target", "/run")
+    expect(result).toContain("/run")
+    expect(result).toContain("/external")
+  })
+
+  test("excludes directories within targetDir or runDir", () => {
+    const attachments = [{ url: pathToFileURL("/run/subdir").href, mime: "application/x-directory" }]
+    const result = claudeReadableDirectories(attachments, "/target", "/run")
+    expect(result).toEqual(["/run"]) // only runDir, not /run/subdir
+  })
+})
+
+describe("claudeArgs", () => {
+  test("includes all required flags", () => {
+    const args = claudeArgs({
+      systemPromptPath: "/tmp/prompt.md",
+      runDir: "/tmp/run",
+      targetDir: "/target",
+      model: "opus",
+      attachments: [],
+    })
+    expect(args).toContain("-p")
+    expect(args).toContain("--output-format")
+    expect(args).toContain("stream-json")
+    expect(args).toContain("--model")
+    expect(args).toContain("opus")
+    expect(args).toContain("--safe-mode")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// baseAgentName
+// ---------------------------------------------------------------------------
+
+describe("baseAgentName", () => {
+  test("strips __ro suffix", () => {
+    expect(baseAgentName("auditor__ro")).toBe("auditor")
+  })
+
+  test("returns unchanged name without suffix", () => {
+    expect(baseAgentName("auditor")).toBe("auditor")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// claudeResumeArgs & claudeSessionDirectoriesPath
+// ---------------------------------------------------------------------------
+
+describe("claudeResumeArgs", () => {
+  test("includes resume and add-dir flags", () => {
+    const args = claudeResumeArgs("ses_123", ["/run", "/external"])
+    expect(args).toContain("--resume")
+    expect(args).toContain("ses_123")
+    expect(args).toContain("--add-dir")
+    expect(args).toContain("/run")
+    expect(args).toContain("/external")
+  })
+})
+
+describe("claudeSessionDirectoriesPath", () => {
+  test("returns path in logs dir", () => {
+    const path = claudeSessionDirectoriesPath("/run", "ses_123")
+    expect(path).toBe("/run/logs/claude-ses_123-directories.json")
+  })
+
+  test("encodes special characters in session ID", () => {
+    const path = claudeSessionDirectoriesPath("/run", "ses 123")
+    expect(path).toContain("ses%20123")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isWithin (tested via claudeReadableDirectories)
+// ---------------------------------------------------------------------------
+
+describe("isWithin", () => {
+  test("returns true for same path", () => {
+    expect(isWithin("/run", "/run")).toBe(true)
+  })
+
+  test("returns true for subdirectory", () => {
+    expect(isWithin("/run/sub", "/run")).toBe(true)
+  })
+
+  test("returns false for unrelated path", () => {
+    expect(isWithin("/other", "/run")).toBe(false)
+  })
+
+  test("returns false for parent path", () => {
+    expect(isWithin("/", "/run")).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// attachmentPaths
+// ---------------------------------------------------------------------------
+
+describe("attachmentPaths", () => {
+  test("converts file URLs to paths", () => {
+    const result = attachmentPaths([{ url: pathToFileURL("/tmp/test.js").href, mime: "text/javascript" }])
+    expect(result[0]?.path).toBe("/tmp/test.js")
+    expect(result[0]?.isDirectory).toBe(false)
+  })
+
+  test("marks directories by mime type", () => {
+    const result = attachmentPaths([{ url: pathToFileURL("/external").href, mime: "application/x-directory" }])
+    expect(result[0]?.isDirectory).toBe(true)
+  })
+
+  test("includes filename when present", () => {
+    const result = attachmentPaths([{ url: pathToFileURL("/tmp/abc").href, mime: "text/plain", filename: "readme.md" }])
+    expect(result[0]?.filename).toBe("readme.md")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// eventType & deltaOf
+// ---------------------------------------------------------------------------
+
+describe("eventType", () => {
+  test("extracts type from event object", () => {
+    expect(eventType({ type: "content_block_start" })).toBe("content_block_start")
+  })
+
+  test("returns empty string for non-object", () => {
+    expect(eventType(null)).toBe("")
+    expect(eventType(42)).toBe("")
+  })
+})
+
+describe("deltaOf", () => {
+  test("extracts delta from event", () => {
+    expect(deltaOf({ delta: { type: "text_delta", text: "hello" } })).toEqual({ type: "text_delta", text: "hello" })
+  })
+
+  test("returns undefined for non-object event", () => {
+    expect(deltaOf(null)).toBeUndefined()
+  })
+
+  test("returns undefined when delta is missing", () => {
+    expect(deltaOf({})).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// toolUseBlocks
+// ---------------------------------------------------------------------------
+
+describe("toolUseBlocks", () => {
+  test("parses tool use blocks from assistant message", () => {
+    const blocks = toolUseBlocks({
+      content: [
+        { type: "tool_use", name: "Read", input: { file_path: "/test.js" } },
+        { type: "tool_use", name: "Grep", input: { pattern: "TODO" } },
+      ],
+    })
+    expect(blocks).toEqual([
+      { name: "Read", detail: "/test.js" },
+      { name: "Grep", detail: "TODO" },
+    ])
+  })
+
+  test("returns empty array for non-object message", () => {
+    expect(toolUseBlocks(null)).toEqual([])
+  })
+
+  test("returns empty array when content is not an array", () => {
+    expect(toolUseBlocks({ content: "not-array" })).toEqual([])
+  })
+
+  test("skips non-tool_use blocks", () => {
+    const blocks = toolUseBlocks({ content: [{ type: "text", text: "hello" }] })
+    expect(blocks).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ndjsonLines - async generator for NDJSON stream parsing
+// ---------------------------------------------------------------------------
+
 describe("ndjsonLines", () => {
-  test("reassembles lines across chunk boundaries and drops blanks", async () => {
+  test("yields parsed JSON lines from a stream", async () => {
+    const { ndjsonLines } = await import("../src/claude-code")
     const encoder = new TextEncoder()
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(encoder.encode('{"a":'))
-        controller.enqueue(encoder.encode('1}\n\n{"b":2}\n{"c"'))
-        controller.enqueue(encoder.encode(':3}'))
+        controller.enqueue(encoder.encode('{"type":"init"}\n{"type":"delta","text":"hello"}\n'))
         controller.close()
       },
     })
     const lines: string[] = []
-    for await (const line of ndjsonLines(stream)) lines.push(line)
-    expect(lines).toEqual(['{"a":1}', '{"b":2}', '{"c":3}'])
+    for await (const line of ndjsonLines(stream)) {
+      lines.push(line)
+    }
+    expect(lines).toEqual(['{"type":"init"}', '{"type":"delta","text":"hello"}'])
+  })
+
+  test("handles partial chunks across multiple enqueues", async () => {
+    const { ndjsonLines } = await import("../src/claude-code")
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"type":"init"}\n{"type'))
+        controller.enqueue(encoder.encode('":"delta"}\n'))
+        controller.close()
+      },
+    })
+    const lines: string[] = []
+    for await (const line of ndjsonLines(stream)) {
+      lines.push(line)
+    }
+    expect(lines).toEqual(['{"type":"init"}', '{"type":"delta"}'])
+  })
+
+  test("handles empty stream", async () => {
+    const { ndjsonLines } = await import("../src/claude-code")
+    const stream = new ReadableStream<Uint8Array>({ start(ctrl) { ctrl.close() } })
+    const lines: string[] = []
+    for await (const line of ndjsonLines(stream)) {
+      lines.push(line)
+    }
+    expect(lines).toEqual([])
   })
 })

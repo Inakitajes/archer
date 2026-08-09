@@ -797,7 +797,7 @@ export function listValue(value: string) {
     .filter(Boolean)
 }
 
-function help() {
+export function help() {
   return `convoy [prompt]
 
 Sequential OpenCode agent pipeline for implementing features.
@@ -891,7 +891,7 @@ Config keys:
 `
 }
 
-function updateHelp() {
+export function updateHelp() {
   return `convoy update [--check]
 
 Check the latest stable GitHub Release for a binary matching this platform.
@@ -920,7 +920,7 @@ export function writeUpdateResult(result: UpdateResult) {
   }
 }
 
-function initHelp() {
+export function initHelp() {
   return `convoy init [--global] [--force] [--dir <path>]
 
 Create Convoy's default config file. An existing config is not overwritten unless --force is set.
@@ -937,7 +937,7 @@ Options:
 `
 }
 
-function agentsHelp() {
+export function agentsHelp() {
   return `convoy agents eject <agent> [--global] [--force] [--dir <path>]
 
 Copy one built-in agent prompt to agents/<agent>.md so you can edit it.
