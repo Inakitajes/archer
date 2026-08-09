@@ -203,4 +203,92 @@ describe("Notifier", () => {
     await notifier.stop()
     expect(notifier.notify({ key: "after2", category: "finish", title: "T", body: "B" })).toBe(false)
   })
+
+  test("stop is idempotent", async () => {
+    const notifier = new Notifier({ platform: "darwin" })
+    await notifier.stop()
+    await notifier.stop() // second call should not throw
+  })
+
+  test("notify works with sound setting", async () => {
+    const { spawn, commands } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn, settings: { sound: "Ping" } })
+    notifier.notify({ key: "snd", category: "finish", title: "T", body: "B" })
+    await new Promise((r) => setTimeout(r, 50))
+    const osascript = commands.find((cmd) => cmd[0] === "osascript")
+    expect(osascript).toBeDefined()
+    expect(osascript!.join(" ")).toContain("sound name")
+  })
+
+  test("notify works without sound setting", async () => {
+    const { spawn, commands } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn, settings: { sound: "" } })
+    notifier.notify({ key: "nosnd", category: "finish", title: "T", body: "B" })
+    await new Promise((r) => setTimeout(r, 50))
+    const osascript = commands.find((cmd) => cmd[0] === "osascript")
+    expect(osascript).toBeDefined()
+    expect(osascript!.join(" ")).not.toContain("sound name")
+  })
+
+  test("deliver falls back to bare banner when attributed notification fails", async () => {
+    const commands: string[][] = []
+    let callCount = 0
+    const spawn: NotifierSpawn = (cmd) => {
+      callCount++
+      // First call (attributed) fails with exit code 1
+      // Second call (bare) succeeds
+      commands.push(cmd)
+      return { exited: Promise.resolve(callCount === 1 ? 1 : 0), kill() {}, unref() {} }
+    }
+    const notifier = new Notifier({ platform: "darwin", spawn, env: { TERM_PROGRAM: "Apple_Terminal" } })
+    notifier.notify({ key: "fb", category: "finish", title: "T", body: "B" })
+    await new Promise((r) => setTimeout(r, 100))
+    // First osascript call should include the tell application id block
+    expect(commands[0]?.join(" ")).toContain("tell application id")
+    // Second osascript call should be the bare banner
+    expect(commands[1]?.join(" ")).not.toContain("tell application id")
+  })
+
+  test("deliver does not fall back when attributed notification succeeds", async () => {
+    const commands: string[][] = []
+    const spawn: NotifierSpawn = (cmd) => {
+      commands.push(cmd)
+      return { exited: Promise.resolve(0), kill() {}, unref() {} }
+    }
+    const notifier = new Notifier({ platform: "darwin", spawn, env: { TERM_PROGRAM: "Apple_Terminal" } })
+    notifier.notify({ key: "attr", category: "finish", title: "T", body: "B" })
+    await new Promise((r) => setTimeout(r, 50))
+    // Only one osascript call: the attributed one
+    const osascriptCalls = commands.filter((cmd) => cmd[0] === "osascript")
+    expect(osascriptCalls.length).toBe(1)
+  })
+
+  test("spawn exception in deliver does not crash notifier", async () => {
+    const spawn: NotifierSpawn = () => {
+      throw new Error("spawn failed")
+    }
+    const notifier = new Notifier({ platform: "darwin", spawn })
+    // This should not throw
+    notifier.notify({ key: "spawn-err", category: "finish", title: "T", body: "B" })
+    await new Promise((r) => setTimeout(r, 50))
+  })
+
+  test("notify with different categories uses correct throttling windows", () => {
+    let now = 1000
+    const { spawn } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn, now: () => now })
+    // waiting has 10s throttle
+    expect(notifier.notify({ key: "w1", category: "waiting", title: "T", body: "B" })).toBe(true)
+    now = 5000 // 4s later - still within waiting's 10s window
+    expect(notifier.notify({ key: "w1", category: "waiting", title: "T", body: "B" })).toBe(false)
+    now = 12000 // 11s later - past waiting's 10s window
+    expect(notifier.notify({ key: "w1", category: "waiting", title: "T", body: "B" })).toBe(true)
+  })
+
+  test("notify ignores settings for terminalTitle category", () => {
+    const { spawn } = fakeSpawn(0)
+    const notifier = new Notifier({ platform: "darwin", spawn, settings: { finish: false } })
+    expect(notifier.notify({ key: "t", category: "finish", title: "T", body: "B" })).toBe(false)
+    expect(notifier.notify({ key: "t2", category: "finish", title: "T2", body: "B2" })).toBe(false)
+  })
 })

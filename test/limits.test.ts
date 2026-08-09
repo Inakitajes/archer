@@ -350,3 +350,49 @@ describe("startLimitsPoller with mocked fetch", () => {
     }
   })
 })
+
+describe("openRouterKeySources", () => {
+  test("returns a result with the expected shape", async () => {
+    const { openRouterKeySources } = await import("../src/limits")
+    const result = await openRouterKeySources()
+    expect(result).toHaveProperty("keychain")
+    expect(result).toHaveProperty("env")
+    expect(result).toHaveProperty("opencode")
+    expect(typeof result.keychain).toBe("boolean")
+    expect(typeof result.env).toBe("boolean")
+    expect(typeof result.opencode).toBe("boolean")
+  })
+
+  test("detects env var when set", async () => {
+    const original = process.env.OPENROUTER_API_KEY
+    process.env.OPENROUTER_API_KEY = "sk-test"
+    const { openRouterKeySources } = await import("../src/limits")
+    try {
+      const result = await openRouterKeySources()
+      expect(result.env).toBe(true)
+    } finally {
+      process.env.OPENROUTER_API_KEY = original
+    }
+  })
+
+  test("detects env var absent", async () => {
+    const original = process.env.OPENROUTER_API_KEY
+    delete process.env.OPENROUTER_API_KEY
+    const { openRouterKeySources } = await import("../src/limits")
+    try {
+      const result = await openRouterKeySources()
+      expect(result.env).toBe(false)
+    } finally {
+      process.env.OPENROUTER_API_KEY = original
+    }
+  })
+})
+
+describe("jwtExpMs with edge cases", () => {
+  test("handles token with empty JSON payload", async () => {
+    const { jwtExpMs } = await import("../src/limits")
+    const token = "header." + Buffer.from("{}").toString("base64url") + ".sig"
+    const result = jwtExpMs(token)
+    expect(result).toBeNull()
+  })
+})

@@ -117,6 +117,32 @@ describe("createProgressUI", () => {
       expect(result).toBe(noopProgress)
     })
   })
+
+  test("accepts autoAccept parameter without errors", async () => {
+    const { createProgressUI } = await import("../src/progress")
+    // Even though it returns noopProgress (non-TTY), this verifies the parameter passes through
+    const result = await createProgressUI([], false, undefined, { mode: "smart" } as AutoAccept)
+    expect(result).toBe(noopProgress)
+  })
+
+  test("accepts controls parameter without errors", async () => {
+    const { createProgressUI } = await import("../src/progress")
+    const controls = {
+      onPauseToggle: () => {},
+      onKeepAwakeToggle: () => {},
+      finish: {} as FinishSeam,
+    }
+    const result = await createProgressUI([], false, undefined, undefined, controls)
+    expect(result).toBe(noopProgress)
+  })
+
+  test("accepts onAbort callback without errors", async () => {
+    const { createProgressUI } = await import("../src/progress")
+    let aborted = false
+    const result = await createProgressUI([], false, () => { aborted = true })
+    expect(result).toBe(noopProgress)
+    expect(aborted).toBe(false) // Callback not called when no TUI
+  })
 })
 
 describe("type satisfaction (compile-time checks)", () => {

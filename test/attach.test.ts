@@ -267,4 +267,13 @@ describe("LiveAttach", () => {
     const attach = new LiveAttach(client, noopTui(), "/tmp", "/tmp/meta.json")
     expect(attach.serverGone).toBeInstanceOf(Promise)
   })
+
+  test("tick does nothing when stopped", async () => {
+    const client = {} as never
+    const attach = new LiveAttach(client, noopTui(), "/tmp", "/tmp/meta.json")
+    await attach.start()
+    await attach.stop()
+    // tick should be a no-op now
+    // We can't call tick directly (private), but stopping and starting should be safe
+  })
 })

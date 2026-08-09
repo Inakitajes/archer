@@ -20,8 +20,8 @@ const ROOT = resolve(import.meta.dirname, "..")
 const COVERAGE_DIR = join(ROOT, "coverage")
 const BADGE_PATH = join(ROOT, "assets", "coverage.svg")
 const CACHED_SUMMARY = join(COVERAGE_DIR, "summary.txt")
-const THRESHOLD_LINES = Number(process.env.COVERAGE_THRESHOLD_LINES ?? 90)
-const THRESHOLD_FUNCS = Number(process.env.COVERAGE_THRESHOLD_FUNCS ?? 90)
+const THRESHOLD_LINES = Number(process.env.COVERAGE_THRESHOLD_LINES ?? 95)
+const THRESHOLD_FUNCS = Number(process.env.COVERAGE_THRESHOLD_FUNCS ?? 95)
 
 interface CoverageTotals {
   linePct: number

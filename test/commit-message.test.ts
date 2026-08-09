@@ -303,3 +303,137 @@ describe("commitMessagePrompt", () => {
     expect(prompt).toContain("convoy(step): Step 1")
   })
 })
+
+describe("formatCommitMessage edge cases", () => {
+  test("renders scope without body lines", () => {
+    expect(formatCommitMessage({ type: "feat", scope: "cli", subject: "add the prompt", body: [] })).toBe("feat(cli): add the prompt")
+  })
+
+  test("renders body items that contain newlines", () => {
+    const result = formatCommitMessage({ type: "fix", subject: "fix parser", body: ["line1\nline2", "line3"] })
+    expect(result).toBe("fix: fix parser\n\n- line1\nline2\n- line3")
+  })
+
+  test("renders very long subject as-is without truncation", () => {
+    const long = "a".repeat(100)
+    const result = formatCommitMessage({ type: "fix", subject: long, body: [] })
+    expect(result).toContain(long)
+    expect(result.length).toBeGreaterThan(100)
+  })
+
+  test("renders type without scope and without body", () => {
+    expect(formatCommitMessage({ type: "chore", subject: "bump deps", body: [] })).toBe("chore: bump deps")
+  })
+
+  test("renders all types correctly", () => {
+    for (const type of ["feat", "fix", "refactor", "perf", "docs", "test", "chore", "build", "ci"] as const) {
+      expect(formatCommitMessage({ type, subject: "change", body: [] })).toBe(`${type}: change`)
+    }
+  })
+})
+
+describe("readCommitMessage edge cases", () => {
+  test("handles newlines embedded in body strings", () => {
+    const reply = JSON.stringify({ type: "feat", subject: "do it", body: ["line1\nline2", "line3"] })
+    const msg = readCommitMessage(reply)
+    expect(msg?.body).toEqual(["line1\nline2", "line3"])
+  })
+
+  test("caps body at maxBodyLines (6)", () => {
+    const body = Array.from({ length: 10 }, (_, i) => `line ${i + 1}`)
+    const reply = JSON.stringify({ type: "feat", subject: "many lines", body })
+    expect(readCommitMessage(reply)?.body?.length).toBe(6)
+  })
+
+  test("strips bullet markers from body lines", () => {
+    const reply = JSON.stringify({ type: "feat", subject: "bullets", body: ["- one", "* two", "three"] })
+    expect(readCommitMessage(reply)?.body).toEqual(["one", "two", "three"])
+  })
+
+  test("handles fenced json with extra whitespace", () => {
+    const reply = "```json\n  {\n    \"type\": \"fix\",\n    \"subject\": \"fix it\"\n  }\n  ```"
+    expect(readCommitMessage(reply)).toMatchObject({ type: "fix", subject: "fix it" })
+  })
+
+  test("strips leading/trailing quotes from subject", () => {
+    const reply = JSON.stringify({ type: "feat", subject: "'add feature'" })
+    expect(readCommitMessage(reply)?.subject).toBe("add feature")
+  })
+
+  test("subject with only whitespace after cleaning returns undefined", () => {
+    const reply = JSON.stringify({ type: "feat", subject: "   " })
+    expect(readCommitMessage(reply)).toBeUndefined()
+  })
+
+  test("body with all empty strings becomes empty array", () => {
+    const reply = JSON.stringify({ type: "feat", subject: "do it", body: ["", "  ", ""] })
+    expect(readCommitMessage(reply)?.body).toEqual([])
+  })
+
+  test("strips trailing period from subject", () => {
+    expect(readCommitMessage(JSON.stringify({ type: "fix", subject: "fix the parser." }))?.subject).toBe("fix the parser")
+  })
+
+  test("type(scope): subject prefix in subject gets stripped", () => {
+    const reply = JSON.stringify({ type: "feat", subject: "feat(cli): add the prompt" })
+    expect(readCommitMessage(reply)?.subject).toBe("add the prompt")
+  })
+})
+
+describe("templateCommitMessage edge cases", () => {
+  test("branch with multiple slashes uses rest after first slash as subject base", () => {
+    const msg = templateCommitMessage({ targetDir: "/repo", branch: "feat/feature/sub-thing", commits: [] })
+    expect(msg.type).toBe("feat")
+    expect(msg.subject).toBe("feature/sub thing")
+  })
+
+  test("prompt with markdown heading is used as subject", () => {
+    const msg = templateCommitMessage({
+      targetDir: "/repo",
+      branch: "fix/bug",
+      prompt: "### The bug fix\n\ndetails",
+      commits: [],
+    })
+    expect(msg.subject).toBe("The bug fix")
+  })
+
+  test("prompt with only whitespace lines falls back to branch subject", () => {
+    const msg = templateCommitMessage({
+      targetDir: "/repo",
+      branch: "feat/new-ui",
+      prompt: "   \n  \n",
+      commits: [],
+    })
+    expect(msg.subject).toBe("new ui")
+  })
+
+  test("body deduplicates empty convoy step commits", () => {
+    const msg = templateCommitMessage({
+      targetDir: "/repo",
+      branch: "feat/x",
+      commits: ["convoy(implementer): ", "convoy(tests): real change", "convoy(lint):   "],
+    })
+    expect(msg.body).toEqual(["real change"])
+  })
+
+  test("subject from branch with hyphens replaces them with spaces", () => {
+    const msg = templateCommitMessage({ targetDir: "/repo", branch: "fix/my-bug-fix", commits: [] })
+    expect(msg.subject).toBe("my bug fix")
+  })
+
+  test("caps subject when prefix + subject exceeds 72 chars", () => {
+    const longSubject = "implement a very long feature that describes everything this change does and then some more details"
+    const msg = templateCommitMessage({
+      targetDir: "/repo",
+      branch: "feat/long-feature",
+      prompt: longSubject,
+      commits: [],
+    })
+    expect(msg.subject.length).toBeLessThanOrEqual(72)
+  })
+
+  test("scope is omitted when not set", () => {
+    const msg = templateCommitMessage({ targetDir: "/repo", branch: "feat/feature", commits: [] })
+    expect(msg.scope).toBeUndefined()
+  })
+})

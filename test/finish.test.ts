@@ -263,6 +263,13 @@ describe("createFinishSeam", () => {
   })
 })
 
+describe("formatSubject and joinMessage (private helpers)", () => {
+  test("backupRefFor is consistent", () => {
+    expect(backupRefFor("branch")).toBe("refs/convoy/finish/branch")
+    expect(backupRefFor("feat/convoy/finish/thing")).toBe("refs/convoy/finish/feat/convoy/finish/thing")
+  })
+})
+
 describe("resolveFinishBase", () => {
   const dirs: string[] = []
   afterAll(async () => {
@@ -308,5 +315,54 @@ describe("resolveFinishBase", () => {
     const result = await resolveFinishBase(dir)
     expect(result).toBeDefined()
     expect(typeof result).toBe("string")
+  })
+})
+
+describe("resolveSquashRange", () => {
+  const dirs: string[] = []
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  async function git(args: string[], cwd: string) {
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "convoy-test",
+        GIT_AUTHOR_EMAIL: "convoy-test@example.invalid",
+        GIT_COMMITTER_NAME: "convoy-test",
+        GIT_COMMITTER_EMAIL: "convoy-test@example.invalid",
+      },
+    })
+    if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(proc.stderr).text()}`)
+  }
+
+  async function createRepo(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-finish-squash-"))
+    dirs.push(dir)
+    await git(["init", "-q"], dir)
+    await writeFile(join(dir, "README.md"), "base\n")
+    await git(["add", "README.md"], dir)
+    await git(["commit", "-q", "-m", "init"], dir)
+    // Create a branch with convoy commits
+    await git(["checkout", "-b", "feat/test"], dir)
+    await writeFile(join(dir, "test.txt"), "change\n")
+    await git(["add", "test.txt"], dir)
+    await git(["commit", "-q", "-m", "convoy(implementer): add test file"], dir)
+    return dir
+  }
+
+  test("returns dirty working tree error", async () => {
+    const dir = await createRepo()
+    await writeFile(join(dir, "unstaged.txt"), "dirty\n")
+    const { resolveSquashRange } = await import("../src/finish")
+    const result = await resolveSquashRange(dir, "main")
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.reason).toBe("dirty")
+    }
   })
 })
