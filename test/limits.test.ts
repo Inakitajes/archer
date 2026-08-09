@@ -3,7 +3,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { parseCodexUsage, jwtExpMs, parseOpenRouterCredits, parseOpenRouterKey, openRouterKeyFrom, limitsPollMs, refreshCodexIfNeeded, startLimitsPoller } from "../src/limits"
+import { refreshCodexIfNeeded } from "../src/limits-auth"
+import { parseCodexUsage, parseOpenRouterCredits, parseOpenRouterKey, openRouterKeyFrom, startLimitsPoller } from "../src/limits"
 
 describe("parseCodexUsage", () => {
   test("parses a valid rate-limit payload", () => {
@@ -101,44 +102,6 @@ describe("parseCodexUsage", () => {
   })
 })
 
-describe("jwtExpMs", () => {
-  function makeJwt(payload: Record<string, unknown>): string {
-    const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url")
-    return `header.${encoded}.signature`
-  }
-
-  test("extracts exp from a valid JWT payload", () => {
-    const exp = Math.floor(Date.now() / 1000) + 3600
-    const token = makeJwt({ exp })
-    expect(jwtExpMs(token)).toBe(exp * 1000)
-  })
-
-  test("returns null when the payload has no exp", () => {
-    expect(jwtExpMs(makeJwt({ sub: "user" }))).toBeNull()
-  })
-
-  test("returns null for undecodable token", () => {
-    expect(jwtExpMs("invalid")).toBeNull()
-  })
-
-  test("returns null for a token with no payload part", () => {
-    expect(jwtExpMs("header")).toBeNull()
-  })
-
-  test("returns null when payload is not valid JSON", () => {
-    const token = "header.not-json.signature"
-    expect(jwtExpMs(token)).toBeNull()
-  })
-
-  test("returns null when exp is not a number", () => {
-    expect(jwtExpMs(makeJwt({ exp: "later" }))).toBeNull()
-  })
-
-  test("returns null for an empty string", () => {
-    expect(jwtExpMs("")).toBeNull()
-  })
-})
-
 describe("refreshCodexIfNeeded", () => {
   const expiredToken = `header.${Buffer.from(JSON.stringify({ exp: 1 })).toString("base64url")}.signature`
 
@@ -188,6 +151,18 @@ describe("refreshCodexIfNeeded", () => {
 
     expect(await refreshCodexIfNeeded(auth, "unused", unavailable)).toEqual({ token: expiredToken })
     expect(await refreshCodexIfNeeded(auth, "unused", serverError)).toEqual({ token: expiredToken })
+  })
+
+  test("keeps tokens whose expiry cannot be decoded", async () => {
+    const auth = { tokens: { access_token: "not-a-jwt", refresh_token: "refresh" } }
+    let requested = false
+    const fetcher = mockFetch(async () => {
+      requested = true
+      return new Response(null, { status: 500 })
+    })
+
+    expect(await refreshCodexIfNeeded(auth, "unused", fetcher)).toEqual({ token: "not-a-jwt" })
+    expect(requested).toBe(false)
   })
 
   test("surfaces rejected refresh credentials", async () => {
@@ -372,12 +347,6 @@ describe("openRouterKeyFrom", () => {
   })
 })
 
-describe("limitsPollMs", () => {
-  test("has the expected default value", () => {
-    expect(limitsPollMs).toBe(180_000)
-  })
-})
-
 describe("startLimitsPoller", () => {
   test("calls onUpdate and returns a stop function", () => {
     const snapshots: unknown[] = []
@@ -455,14 +424,5 @@ describe("openRouterKeySources", () => {
       if (original === undefined) delete process.env.OPENROUTER_API_KEY
       else process.env.OPENROUTER_API_KEY = original
     }
-  })
-})
-
-describe("jwtExpMs with edge cases", () => {
-  test("handles token with empty JSON payload", async () => {
-    const { jwtExpMs } = await import("../src/limits")
-    const token = "header." + Buffer.from("{}").toString("base64url") + ".sig"
-    const result = jwtExpMs(token)
-    expect(result).toBeNull()
   })
 })

@@ -93,7 +93,7 @@ export type BaseRefDetection = {
 }
 
 /** Branch names conventionally used as a repo's trunk, probed in order when origin/HEAD says nothing. */
-export const baseBranchNames = ["main", "master", "develop", "trunk"] as const
+const baseBranchNames = ["main", "master", "develop", "trunk"] as const
 
 /**
  * Best-effort detection of the branch to diff against when neither --base nor

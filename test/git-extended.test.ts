@@ -4,7 +4,6 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
-  baseBranchNames,
   commitsBetween,
   convoyAuthorEmail,
   createCleanRepoSnapshot,
@@ -32,12 +31,6 @@ import {
 describe("convoyAuthorEmail", () => {
   test("is the expected email constant", () => {
     expect(convoyAuthorEmail).toBe("convoy@local")
-  })
-})
-
-describe("baseBranchNames", () => {
-  test("contains conventional trunk names in priority order", () => {
-    expect(baseBranchNames).toEqual(["main", "master", "develop", "trunk"])
   })
 })
 
