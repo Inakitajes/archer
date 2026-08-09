@@ -44,7 +44,7 @@ export function parseTextCoverage(output: string): CoverageTotals {
   }
 }
 
-function badgeColor(p: number): string {
+export function badgeColor(p: number): string {
   if (p >= 95) return "#4c1"       // brightgreen
   if (p >= 90) return "#97ca00"    // green
   if (p >= 80) return "#a4a61d"    // yellowgreen
@@ -56,7 +56,7 @@ function badgeColor(p: number): string {
 /**
  * Generates a shields.io-style SVG badge.
  */
-function generateBadgeSVG(
+export function generateBadgeSVG(
   label: string,
   value: string,
   color: string,

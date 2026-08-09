@@ -1,6 +1,9 @@
 import { describe, expect, test, afterEach } from "bun:test"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-import { parseCodexUsage, jwtExpMs, parseOpenRouterCredits, parseOpenRouterKey, openRouterKeyFrom, limitsPollMs, startLimitsPoller } from "../src/limits"
+import { parseCodexUsage, jwtExpMs, parseOpenRouterCredits, parseOpenRouterKey, openRouterKeyFrom, limitsPollMs, refreshCodexIfNeeded, startLimitsPoller } from "../src/limits"
 
 describe("parseCodexUsage", () => {
   test("parses a valid rate-limit payload", () => {
@@ -133,6 +136,68 @@ describe("jwtExpMs", () => {
 
   test("returns null for an empty string", () => {
     expect(jwtExpMs("")).toBeNull()
+  })
+})
+
+describe("refreshCodexIfNeeded", () => {
+  const expiredToken = `header.${Buffer.from(JSON.stringify({ exp: 1 })).toString("base64url")}.signature`
+
+  function mockFetch(implementation: () => Promise<Response>): typeof fetch {
+    return Object.assign(implementation, { preconnect: globalThis.fetch.preconnect }) as typeof fetch
+  }
+
+  test("refreshes and persists a matching token rotation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-limits-"))
+    const authPath = join(dir, "auth.json")
+    const auth = {
+      tokens: {
+        access_token: expiredToken,
+        refresh_token: "old-refresh",
+        id_token: "old-id",
+        account_id: "account-1",
+      },
+    }
+    await writeFile(authPath, JSON.stringify(auth))
+
+    try {
+      const fetcher = mockFetch(async () => Response.json({
+        access_token: "fresh-access",
+        refresh_token: "fresh-refresh",
+        id_token: "fresh-id",
+      }))
+
+      expect(await refreshCodexIfNeeded(auth, authPath, fetcher)).toEqual({ token: "fresh-access" })
+      expect(JSON.parse(await readFile(authPath, "utf8"))).toEqual({
+        tokens: {
+          access_token: "fresh-access",
+          refresh_token: "fresh-refresh",
+          id_token: "fresh-id",
+          account_id: "account-1",
+        },
+        last_refresh: expect.any(String),
+      })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps the current token when refresh is unavailable", async () => {
+    const auth = { tokens: { access_token: expiredToken, refresh_token: "refresh" } }
+    const unavailable = mockFetch(async () => { throw new Error("offline") })
+    const serverError = mockFetch(async () => new Response(null, { status: 500 }))
+
+    expect(await refreshCodexIfNeeded(auth, "unused", unavailable)).toEqual({ token: expiredToken })
+    expect(await refreshCodexIfNeeded(auth, "unused", serverError)).toEqual({ token: expiredToken })
+  })
+
+  test("surfaces rejected refresh credentials", async () => {
+    const auth = { tokens: { access_token: expiredToken, refresh_token: "refresh" } }
+    const fetcher = mockFetch(async () => new Response(null, { status: 401 }))
+
+    expect(await refreshCodexIfNeeded(auth, "unused", fetcher)).toEqual({
+      token: expiredToken,
+      authError: "codex login",
+    })
   })
 })
 
