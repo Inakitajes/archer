@@ -670,7 +670,7 @@ export class TuiProgress implements ProgressUI {
         if (finished) return
         consume()
         if (this.observer) {
-          this.addEvent("convoy", "system", "pause isn't available while attached read-only")
+          this.addEvent(this.focusedPhase()?.name ?? "convoy", "system", "pause isn't available while attached read-only")
           this.render()
           return
         }
@@ -2148,7 +2148,7 @@ export class TuiProgress implements ProgressUI {
     if (!pending) return
     const explain = pending.info.explain
     if (!explain) {
-      this.addEvent("convoy", "permission", "no safety judge configured to explain this")
+      pending.explain = { status: "error", message: "no safety judge configured to explain this" }
       this.render()
       return
     }
