@@ -4,7 +4,7 @@ import { join } from "node:path"
 
 import { afterAll, describe, expect, test } from "bun:test"
 
-import { advisorToolFileSource, handleAdvise, handleFeedback, installAdvisorTool, startAdvisorBridge } from "../src/advisor-bridge"
+import { installAdvisorTool, startAdvisorBridge } from "../src/advisor-bridge"
 import type { AdvisorPhaseHandle, AdvisorRuntime } from "../src/advisor-runtime"
 
 const dirs: string[] = []
@@ -50,58 +50,61 @@ function stubRuntime(sessions: Record<string, string>): { runtime: AdvisorRuntim
   }
 }
 
-const post = (body: unknown, headers: Record<string, string> = { authorization: `Bearer ${token}` }) =>
-  new Request("http://127.0.0.1/advise", { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) })
+async function post(url: string, body: unknown, authorization = `Bearer ${token}`) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(authorization ? { authorization } : {}) },
+    body: JSON.stringify(body),
+  })
+}
 
 describe("advisor bridge endpoint", () => {
   test("consults the phase that owns the session and returns its advice", async () => {
     const { runtime, handles } = stubRuntime({ ses_1: "Read src/retry.ts first." })
-    const response = await handleAdvise(post({ sessionID: "ses_1" }), runtime, token)
-
-    expect(response.status).toBe(200)
-    expect(await response.json()).toEqual({ advice: "Read src/retry.ts first." })
-    expect(handles.get("ses_1")?.consulted).toEqual([{ reason: "on-demand" }])
-  })
-
-  test("forwards an optional question", async () => {
-    const { runtime, handles } = stubRuntime({ ses_1: "Take the mutex first." })
-    await handleAdvise(post({ sessionID: "ses_1", question: "which lock ordering?" }), runtime, token)
-
-    expect(handles.get("ses_1")?.consulted).toEqual([{ reason: "on-demand", question: "which lock ordering?" }])
+    const bridge = await startAdvisorBridge({ advisors: () => runtime })
+    try {
+      const response = await post(bridge.url, { sessionID: "ses_1", question: "which lock ordering?" }, `Bearer ${bridge.token}`)
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({ advice: "Read src/retry.ts first." })
+      expect(handles.get("ses_1")?.consulted).toEqual([{ reason: "on-demand", question: "which lock ordering?" }])
+    } finally {
+      bridge.close()
+    }
   })
 
   test("rejects a wrong or missing token", async () => {
     const { runtime } = stubRuntime({ ses_1: "advice" })
-
-    expect((await handleAdvise(post({ sessionID: "ses_1" }, { authorization: "Bearer wrong" }), runtime, token)).status).toBe(401)
-    expect((await handleAdvise(post({ sessionID: "ses_1" }, {}), runtime, token)).status).toBe(401)
+    const bridge = await startAdvisorBridge({ advisors: () => runtime })
+    try {
+      expect((await post(bridge.url, { sessionID: "ses_1" }, "Bearer wrong")).status).toBe(401)
+      expect((await post(bridge.url, { sessionID: "ses_1" }, "")).status).toBe(401)
+    } finally {
+      bridge.close()
+    }
   })
 
   test("rejects non-POST and malformed bodies", async () => {
     const { runtime } = stubRuntime({ ses_1: "advice" })
-    const get = new Request("http://127.0.0.1/advise", { method: "GET", headers: { authorization: `Bearer ${token}` } })
-
-    expect((await handleAdvise(get, runtime, token)).status).toBe(405)
-    const bad = new Request("http://127.0.0.1/advise", { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "not json" })
-    expect((await handleAdvise(bad, runtime, token)).status).toBe(400)
-    expect((await handleAdvise(post({}), runtime, token)).status).toBe(400)
+    const bridge = await startAdvisorBridge({ advisors: () => runtime })
+    try {
+      expect((await fetch(bridge.url, { method: "GET", headers: { authorization: `Bearer ${bridge.token}` } })).status).toBe(405)
+      expect((await fetch(bridge.url, { method: "POST", headers: { authorization: `Bearer ${bridge.token}` }, body: "not json" })).status).toBe(400)
+      expect((await post(bridge.url, {}, `Bearer ${bridge.token}`)).status).toBe(400)
+    } finally {
+      bridge.close()
+    }
   })
 
   test("answers an unknown session with degradation guidance rather than an error", async () => {
     const { runtime } = stubRuntime({})
-    const response = await handleAdvise(post({ sessionID: "ses_unowned" }), runtime, token)
-
-    // An agent can carry the tool because another step using it is advised;
-    // failing the tool call there would be a worse experience than saying so.
-    expect(response.status).toBe(200)
-    expect((await response.json()).advice).toContain("Continue on your own judgement")
-  })
-
-  test("degrades the same way before the runtime exists", async () => {
-    const response = await handleAdvise(post({ sessionID: "ses_1" }), () => undefined, token)
-
-    expect(response.status).toBe(200)
-    expect((await response.json()).advice).toContain("Continue on your own judgement")
+    const bridge = await startAdvisorBridge({ advisors: () => runtime })
+    try {
+      const response = await post(bridge.url, { sessionID: "ses_unowned" }, `Bearer ${bridge.token}`)
+      expect(response.status).toBe(200)
+      expect((await response.json()).advice).toContain("Continue on your own judgement")
+    } finally {
+      bridge.close()
+    }
   })
 
   test("validates and records explicit executor feedback", async () => {
@@ -111,33 +114,28 @@ describe("advisor bridge endpoint", () => {
       recorded = args
       return true
     }
-    const request = new Request("http://127.0.0.1/feedback", {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ sessionID: "ses_1", outcome: "partially-adopted", note: "Kept the API." }),
-    })
-    expect(await (await handleFeedback(request, runtime, token)).json()).toMatchObject({ recorded: true })
-    expect(recorded).toEqual([undefined, "partially-adopted", "Kept the API."])
+    const bridge = await startAdvisorBridge({ advisors: () => runtime })
+    try {
+      const feedbackUrl = new URL("/feedback", bridge.url).toString()
+      const response = await post(feedbackUrl, { sessionID: "ses_1", outcome: "partially-adopted", note: "Kept the API." }, `Bearer ${bridge.token}`)
+      expect(await response.json()).toMatchObject({ recorded: true })
+      expect(recorded).toEqual([undefined, "partially-adopted", "Kept the API."])
+    } finally {
+      bridge.close()
+    }
   })
 
   test("rejects malformed feedback and degrades unknown sessions without recording", async () => {
     const { runtime } = stubRuntime({})
-    const get = new Request("http://127.0.0.1/feedback", { method: "GET", headers: { authorization: `Bearer ${token}` } })
-    expect((await handleFeedback(get, runtime, token)).status).toBe(405)
-
-    const invalid = new Request("http://127.0.0.1/feedback", {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ sessionID: "ses_1", outcome: "maybe" }),
-    })
-    expect((await handleFeedback(invalid, runtime, token)).status).toBe(400)
-
-    const unknown = new Request("http://127.0.0.1/feedback", {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ sessionID: "ses_1", outcome: "adopted" }),
-    })
-    expect(await (await handleFeedback(unknown, runtime, token)).json()).toMatchObject({ recorded: false })
+    const bridge = await startAdvisorBridge({ advisors: () => runtime })
+    try {
+      const feedbackUrl = new URL("/feedback", bridge.url).toString()
+      expect((await fetch(feedbackUrl, { method: "GET", headers: { authorization: `Bearer ${bridge.token}` } })).status).toBe(405)
+      expect((await post(feedbackUrl, { sessionID: "ses_1", outcome: "maybe" }, `Bearer ${bridge.token}`)).status).toBe(400)
+      expect(await (await post(feedbackUrl, { sessionID: "ses_1", outcome: "adopted" }, `Bearer ${bridge.token}`)).json()).toMatchObject({ recorded: false })
+    } finally {
+      bridge.close()
+    }
   })
 })
 
@@ -203,7 +201,8 @@ describe("advisor tool file", () => {
     const dir = await scratch()
     // Rewritten as .mjs so it can be imported directly; the source is identical.
     const modulePath = join(dir, "advisor.mjs")
-    await writeFile(modulePath, advisorToolFileSource)
+    const installedPath = await installAdvisorTool({ dir })
+    await writeFile(modulePath, await readFile(installedPath, "utf8"))
     const tool = (await import(modulePath)).default
 
     expect(tool.args).toEqual({})
@@ -234,6 +233,7 @@ describe("advisor tool file", () => {
   test("rewrites only when the content changed, so OpenCode's watcher isn't churned", async () => {
     const dir = await scratch()
     const path = await installAdvisorTool({ dir })
+    const expected = await readFile(path, "utf8")
     const first = (await stat(path)).mtimeMs
 
     await new Promise((resolve) => setTimeout(resolve, 20))
@@ -242,6 +242,6 @@ describe("advisor tool file", () => {
 
     await writeFile(path, "// stale shim from an older Convoy\n")
     await installAdvisorTool({ dir })
-    expect(await readFile(path, "utf8")).toBe(advisorToolFileSource)
+    expect(await readFile(path, "utf8")).toBe(expected)
   })
 })

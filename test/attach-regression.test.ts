@@ -4,7 +4,7 @@ import { join } from "node:path"
 
 import { afterAll, expect, test } from "bun:test"
 
-import { LiveAttach } from "../src/attach"
+import { LiveAttach } from "../src/attach-runtime"
 import { noopProgress, type ProgressPhaseSnapshot, type ProgressUI } from "../src/progress"
 
 import type { AdvisorEvent } from "../src/advisor-events"
@@ -67,7 +67,7 @@ test("live attachment replays the authoritative advisor journal before metadata 
       phases: { build: { status: "completed" } },
     }),
   )
-  await (attach as unknown as { tick(): Promise<void> }).tick()
+  for (let attempt = 0; attempt < 30 && restored.length === 0; attempt++) await Bun.sleep(50)
   await attach.stop()
 
   expect(started).toEqual(["build"])

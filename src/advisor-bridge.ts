@@ -64,7 +64,7 @@ export async function startAdvisorBridge(options: StartAdvisorBridgeOptions): Pr
   return { url, token, close: () => server.stop(true) }
 }
 
-export async function handleAdvise(request: Request, advisors: (() => AdvisorRuntime | undefined) | AdvisorRuntime, token: string): Promise<Response> {
+async function handleAdvise(request: Request, advisors: (() => AdvisorRuntime | undefined) | AdvisorRuntime, token: string): Promise<Response> {
   const runtime = typeof advisors === "function" ? advisors() : advisors
   if (request.method !== "POST") return new Response("method not allowed", { status: 405 })
   if (request.headers.get("authorization") !== `Bearer ${token}`) return new Response("unauthorized", { status: 401 })
@@ -92,7 +92,7 @@ export async function handleAdvise(request: Request, advisors: (() => AdvisorRun
   return advice(result.text)
 }
 
-export async function handleFeedback(request: Request, advisors: (() => AdvisorRuntime | undefined) | AdvisorRuntime, token: string): Promise<Response> {
+async function handleFeedback(request: Request, advisors: (() => AdvisorRuntime | undefined) | AdvisorRuntime, token: string): Promise<Response> {
   const runtime = typeof advisors === "function" ? advisors() : advisors
   if (request.method !== "POST") return new Response("method not allowed", { status: 405 })
   if (request.headers.get("authorization") !== `Bearer ${token}`) return new Response("unauthorized", { status: 401 })
@@ -336,7 +336,3 @@ export default tool({
   },
 })
 `
-
-/** Exposed for the test that asserts the shim stays syntactically valid. */
-export const advisorToolFileSource = fallbackAdvisorToolSource
-export const advisorFeedbackToolFileSource = fallbackAdvisorFeedbackToolSource

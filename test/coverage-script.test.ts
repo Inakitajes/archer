@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { badgeColor, generateBadgeSVG, parseTextCoverage } from "../scripts/coverage"
+import { badgeColor, generateBadgeSVG, parseTextCoverage } from "../scripts/coverage-core"
 
 describe("parseTextCoverage", () => {
   test("maps Bun's function and line columns in the documented order", () => {

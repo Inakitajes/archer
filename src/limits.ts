@@ -1,8 +1,9 @@
-import { readFile, writeFile } from "node:fs/promises"
+import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
 import { log } from "./log"
+import { refreshCodexIfNeeded, type CodexAuth } from "./limits-auth"
 import { readKeychainSecret } from "./secrets"
 
 /**
@@ -34,15 +35,11 @@ export type LimitsSnapshot = {
 }
 
 const usageUrl = "https://chatgpt.com/backend-api/wham/usage"
-const tokenUrl = "https://auth.openai.com/oauth/token"
-// Public OAuth client id of the official Codex CLI.
-const codexClientId = "app_EMoamEEZ73f0CkXaXp7hrann"
-const refreshMarginMs = 5 * 60_000
 const creditsUrl = "https://openrouter.ai/api/v1/credits"
 const keyUrl = "https://openrouter.ai/api/v1/key"
 const fetchTimeoutMs = 10_000
 
-export const limitsPollMs = 180_000
+const limitsPollMs = 180_000
 
 // ---------------------------------------------------------------------------
 // Pure parsers (unit-tested with fixtures).
@@ -68,16 +65,6 @@ export function parseCodexUsage(data: unknown): GptLimits | undefined {
     sessionPct,
     sessionResetsAt: windowResetMs(rateLimit?.primary_window),
     weeklyPct: windowPct(rateLimit?.secondary_window),
-  }
-}
-
-/** Expiry of a JWT access token in epoch ms, or null when undecodable. */
-export function jwtExpMs(token: string): number | null {
-  try {
-    const payload = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString())
-    return typeof payload.exp === "number" ? payload.exp * 1000 : null
-  } catch {
-    return null
   }
 }
 
@@ -120,63 +107,6 @@ function codexAuthPath() {
 
 function opencodeAuthPath() {
   return join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "auth.json")
-}
-
-type CodexAuth = {
-  tokens?: { access_token?: string; refresh_token?: string; id_token?: string; account_id?: string }
-  last_refresh?: string
-}
-
-/**
- * Refresh the Codex access token when it expires within the margin,
- * persisting the rotation like the official CLI does. Runway and the Codex
- * CLI poll the same file, so before writing we re-read it and skip the
- * persist if someone else already rotated past us.
- */
-export async function refreshCodexIfNeeded(
-  auth: CodexAuth,
-  authPath: string,
-  fetcher: typeof fetch = globalThis.fetch,
-): Promise<{ token: string; authError?: string }> {
-  const token = auth.tokens!.access_token!
-  const refreshToken = auth.tokens?.refresh_token
-  const expMs = jwtExpMs(token)
-  if (!refreshToken || expMs === null || expMs > Date.now() + refreshMarginMs) return { token }
-
-  let res: Response
-  try {
-    res = await fetcher(tokenUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: codexClientId,
-        grant_type: "refresh_token",
-        refresh_token: refreshToken,
-        scope: "openid profile email",
-      }),
-      signal: AbortSignal.timeout(fetchTimeoutMs),
-    })
-  } catch {
-    return { token } // No network: try the current token and let the usage fetch fail.
-  }
-  if (res.status === 400 || res.status === 401) return { token, authError: "codex login" }
-  if (!res.ok) return { token }
-
-  try {
-    const fresh = (await res.json()) as { access_token?: string; refresh_token?: string; id_token?: string }
-    if (!fresh.access_token) return { token }
-    const current = JSON.parse(await readFile(authPath, "utf8")) as CodexAuth
-    if (current.tokens?.refresh_token === refreshToken) {
-      current.tokens.access_token = fresh.access_token
-      if (fresh.refresh_token) current.tokens.refresh_token = fresh.refresh_token
-      if (fresh.id_token) current.tokens.id_token = fresh.id_token
-      current.last_refresh = new Date().toISOString()
-      await writeFile(authPath, JSON.stringify(current, null, 2))
-    }
-    return { token: fresh.access_token }
-  } catch {
-    return { token }
-  }
 }
 
 async function fetchGptUsage(): Promise<FetchResult<GptLimits>> {
