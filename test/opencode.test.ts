@@ -20,6 +20,7 @@ import type { OpencodeHandle } from "../src/opencode"
 
 const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")
 const originalTerminal = process.env.CONVOY_TERMINAL
+const originalZellij = process.env.ZELLIJ
 const originalPath = process.env.PATH
 const originalSpawn = Bun.spawn
 const originalWhich = Bun.which
@@ -56,6 +57,7 @@ function mockSpawnResult(exitCode = 0, stderr = ""): SpawnMock {
 afterEach(() => {
   if (originalPlatformDescriptor) Object.defineProperty(process, "platform", originalPlatformDescriptor)
   restoreEnv("CONVOY_TERMINAL", originalTerminal)
+  restoreEnv("ZELLIJ", originalZellij)
   restoreEnv("PATH", originalPath)
   Bun.spawn = originalSpawn
   Bun.which = originalWhich
@@ -283,6 +285,39 @@ describe("openSessionCommand", () => {
 
     try {
       await expect(openSessionCommand("false")).rejects.toThrow("command not found")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("opens a Zellij pane on Linux when running inside Zellij", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      const backend = await openSessionCommand("opencode attach http://127.0.0.1:1234", "/my repo")
+
+      expect(backend).toBe("zellij")
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      expect(args.slice(0, 6)).toEqual(["zellij", "action", "new-pane", "--close-on-exit", "--cwd", "/my repo"])
+      expect(args.slice(6, 9)).toEqual(["--", "sh", "-lc"])
+      expect(args[9]).toContain("opencode attach http://127.0.0.1:1234")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("can force the Zellij backend", async () => {
+    setPlatform("linux")
+    process.env.CONVOY_TERMINAL = "zellij"
+    delete process.env.ZELLIJ
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).resolves.toBe("zellij")
+      expect(mockSpawn.mock.calls[0]![0]).toEqual(["zellij", "action", "new-pane", "--close-on-exit", "--", "sh", "-lc", expect.any(String)])
     } finally {
       mockSpawn.mockRestore()
     }
