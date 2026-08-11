@@ -235,8 +235,8 @@ async function handleRequest(
           if (serverUrl && request.sessionID) {
             try {
               const { openOpencodeSessionWindow } = await import("./opencode")
-              await openOpencodeSessionWindow({ url: serverUrl, targetDir: directory, sessionID: request.sessionID })
-              stdout.write(`\nopened session in new window\n\n`)
+              const backend = await openOpencodeSessionWindow({ url: serverUrl, targetDir: directory, sessionID: request.sessionID })
+              stdout.write(`\nopened session in ${backend}\n\n`)
             } catch (error) {
               stdout.write(`\ncouldn't open session: ${error instanceof Error ? error.message : String(error)}\n\n`)
             }

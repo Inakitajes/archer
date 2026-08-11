@@ -56,7 +56,9 @@ function fetchWithoutIdleTimeout(request: Request) {
   return fetch(request, { timeout: false } as RequestInit)
 }
 
-export type SessionWindowBackend = "zellij" | "ghostty" | "terminal"
+const SESSION_WINDOW_BACKENDS = ["zellij", "ghostty", "terminal"] as const
+
+export type SessionWindowBackend = (typeof SESSION_WINDOW_BACKENDS)[number]
 
 // Async on purpose: this is called from the TUI's render path, and a sync
 // osascript call would freeze the dashboard while macOS opens the window.
@@ -71,6 +73,7 @@ export async function openOpencodeSessionWindow(input: {
   return openSessionCommand(
     ["opencode", "attach", input.url, "--dir", input.targetDir, "--session", input.sessionID].map(shellQuote).join(" "),
     input.targetDir,
+    "opencode session",
   )
 }
 
@@ -82,7 +85,7 @@ export async function openInteractiveOpencodeWindow(input: {
   targetDir: string
 }): Promise<SessionWindowBackend> {
   const args = ["opencode", "attach", input.url, "--dir", input.targetDir, "--continue"]
-  return openSessionCommand(args.map(shellQuote).join(" "), input.targetDir)
+  return openSessionCommand(args.map(shellQuote).join(" "), input.targetDir, "opencode interactive")
 }
 
 // Opens a standalone opencode TUI on a stored session — it starts its own
@@ -92,7 +95,11 @@ export async function openStoredSessionWindow(input: {
   targetDir: string
   sessionID: string
 }): Promise<SessionWindowBackend> {
-  return openSessionCommand(["opencode", input.targetDir, "--session", input.sessionID].map(shellQuote).join(" "), input.targetDir)
+  return openSessionCommand(
+    ["opencode", input.targetDir, "--session", input.sessionID].map(shellQuote).join(" "),
+    input.targetDir,
+    "opencode session",
+  )
 }
 
 // Opens a standalone opencode TUI on a brand-new session seeded with an
@@ -104,32 +111,51 @@ export async function openIterateOpencodeWindow(input: {
   prompt: string
 }): Promise<SessionWindowBackend> {
   const coreCommand = ["opencode", input.targetDir, "--prompt", input.prompt].map(shellQuote).join(" ")
-  return openSessionCommand(coreCommand, input.targetDir)
+  return openSessionCommand(coreCommand, input.targetDir, "opencode iterate")
 }
 
-/** Builds an iterate-window command that makes the target project the shell's working directory. */
-export function iterateSessionShellCommand(input: { targetDir: string; prompt: string }, path = process.env.PATH): string {
-  const coreCommand = ["opencode", input.targetDir, "--prompt", input.prompt].map(shellQuote).join(" ")
-  return sessionShellCommand(coreCommand, input.targetDir, path)
+/**
+ * Opens a command in a Zellij pane or a new macOS terminal window. Shared with
+ * the claude-code runner. `label` names the Zellij pane and is ignored by the
+ * window backends, which have no equivalent.
+ */
+export async function openSessionCommand(coreCommand: string, cwd?: string, label?: string): Promise<SessionWindowBackend> {
+  return openShellCommand(sessionShellCommand(coreCommand, cwd), cwd, label)
 }
 
-/** Opens a command in a Zellij pane or a new macOS terminal window. Shared with the claude-code runner. */
-export async function openSessionCommand(coreCommand: string, cwd?: string): Promise<SessionWindowBackend> {
-  return openShellCommand(sessionShellCommand(coreCommand, cwd), cwd)
-}
-
-async function openShellCommand(command: string, cwd?: string): Promise<SessionWindowBackend> {
-  const forced = process.env.CONVOY_TERMINAL?.toLowerCase()
-  // Zellij exports ZELLIJ for every process in a session (usually "0"). Check
-  // for presence rather than truthiness so that value is not mistaken for false.
-  // Explicit terminal choices still win, which leaves an escape hatch for users
-  // who intentionally want a separate macOS window from a Zellij pane.
-  if (forced === "zellij" || (!forced && process.env.ZELLIJ !== undefined)) {
-    await openInZellij(command, cwd)
+async function openShellCommand(command: string, cwd?: string, label?: string): Promise<SessionWindowBackend> {
+  const forced = forcedBackend()
+  // An explicit choice always wins, which leaves an escape hatch for users who
+  // intentionally want a separate macOS window from inside a Zellij pane.
+  if (forced === "zellij") {
+    await openInZellij(command, cwd, label)
     return "zellij"
   }
+  // Zellij exports ZELLIJ for every process in a session, usually as "0" —
+  // truthy in JS, so it needs no special handling; an empty value means the
+  // export was scrubbed and is deliberately not treated as a live session.
+  // The binary is probed because Convoy's own PATH is not necessarily the one
+  // that started the session, and a macOS window still beats no session at all.
+  if (!forced && process.env.ZELLIJ && Bun.which("zellij") !== null) {
+    try {
+      await openInZellij(command, cwd, label)
+      return "zellij"
+    } catch (error) {
+      // Best effort, mirroring the Ghostty fallback below: on macOS there are
+      // two working window backends behind this. Elsewhere there is nothing.
+      if (process.platform !== "darwin") throw error
+    }
+  }
   if (process.platform !== "darwin") {
-    throw new Error("opening a new terminal window is implemented for macOS only; run Convoy inside Zellij to open a session pane")
+    // Telling someone already inside Zellij to run Convoy inside Zellij would
+    // name the wrong cause: reaching here un-forced with ZELLIJ set means the
+    // probe above failed to find the binary. A forced window backend gets the
+    // plain message, since it never asked for a pane.
+    throw new Error(
+      !forced && process.env.ZELLIJ
+        ? "couldn't find the zellij binary on PATH to open a session pane"
+        : "opening a new terminal window is implemented for macOS only; run Convoy inside Zellij to open a session pane",
+    )
   }
 
   if (forced === "terminal") {
@@ -150,12 +176,27 @@ async function openShellCommand(command: string, cwd?: string): Promise<SessionW
   return "terminal"
 }
 
+/** Reads CONVOY_TERMINAL, rejecting values that would otherwise fail obscurely. */
+function forcedBackend(): SessionWindowBackend | undefined {
+  const raw = process.env.CONVOY_TERMINAL?.trim().toLowerCase()
+  if (!raw) return undefined
+  const backend = SESSION_WINDOW_BACKENDS.find((candidate) => candidate === raw)
+  if (!backend) throw new Error(`CONVOY_TERMINAL=${raw} is not a known backend; use one of ${SESSION_WINDOW_BACKENDS.join(", ")}`)
+  return backend
+}
+
 // `zellij action new-pane` launches the command in the current session and
-// focuses it. A POSIX shell executes the command string built above, while
-// --cwd keeps the pane in the target project, and --close-on-exit removes it
-// when OpenCode exits so focus returns to Convoy under Zellij's normal rules.
-async function openInZellij(command: string, cwd?: string) {
-  await spawnChecked(["zellij", "action", "new-pane", "--close-on-exit", ...(cwd ? ["--cwd", cwd] : []), "--", "sh", "-lc", command])
+// focuses it, then exits 0 as soon as the pane exists — which says nothing
+// about whether OpenCode started. So the pane is deliberately left to hold on
+// exit (no --close-on-exit): a failed launch stays on screen with its exit
+// code, and `Ctrl-c` closes it. --cwd gives Zellij the right pane metadata
+// while the command's own `cd` stays the guard that stops a launch into a
+// missing directory. `sh` suffices where Ghostty needs a `zsh` login shell,
+// because sessionShellCommand re-exports the PATH Convoy inherited from the
+// shell that started the Zellij session.
+async function openInZellij(command: string, cwd?: string, label?: string) {
+  const options = [...(label ? ["--name", label] : []), ...(cwd ? ["--cwd", cwd] : [])]
+  await spawnChecked(["zellij", "action", "new-pane", ...options, "--", "sh", "-lc", command])
 }
 
 /** Builds the login-shell command, stopping before launch if setup or `cd` fails. */
