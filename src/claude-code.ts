@@ -554,7 +554,7 @@ export async function* ndjsonLines(stream: ReadableStream<Uint8Array>): AsyncGen
 export async function openClaudeSessionWindow(input: { targetDir: string; sessionID: string; runDir: string }): Promise<SessionWindowBackend> {
   const readableDirectories = await readClaudeSessionDirectories(input.runDir, input.sessionID)
   const command = [claudeBinaryName, ...claudeResumeArgs(input.sessionID, readableDirectories)].map(shellQuote).join(" ")
-  return openSessionCommand(command, input.targetDir)
+  return openSessionCommand(command, input.targetDir, "claude session")
 }
 
 export function claudeResumeArgs(sessionID: string, readableDirectories: readonly string[]): string[] {

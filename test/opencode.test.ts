@@ -6,7 +6,6 @@ import { join } from "node:path"
 import {
   shellQuote,
   sessionShellCommand,
-  iterateSessionShellCommand,
   openSessionCommand,
   openOpencodeSessionWindow,
   openInteractiveOpencodeWindow,
@@ -20,6 +19,7 @@ import type { OpencodeHandle } from "../src/opencode"
 
 const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")
 const originalTerminal = process.env.CONVOY_TERMINAL
+const originalZellij = process.env.ZELLIJ
 const originalPath = process.env.PATH
 const originalSpawn = Bun.spawn
 const originalWhich = Bun.which
@@ -53,9 +53,33 @@ function mockSpawnResult(exitCode = 0, stderr = ""): SpawnMock {
   return spawn as unknown as SpawnMock
 }
 
+// Fails only the named binary, so a fallback backend can still succeed in the
+// same test — mockSpawnResult(1) would fail the fallback too.
+function mockSpawnFailing(binary: string): SpawnMock {
+  const spawn = spyOn(Bun, "spawn")
+  spawn.mockImplementation(((cmd: string[]) => {
+    const failed = cmd[0] === binary
+    return {
+      exited: Promise.resolve(failed ? 1 : 0),
+      stderr: new ReadableStream({
+        start(controller) {
+          if (failed) controller.enqueue(Buffer.from(`${binary}: no active session`))
+          controller.close()
+        },
+      }),
+    }
+  }) as unknown as typeof Bun.spawn)
+  return spawn as unknown as SpawnMock
+}
+
+function spawnedBinaries(mockSpawn: SpawnMock): string[] {
+  return mockSpawn.mock.calls.map((call) => call[0]![0]!)
+}
+
 afterEach(() => {
   if (originalPlatformDescriptor) Object.defineProperty(process, "platform", originalPlatformDescriptor)
   restoreEnv("CONVOY_TERMINAL", originalTerminal)
+  restoreEnv("ZELLIJ", originalZellij)
   restoreEnv("PATH", originalPath)
   Bun.spawn = originalSpawn
   Bun.which = originalWhich
@@ -184,37 +208,6 @@ describe("sessionShellCommand", () => {
   })
 })
 
-describe("iterateSessionShellCommand", () => {
-  test("builds a command with the prompt", () => {
-    const cmd = iterateSessionShellCommand(
-      { targetDir: "/repo", prompt: "Add login" },
-      "/usr/bin:/bin",
-    )
-    expect(cmd).toContain("opencode")
-    expect(cmd).toContain("/repo")
-    expect(cmd).toContain("--prompt")
-    expect(cmd).toContain("'Add login'")
-  })
-
-  test("escapes special characters in the prompt", () => {
-    const cmd = iterateSessionShellCommand(
-      { targetDir: "/repo", prompt: "it's fine" },
-      "/usr/bin",
-    )
-    expect(cmd).toContain("'it'\\''s fine'")
-  })
-
-  test("includes cwd and PATH setup", () => {
-    const cmd = iterateSessionShellCommand(
-      { targetDir: "/my project", prompt: "hello" },
-      "/usr/local/bin:/usr/bin",
-    )
-    expect(cmd).toContain("export PATH=")
-    expect(cmd).toContain("cd '/my project'")
-    expect(cmd).toMatch(/opencode.*--prompt/)
-  })
-})
-
 describe("openSessionCommand", () => {
   const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")?.value
   const originalTerminal = process.env.CONVOY_TERMINAL
@@ -244,6 +237,9 @@ describe("openSessionCommand", () => {
 
   test("throws when process.platform is not darwin", async () => {
     setPlatform("linux")
+    // A forced window backend never asked for a pane, so the message stays the
+    // plain one even when the suite itself runs inside a Zellij session.
+    process.env.ZELLIJ = "0"
 
     try {
       await expect(openSessionCommand("echo hello")).rejects.toThrow("macOS only")
@@ -283,6 +279,187 @@ describe("openSessionCommand", () => {
 
     try {
       await expect(openSessionCommand("false")).rejects.toThrow("command not found")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("opens a Zellij pane on Linux when running inside Zellij", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    Bun.which = (() => "/usr/bin/zellij") as typeof Bun.which
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      const backend = await openSessionCommand("opencode attach http://127.0.0.1:1234", "/my repo", "opencode session")
+
+      expect(backend).toBe("zellij")
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      expect(args.slice(0, 9)).toEqual([
+        "zellij",
+        "action",
+        "new-pane",
+        "--name",
+        "opencode session",
+        "--cwd",
+        "/my repo",
+        "--",
+        "sh",
+      ])
+      expect(args[9]).toBe("-lc")
+      expect(args[10]).toContain("opencode attach http://127.0.0.1:1234")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // A pane that vanished on exit would hide a failed launch, and `zellij
+  // action` exits 0 as soon as the pane exists — so the pane must hold.
+  test("never passes --close-on-exit, so a failed launch stays on screen", async () => {
+    setPlatform("linux")
+    process.env.CONVOY_TERMINAL = "zellij"
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await openSessionCommand("opencode /repo", "/repo", "opencode session")
+      expect(mockSpawn.mock.calls[0]![0]).not.toContain("--close-on-exit")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("can force the Zellij backend", async () => {
+    setPlatform("linux")
+    process.env.CONVOY_TERMINAL = "zellij"
+    delete process.env.ZELLIJ
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).resolves.toBe("zellij")
+      expect(mockSpawn.mock.calls[0]![0]).toEqual(["zellij", "action", "new-pane", "--", "sh", "-lc", expect.any(String)])
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("propagates errors from a forced Zellij pane", async () => {
+    setPlatform("linux")
+    process.env.CONVOY_TERMINAL = "zellij"
+    const mockSpawn = mockSpawnResult(1, "zellij: no active session")
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).rejects.toThrow("no active session")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // The documented escape hatch: an explicit choice beats auto-detection, so a
+  // user inside Zellij can still ask for a separate macOS window.
+  test("an explicit terminal choice wins over an active Zellij session", async () => {
+    setPlatform("darwin")
+    process.env.CONVOY_TERMINAL = "ghostty"
+    process.env.ZELLIJ = "0"
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await expect(openSessionCommand("opencode /repo", "/repo")).resolves.toBe("ghostty")
+      expect(mockSpawn.mock.calls[0]![0]![0]).toBe("open")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // Which window backend takes over depends on whether Ghostty is installed on
+  // the machine running the suite; what matters here is that Zellij is skipped
+  // and a window still opens, rather than the user losing session opening.
+  test("falls back to a macOS window when the zellij binary is missing", async () => {
+    setPlatform("darwin")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    Bun.which = (() => null) as typeof Bun.which
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await expect(openSessionCommand("opencode /repo", "/repo")).resolves.not.toBe("zellij")
+      expect(spawnedBinaries(mockSpawn)).not.toContain("zellij")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("falls back to a macOS window when an auto-detected pane fails to open", async () => {
+    setPlatform("darwin")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    Bun.which = ((name: string) => (name === "zellij" ? "/usr/bin/zellij" : null)) as typeof Bun.which
+    const mockSpawn = mockSpawnFailing("zellij")
+
+    try {
+      await expect(openSessionCommand("opencode /repo", "/repo")).resolves.not.toBe("zellij")
+      expect(spawnedBinaries(mockSpawn)[0]).toBe("zellij")
+      expect(spawnedBinaries(mockSpawn).length).toBeGreaterThan(1)
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("propagates a failed pane off macOS, where nothing can take over", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    Bun.which = (() => "/usr/bin/zellij") as typeof Bun.which
+    const mockSpawn = mockSpawnFailing("zellij")
+
+    try {
+      await expect(openSessionCommand("opencode /repo", "/repo")).rejects.toThrow("no active session")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("ignores an empty ZELLIJ export rather than treating it as a live session", async () => {
+    setPlatform("darwin")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = ""
+    Bun.which = (() => "/usr/bin/zellij") as typeof Bun.which
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await expect(openSessionCommand("opencode /repo", "/repo")).resolves.not.toBe("zellij")
+      expect(spawnedBinaries(mockSpawn)).not.toContain("zellij")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // "run Convoy inside Zellij" would name the wrong cause for someone who is
+  // already inside Zellij and only missing the binary.
+  test("names the missing binary off macOS instead of advising Zellij", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    Bun.which = (() => null) as typeof Bun.which
+
+    await expect(openSessionCommand("opencode /repo", "/repo")).rejects.toThrow("couldn't find the zellij binary on PATH")
+  })
+
+  test("rejects an unknown CONVOY_TERMINAL instead of silently ignoring it", async () => {
+    setPlatform("linux")
+    process.env.CONVOY_TERMINAL = "kitty"
+    process.env.ZELLIJ = "0"
+
+    await expect(openSessionCommand("opencode /repo")).rejects.toThrow("CONVOY_TERMINAL=kitty is not a known backend")
+  })
+
+  test("tolerates surrounding whitespace and case in CONVOY_TERMINAL", async () => {
+    setPlatform("linux")
+    process.env.CONVOY_TERMINAL = "  Zellij  "
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).resolves.toBe("zellij")
     } finally {
       mockSpawn.mockRestore()
     }
@@ -369,6 +546,29 @@ describe("openOpencodeSessionWindow", () => {
           sessionID: "sess-1",
         }),
       ).rejects.toThrow()
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // [o] is documented as opening a pane under Zellij, so the entry point — not
+  // just openSessionCommand — has to reach that backend and name its pane.
+  test("opens a named Zellij pane when running inside Zellij", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    Bun.which = (() => "/usr/bin/zellij") as typeof Bun.which
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      const backend = await openOpencodeSessionWindow({
+        url: "http://127.0.0.1:12345",
+        targetDir: "/repo",
+        sessionID: "sess-1",
+      })
+      expect(backend).toBe("zellij")
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      expect(args.slice(0, 5)).toEqual(["zellij", "action", "new-pane", "--name", "opencode session"])
     } finally {
       mockSpawn.mockRestore()
     }
@@ -525,6 +725,24 @@ describe("openIterateOpencodeWindow", () => {
         prompt: "hello",
       })
       expect(backend).toBe("terminal")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // [i] is documented alongside [o] as opening a pane under Zellij.
+  test("opens a named Zellij pane when running inside Zellij", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    Bun.which = (() => "/usr/bin/zellij") as typeof Bun.which
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      const backend = await openIterateOpencodeWindow({ targetDir: "/repo", prompt: "hello" })
+      expect(backend).toBe("zellij")
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      expect(args.slice(0, 5)).toEqual(["zellij", "action", "new-pane", "--name", "opencode iterate"])
     } finally {
       mockSpawn.mockRestore()
     }
