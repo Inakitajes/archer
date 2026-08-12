@@ -148,6 +148,10 @@ export type RunOutcome = {
   error?: string
   /** Run workspace dir; still alive while the finish screen is up (cleanup happens after). */
   runDir: string
+  /** This run's consensus quality score, when the pipeline scored itself. */
+  qualityScore?: number
+  /** The goal loop's score trajectory including this run, oldest first; absent when not in goal mode. */
+  goalTrajectory?: number[]
 }
 
 export type RunControlState = "running" | "pausing" | "paused"

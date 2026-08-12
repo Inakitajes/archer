@@ -65,6 +65,8 @@ export type RunOptions = {
    * (same config chain as the main pipeline). Absent when goal mode is off.
    */
   goalFixPipeline?: Pipeline
+  /** Goal loop: scores of the iterations that already ran (this run's own score is appended for display). */
+  goalTrajectory?: number[]
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */

@@ -155,6 +155,8 @@ Flags: `--goal <0-100>`, `--goal-max-iterations <n>`, `--goal-plateau <n>`. The 
 
 Goal mode is a bounded loop, not an open cheque: the plateau and the iteration cap exist precisely so the loop cannot chase a score forever. If it stops below the goal, the branch is left at the best measured state and the final score report tells you what is still missing.
 
+In the TUI, each run's finish screen shows the score it just produced and, from the second iteration on, the trajectory so far (`71 → 84 → 92`); when the loop ends the terminal prints the full trajectory and why it stopped.
+
 ## Requirements
 
 ### Release binary

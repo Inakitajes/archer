@@ -702,7 +702,14 @@ export async function run(options: RunOptions) {
       signal: shutdown.signal,
     })
     await caffeinate.stop()
-    await holdFinishScreen(progress, shutdown, { status: "completed", runDir: workspace.dir })
+    await holdFinishScreen(progress, shutdown, {
+      status: "completed",
+      runDir: workspace.dir,
+      ...(runScoreResult ? { qualityScore: runScoreResult.score.score } : {}),
+      // The goal loop passes earlier iterations' scores; this run's own score
+      // completes the trajectory shown on the finish screen.
+      ...(options.goalTrajectory || runScoreResult ? { goalTrajectory: [...(options.goalTrajectory ?? []), ...(runScoreResult ? [runScoreResult.score.score] : [])] } : {}),
+    })
     return { runID: workspace.runID, dir: workspace.dir, ...(runScoreResult ? { qualityScore: runScoreResult.score, scoreReportText: runScoreResult.reportText } : {}) }
   } catch (error) {
     let failure = error

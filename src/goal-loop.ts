@@ -63,7 +63,7 @@ export async function runGoalLoop(
   }
 
   for (let iteration = 1; iteration <= config.maxIterations; iteration++) {
-    const fixOptions = goalFixOptions(options, previous)
+    const fixOptions = goalFixOptions(options, previous, scores)
     try {
       previous = await deps.run({ ...fixOptions, plan: buildRunPlan(fixOptions) })
     } catch (error) {
@@ -94,7 +94,7 @@ export async function runGoalLoop(
   return summarize({ scores, reached: (scores[scores.length - 1] ?? 0) >= config.goal, reason: outcome })
 }
 
-function goalFixOptions(options: RunOptions, previous: RunResult): RunOptions {
+function goalFixOptions(options: RunOptions, previous: RunResult, trajectory: number[]): RunOptions {
   const base = options.goalFixPipeline
   if (!base) throw new Error("goal loop: the goal-fix pipeline is not resolved for this run")
   const brief = goalBriefFor(previous)
@@ -107,6 +107,8 @@ function goalFixOptions(options: RunOptions, previous: RunResult): RunOptions {
   return {
     ...options,
     pipeline,
+    // The finish screen shows the trajectory building across iterations.
+    goalTrajectory: [...trajectory],
     // Fix iterations must never re-enter goal mode or filter steps.
     goal: undefined,
     goalMaxIterations: undefined,
@@ -157,6 +159,9 @@ function logIteration(iteration: number, score: number, config: GoalLoopConfig, 
 function summarize(outcome: GoalLoopOutcome): GoalLoopOutcome {
   const final = outcome.scores[outcome.scores.length - 1]
   const goalText = `goal ${outcome.reason === "goal" ? "met" : "not met"}`
+  if (outcome.scores.length > 0) {
+    log.info(`goal loop trajectory: ${outcome.scores.join(" → ")}`)
+  }
   if (outcome.reached && final !== undefined) {
     log.info(`goal loop: done — ${final}/100, ${goalText}`)
   } else if (final !== undefined) {

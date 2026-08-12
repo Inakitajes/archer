@@ -143,6 +143,9 @@ describe("runGoalLoop", () => {
     expect(fixCall.onlySteps).toEqual([])
     expect(fixCall.skipSteps).toEqual([])
     expect(fixCall.targetDir).toBe("/repo")
+    // The finish screen shows the trajectory building up: the scores that ran so far.
+    expect(fixCall.goalTrajectory).toEqual([71])
+    expect(calls[2]?.goalTrajectory).toEqual([71, 88])
 
     const steps = fixCall.pipeline.steps
     const fixer = steps.find((step) => step.type === "agent" && step.agentName === "goal-fixer")
