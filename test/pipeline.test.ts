@@ -211,6 +211,133 @@ describe("built-in implement-advised pipeline", () => {
   })
 })
 
+describe("built-in implement-scored pipeline", () => {
+  const scored = () =>
+    resolvePipeline({ name: "implement-scored", spec: builtInPipelines["implement-scored"]!, agents: builtInAgents }).steps.filter(
+      (step): step is AgentStep => step.type === "agent",
+    )
+
+  test("is implement plus the measurement layer: scorer fan-out and a consensus step", () => {
+    expect(scored().map((step) => step.name)).toEqual([
+      "implementer",
+      "patterns",
+      "security",
+      "design",
+      "tests",
+      "adversarial",
+      "score__openai-gpt-5-6-sol-xhigh",
+      "score__anthropic-claude-opus-5",
+      "score-report",
+    ])
+  })
+
+  test("keeps implement's six phases exactly, model for model", () => {
+    const implement = resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents }).steps.filter(
+      (step): step is AgentStep => step.type === "agent",
+    )
+    const byName = Object.fromEntries(implement.map((step) => [step.name, step]))
+
+    expect(scored().slice(0, 6).map((step) => step.name)).toEqual(implement.map((step) => step.name))
+    for (const step of scored().slice(0, 6)) {
+      expect({ model: step.model, variant: step.variant }).toEqual({ model: byName[step.name]!.model, variant: byName[step.name]!.variant })
+    }
+  })
+
+  test("fans the scorers across Sol xhigh + opus as forced read-only, grading with all reports", () => {
+    const scorers = scored().filter((step) => step.stepName === "score")
+
+    expect(scorers).toHaveLength(2)
+    expect(scorers.map((step) => ({ model: step.model, variant: step.variant }))).toEqual([
+      { model: "openai/gpt-5.6-sol", variant: "xhigh" },
+      { model: "anthropic/claude-opus-5", variant: undefined },
+    ])
+    // Fanned out across models: no bash even though the base agent is a verifier.
+    for (const step of scorers) {
+      expect(step.agentName).toBe("quality-scorer__ro")
+      expect(step.readOnly).toBe(true)
+      expect(step.verify).toBeUndefined()
+      expect(step.inputFiles).toEqual([
+        "prd.md",
+        "reports/implementer.md",
+        "reports/patterns.md",
+        "reports/security.md",
+        "reports/design.md",
+        "reports/tests.md",
+        "reports/adversarial.md",
+      ])
+      expect(step.inputDiff).toBe(true)
+    }
+  })
+
+  test("consensus step keeps bash to verify the scorers' claims and reads every report", () => {
+    const report = scored().find((step) => step.name === "score-report")
+
+    expect(report).toMatchObject({
+      agentName: "quality-score-report",
+      model: "openai/gpt-5.6-sol",
+      variant: "xhigh",
+      readOnly: true,
+      verify: true,
+    })
+    expect(report?.inputFiles).toEqual([
+      "prd.md",
+      "reports/implementer.md",
+      "reports/patterns.md",
+      "reports/security.md",
+      "reports/design.md",
+      "reports/tests.md",
+      "reports/adversarial.md",
+      "reports/score__openai-gpt-5-6-sol-xhigh.md",
+      "reports/score__anthropic-claude-opus-5.md",
+    ])
+  })
+})
+
+describe("built-in review-scored pipeline", () => {
+  const scored = () => resolvePipeline({ name: "review-scored", spec: builtInPipelines["review-scored"]!, agents: builtInAgents })
+
+  test("is report-only: every step is read-only and there is no human gate", () => {
+    const pipeline = scored()
+    const agents = pipeline.steps.filter((step): step is AgentStep => step.type === "agent")
+    expect(agents.length).toBeGreaterThan(0)
+    expect(agents.every((step) => step.readOnly)).toBe(true)
+    expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
+  })
+
+  test("scopes, runs the three audits fanned across two models, then scores", () => {
+    expect(stepNames(scored())).toEqual([
+      "scope",
+      "clean-code__openai-gpt-5-6-terra-xhigh",
+      "clean-code__anthropic-claude-opus-5",
+      "security__openai-gpt-5-6-terra-xhigh",
+      "security__anthropic-claude-opus-5",
+      "bugs__openai-gpt-5-6-terra-xhigh",
+      "bugs__anthropic-claude-opus-5",
+      "score__openai-gpt-5-6-sol-xhigh",
+      "score__anthropic-claude-opus-5",
+      "score-report",
+    ])
+  })
+
+  test("consensus step reads every report and keeps bash to verify the score", () => {
+    const report = scored().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")
+
+    expect(report).toMatchObject({ agentName: "quality-score-report", readOnly: true, verify: true })
+    expect(report?.inputFiles).toEqual([
+      "prd.md",
+      "reports/scope.md",
+      "reports/clean-code__openai-gpt-5-6-terra-xhigh.md",
+      "reports/clean-code__anthropic-claude-opus-5.md",
+      "reports/security__openai-gpt-5-6-terra-xhigh.md",
+      "reports/security__anthropic-claude-opus-5.md",
+      "reports/bugs__openai-gpt-5-6-terra-xhigh.md",
+      "reports/bugs__anthropic-claude-opus-5.md",
+      "reports/score__openai-gpt-5-6-sol-xhigh.md",
+      "reports/score__anthropic-claude-opus-5.md",
+    ])
+  })
+})
+
 describe("built-in ship pipeline", () => {
   const ship = () =>
     resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents }).steps.filter(

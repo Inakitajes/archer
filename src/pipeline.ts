@@ -275,6 +275,28 @@ export const builtInAgents: readonly AgentSpec[] = [
     readOnly: true,
     builtIn: true,
   },
+  // Quality scoring: independent measurement against a fixed rubric, with a
+  // separate consensus step that verifies the scorers' claims by running the
+  // checks itself (the Gauntlet Loop's "never let the builder grade itself",
+  // plus a fresh critic that inspects the real artifact rather than a summary).
+  {
+    name: "quality-scorer",
+    description: "Scores an implementation against the quality rubric: six weighted dimensions, absolute severity, evidence-cited, machine-readable output",
+    defaultModel: defaultOpusModel,
+    temperature: 0.1,
+    readOnly: true,
+    verify: true,
+    builtIn: true,
+  },
+  {
+    name: "quality-score-report",
+    description: "Consolidates independent quality-scorer reports into one consensus score, verifies the load-bearing claims by running the checks, and emits the authoritative machine-readable score",
+    defaultModel: defaultOpusModel,
+    temperature: 0.1,
+    readOnly: true,
+    verify: true,
+    builtIn: true,
+  },
 ]
 
 /** Short names accepted in pipeline steps for the built-in agents. */
@@ -389,6 +411,29 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "design", model: defaultImplementReviewModel, advisor: false },
       { agent: "tests", model: defaultImplementAuditModel, advisor: false, reports: "none" },
       { agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" },
+    ],
+  },
+  // implement + the measurement layer: the final diff is graded by two
+  // independent quality-scorers (fresh agents, no shared context with the
+  // builder) against the fixed rubric, and a consensus step reconciles them and
+  // verifies their claims by running the checks itself. The result lands in
+  // reports/score-report.md with a machine-readable score block that a goal
+  // loop (--goal) can act on.
+  "implement-scored": {
+    description: "Like implement, then measures the result: two independent quality-scorers grade the final diff against the rubric and a consensus step reconciles and verifies the score",
+    steps: [
+      { agent: "implementer", model: defaultImplementerModel, reports: "none" },
+      { agent: "patterns", model: defaultImplementAuditModel },
+      { agent: "security", model: defaultImplementAuditModel },
+      { agent: "design", model: defaultImplementReviewModel },
+      { agent: "tests", model: defaultImplementAuditModel, reports: "none" },
+      { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
+      {
+        parallel: [
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+        ],
+      },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
     ],
   },
   review: {
@@ -525,6 +570,30 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
         ],
       },
       { agent: "review-report", name: "report", model: solXhighModel, reports: "all" },
+    ],
+  },
+  // Report-only review + the measurement layer: after the parallel audits, two
+  // independent quality-scorers grade the same diff against the rubric and a
+  // consensus step reconciles and verifies. The score block is the deliverable
+  // alongside the findings report.
+  "review-scored": {
+    description:
+      "Report-only PR review plus a verified quality score: scope, parallel bug/clean-code/security audits across two models, then two independent quality-scorers and a consensus step. Makes no changes.",
+    steps: [
+      { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true },
+      {
+        parallel: [
+          { agent: "clean-code-auditor", name: "clean-code", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
+        ],
+      },
+      {
+        parallel: [
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+        ],
+      },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
     ],
   },
   hunter: {

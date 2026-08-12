@@ -445,6 +445,8 @@ describe("agent registry", () => {
       "hunter-supply-chain",
       "hunter-report",
       "hunter-max-report",
+      "quality-scorer",
+      "quality-score-report",
     ])
   })
 })
@@ -458,7 +460,7 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ship, ultra-implement, ultra-refine)',
+      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-advised, implement-lite, implement-scored, quick, refine, review, review-cc, review-lite, review-scored, ship, ultra-implement, ultra-refine)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
   })

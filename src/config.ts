@@ -281,6 +281,8 @@ defaults:
 # Convoy ships these pipelines built in; pick one with -p/--pipeline without redeclaring it here:
 #   implement            the default: build the feature, then audit, polish, test, and adversarial review
 #   implement-lite       like implement, but swaps GPT 5.6 Terra xhigh phases for GLM 5.2
+#   implement-scored     like implement, then measures the result: two independent scorers + a verified consensus score
+#   implement-advised    like implement, but the implementer consults GPT 5.6 Sol as an advisor
 #   ultra-implement      like implement, with dual-model parallel audits and a final review/fix/validate stage
 #   refine               audit the current diff, then apply the triaged fixes (changes code)
 #   ultra-refine         like refine, with every audit fanned out across two models
@@ -289,6 +291,7 @@ defaults:
 #                        and, optionally, hooks.pipelines.ship to fetch the base first / open the PR after
 #   review               report-only: parallel audits across two models plus one prioritized report (no changes)
 #   review-lite          like review, but swaps GPT 5.6 Terra xhigh for GLM 5.2 (scope + audit fan-out); report stays on Opus
+#   review-scored        like review, then scores the result against the quality rubric (report-only)
 #   review-cc            like review, but pairs each audit with a Claude Code run (needs the \`claude\` CLI on PATH)
 #   hunter               report-only repo audit: six specialty tracks on two models each, then one consensus report
 #   hunter-max           like hunter, with every track fanned across all five models (30 audits — slow and expensive)
