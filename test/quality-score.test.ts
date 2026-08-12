@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { parseQualityScoreReport, qualityVerdict, qualityDimensions, weightedQualityScore, type QualityDimensionScores } from "../src/quality-score"
+import { parseQualityScoreReport, qualityVerdict, qualityDimensions, weightedQualityScore, type QualityDimension, type QualityDimensionScores } from "../src/quality-score"
 
 const dimensions: QualityDimensionScores = { prd: 92, tests: 70, security: 95, maintainability: 88, operational: 90, scope: 85 }
 
@@ -21,6 +21,14 @@ describe("weighted quality score", () => {
     const weakScope = weightedQualityScore({ ...dimensions, scope: 40 })
     expect(weakPrd).toBeLessThan(weakTests)
     expect(weakTests).toBeLessThan(weakScope)
+  })
+
+  test("honors a custom rubric's weights", () => {
+    // A project rubric (.convoy/quality-rubric.md) overrides the v1 weights;
+    // the canonical computation must follow the weights it is given, not
+    // hardcode the defaults. 92*0.5 + 70*0.5 = 81.
+    const customWeights: Record<QualityDimension, number> = { prd: 0.5, tests: 0.5, security: 0, maintainability: 0, operational: 0, scope: 0 }
+    expect(weightedQualityScore(dimensions, customWeights)).toBe(81)
   })
 })
 
@@ -74,12 +82,43 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
     expect(parsed?.confidence).toBe("high")
   })
 
-  test("accepts a json-fenced block and a bare object", () => {
+  test("rejects a json-fenced block and a bare object", () => {
     const jsonFenced = `x\n\`\`\`json\n${JSON.stringify({ score: 91, dimensions, verdict: "ready", mustFix: [] })}\n\`\`\`\n`
-    expect(parseQualityScoreReport(jsonFenced)?.score).toBe(91)
+    expect(parseQualityScoreReport(jsonFenced)).toBeUndefined()
 
     const bare = `Preamble ${JSON.stringify({ score: 80, dimensions, verdict: "ready-with-caveats", mustFix: [] })} trailing`
-    expect(parseQualityScoreReport(bare)?.score).toBe(80)
+    expect(parseQualityScoreReport(bare)).toBeUndefined()
+  })
+
+  test("uses the final quality-score block, not an earlier example", () => {
+    const report = [
+      "The scorer pasted the contract example earlier in the report;",
+      "the authoritative block is the last one.",
+      `\`\`\`quality-score\n${JSON.stringify({ score: 87, dimensions, mustFix: [] })}\n\`\`\`\n`,
+      "Final consensus:",
+      `\`\`\`quality-score\n${JSON.stringify({ score: 92, dimensions: { ...dimensions, prd: 95 }, mustFix: [] })}\n\`\`\`\n`,
+    ].join("\n")
+    expect(parseQualityScoreReport(report)?.score).toBe(92)
+  })
+
+  test("skips an invalid earlier block and uses the final valid one", () => {
+    const report = [
+      "```quality-score\n{ this is not json }\n```",
+      `\`\`\`quality-score\n${JSON.stringify({ score: 84, dimensions, mustFix: [] })}\n\`\`\`\n`,
+    ].join("\n")
+    expect(parseQualityScoreReport(report)?.score).toBe(84)
+  })
+
+  test("rejects a report where the final block is not at the end", () => {
+    const report = `\`\`\`quality-score\n${JSON.stringify({ score: 80, dimensions, mustFix: [] })}\n\`\`\`\n\n(aside: the run is done)`
+    expect(parseQualityScoreReport(report)).toBeUndefined()
+  })
+
+  test("never treats a bare object with braces inside strings as a score block", () => {
+    const bare = `Preamble ${JSON.stringify({ score: 80, dimensions, gaps: { tests: "use {x} and }y }" }, mustFix: [] })} trailing`
+    // A bare-object fallback that counts braces naively mis-slices on braces
+    // inside string values; the strict contract accepts only the fenced block.
+    expect(parseQualityScoreReport(bare)).toBeUndefined()
   })
 
   test("derives the score from dimensions when omitted", () => {
@@ -95,9 +134,26 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
     expect(parseQualityScoreReport(wrong)?.verdict).toBe("failing")
   })
 
-  test("clamps and rounds out-of-band scores", () => {
+  test("never trusts a declared score that contradicts the dimensions", () => {
+    // The canonical-score rule: the weighted total is computed in code from the
+    // dimensions and weights; an agent's declared score is at most informative.
+    const weak: QualityDimensionScores = { prd: 20, tests: 20, security: 20, maintainability: 20, operational: 10, scope: 10 }
+    const report = `\`\`\`quality-score\n${JSON.stringify({ score: 100, dimensions: weak, mustFix: [] })}\n\`\`\`\n`
+    const parsed = parseQualityScoreReport(report)
+    expect(parsed?.score).not.toBe(100)
+    if (parsed) expect(parsed.score).toBe(weightedQualityScore(weak))
+  })
+
+  test("derives the canonical score from the dimensions when the declared score is out of band", () => {
     const report = `\`\`\`quality-score\n${JSON.stringify({ score: 140.4, dimensions, verdict: "ready", mustFix: [] })}\n\`\`\`\n`
-    expect(parseQualityScoreReport(report)?.score).toBe(100)
+    // The declared score is not authoritative: the weighted total is recomputed
+    // from the dimensions, which weigh to 87.
+    expect(parseQualityScoreReport(report)?.score).toBe(87)
+  })
+
+  test("rejects dimensions outside 0–100", () => {
+    const outOfRange = `\`\`\`quality-score\n${JSON.stringify({ score: 87, dimensions: { ...dimensions, prd: 120 }, mustFix: [] })}\n\`\`\`\n`
+    expect(parseQualityScoreReport(outOfRange)).toBeUndefined()
   })
 
   test("is undefined for reports without a parseable block", () => {

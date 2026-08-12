@@ -77,6 +77,14 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--goal-max-iterations", "0"])).toThrow("--goal-max-iterations must be a positive integer")
   })
 
+  test("parses --goal with strict integer parsing", () => {
+    // A goal is a whole number between 1 and 100; anything else must be
+    // rejected instead of silently coerced by parseInt.
+    expect(() => parseArgs(["--goal", "90abc"])).toThrow(/--goal/)
+    expect(() => parseArgs(["--goal", "1.5"])).toThrow(/--goal/)
+    expect(() => parseArgs(["--goal", "90 "])).toThrow(/--goal/)
+  })
+
   test("parses --plan", () => {
     const result = parseArgs(["--plan"])
     expect(result.planOnly).toBe(true)

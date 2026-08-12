@@ -486,6 +486,13 @@ describe("pipeline selection", () => {
     const dir = await projectDir()
     expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    goal: 150", dir)).toThrow("between 0 and 100")
   })
+
+  test("rejects a pipeline goal of zero", async () => {
+    // goal: 0 would make the loop a no-op — any score instantly meets it — so
+    // the configured goal must live in the same 1–100 range the CLI enforces.
+    const dir = await projectDir()
+    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    goal: 0", dir)).toThrow(/goal/)
+  })
 })
 
 describe("isValidModelString", () => {
