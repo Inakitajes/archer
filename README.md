@@ -29,7 +29,7 @@ Typical uses:
 
 Use it as a **CLI** or as a **TUI**, interchangeably: every run can be launched with plain flags and prompt files (`--no-tui` gives you plain logs for pipes and CI), or driven entirely from the TUI — `convoy` with no arguments opens the interactive launcher, every run gets a live dashboard, `convoy runs` browses past runs, and `convoy config` edits global and project config in place.
 
-**Pipelines are data, not code.** Convoy ships a family of built-in pipelines (`implement` — the default — plus `implement-lite`, `implement-advised`, `implement-scored`, `ultra-implement`, `refine`, `ultra-refine`, `ship`, `fixer`, and the report-only `review`, `review-lite`, `review-scored`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
+**Pipelines are data, not code.** Convoy ships a family of built-in pipelines (`implement` — the default — plus `implement-lite`, `implement-advised`, `implement-scored`, `ultra-implement`, `refine`, `ultra-refine`, `ship`, `fixer`, `goal-fix`, and the report-only `review`, `review-lite`, `review-scored`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
 
 Beyond sequencing agents, Convoy owns the operational layer around OpenCode: repo context attachment, runtime guard rails, a live permission gate, commit safety, phase reports, diff tracking, and a TUI that shows cost, tokens, and provider limits while the run is live.
 
@@ -72,6 +72,7 @@ Convoy ships these pipelines; select one with `-p/--pipeline` (no config needed)
 | `review` | **no — report only** | Scope the diff, run the bug / clean-code(+patterns) / security audits **in parallel across two models each**, then a single step synthesizes everything into one prioritized findings report. Makes no changes; the run's output is `reports/report.md`, which you read to decide whether to follow up with a `refine` run. |
 | `review-lite` | **no — report only** | Same shape as `review`, but nothing runs on Opus: `openrouter/z-ai/glm-5.2` scopes the diff and writes the final report, and each parallel audit fans out across `openrouter/z-ai/glm-5.2` + `openrouter/moonshotai/kimi-k3`. The cheap way to get a full review report. |
 | `fixer` | yes | The follow-up to a report-only run. Give it a set of findings (as the prompt or an attachment) and it proves each one with a focused regression test **before** touching production code, applies minimal fixes only for the findings that actually went red, then independently reruns those proofs and the surrounding checks to report a final per-finding verdict (`fixed`, `already-resolved`, `not-reproducible`, `not-automatable`, `blocked`, `not-fixed`). The validation phase runs the commands itself (see [verifying agents](#project-configuration-convoyconfigyaml)) rather than taking the fix phase's word for it, and never promotes an unproven finding to fixed. |
+| `goal-fix` | yes | The goal loop's fix iteration: applies exactly the gaps the previous scoring round reported, then re-scores. Not run directly — `--goal` drives it. See [Goal mode](#goal-mode). |
 | `review-cc` | **no — report only** | Same shape as `review`, but each audit is paired with a second run on the locally installed [`claude` CLI](https://code.claude.com) (`runner: claude-code`) instead of a second API model — cross-vendor diversity billed to a Claude subscription rather than per token. Requires `claude` on `PATH`. |
 | `review-scored` | **no — report only** | `review`, then **measures** the result: the same parallel audits, followed by two independent quality-scorers and a consensus step that reconciles and verifies the score. The deliverables are the findings report and the machine-readable score in `reports/score-report.md`. Makes no changes. |
 | `hunter` | **no — report only** | Repo-wide audit across six specialty tracks (correctness, memory, performance, security, reliability, supply chain), each run on GPT 5.6 Terra xhigh plus one specialty model, then reconciled into a single deduplicated, prioritized consensus report. |
@@ -125,6 +126,34 @@ The final score lands in `reports/score-report.md` with a machine-readable block
 Verdicts map to the score: `ready` (≥90) · `ready-with-caveats` (75–89) · `not-ready` (60–74) · `failing` (<60). This block is the interface a goal loop will act on; today it is the interface you read to decide whether to merge or to follow up with a `fixer`/`refine` run.
 
 **Calibrate before you trust it.** The first few scored runs will grade "differently" from your judgment. Run `review-scored` against 2–3 PRs you already know are good or bad, compare your expectation to the score, and adjust `.convoy/quality-rubric.md` (weights, anchors, deductions) until the score matches your call. The rubric is a contract; like any contract, it is only useful once you agree with it.
+
+## Goal mode
+
+Goal mode answers the "when is it enough?" question mechanically: **don't stop until the implementation scores at or above a target**, or until the score stops improving.
+
+```bash
+convoy -p implement-scored --prompt-file prd.md --goal 90
+```
+
+Each iteration is a full run in the same worktree, so the diff accumulates:
+
+```
+Iteration 0:  implement → audits → tests → adversarial → SCORERS → consensus   score 71
+Iteration 1:  goal-fix (exactly the reported gaps) → SCORERS → consensus        score 86
+Iteration 2:  goal-fix (the remaining gap) → SCORERS → consensus                score 92  ✅
+```
+
+- The **goal-fixer** receives only the previous scoring round's work order — the score, the per-dimension gaps, and the must-fix findings — as a per-step phase brief. Its job is to close exactly those gaps and nothing else: no new scope, no speculative improvements, no restructuring.
+- The re-scorers are **blind to the previous score**: the brief goes to the goal-fixer step only, so a re-score cannot anchor on the number it is supposed to measure.
+- The loop stops when any of these happens:
+  1. **Score ≥ goal** — done.
+  2. **Plateau** — a fix iteration improved the score by less than `--goal-plateau` points (default 3): it keeps reporting "you can do better", but the measurement says it isn't.
+  3. **Iteration cap** — `--goal-max-iterations` (default 3) is exhausted.
+  4. A run fails or produces no parseable score.
+
+Flags: `--goal <0-100>`, `--goal-max-iterations <n>`, `--goal-plateau <n>`. The same values can live on a pipeline in `.convoy/config.yaml` (`goal:`, `goalMaxIterations:`, `goalPlateau:`) and the CLI flags override them. Goal mode requires a pipeline that ends in a `quality-score-report` step — `implement-scored` and `review-scored` do; `implement` alone will refuse `--goal` with a clear error.
+
+Goal mode is a bounded loop, not an open cheque: the plateau and the iteration cap exist precisely so the loop cannot chase a score forever. If it stops below the goal, the branch is left at the best measured state and the final score report tells you what is still missing.
 
 ## Requirements
 

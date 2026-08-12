@@ -53,6 +53,14 @@ export function qualityVerdict(score: number): QualityScoreVerdict {
   return "failing"
 }
 
+/** The pipeline's authoritative scorer step, when it has one: the step running the quality-score-report agent. */
+export function consensusStep(
+  pipeline: { steps: readonly { type: string; agentName?: string; reportPath?: string }[] },
+): { type: string; agentName?: string; reportPath: string } | undefined {
+  const step = pipeline.steps.find((candidate) => candidate.type === "agent" && candidate.agentName === "quality-score-report")
+  return step && step.reportPath ? { ...step, reportPath: step.reportPath } : undefined
+}
+
 /**
  * Extracts and validates the `quality-score` JSON block from a scorer report.
  * Accepts the fenced block (```quality-score or ```json), or a bare JSON object

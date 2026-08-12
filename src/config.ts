@@ -284,6 +284,7 @@ defaults:
 #   implement-scored     like implement, then measures the result: two independent scorers + a verified consensus score
 #   implement-advised    like implement, but the implementer consults GPT 5.6 Sol as an advisor
 #   ultra-implement      like implement, with dual-model parallel audits and a final review/fix/validate stage
+#   goal-fix             the goal loop's fix iteration (not run directly; --goal drives it)
 #   refine               audit the current diff, then apply the triaged fixes (changes code)
 #   ultra-refine         like refine, with every audit fanned out across two models
 #   ship                 merge the advanced base in (resolving conflicts), then refine the merged branch
@@ -634,7 +635,7 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
   for (const [name, value] of Object.entries(record)) {
     const path = `pipelines.${name}`
     const entry = v.record(value, path)
-    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "steps"])
+    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "goal", "goalMaxIterations", "goalPlateau", "steps"])
 
     if (!Array.isArray(entry.steps) || entry.steps.length === 0) v.fail(`${path}.steps`, "must be a non-empty list of steps")
     const steps = (entry.steps as unknown[]).map((step, index) => validateStep(v, step, `${path}.steps[${index}]`))
@@ -642,6 +643,9 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
     pipelines[name] = {
       ...(entry.description !== undefined ? { description: v.nonEmptyString(entry.description, `${path}.description`) } : {}),
       ...(entry.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: v.positiveInt(entry.maxConcurrentAgents, `${path}.maxConcurrentAgents`) } : {}),
+      ...(entry.goal !== undefined ? { goal: v.rangeInt(entry.goal, `${path}.goal`, 0, 100) } : {}),
+      ...(entry.goalMaxIterations !== undefined ? { goalMaxIterations: v.positiveInt(entry.goalMaxIterations, `${path}.goalMaxIterations`) } : {}),
+      ...(entry.goalPlateau !== undefined ? { goalPlateau: v.positiveInt(entry.goalPlateau, `${path}.goalPlateau`) } : {}),
       steps,
     }
   }
@@ -1029,6 +1033,13 @@ class Validator {
 
   positiveInt(value: unknown, path: string): number {
     if (typeof value !== "number" || !Number.isInteger(value) || value < 1) this.fail(path, "must be a positive integer")
+    return value
+  }
+
+  rangeInt(value: unknown, path: string, min: number, max: number): number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+      this.fail(path, `must be an integer between ${min} and ${max}`)
+    }
     return value
   }
 

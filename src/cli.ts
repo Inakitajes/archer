@@ -6,13 +6,15 @@ import { detectBaseRef, resolveWorktreeDefault } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
 import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
+import { consensusStep } from "./quality-score"
+import { defaultGoalMaxIterations, defaultGoalPlateau } from "./goal-loop"
 import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
 import { buildRunPlan } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
 import { isModelGateway, type ModelGateway } from "./model-routing"
 import { browseRuns } from "./runs"
 import { deleteKeychainSecret, keychainAvailable, storeKeychainSecret } from "./secrets"
-import type { Pipeline, RunOptions } from "./types"
+import type { Pipeline, RunOptions, RunPlan } from "./types"
 import { isValidRunID, resumeWorkspace } from "./workspace"
 import { readRunMetadata } from "./metadata"
 import { preflightRunPlan } from "./preflight"
@@ -65,6 +67,12 @@ export type ParsedArgs = {
   gateway?: ModelGateway
   planOnly?: boolean
   noConfirm?: boolean
+  /** --goal: keep fixing until the quality score reaches this value (0–100). */
+  goal?: number
+  /** --goal-max-iterations: cap on fix iterations after the initial run. */
+  goalMaxIterations?: number
+  /** --goal-plateau: stop when a fix iteration improves the score by less than this many points. */
+  goalPlateau?: number
 }
 
 export type InitOptions = {
@@ -169,7 +177,30 @@ export async function parseAndRun(argv: string[]) {
     await ensureRepoReady(options.targetDir, { baseRef: options.baseRef, allowDirty: true })
     options = await prepareWorktreeForRun(options.targetDir, options)
   }
-  await run({ ...options, plan })
+  await executeRun(options, plan)
+}
+
+/** Runs the plan, entering the goal loop when goal mode is configured for this run. */
+async function executeRun(options: RunOptions, plan: RunPlan): Promise<void> {
+  const goal = options.goal ?? plan.pipeline.goal
+  if (goal === undefined) {
+    await run({ ...options, plan })
+    return
+  }
+  if (!consensusStep(plan.pipeline)) {
+    throw new Error(
+      `--goal ${goal} requires a scored pipeline: the pipeline must end in a quality-score-report step (implement-scored, review-scored, or a custom scored pipeline).`,
+    )
+  }
+  if (!options.goalFixPipeline) {
+    throw new Error("goal mode could not resolve the goal-fix pipeline; is a project config overriding or removing it?")
+  }
+  const { runGoalLoop } = await import("./goal-loop")
+  await runGoalLoop(options, plan, {
+    goal,
+    maxIterations: options.goalMaxIterations ?? defaultGoalMaxIterations,
+    plateau: options.goalPlateau ?? defaultGoalPlateau,
+  })
 }
 
 /**
@@ -235,7 +266,7 @@ async function launchInteractiveRun(targetDir: string) {
     if (!options.branch) throw new Error("worktree plan is missing its confirmed branch name")
     options = await prepareWorktreeForRun(targetDir, options)
   }
-  await run({ ...options, plan, noConfirm: true })
+  await executeRun(options, plan)
 }
 
 async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSelection): Promise<LaunchRunPreparation> {
@@ -562,6 +593,22 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
   const smartJudgeModel =
     parsed.smartModel || defaults.autoAcceptJudgeModel || parsed.modelOverride || defaults.model || `${defaultGptModel}#${defaultGptVariant}`
 
+  // Goal mode: CLI flag beats the pipeline's own `goal:` config. When either is
+  // set, resolve the goal-fix pipeline through the same chain so project agents
+  // and defaults apply to the fix iterations too.
+  const goal = parsed.goal ?? pipeline.goal
+  const goalFixPipeline =
+    goal === undefined
+      ? undefined
+      : resolvePipeline({
+          name: "goal-fix",
+          spec: selectPipelineSpec(config, "goal-fix"),
+          agents,
+          defaultModel: defaults.model,
+          defaultAdvisor: defaults.advisor,
+          defaultAdvisorMaxCalls: defaults.advisorMaxCalls,
+        })
+
   const options: Omit<RunOptions, "prompt"> = {
     files: [...(config?.attachments ?? []), ...parsed.files],
     onlySteps: parsed.onlySteps,
@@ -579,6 +626,10 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     maxConcurrentAgents: parsed.maxConcurrent ?? pipeline.maxConcurrentAgents ?? defaults.maxConcurrentAgents ?? defaultMaxConcurrentAgents,
     baseRef: await resolveBaseRef(parsed, defaults),
     targetDir: parsed.targetDir,
+    goal,
+    goalMaxIterations: parsed.goalMaxIterations ?? pipeline.goalMaxIterations ?? defaultGoalMaxIterations,
+    goalPlateau: parsed.goalPlateau ?? pipeline.goalPlateau ?? defaultGoalPlateau,
+    ...(goalFixPipeline ? { goalFixPipeline } : {}),
     // A resumed run continues in the directory its metadata recorded — which is
     // already the worktree, when the original run made one — so it never creates
     // another.
@@ -772,6 +823,18 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "--base":
         parsed.baseRef = takeValue()
         break
+      case "--goal": {
+        const goal = parsePositiveInt(takeValue(), "--goal")
+        if (goal > 100) throw new Error("--goal must be a score from 0 to 100")
+        parsed.goal = goal
+        break
+      }
+      case "--goal-max-iterations":
+        parsed.goalMaxIterations = parsePositiveInt(takeValue(), "--goal-max-iterations")
+        break
+      case "--goal-plateau":
+        parsed.goalPlateau = parsePositiveInt(takeValue(), "--goal-plateau")
+        break
       case "--dir":
         parsed.targetDir = resolve(process.cwd(), takeValue())
         break
@@ -781,6 +844,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
   }
 
   if (positional.length > 0) parsed.prompt = positional.join(" ")
+  return parsed
+}
+
+function parsePositiveInt(value: string, flag: string): number {
+  const parsed = parseInt(value, 10)
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${flag} must be a positive integer`)
   return parsed
 }
 
@@ -869,6 +938,15 @@ Flags:
   --no-worktree            Run in the current working tree instead
                            (default: worktree on a trunk branch, current tree on any other)
   --branch <name>          Name for the worktree branch, instead of asking the naming model
+  --goal <0-100>           Goal mode: keep fixing until the quality score reaches this value.
+                           Requires a scored pipeline (implement-scored, review-scored, or any
+                           pipeline ending in a quality-score-report step). Each fix iteration
+                           applies exactly the gaps the previous scoring round reported and
+                           re-scores; the loop stops at the goal, at a plateau, or at the
+                           iteration cap. See the Quality scoring section of the README.
+  --goal-max-iterations <n> Cap on fix iterations after the initial run (default: 3)
+  --goal-plateau <n>       Stop when a fix iteration improves the score by less than this many
+                           points (default: 3)
   --dir <path>             Target repo (default: cwd)
 
 Config files:

@@ -297,6 +297,15 @@ export const builtInAgents: readonly AgentSpec[] = [
     verify: true,
     builtIn: true,
   },
+  // Goal loop: the directed-fix agent. Its phase brief carries the previous
+  // scoring round's gaps, and its only job is closing exactly those.
+  {
+    name: "goal-fixer",
+    description: "Applies exactly the gaps the previous quality-scorer round reported, without adding new scope",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    builtIn: true,
+  },
 ]
 
 /** Short names accepted in pipeline steps for the built-in agents. */
@@ -359,6 +368,15 @@ export type PipelineSpec = {
    * loses to the `--max-concurrent` CLI flag. Unset inherits the defaults chain.
    */
   maxConcurrentAgents?: number
+  /**
+   * Goal loop: keep fixing until the quality score reaches this value (0–100).
+   * Requires the pipeline to end in a quality-score-report step. CLI --goal wins.
+   */
+  goal?: number
+  /** Goal loop: cap on fix iterations after the initial run. CLI --goal-max-iterations wins. */
+  goalMaxIterations?: number
+  /** Goal loop: stop when a fix iteration improves the score by less than this many points. CLI --goal-plateau wins. */
+  goalPlateau?: number
   steps: StepSpec[]
 }
 
@@ -428,6 +446,23 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "design", model: defaultImplementReviewModel },
       { agent: "tests", model: defaultImplementAuditModel, reports: "none" },
       { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
+      {
+        parallel: [
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+        ],
+      },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
+    ],
+  },
+  // The goal loop's fix iteration: applies exactly the gaps the previous
+  // scoring round reported (delivered as a per-step phase brief on the fixer),
+  // then re-scores with the same independent scorer fan-out and consensus. The
+  // loop keeps the same worktree, so the diff accumulates; nothing here is run
+  // directly by a user, only by --goal.
+  "goal-fix": {
+    description: "The goal loop's fix iteration: apply exactly the gaps from the previous scoring round, then re-score. Not run directly; use --goal.",
+    steps: [
+      { agent: "goal-fixer", name: "fix", reports: "none", diff: true },
       {
         parallel: [
           { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
@@ -763,7 +798,15 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
     throw new Error(`pipeline "${input.name}" has no agent steps`)
   }
 
-  return { name: input.name, ...(input.spec.description ? { description: input.spec.description } : {}), ...(input.spec.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: input.spec.maxConcurrentAgents } : {}), steps }
+  return {
+    name: input.name,
+    ...(input.spec.description ? { description: input.spec.description } : {}),
+    ...(input.spec.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: input.spec.maxConcurrentAgents } : {}),
+    ...(input.spec.goal !== undefined ? { goal: input.spec.goal } : {}),
+    ...(input.spec.goalMaxIterations !== undefined ? { goalMaxIterations: input.spec.goalMaxIterations } : {}),
+    ...(input.spec.goalPlateau !== undefined ? { goalPlateau: input.spec.goalPlateau } : {}),
+    steps,
+  }
 }
 
 export function isParallelSpec(raw: StepSpec): raw is ParallelStepSpec {

@@ -63,6 +63,20 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--gateway", "invalid"])).toThrow()
   })
 
+  test("parses --goal with its iteration and plateau controls", () => {
+    const result = parseArgs(["--goal", "90", "--goal-max-iterations", "5", "--goal-plateau", "2"])
+    expect(result.goal).toBe(90)
+    expect(result.goalMaxIterations).toBe(5)
+    expect(result.goalPlateau).toBe(2)
+  })
+
+  test("rejects invalid --goal values", () => {
+    expect(() => parseArgs(["--goal", "101"])).toThrow("--goal must be a score from 0 to 100")
+    expect(() => parseArgs(["--goal", "0"])).toThrow("--goal must be a positive integer")
+    expect(() => parseArgs(["--goal", "abc"])).toThrow("--goal must be a positive integer")
+    expect(() => parseArgs(["--goal-max-iterations", "0"])).toThrow("--goal-max-iterations must be a positive integer")
+  })
+
   test("parses --plan", () => {
     const result = parseArgs(["--plan"])
     expect(result.planOnly).toBe(true)

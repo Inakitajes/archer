@@ -50,6 +50,21 @@ export type RunOptions = {
   smart: boolean
   /** Resolved model for the smart auto-accept judge (--smart-model → config → --model → defaults.model). */
   smartJudgeModel: string
+  /**
+   * Goal loop: keep fixing until the quality score reaches this value (0–100).
+   * Requires a pipeline that ends in a quality-score-report step. CLI --goal
+   * beats the pipeline's own `goal:` config.
+   */
+  goal?: number
+  /** Goal loop: cap on fix iterations after the initial run. Defaults to 3. */
+  goalMaxIterations?: number
+  /** Goal loop: stop when a fix iteration improves the score by less than this many points. Defaults to 3. */
+  goalPlateau?: number
+  /**
+   * Goal loop: the resolved goal-fix pipeline the loop runs for fix iterations
+   * (same config chain as the main pipeline). Absent when goal mode is off.
+   */
+  goalFixPipeline?: Pipeline
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */
@@ -164,6 +179,13 @@ export type AgentStep = {
   groupId: string
   /** Pre-fan-out logical name; equals `name` unless this step was produced by a `models:` fan-out. */
   stepName: string
+  /**
+   * A per-step prompt suffix appended to this phase's instructions and no
+   * other. Used by the goal loop to hand the goal-fixer the previous scoring
+   * round's gaps without leaking them to the re-scorer (which must stay blind
+   * to the previous score to avoid anchoring).
+   */
+  goalBrief?: string
 }
 
 export type HumanStep = {
@@ -179,6 +201,12 @@ export type Pipeline = {
   description?: string
   /** Per-pipeline cap on concurrent agents within a group; unset inherits the defaults/CLI chain. */
   maxConcurrentAgents?: number
+  /** Goal loop: keep fixing until the quality score reaches this value. CLI --goal wins. */
+  goal?: number
+  /** Goal loop: cap on fix iterations after the initial run. */
+  goalMaxIterations?: number
+  /** Goal loop: stop when a fix iteration improves the score by less than this many points. */
+  goalPlateau?: number
   steps: Step[]
 }
 

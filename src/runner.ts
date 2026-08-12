@@ -48,6 +48,7 @@ import { discoverProjectContextFiles } from "./project-context"
 import { createStepRunnerImpl, stepRunnerFor, stepRunnerModel, type StepRunnerId, type StepRunnerImpl } from "./step-runners"
 import { createTerminalInput, type TerminalInput } from "./terminal-input"
 import type { AgentSpec, AgentStep, HookSet, HookSpec, Pipeline, RunOptions, Step } from "./types"
+import { consensusStep, parseQualityScoreReport, type QualityScore } from "./quality-score"
 import { addTokens, emptyTokens, tokensFromValue } from "./usage"
 import { cleanupWorkspace, createWorkspace, opencodeConfigDir, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
 
@@ -368,6 +369,16 @@ function installShutdownSignals(shutdown: RunShutdown) {
   }
 }
 
+export type RunResult = {
+  runID: string
+  /** Absolute path of the run workspace; removed on success unless the run is kept. */
+  dir: string
+  /** Parsed consensus score when the pipeline ended in a quality-score-report step. */
+  qualityScore?: QualityScore
+  /** The raw consensus report text, so a goal loop can hand it to the next fixer without re-reading a cleaned-up workspace. */
+  scoreReportText?: string
+}
+
 export async function run(options: RunOptions) {
   // CLI callers hand the exact reviewed plan to the runner. Keep accepting
   // legacy programmatic RunOptions for API/tests, but never re-resolve a plan.
@@ -673,6 +684,13 @@ export async function run(options: RunOptions) {
       pipeline.steps.map((step) => step.name),
       advisorSection ? [advisorSection] : [],
     )
+    // Capture the consensus score before cleanup: the workspace (and with it
+    // reports/score-report.md) is deleted on success, and the goal loop needs
+    // the score and the report text to decide whether to keep fixing.
+    const runScoreResult = await readRunQualityScore(pipeline, workspace.dir)
+    if (runScoreResult) {
+      log.info(`quality score: ${runScoreResult.score.score}/100 (${runScoreResult.score.verdict})`)
+    }
     postHooksStarted = true
     await runHooks("post", hookSet.post, {
       workspace,
@@ -685,6 +703,7 @@ export async function run(options: RunOptions) {
     })
     await caffeinate.stop()
     await holdFinishScreen(progress, shutdown, { status: "completed", runDir: workspace.dir })
+    return { runID: workspace.runID, dir: workspace.dir, ...(runScoreResult ? { qualityScore: runScoreResult.score, scoreReportText: runScoreResult.reportText } : {}) }
   } catch (error) {
     let failure = error
     if (!postHooksStarted && !isUserAbortError(failure)) {
@@ -2325,6 +2344,7 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
       : `- Write your final report to: ${join(workspace.dir, phase.reportPath)}`,
     "- Working directory: the directory where `convoy` was invoked (root of the target repo).",
     "",
+    ...(phase.goalBrief ? ["## Phase brief", phase.goalBrief, ""] : []),
     "## Access mode",
     phase.readOnly && phase.verify
       ? "This phase verifies without editing: you have bash, so run the tests, typecheck, lint, and other checks your instructions call for, and quote the exact command and its real result as evidence — never claim a check you did not run. You have no write or edit tools, and that is expected: do not try to write any file, and do not apologize for or comment on being unable to. Do not run commands that modify the repository either — no snapshot updates (`-u`, `--update-snapshots`), no formatters that rewrite files, no dependency installs; Convoy fails this phase if the repository changes. Convoy saves your report itself by concatenating the text you emit and storing it verbatim, so your visible output for this phase must be the report and nothing else: no preamble (\"I'll verify…\", \"Let me write the report…\"), no step-by-step narration, and no closing note about writing. Keep any planning in your private reasoning; begin your visible output at the report's first line (e.g. the `#` heading)."
@@ -2353,6 +2373,22 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
     "",
     "Follow your system prompt instructions for everything else.",
   ].join("\n")
+}
+
+/** Reads and parses the run's consensus quality score from its workspace, when the pipeline scored itself. */
+async function readRunQualityScore(pipeline: Pipeline, workspaceDir: string): Promise<{ score: QualityScore; reportText: string } | undefined> {
+  const step = consensusStep(pipeline)
+  if (!step) return undefined
+  const reportAbs = join(workspaceDir, step.reportPath)
+  let text: string
+  try {
+    text = await readFile(reportAbs, "utf8")
+  } catch {
+    return undefined
+  }
+  const score = parseQualityScoreReport(text)
+  if (!score) return undefined
+  return { score, reportText: text }
 }
 
 export function parseModel(value: string) {

@@ -7,6 +7,7 @@ import designPolisher from "../prompts/design-polisher.md" with { type: "text" }
 import fixerImplementer from "../prompts/fixer-implementer.md" with { type: "text" }
 import fixerTestAuthor from "../prompts/fixer-test-author.md" with { type: "text" }
 import fixerValidator from "../prompts/fixer-validator.md" with { type: "text" }
+import goalFixer from "../prompts/goal-fixer.md" with { type: "text" }
 import hunterCorrectness from "../prompts/hunter-correctness.md" with { type: "text" }
 import hunterMaxReport from "../prompts/hunter-max-report.md" with { type: "text" }
 import hunterMemory from "../prompts/hunter-memory.md" with { type: "text" }
@@ -50,6 +51,7 @@ export const builtInPrompts: Record<string, string> = {
   "fixer-implementer": fixerImplementer,
   "fixer-test-author": fixerTestAuthor,
   "fixer-validator": fixerValidator,
+  "goal-fixer": goalFixer,
   "hunter-correctness": hunterCorrectness,
   "hunter-max-report": hunterMaxReport,
   "hunter-memory": hunterMemory,
