@@ -67,6 +67,13 @@ export type RunOptions = {
   goalFixPipeline?: Pipeline
   /** Goal loop: scores of the iterations that already ran (this run's own score is appended for display). */
   goalTrajectory?: number[]
+  /**
+   * Goal loop: this run is one of the loop's iterations and another will follow
+   * (or this is the initial run that the loop will keep building on). The runner
+   * suppresses the finish-screen hold so the loop continues unattended instead
+   * of blocking on a keypress between every iteration.
+   */
+  goalContinues?: boolean
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */
@@ -230,6 +237,18 @@ export type RunPlan = {
   hooks: HookSet
   attachments: string[]
   permissions: "interactive" | "smart" | "yolo"
+  /**
+   * Goal mode, when enabled for this run: the target score, the bounded loop
+   * configuration, and the routed goal-fix pipeline the iterations will run.
+   * Surfaced in the reviewed plan and preflighted alongside the main pipeline
+   * so the operator consents to the full loop — not just its first iteration.
+   */
+  goal?: {
+    target: number
+    maxIterations: number
+    plateau: number
+    fixPipeline: Pipeline
+  }
   resume?: {
     runID: string
     /** Set when an explicit --gateway reroutes pending phases away from the run's frozen gateway. */

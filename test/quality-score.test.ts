@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { parseQualityScoreReport, qualityVerdict, qualityDimensions, weightedQualityScore, type QualityDimension, type QualityDimensionScores } from "../src/quality-score"
+import { parseQualityRubricWeights, parseQualityScoreReport, qualityDimensions, qualityDimensionWeights, qualityVerdict, weightedQualityScore, type QualityDimension, type QualityDimensionScores } from "../src/quality-score"
 
 const dimensions: QualityDimensionScores = { prd: 92, tests: 70, security: 95, maintainability: 88, operational: 90, scope: 85 }
 
@@ -171,5 +171,92 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
 
   test("keeps every dimension in the contract", () => {
     expect(qualityDimensions).toEqual(["prd", "tests", "security", "maintainability", "operational", "scope"])
+  })
+
+  test("honors project rubric weights passed to the canonical parser", () => {
+    // A project rubric (.convoy/quality-rubric.md) overrides the v1 weights; the
+    // canonical recompute must use the weights it is given, not hardcode the
+    // defaults. With prd/tests each 50%, 92*0.5 + 70*0.5 = 81.
+    const customWeights: Record<QualityDimension, number> = { prd: 0.5, tests: 0.5, security: 0, maintainability: 0, operational: 0, scope: 0 }
+    const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions, mustFix: [] })}\n\`\`\`\n`
+    expect(parseQualityScoreReport(report, customWeights)?.score).toBe(81)
+  })
+
+  test("falls back to the v1 weights when none are passed", () => {
+    const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions, mustFix: [] })}\n\`\`\`\n`
+    expect(parseQualityScoreReport(report)?.score).toBe(weightedQualityScore(dimensions))
+  })
+})
+
+describe("parseQualityRubricWeights", () => {
+  // A rubric file is the prose the scorer agents read. Its weight table is a
+  // markdown table with a `| `dimension` | <n>% |` row per dimension; the parser
+  // extracts and normalizes those weights so the canonical score matches the
+  // rubric the scorers used rather than the hardcoded v1 defaults.
+  const rubricTable = [
+    "# Quality rubric (project override)",
+    "",
+    "| Dimension | Weight | What it measures |",
+    "|---|---|---|",
+    "| `prd` | 50% | The PRD is implemented. |",
+    "| `tests` | 50% | Behavioral coverage. |",
+    "| `security` | 0% | Security (de-prioritized for this project). |",
+    "| `maintainability` | 0% | Maintainability. |",
+    "| `operational` | 0% | Operational. |",
+    "| `scope` | 0% | Scope. |",
+  ].join("\n")
+
+  test("parses a rubric weight table into normalized weights", () => {
+    const weights = parseQualityRubricWeights(rubricTable)
+    expect(weights).toBeDefined()
+    if (!weights) return
+    // 50/50/0/0/0/0 sums to 100, normalized to 0.5/0.5/0/0/0/0.
+    expect(weights.prd).toBeCloseTo(0.5)
+    expect(weights.tests).toBeCloseTo(0.5)
+    expect(weights.security).toBe(0)
+  })
+
+  test("normalizes weights that do not sum to 100", () => {
+    // 30/30/10/10/10/10 = 90; the parser normalizes proportionally so the
+    // weighted total stays coherent rather than contradicting the dimensions.
+    const weights = parseQualityRubricWeights(
+      rubricTable
+        .replace("| `prd` | 50% |", "| `prd` | 30% |")
+        .replace("| `tests` | 50% |", "| `tests` | 30% |")
+        .replace("| `security` | 0% |", "| `security` | 10% |")
+        .replace("| `maintainability` | 0% |", "| `maintainability` | 10% |")
+        .replace("| `operational` | 0% |", "| `operational` | 10% |")
+        .replace("| `scope` | 0% |", "| `scope` | 10% |"),
+    )
+    expect(weights).toBeDefined()
+    if (!weights) return
+    const total = qualityDimensions.reduce((sum, d) => sum + weights[d], 0)
+    expect(total).toBeCloseTo(1)
+  })
+
+  test("returns undefined when a dimension is missing", () => {
+    const incomplete = rubricTable.replace("| `scope` | 0% | Scope. |", "")
+    expect(parseQualityRubricWeights(incomplete)).toBeUndefined()
+  })
+
+  test("returns undefined when a weight is negative", () => {
+    // A negative weight is malformed; the parser rejects it. (0% is legitimate —
+    // a project may de-prioritize a dimension — so only negatives are rejected.)
+    const bad = rubricTable.replace("| `prd` | 50% |", "| `prd` | -10% |")
+    expect(parseQualityRubricWeights(bad)).toBeUndefined()
+  })
+
+  test("returns undefined when every weight is zero (normalization would divide by zero)", () => {
+    const allZero = rubricTable
+      .replace("| `prd` | 50% |", "| `prd` | 0% |")
+      .replace("| `tests` | 50% |", "| `tests` | 0% |")
+    expect(parseQualityRubricWeights(allZero)).toBeUndefined()
+  })
+
+  test("the default v1 weights are a complete, normalized set", () => {
+    // Guard: the built-in fallback must always parse to a 1.0 sum so a missing
+    // rubric never produces a contradictory score.
+    const total = qualityDimensions.reduce((sum, d) => sum + qualityDimensionWeights[d], 0)
+    expect(total).toBeCloseTo(1)
   })
 })

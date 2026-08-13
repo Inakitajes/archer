@@ -618,7 +618,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   // alongside the findings report.
   "review-scored": {
     description:
-      "Report-only PR review plus a verified quality score: scope, parallel bug/clean-code/security audits across two models, then two independent quality-scorers and a consensus step. Makes no changes.",
+      "Report-only PR review plus a verified quality score: scope, parallel bug/clean-code/security audits across two models, a prioritized findings report, then two independent quality-scorers and a consensus step. Makes no changes.",
     steps: [
       { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true },
       {
@@ -628,6 +628,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
           { agent: "bug-auditor", name: "bugs", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
         ],
       },
+      { agent: "review-report", name: "report", model: defaultOpusModel, reports: "all" },
       {
         parallel: [
           { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
@@ -1040,6 +1041,11 @@ export function validateStepFilters(pipeline: Pipeline, filters: { onlySteps: st
       throw new Error(`${flag}: unknown step "${name}" in pipeline "${pipeline.name}" (valid: ${[...valid].join(", ")})`)
     }
   }
+}
+
+/** Whether a pipeline contains any agent step that may edit the repository (a writable, non-read-only step). */
+export function hasWritableStep(pipeline: Pipeline): boolean {
+  return pipeline.steps.some((step) => step.type === "agent" && !step.readOnly)
 }
 
 export function defaultPipeline(): Pipeline {

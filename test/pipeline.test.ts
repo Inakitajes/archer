@@ -304,7 +304,7 @@ describe("built-in review-scored pipeline", () => {
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
   })
 
-  test("scopes, runs the three audits fanned across two models, then scores", () => {
+  test("scopes, runs the three audits fanned across two models, synthesizes a findings report, then scores", () => {
     expect(stepNames(scored())).toEqual([
       "scope",
       "clean-code__openai-gpt-5-6-terra-xhigh",
@@ -313,13 +313,27 @@ describe("built-in review-scored pipeline", () => {
       "security__anthropic-claude-opus-5",
       "bugs__openai-gpt-5-6-terra-xhigh",
       "bugs__anthropic-claude-opus-5",
+      "report",
       "score__openai-gpt-5-6-sol-xhigh",
       "score__anthropic-claude-opus-5",
       "score-report",
     ])
   })
 
-  test("consensus step reads every report and keeps bash to verify the score", () => {
+  test("the findings report synthesizes every audit and the consensus step reads it alongside the scores", () => {
+    const findings = scored().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "report")
+    expect(findings).toMatchObject({ agentName: "review-report", readOnly: true })
+    expect(findings?.inputFiles).toEqual([
+      "prd.md",
+      "reports/scope.md",
+      "reports/clean-code__openai-gpt-5-6-terra-xhigh.md",
+      "reports/clean-code__anthropic-claude-opus-5.md",
+      "reports/security__openai-gpt-5-6-terra-xhigh.md",
+      "reports/security__anthropic-claude-opus-5.md",
+      "reports/bugs__openai-gpt-5-6-terra-xhigh.md",
+      "reports/bugs__anthropic-claude-opus-5.md",
+    ])
+
     const report = scored().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")
 
     expect(report).toMatchObject({ agentName: "quality-score-report", readOnly: true, verify: true })
@@ -332,6 +346,7 @@ describe("built-in review-scored pipeline", () => {
       "reports/security__anthropic-claude-opus-5.md",
       "reports/bugs__openai-gpt-5-6-terra-xhigh.md",
       "reports/bugs__anthropic-claude-opus-5.md",
+      "reports/report.md",
       "reports/score__openai-gpt-5-6-sol-xhigh.md",
       "reports/score__anthropic-claude-opus-5.md",
     ])

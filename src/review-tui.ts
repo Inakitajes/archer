@@ -66,6 +66,16 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   pushStepRows(rows, plan, width)
   rows.push(plain(""))
 
+  // Goal mode is a bounded loop the operator is consenting to in full: the
+  // initial run plus up to maxIterations fix runs of the writable goal-fix
+  // pipeline. Surface it before confirmation so the cost/mutation envelope is
+  // explicit in the TUI review, not just the headless plan.
+  if (plan.goal) {
+    rows.push(labelRow("goal", [fg(theme.text)(`target ${plan.goal.target}/100 · up to ${plan.goal.maxIterations} fix iterations · plateau ${plan.goal.plateau}`)]))
+    rows.push(continuation([fg(theme.dim)(`fix pipeline ${sanitizeReviewInline(plan.goal.fixPipeline.name)} · writable goal-fixer + re-scorers`)]))
+    rows.push(plain(""))
+  }
+
   const hooks = [...plan.hooks.pre.map((hook) => hookChunks("pre", hook, value)), ...plan.hooks.post.map((hook) => hookChunks("post", hook, value))]
   if (hooks.length > 0) {
     rows.push(labelRow("hooks", hooks[0]!))

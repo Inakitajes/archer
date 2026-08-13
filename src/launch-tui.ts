@@ -8,7 +8,7 @@ import { buildAgentRegistry, emptyHooksConfig, loadMergedConvoyConfig } from "./
 import { resolveWorktreeDefault } from "./git"
 import { hooksForPipeline } from "./hooks"
 import { startLimitsPoller } from "./limits"
-import { builtInPipelines, defaultPipelineName, resolvePipeline } from "./pipeline"
+import { builtInPipelines, defaultPipelineName, hasWritableStep, resolvePipeline } from "./pipeline"
 import { stepRunnerFor } from "./step-runners"
 import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { consensusStep } from "./quality-score"
@@ -262,7 +262,10 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
         hooks,
         valid: true,
         advisedSteps: pipeline.steps.filter((step) => step.type === "agent" && Boolean(step.resolvedAdvisor ?? step.advisor)).length,
-        scored: Boolean(consensusStep(pipeline)),
+        // Goal mode needs both a consensus score step and a writable step: a
+        // report-only scored pipeline (review-scored) would be mutated by the
+        // goal-fixer, contradicting its "makes no changes" contract.
+        scored: Boolean(consensusStep(pipeline)) && hasWritableStep(pipeline),
       }
     } catch (error) {
       return {
@@ -1425,7 +1428,7 @@ class LaunchPicker {
       const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
       const toggle = toggleSwitch(enabled)
       const label = selected ? bold(fg(theme.text)("Goal mode")) : fg(theme.text)("Goal mode")
-      const flag = fg(enabled ? theme.green : theme.dim)(enabled ? `--goal ${this.goalTarget}` : "--goal 90")
+      const flag = fg(enabled ? theme.green : theme.dim)(enabled ? `--goal ${this.goalTarget}` : `--goal ${defaultGoalTarget}`)
       lines.push(padBetween([marker, ...toggle, raw(" "), label], [flag], width))
       this.optionRows.push(toggles.length)
       const description = enabled

@@ -152,6 +152,12 @@ export type RunOutcome = {
   qualityScore?: number
   /** The goal loop's score trajectory including this run, oldest first; absent when not in goal mode. */
   goalTrajectory?: number[]
+  /**
+   * Another goal-loop iteration will follow this run. The runner suppresses the
+   * finish-screen hold so the loop runs unattended instead of waiting on a
+   * keypress between iterations.
+   */
+  goalContinues?: boolean
 }
 
 export type RunControlState = "running" | "pausing" | "paused"

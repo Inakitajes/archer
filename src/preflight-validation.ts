@@ -10,6 +10,15 @@ export function preflightTargets(plan: RunPlan): ResolvedModel[] {
   const targets = plan.pipeline.steps.flatMap((step) =>
     step.type === "agent" && step.runner !== "claude-code" && step.resolvedModel ? [step.resolvedModel] : [],
   )
+  // Goal mode runs the goal-fix pipeline for each fix iteration, but its models
+  // are absent from the main pipeline. Preflight them alongside the initial run
+  // so an unavailable model surfaces before the first run is paid for, not after.
+  if (plan.goal) {
+    for (const step of plan.goal.fixPipeline.steps) {
+      if (step.type === "agent" && step.runner !== "claude-code" && step.resolvedModel) targets.push(step.resolvedModel)
+      if (step.type === "agent" && step.resolvedAdvisor) targets.push(step.resolvedAdvisor)
+    }
+  }
   // Advising models are validated as themselves, not as the synthetic capped
   // alias the advisor is actually invoked with: the alias only exists inside the
   // run's own OpenCode config, so a clean discovery server would never see it.

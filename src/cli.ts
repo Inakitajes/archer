@@ -5,7 +5,7 @@ import { buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, globalConfigPat
 import { detectBaseRef, resolveWorktreeDefault } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
-import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
+import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, hasWritableStep, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { consensusStep } from "./quality-score"
 import { defaultGoalMaxIterations, defaultGoalPlateau, runGoalLoop } from "./goal-loop"
 import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
@@ -180,23 +180,52 @@ export async function parseAndRun(argv: string[]) {
   await executeRun(options, plan)
 }
 
+/** The result of deciding whether goal mode applies to a resolved run. */
+export type GoalModeDecision =
+  | { mode: "off" }
+  | { mode: "on"; goal: number }
+  | { mode: "rejected"; reason: "no-consensus" | "not-writable" | "no-fix-pipeline"; goal: number }
+
+/**
+ * Pure decision: is goal mode on for this run, and if not, why? Goal mode is
+ * resolved once in `resolveRunOptions` (`options.goal` already reflects the
+ * flag → pipeline → default chain), so this consumes that resolved value rather
+ * than re-deriving it. Exported so the refusals are exercised by tests rather
+ * than left untested inside the module-private execution path.
+ */
+export function goalModeFor(options: { goal?: number; goalFixPipeline?: Pipeline }, plan: RunPlan): GoalModeDecision {
+  const goal = options.goal
+  if (goal === undefined) return { mode: "off" }
+  if (!consensusStep(plan.pipeline)) return { mode: "rejected", reason: "no-consensus", goal }
+  if (!hasWritableStep(plan.pipeline)) return { mode: "rejected", reason: "not-writable", goal }
+  if (!options.goalFixPipeline) return { mode: "rejected", reason: "no-fix-pipeline", goal }
+  return { mode: "on", goal }
+}
+
 /** Runs the plan, entering the goal loop when goal mode is configured for this run. */
 async function executeRun(options: RunOptions, plan: RunPlan): Promise<void> {
-  const goal = options.goal ?? plan.pipeline.goal
-  if (goal === undefined) {
+  const decision = goalModeFor(options, plan)
+  if (decision.mode === "off") {
     await run({ ...options, plan })
     return
   }
-  if (!consensusStep(plan.pipeline)) {
-    throw new Error(
-      `--goal ${goal} requires a scored pipeline: the pipeline must end in a quality-score-report step (implement-scored, review-scored, or a custom scored pipeline).`,
-    )
-  }
-  if (!options.goalFixPipeline) {
+  if (decision.mode === "rejected") {
+    if (decision.reason === "no-consensus") {
+      throw new Error(
+        `--goal ${decision.goal} requires a scored pipeline: the pipeline must end in a quality-score-report step (implement-scored or a custom scored pipeline).`,
+      )
+    }
+    if (decision.reason === "not-writable") {
+      throw new Error(
+        `--goal ${decision.goal} requires a pipeline that can edit the repository: "${plan.pipeline.name}" is report-only (every step is read-only), but goal mode runs the writable goal-fixer. Use a scored pipeline with a writing step (e.g. implement-scored), or drop --goal to review without fixing.`,
+      )
+    }
     throw new Error("goal mode could not resolve the goal-fix pipeline; is a project config overriding or removing it?")
   }
+  // options.goal/maxIterations/plateau are already resolved by resolveRunOptions;
+  // consume them directly instead of re-deriving from the plan (single source of truth).
   await runGoalLoop(options, plan, {
-    goal,
+    goal: decision.goal,
     maxIterations: options.goalMaxIterations ?? defaultGoalMaxIterations,
     plateau: options.goalPlateau ?? defaultGoalPlateau,
   })

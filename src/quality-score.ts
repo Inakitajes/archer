@@ -10,6 +10,9 @@
  * here — never an agent-supplied number taken on faith.
  */
 
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
+
 import { log } from "./log"
 
 export const qualityDimensions = ["prd", "tests", "security", "maintainability", "operational", "scope"] as const
@@ -50,6 +53,54 @@ export function weightedQualityScore(dimensions: QualityDimensionScores, weights
   return Math.round(total * 100)
 }
 
+/** The path of a project's optional rubric override, relative to the target repo. */
+export const qualityRubricPath = ".convoy/quality-rubric.md"
+
+/**
+ * Loads and parses a project rubric's dimension weights from
+ * `.convoy/quality-rubric.md`, when present. The rubric is the same prose the
+ * scorer agents read, so the weights are extracted from its markdown table (a
+ * `| \`dimension\` | <n>% |` row per dimension). Returns undefined when there is
+ * no rubric, or when the rubric is missing a dimension or has non-positive
+ * weights — the canonical computation then falls back to the v1 defaults so a
+ * malformed rubric never silently produces a contradictory score.
+ */
+export async function loadQualityRubricWeights(targetDir: string): Promise<Record<QualityDimension, number> | undefined> {
+  let body: string
+  try {
+    body = await readFile(join(targetDir, qualityRubricPath), "utf8")
+  } catch {
+    return undefined
+  }
+  const weights = parseQualityRubricWeights(body)
+  if (!weights) {
+    log.warn(`quality score: ${qualityRubricPath} is present but its weight table could not be parsed; using the default v1 weights`)
+  }
+  return weights
+}
+
+/** Parses a rubric's weight table into normalized weights summing to 1.0, or undefined when it is incomplete. */
+export function parseQualityRubricWeights(body: string): Record<QualityDimension, number> | undefined {
+  const weights = {} as Partial<Record<QualityDimension, number>>
+  for (const dimension of qualityDimensions) {
+    const pattern = new RegExp(`^\\|\\s*\`?${dimension}\`?\\s*\\|\\s*(\\d+(?:\\.\\d+)?)\\s*%`, "im")
+    const match = body.match(pattern)
+    if (!match) return undefined
+    const value = Number(match[1])
+    // A dimension may be de-prioritized to 0%, but a negative weight is malformed.
+    if (!Number.isFinite(value) || value < 0) return undefined
+    weights[dimension] = value
+  }
+  // Normalize to a 1.0 sum so a rubric whose percentages don't add up to exactly
+  // 100 still produces a coherent weighted total rather than a contradictory one.
+  // An all-zero rubric is rejected so the normalization never divides by zero.
+  const total = qualityDimensions.reduce((sum, dimension) => sum + (weights[dimension] ?? 0), 0)
+  if (total <= 0) return undefined
+  const normalized = {} as Record<QualityDimension, number>
+  for (const dimension of qualityDimensions) normalized[dimension] = (weights[dimension] ?? 0) / total
+  return normalized
+}
+
 export function qualityVerdict(score: number): QualityScoreVerdict {
   if (score >= 90) return "ready"
   if (score >= 75) return "ready-with-caveats"
@@ -75,7 +126,10 @@ export function consensusStep(
  * having failed the contract — it is safer to reject an ambiguous or accidental
  * object than to take it as a control signal.
  */
-export function parseQualityScoreReport(markdown: string): QualityScore | undefined {
+export function parseQualityScoreReport(
+  markdown: string,
+  weights: Record<QualityDimension, number> = qualityDimensionWeights,
+): QualityScore | undefined {
   const block = extractQualityScoreBlock(markdown)
   if (!block) return undefined
 
@@ -93,7 +147,7 @@ export function parseQualityScoreReport(markdown: string): QualityScore | undefi
   // The score is always recomputed in code from the dimensions and the rubric
   // weights. An agent-declared score is at most informative: a report whose
   // declared score contradicts its own dimensions must not drive the loop.
-  const score = weightedQualityScore(dimensions)
+  const score = weightedQualityScore(dimensions, weights)
   const declaredScore = typeof parsed.score === "number" && Number.isFinite(parsed.score) ? parsed.score : undefined
   if (declaredScore !== undefined && Math.abs(declaredScore - score) > 1) {
     log.warn(

@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import { beforeEach } from "bun:test"
 
-import { parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
+import { goalModeFor, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
+import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
+import type { Pipeline, RunPlan } from "../src/types"
 
 const validRunID = "20240101-120000-abcd"
 
@@ -494,5 +496,50 @@ describe("resolveRunOptions", () => {
     const parsed = parseArgs(["--no-confirm"])
     const options = await resolveRunOptions(parsed)
     expect(options.noConfirm).toBe(true)
+  })
+})
+
+describe("goalModeFor", () => {
+  // A pipeline is goal-eligible only when it has a quality-score-report step
+  // (consensus) AND a writable step. report-only scored pipelines (review-scored)
+  // have the consensus step but no writable step, so --goal is refused — the
+  // goal-fixer would mutate a pipeline whose contract says "makes no changes".
+  const implementScored = resolvePipeline({ name: "implement-scored", spec: builtInPipelines["implement-scored"]!, agents: builtInAgents })
+  const reviewScored = resolvePipeline({ name: "review-scored", spec: builtInPipelines["review-scored"]!, agents: builtInAgents })
+  const implement = resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents })
+  const goalFix = resolvePipeline({ name: "goal-fix", spec: builtInPipelines["goal-fix"]!, agents: builtInAgents })
+
+  function planWith(pipeline: Pipeline): RunPlan {
+    return { pipeline } as RunPlan
+  }
+
+  test("is off when no goal is set", () => {
+    expect(goalModeFor({}, planWith(implementScored))).toEqual({ mode: "off" })
+  })
+
+  test("is on for a scored pipeline with a writable step and a resolved fix pipeline", () => {
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(implementScored))
+    expect(decision).toEqual({ mode: "on", goal: 90 })
+  })
+
+  test("rejects --goal on a report-only scored pipeline (no writable step)", () => {
+    // review-scored ends in a quality-score-report step but every step is
+    // read-only, so --goal would run the writable goal-fixer against a pipeline
+    // documented as "makes no changes" — refuse it with a clear reason.
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(reviewScored))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("not-writable")
+  })
+
+  test("rejects --goal on a pipeline with no consensus step", () => {
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(implement))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("no-consensus")
+  })
+
+  test("rejects --goal when the goal-fix pipeline could not be resolved", () => {
+    const decision = goalModeFor({ goal: 90 }, planWith(implementScored))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("no-fix-pipeline")
   })
 })
