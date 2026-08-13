@@ -369,7 +369,7 @@ export type PipelineSpec = {
    */
   maxConcurrentAgents?: number
   /**
-   * Goal loop: keep fixing until the quality score reaches this value (0–100).
+   * Goal loop: keep fixing until the quality score reaches this value (1–100).
    * Requires the pipeline to end in a quality-score-report step. CLI --goal wins.
    */
   goal?: number
@@ -465,10 +465,15 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "goal-fixer", name: "fix", reports: "none", diff: true },
       {
         parallel: [
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+          // The re-scorers must stay blind to the previous score: the fixer's
+          // report restates it, so the scorer steps receive no reports at all
+          // (they grade the artifact, not the round's history).
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "none" },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
+      // The consensus sees only the fresh scorer reports, never the fixer's,
+      // so its measurement cannot anchor on the number it is reconciling.
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: ["score"] },
     ],
   },
   review: {

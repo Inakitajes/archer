@@ -7,7 +7,7 @@ import { openRouterKeySources } from "./limits"
 import { log } from "./log"
 import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { consensusStep } from "./quality-score"
-import { defaultGoalMaxIterations, defaultGoalPlateau } from "./goal-loop"
+import { defaultGoalMaxIterations, defaultGoalPlateau, runGoalLoop } from "./goal-loop"
 import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
 import { buildRunPlan } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
@@ -67,7 +67,7 @@ export type ParsedArgs = {
   gateway?: ModelGateway
   planOnly?: boolean
   noConfirm?: boolean
-  /** --goal: keep fixing until the quality score reaches this value (0–100). */
+  /** --goal: keep fixing until the quality score reaches this value (1–100). */
   goal?: number
   /** --goal-max-iterations: cap on fix iterations after the initial run. */
   goalMaxIterations?: number
@@ -195,7 +195,6 @@ async function executeRun(options: RunOptions, plan: RunPlan): Promise<void> {
   if (!options.goalFixPipeline) {
     throw new Error("goal mode could not resolve the goal-fix pipeline; is a project config overriding or removing it?")
   }
-  const { runGoalLoop } = await import("./goal-loop")
   await runGoalLoop(options, plan, {
     goal,
     maxIterations: options.goalMaxIterations ?? defaultGoalMaxIterations,
@@ -848,6 +847,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function parsePositiveInt(value: string, flag: string): number {
+  // Strict integer parsing: a goal of "90abc", "1.5", or "90 " must be
+  // rejected instead of silently coerced by parseInt.
+  if (!/^[0-9]+$/.test(value)) throw new Error(`${flag} must be a positive integer`)
   const parsed = parseInt(value, 10)
   if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${flag} must be a positive integer`)
   return parsed
@@ -938,7 +940,7 @@ Flags:
   --no-worktree            Run in the current working tree instead
                            (default: worktree on a trunk branch, current tree on any other)
   --branch <name>          Name for the worktree branch, instead of asking the naming model
-  --goal <0-100>           Goal mode: keep fixing until the quality score reaches this value.
+  --goal <1-100>           Goal mode: keep fixing until the quality score reaches this value.
                            Requires a scored pipeline (implement-scored, review-scored, or any
                            pipeline ending in a quality-score-report step). Each fix iteration
                            applies exactly the gaps the previous scoring round reported and

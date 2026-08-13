@@ -96,17 +96,19 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
       "the authoritative block is the last one.",
       `\`\`\`quality-score\n${JSON.stringify({ score: 87, dimensions, mustFix: [] })}\n\`\`\`\n`,
       "Final consensus:",
-      `\`\`\`quality-score\n${JSON.stringify({ score: 92, dimensions: { ...dimensions, prd: 95 }, mustFix: [] })}\n\`\`\`\n`,
+      // The final block wins — and the score is the canonical weighted total of
+      // its own dimensions (prd 100 → 89), not the number it declares.
+      `\`\`\`quality-score\n${JSON.stringify({ score: 89, dimensions: { ...dimensions, prd: 100 }, mustFix: [] })}\n\`\`\`\n`,
     ].join("\n")
-    expect(parseQualityScoreReport(report)?.score).toBe(92)
+    expect(parseQualityScoreReport(report)?.score).toBe(89)
   })
 
   test("skips an invalid earlier block and uses the final valid one", () => {
     const report = [
       "```quality-score\n{ this is not json }\n```",
-      `\`\`\`quality-score\n${JSON.stringify({ score: 84, dimensions, mustFix: [] })}\n\`\`\`\n`,
+      `\`\`\`quality-score\n${JSON.stringify({ score: 87, dimensions, mustFix: [] })}\n\`\`\`\n`,
     ].join("\n")
-    expect(parseQualityScoreReport(report)?.score).toBe(84)
+    expect(parseQualityScoreReport(report)?.score).toBe(87)
   })
 
   test("rejects a report where the final block is not at the end", () => {
@@ -127,11 +129,14 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
   })
 
   test("derives the verdict from the score when omitted or wrong", () => {
-    const report = `\`\`\`quality-score\n${JSON.stringify({ score: 96, dimensions, mustFix: [] })}\n\`\`\`\n`
+    // The verdict derives from the canonical score computed from the
+    // dimensions, never from a declared score or verdict an agent supplies.
+    const high: QualityDimensionScores = { prd: 95, tests: 92, security: 96, maintainability: 93, operational: 95, scope: 94 }
+    const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions: high, mustFix: [] })}\n\`\`\`\n`
     expect(parseQualityScoreReport(report)?.verdict).toBe("ready")
 
     const wrong = `\`\`\`quality-score\n${JSON.stringify({ score: 55, dimensions, verdict: "ready", mustFix: [] })}\n\`\`\`\n`
-    expect(parseQualityScoreReport(wrong)?.verdict).toBe("failing")
+    expect(parseQualityScoreReport(wrong)?.verdict).toBe("ready-with-caveats")
   })
 
   test("never trusts a declared score that contradicts the dimensions", () => {

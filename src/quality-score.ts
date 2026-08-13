@@ -3,10 +3,14 @@
  * quality-score-report agents, and parsed by the runner.
  *
  * The scorer agents emit a fenced `quality-score` JSON block at the end of
- * their report. This module validates that block, computes the weighted total
- * when a report omits it, and derives the verdict. The goal loop (--goal) will
- * read this from reports/score-report.md to decide whether to keep iterating.
+ * their report. This module validates that block, computes the canonical
+ * weighted total from the dimensions and weights in code, and derives the
+ * verdict. The goal loop (--goal) reads this from reports/score-report.md to
+ * decide whether to keep iterating, so the score is a control signal computed
+ * here — never an agent-supplied number taken on faith.
  */
+
+import { log } from "./log"
 
 export const qualityDimensions = ["prd", "tests", "security", "maintainability", "operational", "scope"] as const
 
@@ -63,9 +67,13 @@ export function consensusStep(
 
 /**
  * Extracts and validates the `quality-score` JSON block from a scorer report.
- * Accepts the fenced block (```quality-score or ```json), or a bare JSON object
- * when no fence is present. A report without a parseable block yields undefined
- * so the caller can decide how to treat a scorer that failed the contract.
+ *
+ * Strict contract: the report must end with exactly one `quality-score` fenced
+ * block (no `json` alias, no bare-object fallback), that block must be the last
+ * thing in the report, and it must contain valid, in-range data. A report that
+ * fails any of that yields undefined so the caller can treat the scorer as
+ * having failed the contract — it is safer to reject an ambiguous or accidental
+ * object than to take it as a control signal.
  */
 export function parseQualityScoreReport(markdown: string): QualityScore | undefined {
   const block = extractQualityScoreBlock(markdown)
@@ -82,7 +90,16 @@ export function parseQualityScoreReport(markdown: string): QualityScore | undefi
   const dimensions = parseDimensions(parsed.dimensions)
   if (!dimensions) return undefined
 
-  const score = typeof parsed.score === "number" && Number.isFinite(parsed.score) ? Math.round(clampScore(parsed.score)) : weightedQualityScore(dimensions)
+  // The score is always recomputed in code from the dimensions and the rubric
+  // weights. An agent-declared score is at most informative: a report whose
+  // declared score contradicts its own dimensions must not drive the loop.
+  const score = weightedQualityScore(dimensions)
+  const declaredScore = typeof parsed.score === "number" && Number.isFinite(parsed.score) ? parsed.score : undefined
+  if (declaredScore !== undefined && Math.abs(declaredScore - score) > 1) {
+    log.warn(
+      `quality score: declared score ${declaredScore} disagrees with the dimensions (weighted total ${score}); using the computed score`,
+    )
+  }
 
   const mustFix = Array.isArray(parsed.mustFix) ? parsed.mustFix.filter((item): item is string => typeof item === "string") : []
 
@@ -97,23 +114,21 @@ export function parseQualityScoreReport(markdown: string): QualityScore | undefi
   return { score, dimensions, verdict, mustFix, ...(gaps ? { gaps } : {}), ...(confidence ? { confidence } : {}) }
 }
 
+/**
+ * Finds the report's authoritative quality-score block: the last
+ * `quality-score` fence, which must also end the report (only whitespace may
+ * follow its closing fence). Blocks earlier in the report are examples, not
+ * results, and trailing content after the final block makes the report
+ * malformed rather than selecting a different candidate.
+ */
 function extractQualityScoreBlock(markdown: string): string | undefined {
-  const fenced = /```(?:quality-score|json)\s*\n([\s\S]*?)```/i.exec(markdown)
-  if (fenced) return fenced[1].trim()
-
-  const bareStart = markdown.search(/\{\s*"/)
-  if (bareStart === -1) return undefined
-  // A bare object fallback: find the matching close brace of the first object.
-  let depth = 0
-  for (let index = bareStart; index < markdown.length; index++) {
-    const char = markdown[index]
-    if (char === "{") depth++
-    else if (char === "}") {
-      depth--
-      if (depth === 0) return markdown.slice(bareStart, index + 1)
-    }
-  }
-  return undefined
+  const fence = /```quality-score\s*\n([\s\S]*?)```/gi
+  let match: RegExpExecArray | null
+  let last: RegExpExecArray | null = null
+  while ((match = fence.exec(markdown)) !== null) last = match
+  if (!last) return undefined
+  if (markdown.slice(last.index + last[0].length).trim() !== "") return undefined
+  return last[1].trim()
 }
 
 function parseDimensions(value: unknown): QualityDimensionScores | undefined {
@@ -122,7 +137,10 @@ function parseDimensions(value: unknown): QualityDimensionScores | undefined {
   for (const dimension of qualityDimensions) {
     const raw = value[dimension]
     if (typeof raw !== "number" || !Number.isFinite(raw)) return undefined
-    dimensions[dimension] = Math.round(clampScore(raw))
+    // Dimensions are contract-bounded: an out-of-range value is a malformed
+    // report, not a value to clamp into shape.
+    if (raw < 0 || raw > 100) return undefined
+    dimensions[dimension] = Math.round(raw)
   }
   return dimensions
 }

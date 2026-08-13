@@ -643,13 +643,20 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
     pipelines[name] = {
       ...(entry.description !== undefined ? { description: v.nonEmptyString(entry.description, `${path}.description`) } : {}),
       ...(entry.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: v.positiveInt(entry.maxConcurrentAgents, `${path}.maxConcurrentAgents`) } : {}),
-      ...(entry.goal !== undefined ? { goal: v.rangeInt(entry.goal, `${path}.goal`, 0, 100) } : {}),
+      ...(entry.goal !== undefined ? { goal: validatePipelineGoal(v, entry.goal, `${path}.goal`) } : {}),
       ...(entry.goalMaxIterations !== undefined ? { goalMaxIterations: v.positiveInt(entry.goalMaxIterations, `${path}.goalMaxIterations`) } : {}),
       ...(entry.goalPlateau !== undefined ? { goalPlateau: v.positiveInt(entry.goalPlateau, `${path}.goalPlateau`) } : {}),
       steps,
     }
   }
   return pipelines
+}
+
+/** A pipeline's configured goal lives in the same 1–100 range the CLI enforces: 0 would make the goal loop a no-op. */
+function validatePipelineGoal(v: Validator, raw: unknown, path: string): number {
+  const goal = v.rangeInt(raw, path, 0, 100)
+  if (goal === 0) v.fail(path, "must be an integer from 1 to 100; 0 would make the goal loop a no-op")
+  return goal
 }
 
 function validateStep(v: Validator, raw: unknown, path: string, context: { insideParallel?: boolean } = {}): StepSpec {

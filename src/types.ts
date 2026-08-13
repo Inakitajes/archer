@@ -51,7 +51,7 @@ export type RunOptions = {
   /** Resolved model for the smart auto-accept judge (--smart-model → config → --model → defaults.model). */
   smartJudgeModel: string
   /**
-   * Goal loop: keep fixing until the quality score reaches this value (0–100).
+   * Goal loop: keep fixing until the quality score reaches this value (1–100).
    * Requires a pipeline that ends in a quality-score-report step. CLI --goal
    * beats the pipeline's own `goal:` config.
    */

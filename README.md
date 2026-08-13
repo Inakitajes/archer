@@ -151,7 +151,7 @@ Iteration 2:  goal-fix (the remaining gap) → SCORERS → consensus            
   3. **Iteration cap** — `--goal-max-iterations` (default 3) is exhausted.
   4. A run fails or produces no parseable score.
 
-Flags: `--goal <0-100>`, `--goal-max-iterations <n>`, `--goal-plateau <n>`. The same values can live on a pipeline in `.convoy/config.yaml` (`goal:`, `goalMaxIterations:`, `goalPlateau:`) and the CLI flags override them. Goal mode requires a pipeline that ends in a `quality-score-report` step — `implement-scored` and `review-scored` do; `implement` alone will refuse `--goal` with a clear error.
+Flags: `--goal <1-100>`, `--goal-max-iterations <n>`, `--goal-plateau <n>`. The same values can live on a pipeline in `.convoy/config.yaml` (`goal:`, `goalMaxIterations:`, `goalPlateau:`) and the CLI flags override them. Goal mode requires a pipeline that ends in a `quality-score-report` step — `implement-scored` and `review-scored` do; `implement` alone will refuse `--goal` with a clear error.
 
 Goal mode is a bounded loop, not an open cheque: the plateau and the iteration cap exist precisely so the loop cannot chase a score forever. If it stops below the goal, the branch is left at the best measured state and the final score report tells you what is still missing.
 
