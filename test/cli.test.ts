@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import { beforeEach } from "bun:test"
 
-import { parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
+import { goalModeFor, goalModeRejectionError, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
+import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
+import type { Pipeline, RunPlan } from "../src/types"
 
 const validRunID = "20240101-120000-abcd"
 
@@ -61,6 +63,28 @@ describe("parseArgs", () => {
 
   test("throws for invalid --gateway", () => {
     expect(() => parseArgs(["--gateway", "invalid"])).toThrow()
+  })
+
+  test("parses --goal with its iteration and plateau controls", () => {
+    const result = parseArgs(["--goal", "90", "--goal-max-iterations", "5", "--goal-plateau", "2"])
+    expect(result.goal).toBe(90)
+    expect(result.goalMaxIterations).toBe(5)
+    expect(result.goalPlateau).toBe(2)
+  })
+
+  test("rejects invalid --goal values", () => {
+    expect(() => parseArgs(["--goal", "101"])).toThrow("--goal must be an integer from 1 to 100")
+    expect(() => parseArgs(["--goal", "0"])).toThrow("--goal must be an integer from 1 to 100")
+    expect(() => parseArgs(["--goal", "abc"])).toThrow("--goal must be an integer from 1 to 100")
+    expect(() => parseArgs(["--goal-max-iterations", "0"])).toThrow("--goal-max-iterations must be a positive integer")
+  })
+
+  test("parses --goal with strict integer parsing", () => {
+    // A goal is a whole number between 1 and 100; anything else must be
+    // rejected instead of silently coerced by parseInt.
+    expect(() => parseArgs(["--goal", "90abc"])).toThrow(/--goal/)
+    expect(() => parseArgs(["--goal", "1.5"])).toThrow(/--goal/)
+    expect(() => parseArgs(["--goal", "90 "])).toThrow(/--goal/)
   })
 
   test("parses --plan", () => {
@@ -472,5 +496,77 @@ describe("resolveRunOptions", () => {
     const parsed = parseArgs(["--no-confirm"])
     const options = await resolveRunOptions(parsed)
     expect(options.noConfirm).toBe(true)
+  })
+})
+
+describe("goalModeFor", () => {
+  // A pipeline is goal-eligible only when it has a quality-score-report step
+  // (consensus) AND a writable step. report-only scored pipelines (review-scored)
+  // have the consensus step but no writable step, so --goal is refused — the
+  // goal-fixer would mutate a pipeline whose contract says "makes no changes".
+  const implementScored = resolvePipeline({ name: "implement-scored", spec: builtInPipelines["implement-scored"]!, agents: builtInAgents })
+  const reviewScored = resolvePipeline({ name: "review-scored", spec: builtInPipelines["review-scored"]!, agents: builtInAgents })
+  const implement = resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents })
+  const goalFix = resolvePipeline({ name: "goal-fix", spec: builtInPipelines["goal-fix"]!, agents: builtInAgents })
+
+  function planWith(pipeline: Pipeline): RunPlan {
+    return { pipeline } as RunPlan
+  }
+
+  test("is off when no goal is set", () => {
+    expect(goalModeFor({}, planWith(implementScored))).toEqual({ mode: "off" })
+  })
+
+  test("is on for a scored pipeline with a writable step and a resolved fix pipeline", () => {
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(implementScored))
+    expect(decision).toEqual({ mode: "on", goal: 90 })
+  })
+
+  test("rejects --goal on a report-only scored pipeline (no writable step)", () => {
+    // review-scored ends in a quality-score-report step but every step is
+    // read-only, so --goal would run the writable goal-fixer against a pipeline
+    // documented as "makes no changes" — refuse it with a clear reason.
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(reviewScored))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("not-writable")
+  })
+
+  test("rejects --goal on a pipeline with no consensus step", () => {
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(implement))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("no-consensus")
+  })
+
+  test("rejects --goal when the goal-fix pipeline could not be resolved", () => {
+    const decision = goalModeFor({ goal: 90 }, planWith(implementScored))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("no-fix-pipeline")
+  })
+
+  test("rejects --goal when the fix pipeline lacks a goal-fixer step", () => {
+    // A project override of goal-fix that drops the goal-fixer step would leave
+    // the fixer running blind (no brief reaches it); reject so the
+    // misconfiguration is surfaced, not silently swallowed.
+    const badFix = { ...goalFix, steps: goalFix.steps.filter((s) => !(s.type === "agent" && s.agentName === "goal-fixer")) }
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(implementScored))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("bad-fix-pipeline")
+  })
+
+  test("rejects --goal when the fix pipeline lacks a consensus step", () => {
+    const noConsensus = { ...goalFix, steps: goalFix.steps.filter((s) => !(s.type === "agent" && s.agentName === "quality-score-report")) }
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: noConsensus }, planWith(implementScored))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("bad-fix-pipeline")
+  })
+
+  test("the bad-fix-pipeline rejection error mentions the project override", () => {
+    const badFix = { ...goalFix, steps: [] }
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(implementScored))
+    if (decision.mode === "rejected") {
+      const error = goalModeRejectionError(decision, planWith(implementScored))
+      expect(error.message).toContain("goal-fixer step")
+      expect(error.message).toContain("quality-score-report step")
+    }
   })
 })

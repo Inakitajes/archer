@@ -1,4 +1,5 @@
 import { resolveModel, type ModelGateway, type ModelRoutingOverrides } from "./model-routing"
+import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { stepRunnerFor } from "./step-runners"
 import type { AgentStep, Pipeline, RunOptions, RunPlan, Step } from "./types"
 
@@ -26,6 +27,22 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     ? resolveModel(input.smartJudgeModel, gateway, overrides)
     : undefined
   const hooks = hooksForPlan(input, pipeline.name)
+  // Goal mode: when on, route the goal-fix pipeline through the same gateway
+  // and freeze its config into the plan the operator reviews and preflights —
+  // so the full bounded loop (target, cap, plateau, fix pipeline, mutation) is
+  // visible and validated before a single model session starts.
+  const goal =
+    input.goal !== undefined && input.goalFixPipeline
+      ? {
+          target: input.goal,
+          maxIterations: input.goalMaxIterations ?? defaultGoalMaxIterations,
+          plateau: input.goalPlateau ?? defaultGoalPlateau,
+          fixPipeline: routePipeline(structuredClone(input.goalFixPipeline), gateway, overrides, input.modelOverride, {
+            advisorOverride: input.advisorOverride,
+            advisorDisabled: input.advisorDisabled,
+          }),
+        }
+      : undefined
   return deepFreeze({
     prompt: { source: input.promptSource ?? (input.resumeRunID ? "resume" : "inline"), text: input.prompt },
     target: {
@@ -42,6 +59,7 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     hooks,
     attachments: [...input.files],
     permissions: input.yolo ? "yolo" : input.smart ? "smart" : "interactive",
+    ...(goal ? { goal } : {}),
     ...(input.resumeRunID
       ? {
           resume: {

@@ -5,14 +5,16 @@ import { buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, globalConfigPat
 import { detectBaseRef, resolveWorktreeDefault } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
-import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
+import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, hasWritableStep, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
+import { consensusStep, defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
+import { runGoalLoop } from "./goal-loop"
 import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
 import { buildRunPlan } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
 import { isModelGateway, type ModelGateway } from "./model-routing"
 import { browseRuns } from "./runs"
 import { deleteKeychainSecret, keychainAvailable, storeKeychainSecret } from "./secrets"
-import type { Pipeline, RunOptions } from "./types"
+import type { Pipeline, RunOptions, RunPlan } from "./types"
 import { isValidRunID, resumeWorkspace } from "./workspace"
 import { readRunMetadata } from "./metadata"
 import { preflightRunPlan } from "./preflight"
@@ -65,6 +67,12 @@ export type ParsedArgs = {
   gateway?: ModelGateway
   planOnly?: boolean
   noConfirm?: boolean
+  /** --goal: keep fixing until the quality score reaches this value (1–100). */
+  goal?: number
+  /** --goal-max-iterations: cap on fix iterations after the initial run. */
+  goalMaxIterations?: number
+  /** --goal-plateau: stop when a fix iteration improves the score by less than this many points. */
+  goalPlateau?: number
 }
 
 export type InitOptions = {
@@ -151,6 +159,16 @@ export async function parseAndRun(argv: string[]) {
     process.stdout.write(renderRunPlan(plan))
     return
   }
+  // goal-fix is an internal pipeline the goal loop drives with a per-step brief;
+  // running it directly gives the goal-fixer no work order (no brief, no
+  // previous score). Refuse it here so the contract is enforced, not just documented.
+  if (plan.pipeline.name === "goal-fix") {
+    throw new Error("goal-fix is the goal loop's internal fix pipeline and is not run directly; use --goal with a scored pipeline (e.g. convoy -p implement-scored --goal 90) instead.")
+  }
+  // Refuse an ineligible --goal before the plan is reviewed, preflighted, or a
+  // worktree is created — the operator must not consent to a plan that cannot
+  // run, and a refused --goal must not orphan a worktree+branch on disk.
+  assertGoalMode(command.options, plan)
   const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY)
   if (interactive && !command.options.noConfirm) {
     if (!(await confirmRunPlan(plan))) {
@@ -169,7 +187,90 @@ export async function parseAndRun(argv: string[]) {
     await ensureRepoReady(options.targetDir, { baseRef: options.baseRef, allowDirty: true })
     options = await prepareWorktreeForRun(options.targetDir, options)
   }
-  await run({ ...options, plan })
+  await executeRun(options, plan)
+}
+
+/** The result of deciding whether goal mode applies to a resolved run. */
+export type GoalModeDecision =
+  | { mode: "off" }
+  | { mode: "on"; goal: number }
+  | { mode: "rejected"; reason: "no-consensus" | "not-writable" | "no-fix-pipeline" | "bad-fix-pipeline"; goal: number }
+
+/** A goal-fix pipeline must have a goal-fixer step (to apply the gaps) and a consensus step (to re-score). */
+function hasGoalFixerStep(pipeline: Pipeline): boolean {
+  return pipeline.steps.some((step) => step.type === "agent" && step.agentName === "goal-fixer")
+}
+
+/**
+ * Pure decision: is goal mode on for this run, and if not, why? Goal mode is
+ * resolved once in `resolveRunOptions` (`options.goal` already reflects the
+ * flag → pipeline → default chain), so this consumes that resolved value rather
+ * than re-deriving it. Exported so the refusals are exercised by tests rather
+ * than left untested inside the module-private execution path.
+ */
+export function goalModeFor(options: { goal?: number; goalFixPipeline?: Pipeline }, plan: RunPlan): GoalModeDecision {
+  const goal = options.goal
+  if (goal === undefined) return { mode: "off" }
+  if (!consensusStep(plan.pipeline)) return { mode: "rejected", reason: "no-consensus", goal }
+  if (!hasWritableStep(plan.pipeline)) return { mode: "rejected", reason: "not-writable", goal }
+  if (!options.goalFixPipeline) return { mode: "rejected", reason: "no-fix-pipeline", goal }
+  // A project override of goal-fix that drops the goal-fixer or the consensus
+  // step would silently degrade the loop (fixer runs blind, or every iteration
+  // scores nothing). Reject it so the misconfiguration is surfaced, not swallowed.
+  if (!hasGoalFixerStep(options.goalFixPipeline) || !consensusStep(options.goalFixPipeline)) {
+    return { mode: "rejected", reason: "bad-fix-pipeline", goal }
+  }
+  return { mode: "on", goal }
+}
+
+/** Builds the error message for a goal-mode rejection so the early and late checks share one wording. */
+export function goalModeRejectionError(decision: GoalModeDecision & { mode: "rejected" }, plan: RunPlan): Error {
+  if (decision.reason === "no-consensus") {
+    return new Error(
+      `--goal ${decision.goal} requires a scored pipeline: the pipeline must end in a quality-score-report step (implement-scored or a custom scored pipeline).`,
+    )
+  }
+  if (decision.reason === "not-writable") {
+    return new Error(
+      `--goal ${decision.goal} requires a pipeline that can edit the repository: "${plan.pipeline.name}" is report-only (every step is read-only), but goal mode runs the writable goal-fixer. Use a scored pipeline with a writing step (e.g. implement-scored), or drop --goal to review without fixing.`,
+    )
+  }
+  if (decision.reason === "bad-fix-pipeline") {
+    return new Error(
+      `--goal ${decision.goal} requires a goal-fix pipeline with a goal-fixer step and a quality-score-report step; the resolved goal-fix pipeline is missing one or both. Check a project override of pipelines.goal-fix in .convoy/config.yaml.`,
+    )
+  }
+  return new Error("goal mode could not resolve the goal-fix pipeline; is a project config overriding or removing it?")
+}
+
+/**
+ * Refuses an ineligible --goal before the plan is reviewed, preflighted, or a
+ * worktree is created. The operator must not consent to a plan that will
+ * immediately error, and an orphaned worktree must not be left behind.
+ */
+function assertGoalMode(options: { goal?: number; goalFixPipeline?: Pipeline }, plan: RunPlan): void {
+  const decision = goalModeFor(options, plan)
+  if (decision.mode === "rejected") throw goalModeRejectionError(decision, plan)
+}
+
+/** Runs the plan, entering the goal loop when goal mode is configured for this run. */
+async function executeRun(options: RunOptions, plan: RunPlan): Promise<void> {
+  const decision = goalModeFor(options, plan)
+  if (decision.mode === "off") {
+    await run({ ...options, plan })
+    return
+  }
+  // Defensive re-check: the early refusal in parseAndRun/launchInteractiveRun
+  // should have already caught rejections before any side effect, but executeRun
+  // is also called from paths that might bypass that check (e.g. resume).
+  if (decision.mode === "rejected") throw goalModeRejectionError(decision, plan)
+  // options.goal/maxIterations/plateau are already resolved by resolveRunOptions;
+  // consume them directly instead of re-deriving from the plan (single source of truth).
+  await runGoalLoop(options, plan, {
+    goal: decision.goal,
+    maxIterations: options.goalMaxIterations ?? defaultGoalMaxIterations,
+    plateau: options.goalPlateau ?? defaultGoalPlateau,
+  })
 }
 
 /**
@@ -216,6 +317,10 @@ async function launchInteractiveRun(targetDir: string) {
   let options = selection.options
   const plan = selection.plan
   const runSelection = selection.selection
+  // The TUI gates the goal row on scored+writable pipelines, but a project
+  // override of goal-fix could still make an eligible-looking selection
+  // unrunnable. Refuse before preflight and worktree creation.
+  assertGoalMode(options, plan)
   await preflightRunPlan(plan)
   if (runSelection.initializeGit) {
     const { initializeRepoWithInitialCommit } = await import("./git")
@@ -235,7 +340,7 @@ async function launchInteractiveRun(targetDir: string) {
     if (!options.branch) throw new Error("worktree plan is missing its confirmed branch name")
     options = await prepareWorktreeForRun(targetDir, options)
   }
-  await run({ ...options, plan, noConfirm: true })
+  await executeRun(options, plan)
 }
 
 async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSelection): Promise<LaunchRunPreparation> {
@@ -253,6 +358,7 @@ async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSele
   parsed.gateway = selection.gateway
   parsed.worktree = Boolean(selection.isolateWorktree)
   if (selection.branchName) parsed.branch = selection.branchName
+  if (selection.goal !== undefined) parsed.goal = selection.goal
 
   const options = { ...(await resolveRunOptions(parsed)), prompt: selection.prompt }
   // The branch was named and confirmed in the launcher's branch step, so the
@@ -562,6 +668,22 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
   const smartJudgeModel =
     parsed.smartModel || defaults.autoAcceptJudgeModel || parsed.modelOverride || defaults.model || `${defaultGptModel}#${defaultGptVariant}`
 
+  // Goal mode: CLI flag beats the pipeline's own `goal:` config. When either is
+  // set, resolve the goal-fix pipeline through the same chain so project agents
+  // and defaults apply to the fix iterations too.
+  const goal = parsed.goal ?? pipeline.goal
+  const goalFixPipeline =
+    goal === undefined
+      ? undefined
+      : resolvePipeline({
+          name: "goal-fix",
+          spec: selectPipelineSpec(config, "goal-fix"),
+          agents,
+          defaultModel: defaults.model,
+          defaultAdvisor: defaults.advisor,
+          defaultAdvisorMaxCalls: defaults.advisorMaxCalls,
+        })
+
   const options: Omit<RunOptions, "prompt"> = {
     files: [...(config?.attachments ?? []), ...parsed.files],
     onlySteps: parsed.onlySteps,
@@ -579,6 +701,10 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     maxConcurrentAgents: parsed.maxConcurrent ?? pipeline.maxConcurrentAgents ?? defaults.maxConcurrentAgents ?? defaultMaxConcurrentAgents,
     baseRef: await resolveBaseRef(parsed, defaults),
     targetDir: parsed.targetDir,
+    goal,
+    goalMaxIterations: parsed.goalMaxIterations ?? pipeline.goalMaxIterations ?? defaultGoalMaxIterations,
+    goalPlateau: parsed.goalPlateau ?? pipeline.goalPlateau ?? defaultGoalPlateau,
+    ...(goalFixPipeline ? { goalFixPipeline } : {}),
     // A resumed run continues in the directory its metadata recorded — which is
     // already the worktree, when the original run made one — so it never creates
     // another.
@@ -772,6 +898,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "--base":
         parsed.baseRef = takeValue()
         break
+      case "--goal": {
+        parsed.goal = parsePositiveInt(takeValue(), "--goal", 100)
+        break
+      }
+      case "--goal-max-iterations":
+        parsed.goalMaxIterations = parsePositiveInt(takeValue(), "--goal-max-iterations")
+        break
+      case "--goal-plateau":
+        parsed.goalPlateau = parsePositiveInt(takeValue(), "--goal-plateau")
+        break
       case "--dir":
         parsed.targetDir = resolve(process.cwd(), takeValue())
         break
@@ -781,6 +917,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
   }
 
   if (positional.length > 0) parsed.prompt = positional.join(" ")
+  return parsed
+}
+
+function parsePositiveInt(value: string, flag: string, max?: number): number {
+  // Strict integer parsing: a goal of "90abc", "1.5", or "90 " must be
+  // rejected instead of silently coerced by parseInt. When `max` is given,
+  // both bounds share one message so the 0 and >max edges agree on the range.
+  const outOfRange = max !== undefined ? `${flag} must be an integer from 1 to ${max}` : `${flag} must be a positive integer`
+  if (!/^[0-9]+$/.test(value)) throw new Error(outOfRange)
+  const parsed = parseInt(value, 10)
+  if (!Number.isInteger(parsed) || parsed < 1 || (max !== undefined && parsed > max)) throw new Error(outOfRange)
   return parsed
 }
 
@@ -869,6 +1016,15 @@ Flags:
   --no-worktree            Run in the current working tree instead
                            (default: worktree on a trunk branch, current tree on any other)
   --branch <name>          Name for the worktree branch, instead of asking the naming model
+  --goal <1-100>           Goal mode: keep fixing until the quality score reaches this value.
+                           Requires a writable scored pipeline (implement-scored, or any
+                           pipeline ending in a quality-score-report step with a writing step).
+                           Each fix iteration applies exactly the gaps the previous scoring
+                           round reported and re-scores; the loop stops at the goal, at a
+                           plateau, or at the iteration cap. See the Quality scoring section.
+  --goal-max-iterations <n> Cap on fix iterations after the initial run (default: 3)
+  --goal-plateau <n>       Stop when a fix iteration improves the score by less than this many
+                           points (default: 3)
   --dir <path>             Target repo (default: cwd)
 
 Config files:

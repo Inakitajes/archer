@@ -29,6 +29,16 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     `Gateway: ${gatewayLabel(plan.modelRouting.gateway)}`,
     `Advisors: ${plan.pipeline.steps.filter((step) => step.type === "agent" && Boolean(plannedStepAdvisor(step))).length}/${plan.pipeline.steps.filter((step) => step.type === "agent").length} steps advised`,
   ]
+  if (plan.goal) {
+    // Goal mode is a bounded loop the operator is consenting to in full: the
+    // initial run plus up to maxIterations fix runs of the writable goal-fix
+    // pipeline. Surface it before confirmation so the cost/mutation envelope is
+    // explicit, not discovered after the first run.
+    lines.push(
+      `Goal mode: target ${plan.goal.target}/100 · up to ${plan.goal.maxIterations} fix iterations · plateau ${plan.goal.plateau}`,
+      `  Fix pipeline: ${sanitizeInline(plan.goal.fixPipeline.name)} · ${plan.goal.fixPipeline.steps.length} steps (writable goal-fixer + re-scorers)`,
+    )
+  }
   const promptLines = options.fullPrompt && !compact
     ? prompt.split("\n").map((line) => `  ${line}`)
     : [`  ${preview}${preview.length < prompt.replace(/\s+/g, " ").length ? "…" : ""}`]

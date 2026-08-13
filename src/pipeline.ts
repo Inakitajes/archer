@@ -275,6 +275,37 @@ export const builtInAgents: readonly AgentSpec[] = [
     readOnly: true,
     builtIn: true,
   },
+  // Quality scoring: independent measurement against a fixed rubric, with a
+  // separate consensus step that verifies the scorers' claims by running the
+  // checks itself (the Gauntlet Loop's "never let the builder grade itself",
+  // plus a fresh critic that inspects the real artifact rather than a summary).
+  {
+    name: "quality-scorer",
+    description: "Scores an implementation against the quality rubric: six weighted dimensions, absolute severity, evidence-cited, machine-readable output",
+    defaultModel: defaultOpusModel,
+    temperature: 0.1,
+    readOnly: true,
+    verify: true,
+    builtIn: true,
+  },
+  {
+    name: "quality-score-report",
+    description: "Consolidates independent quality-scorer reports into one consensus score, verifies the load-bearing claims by running the checks, and emits the authoritative machine-readable score",
+    defaultModel: defaultOpusModel,
+    temperature: 0.1,
+    readOnly: true,
+    verify: true,
+    builtIn: true,
+  },
+  // Goal loop: the directed-fix agent. Its phase brief carries the previous
+  // scoring round's gaps, and its only job is closing exactly those.
+  {
+    name: "goal-fixer",
+    description: "Applies exactly the gaps the previous quality-scorer round reported, without adding new scope",
+    defaultModel: fallbackModel,
+    temperature: 0.1,
+    builtIn: true,
+  },
 ]
 
 /** Short names accepted in pipeline steps for the built-in agents. */
@@ -337,6 +368,15 @@ export type PipelineSpec = {
    * loses to the `--max-concurrent` CLI flag. Unset inherits the defaults chain.
    */
   maxConcurrentAgents?: number
+  /**
+   * Goal loop: keep fixing until the quality score reaches this value (1–100).
+   * Requires the pipeline to end in a quality-score-report step. CLI --goal wins.
+   */
+  goal?: number
+  /** Goal loop: cap on fix iterations after the initial run. CLI --goal-max-iterations wins. */
+  goalMaxIterations?: number
+  /** Goal loop: stop when a fix iteration improves the score by less than this many points. CLI --goal-plateau wins. */
+  goalPlateau?: number
   steps: StepSpec[]
 }
 
@@ -389,6 +429,51 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "design", model: defaultImplementReviewModel, advisor: false },
       { agent: "tests", model: defaultImplementAuditModel, advisor: false, reports: "none" },
       { agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" },
+    ],
+  },
+  // implement + the measurement layer: the final diff is graded by two
+  // independent quality-scorers (fresh agents, no shared context with the
+  // builder) against the fixed rubric, and a consensus step reconciles them and
+  // verifies their claims by running the checks itself. The result lands in
+  // reports/score-report.md with a machine-readable score block that a goal
+  // loop (--goal) can act on.
+  "implement-scored": {
+    description: "Like implement, then measures the result: two independent quality-scorers grade the final diff against the rubric and a consensus step reconciles and verifies the score",
+    steps: [
+      { agent: "implementer", model: defaultImplementerModel, reports: "none" },
+      { agent: "patterns", model: defaultImplementAuditModel },
+      { agent: "security", model: defaultImplementAuditModel },
+      { agent: "design", model: defaultImplementReviewModel },
+      { agent: "tests", model: defaultImplementAuditModel, reports: "none" },
+      { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
+      {
+        parallel: [
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+        ],
+      },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
+    ],
+  },
+  // The goal loop's fix iteration: applies exactly the gaps the previous
+  // scoring round reported (delivered as a per-step phase brief on the fixer),
+  // then re-scores with the same independent scorer fan-out and consensus. The
+  // loop keeps the same worktree, so the diff accumulates; nothing here is run
+  // directly by a user, only by --goal.
+  "goal-fix": {
+    description: "The goal loop's fix iteration: apply exactly the gaps from the previous scoring round, then re-score. Not run directly; use --goal.",
+    steps: [
+      { agent: "goal-fixer", name: "fix", reports: "none", diff: true },
+      {
+        parallel: [
+          // The re-scorers must stay blind to the previous score: the fixer's
+          // report restates it, so the scorer steps receive no reports at all
+          // (they grade the artifact, not the round's history).
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "none" },
+        ],
+      },
+      // The consensus sees only the fresh scorer reports, never the fixer's,
+      // so its measurement cannot anchor on the number it is reconciling.
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: ["score"] },
     ],
   },
   review: {
@@ -525,6 +610,31 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
         ],
       },
       { agent: "review-report", name: "report", model: solXhighModel, reports: "all" },
+    ],
+  },
+  // Report-only review + the measurement layer: after the parallel audits, two
+  // independent quality-scorers grade the same diff against the rubric and a
+  // consensus step reconciles and verifies. The score block is the deliverable
+  // alongside the findings report.
+  "review-scored": {
+    description:
+      "Report-only PR review plus a verified quality score: scope, parallel bug/clean-code/security audits across two models, a prioritized findings report, then two independent quality-scorers and a consensus step. Makes no changes.",
+    steps: [
+      { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true },
+      {
+        parallel: [
+          { agent: "clean-code-auditor", name: "clean-code", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
+        ],
+      },
+      { agent: "review-report", name: "report", model: defaultOpusModel, reports: "all" },
+      {
+        parallel: [
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+        ],
+      },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
     ],
   },
   hunter: {
@@ -694,7 +804,15 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
     throw new Error(`pipeline "${input.name}" has no agent steps`)
   }
 
-  return { name: input.name, ...(input.spec.description ? { description: input.spec.description } : {}), ...(input.spec.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: input.spec.maxConcurrentAgents } : {}), steps }
+  return {
+    name: input.name,
+    ...(input.spec.description ? { description: input.spec.description } : {}),
+    ...(input.spec.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: input.spec.maxConcurrentAgents } : {}),
+    ...(input.spec.goal !== undefined ? { goal: input.spec.goal } : {}),
+    ...(input.spec.goalMaxIterations !== undefined ? { goalMaxIterations: input.spec.goalMaxIterations } : {}),
+    ...(input.spec.goalPlateau !== undefined ? { goalPlateau: input.spec.goalPlateau } : {}),
+    steps,
+  }
 }
 
 export function isParallelSpec(raw: StepSpec): raw is ParallelStepSpec {
@@ -923,6 +1041,11 @@ export function validateStepFilters(pipeline: Pipeline, filters: { onlySteps: st
       throw new Error(`${flag}: unknown step "${name}" in pipeline "${pipeline.name}" (valid: ${[...valid].join(", ")})`)
     }
   }
+}
+
+/** Whether a pipeline contains any agent step that may edit the repository (a writable, non-read-only step). */
+export function hasWritableStep(pipeline: Pipeline): boolean {
+  return pipeline.steps.some((step) => step.type === "agent" && !step.readOnly)
 }
 
 export function defaultPipeline(): Pipeline {

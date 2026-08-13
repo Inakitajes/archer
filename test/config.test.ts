@@ -37,6 +37,7 @@ import {
   defaultOpusModel,
   isHumanStepSpec,
   isParallelSpec,
+  resolvePipeline,
 } from "../src/pipeline"
 
 const dirs: string[] = []
@@ -445,6 +446,9 @@ describe("agent registry", () => {
       "hunter-supply-chain",
       "hunter-report",
       "hunter-max-report",
+      "quality-scorer",
+      "quality-score-report",
+      "goal-fixer",
     ])
   })
 })
@@ -458,9 +462,36 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-advised, implement-lite, quick, refine, review, review-cc, review-lite, ship, ultra-implement, ultra-refine)',
+      'unknown pipeline "ghost" (available: fixer, goal-fix, hunter, hunter-max, implement, implement-advised, implement-lite, implement-scored, quick, refine, review, review-cc, review-lite, review-scored, ship, ultra-implement, ultra-refine)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
+  })
+
+  test("parses a pipeline's goal fields and resolves them onto the pipeline", async () => {
+    const dir = await projectDir()
+    const config = parse(
+      "pipelines:\n  scored:\n    steps:\n      - implementer\n      - quality-score-report\n    goal: 92\n    goalMaxIterations: 5\n    goalPlateau: 2",
+      dir,
+    )
+    const spec = selectPipelineSpec(config, "scored")
+    expect(spec).toMatchObject({ goal: 92, goalMaxIterations: 5, goalPlateau: 2 })
+
+    const resolved = resolvePipeline({ name: "scored", spec, agents: builtInAgents })
+    expect(resolved.goal).toBe(92)
+    expect(resolved.goalMaxIterations).toBe(5)
+    expect(resolved.goalPlateau).toBe(2)
+  })
+
+  test("rejects a pipeline goal outside 1–100", async () => {
+    const dir = await projectDir()
+    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    goal: 150", dir)).toThrow("between 1 and 100")
+  })
+
+  test("rejects a pipeline goal of zero", async () => {
+    // goal: 0 would make the loop a no-op — any score instantly meets it — so
+    // the configured goal must live in the same 1–100 range the CLI enforces.
+    const dir = await projectDir()
+    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    goal: 0", dir)).toThrow("between 1 and 100")
   })
 })
 

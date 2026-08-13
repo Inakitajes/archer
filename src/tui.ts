@@ -2654,6 +2654,13 @@ export class TuiProgress implements ProgressUI {
         this.finished.status === "completed" ? bold(fg(theme.green)("✓ run completed")) : bold(fg(theme.red)("✗ run failed")),
       )
     }
+    if (this.finished?.qualityScore !== undefined) {
+      title.push(fg(theme.faint)("  ·  "), bold(fg(theme.accent)(`score ${this.finished.qualityScore}/100`)))
+    }
+    const trajectory = this.finished?.goalTrajectory
+    if (trajectory && trajectory.length > 1) {
+      title.push(fg(theme.faint)("  ·  "), fg(theme.dim)(trajectory.join(" → ")))
+    }
     return joinLines([padBetween(title, totals, width), limitsRow(this.limits, now, width)])
   }
 

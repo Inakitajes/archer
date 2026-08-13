@@ -50,6 +50,30 @@ export type RunOptions = {
   smart: boolean
   /** Resolved model for the smart auto-accept judge (--smart-model → config → --model → defaults.model). */
   smartJudgeModel: string
+  /**
+   * Goal loop: keep fixing until the quality score reaches this value (1–100).
+   * Requires a pipeline that ends in a quality-score-report step. CLI --goal
+   * beats the pipeline's own `goal:` config.
+   */
+  goal?: number
+  /** Goal loop: cap on fix iterations after the initial run. Defaults to 3. */
+  goalMaxIterations?: number
+  /** Goal loop: stop when a fix iteration improves the score by less than this many points. Defaults to 3. */
+  goalPlateau?: number
+  /**
+   * Goal loop: the resolved goal-fix pipeline the loop runs for fix iterations
+   * (same config chain as the main pipeline). Absent when goal mode is off.
+   */
+  goalFixPipeline?: Pipeline
+  /** Goal loop: scores of the iterations that already ran (this run's own score is appended for display). */
+  goalTrajectory?: number[]
+  /**
+   * Goal loop: this run is one of the loop's iterations and another will follow
+   * (or this is the initial run that the loop will keep building on). The runner
+   * suppresses the finish-screen hold so the loop continues unattended instead
+   * of blocking on a keypress between every iteration.
+   */
+  goalContinues?: boolean
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */
@@ -164,6 +188,13 @@ export type AgentStep = {
   groupId: string
   /** Pre-fan-out logical name; equals `name` unless this step was produced by a `models:` fan-out. */
   stepName: string
+  /**
+   * A per-step prompt suffix appended to this phase's instructions and no
+   * other. Used by the goal loop to hand the goal-fixer the previous scoring
+   * round's gaps without leaking them to the re-scorer (which must stay blind
+   * to the previous score to avoid anchoring).
+   */
+  goalBrief?: string
 }
 
 export type HumanStep = {
@@ -179,6 +210,12 @@ export type Pipeline = {
   description?: string
   /** Per-pipeline cap on concurrent agents within a group; unset inherits the defaults/CLI chain. */
   maxConcurrentAgents?: number
+  /** Goal loop: keep fixing until the quality score reaches this value. CLI --goal wins. */
+  goal?: number
+  /** Goal loop: cap on fix iterations after the initial run. */
+  goalMaxIterations?: number
+  /** Goal loop: stop when a fix iteration improves the score by less than this many points. */
+  goalPlateau?: number
   steps: Step[]
 }
 
@@ -200,6 +237,18 @@ export type RunPlan = {
   hooks: HookSet
   attachments: string[]
   permissions: "interactive" | "smart" | "yolo"
+  /**
+   * Goal mode, when enabled for this run: the target score, the bounded loop
+   * configuration, and the routed goal-fix pipeline the iterations will run.
+   * Surfaced in the reviewed plan and preflighted alongside the main pipeline
+   * so the operator consents to the full loop — not just its first iteration.
+   */
+  goal?: {
+    target: number
+    maxIterations: number
+    plateau: number
+    fixPipeline: Pipeline
+  }
   resume?: {
     runID: string
     /** Set when an explicit --gateway reroutes pending phases away from the run's frozen gateway. */

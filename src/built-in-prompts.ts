@@ -7,6 +7,7 @@ import designPolisher from "../prompts/design-polisher.md" with { type: "text" }
 import fixerImplementer from "../prompts/fixer-implementer.md" with { type: "text" }
 import fixerTestAuthor from "../prompts/fixer-test-author.md" with { type: "text" }
 import fixerValidator from "../prompts/fixer-validator.md" with { type: "text" }
+import goalFixer from "../prompts/goal-fixer.md" with { type: "text" }
 import hunterCorrectness from "../prompts/hunter-correctness.md" with { type: "text" }
 import hunterMaxReport from "../prompts/hunter-max-report.md" with { type: "text" }
 import hunterMemory from "../prompts/hunter-memory.md" with { type: "text" }
@@ -21,6 +22,8 @@ import implementationTriage from "../prompts/implementation-triage.md" with { ty
 import implementationValidator from "../prompts/implementation-validator.md" with { type: "text" }
 import implementer from "../prompts/implementer.md" with { type: "text" }
 import patternAuditor from "../prompts/pattern-auditor.md" with { type: "text" }
+import qualityScoreReport from "../prompts/quality-score-report.md" with { type: "text" }
+import qualityScorer from "../prompts/quality-scorer.md" with { type: "text" }
 import reviewAdversary from "../prompts/review-adversary.md" with { type: "text" }
 import reviewFixer from "../prompts/review-fixer.md" with { type: "text" }
 import reviewReport from "../prompts/review-report.md" with { type: "text" }
@@ -48,6 +51,7 @@ export const builtInPrompts: Record<string, string> = {
   "fixer-implementer": fixerImplementer,
   "fixer-test-author": fixerTestAuthor,
   "fixer-validator": fixerValidator,
+  "goal-fixer": goalFixer,
   "hunter-correctness": hunterCorrectness,
   "hunter-max-report": hunterMaxReport,
   "hunter-memory": hunterMemory,
@@ -62,6 +66,8 @@ export const builtInPrompts: Record<string, string> = {
   "implementation-validator": implementationValidator,
   implementer,
   "pattern-auditor": patternAuditor,
+  "quality-score-report": qualityScoreReport,
+  "quality-scorer": qualityScorer,
   "review-adversary": reviewAdversary,
   "review-fixer": reviewFixer,
   "review-report": reviewReport,

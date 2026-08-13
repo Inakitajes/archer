@@ -281,7 +281,10 @@ defaults:
 # Convoy ships these pipelines built in; pick one with -p/--pipeline without redeclaring it here:
 #   implement            the default: build the feature, then audit, polish, test, and adversarial review
 #   implement-lite       like implement, but swaps GPT 5.6 Terra xhigh phases for GLM 5.2
+#   implement-scored     like implement, then measures the result: two independent scorers + a verified consensus score
+#   implement-advised    like implement, but the implementer consults GPT 5.6 Sol as an advisor
 #   ultra-implement      like implement, with dual-model parallel audits and a final review/fix/validate stage
+#   goal-fix             the goal loop's fix iteration (not run directly; --goal drives it)
 #   refine               audit the current diff, then apply the triaged fixes (changes code)
 #   ultra-refine         like refine, with every audit fanned out across two models
 #   ship                 merge the advanced base in (resolving conflicts), then refine the merged branch
@@ -289,6 +292,7 @@ defaults:
 #                        and, optionally, hooks.pipelines.ship to fetch the base first / open the PR after
 #   review               report-only: parallel audits across two models plus one prioritized report (no changes)
 #   review-lite          like review, but swaps GPT 5.6 Terra xhigh for GLM 5.2 (scope + audit fan-out); report stays on Opus
+#   review-scored        like review, then scores the result against the quality rubric (report-only)
 #   review-cc            like review, but pairs each audit with a Claude Code run (needs the \`claude\` CLI on PATH)
 #   hunter               report-only repo audit: six specialty tracks on two models each, then one consensus report
 #   hunter-max           like hunter, with every track fanned across all five models (30 audits — slow and expensive)
@@ -631,7 +635,7 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
   for (const [name, value] of Object.entries(record)) {
     const path = `pipelines.${name}`
     const entry = v.record(value, path)
-    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "steps"])
+    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "goal", "goalMaxIterations", "goalPlateau", "steps"])
 
     if (!Array.isArray(entry.steps) || entry.steps.length === 0) v.fail(`${path}.steps`, "must be a non-empty list of steps")
     const steps = (entry.steps as unknown[]).map((step, index) => validateStep(v, step, `${path}.steps[${index}]`))
@@ -639,10 +643,18 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
     pipelines[name] = {
       ...(entry.description !== undefined ? { description: v.nonEmptyString(entry.description, `${path}.description`) } : {}),
       ...(entry.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: v.positiveInt(entry.maxConcurrentAgents, `${path}.maxConcurrentAgents`) } : {}),
+      ...(entry.goal !== undefined ? { goal: validatePipelineGoal(v, entry.goal, `${path}.goal`) } : {}),
+      ...(entry.goalMaxIterations !== undefined ? { goalMaxIterations: v.positiveInt(entry.goalMaxIterations, `${path}.goalMaxIterations`) } : {}),
+      ...(entry.goalPlateau !== undefined ? { goalPlateau: v.positiveInt(entry.goalPlateau, `${path}.goalPlateau`) } : {}),
       steps,
     }
   }
   return pipelines
+}
+
+/** A pipeline's configured goal lives in the same 1–100 range the CLI enforces: 0 would make the goal loop a no-op. */
+function validatePipelineGoal(v: Validator, raw: unknown, path: string): number {
+  return v.rangeInt(raw, path, 1, 100)
 }
 
 function validateStep(v: Validator, raw: unknown, path: string, context: { insideParallel?: boolean } = {}): StepSpec {
@@ -1026,6 +1038,13 @@ class Validator {
 
   positiveInt(value: unknown, path: string): number {
     if (typeof value !== "number" || !Number.isInteger(value) || value < 1) this.fail(path, "must be a positive integer")
+    return value
+  }
+
+  rangeInt(value: unknown, path: string, min: number, max: number): number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+      this.fail(path, `must be an integer between ${min} and ${max}`)
+    }
     return value
   }
 
