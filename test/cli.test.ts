@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { beforeEach } from "bun:test"
 
-import { goalModeFor, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
+import { goalModeFor, goalModeRejectionError, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import type { Pipeline, RunPlan } from "../src/types"
 
@@ -73,9 +73,9 @@ describe("parseArgs", () => {
   })
 
   test("rejects invalid --goal values", () => {
-    expect(() => parseArgs(["--goal", "101"])).toThrow("--goal must be a score from 0 to 100")
-    expect(() => parseArgs(["--goal", "0"])).toThrow("--goal must be a positive integer")
-    expect(() => parseArgs(["--goal", "abc"])).toThrow("--goal must be a positive integer")
+    expect(() => parseArgs(["--goal", "101"])).toThrow("--goal must be an integer from 1 to 100")
+    expect(() => parseArgs(["--goal", "0"])).toThrow("--goal must be an integer from 1 to 100")
+    expect(() => parseArgs(["--goal", "abc"])).toThrow("--goal must be an integer from 1 to 100")
     expect(() => parseArgs(["--goal-max-iterations", "0"])).toThrow("--goal-max-iterations must be a positive integer")
   })
 
@@ -541,5 +541,32 @@ describe("goalModeFor", () => {
     const decision = goalModeFor({ goal: 90 }, planWith(implementScored))
     expect(decision.mode).toBe("rejected")
     if (decision.mode === "rejected") expect(decision.reason).toBe("no-fix-pipeline")
+  })
+
+  test("rejects --goal when the fix pipeline lacks a goal-fixer step", () => {
+    // A project override of goal-fix that drops the goal-fixer step would leave
+    // the fixer running blind (no brief reaches it); reject so the
+    // misconfiguration is surfaced, not silently swallowed.
+    const badFix = { ...goalFix, steps: goalFix.steps.filter((s) => !(s.type === "agent" && s.agentName === "goal-fixer")) }
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(implementScored))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("bad-fix-pipeline")
+  })
+
+  test("rejects --goal when the fix pipeline lacks a consensus step", () => {
+    const noConsensus = { ...goalFix, steps: goalFix.steps.filter((s) => !(s.type === "agent" && s.agentName === "quality-score-report")) }
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: noConsensus }, planWith(implementScored))
+    expect(decision.mode).toBe("rejected")
+    if (decision.mode === "rejected") expect(decision.reason).toBe("bad-fix-pipeline")
+  })
+
+  test("the bad-fix-pipeline rejection error mentions the project override", () => {
+    const badFix = { ...goalFix, steps: [] }
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(implementScored))
+    if (decision.mode === "rejected") {
+      const error = goalModeRejectionError(decision, planWith(implementScored))
+      expect(error.message).toContain("goal-fixer step")
+      expect(error.message).toContain("quality-score-report step")
+    }
   })
 })

@@ -198,6 +198,16 @@ export function dirtyFilesPreview(porcelain: string) {
   return shown.join("\n")
 }
 
+/** Returns the current HEAD commit SHA, or undefined when the repo has no commits or git fails. */
+export async function currentHead(cwd: string): Promise<string | undefined> {
+  try {
+    const result = await execFile("git", ["rev-parse", "HEAD"], { cwd, allowFailure: true })
+    return result.exitCode === 0 ? result.stdout.trim() : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export async function createCleanRepoSnapshot(cwd: string): Promise<RepoSnapshot | undefined> {
   const status = await execFile("git", statusArgs, { cwd })
   if (status.stdout.trim() !== "") return undefined

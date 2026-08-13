@@ -21,12 +21,10 @@
 
 import { buildRunPlan } from "./run-plan"
 import { log } from "./log"
-import { createCleanRepoSnapshot, restoreRepoSnapshot, statusPorcelain, type RepoSnapshot } from "./git"
+import { createCleanRepoSnapshot, currentHead, restoreRepoSnapshot, statusPorcelain, type RepoSnapshot } from "./git"
 import { isUserAbortError, run, type RunResult } from "./runner"
+import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import type { RunOptions, RunPlan } from "./types"
-
-export const defaultGoalMaxIterations = 3
-export const defaultGoalPlateau = 3
 
 export type GoalLoopConfig = {
   goal: number
@@ -59,6 +57,8 @@ type GoalLoopDeps = {
   restoreSnapshot: (snapshot: RepoSnapshot, cwd: string) => Promise<void>
   /** Reports whether the working tree at `cwd` is clean (no uncommitted or untracked changes). */
   isCleanRepo: (cwd: string) => Promise<boolean>
+  /** Returns the current HEAD commit SHA, or undefined when git fails. */
+  currentHead: (cwd: string) => Promise<string | undefined>
 }
 
 /**
@@ -71,6 +71,7 @@ const defaultGoalLoopDeps: GoalLoopDeps = {
   captureSnapshot: createCleanRepoSnapshot,
   restoreSnapshot: restoreRepoSnapshot,
   isCleanRepo: async (cwd) => (await statusPorcelain(cwd)).trim() === "",
+  currentHead,
 }
 
 /** The best measured state: the score and the repo state it was measured on. */
@@ -85,15 +86,23 @@ export async function runGoalLoop(
   config: GoalLoopConfig,
   deps: GoalLoopDeps = defaultGoalLoopDeps,
 ): Promise<GoalLoopOutcome> {
-  const { run: runRun, captureSnapshot, restoreSnapshot, isCleanRepo } = deps
+  const { run: runRun, captureSnapshot, restoreSnapshot, isCleanRepo, currentHead } = deps
   const scores: number[] = []
   let best: BestState | undefined
+  // Track the HEAD the loop's own runs leave behind, so the restore can refuse
+  // when someone else committed on the branch between the last run and the
+  // restore — that committed work would be silently discarded by a reset --hard.
+  let lastHead: string | undefined
 
-  // The initial run is the first iteration of the loop; every run it makes is
-  // flagged goalContinues so the runner never holds the finish screen between
-  // iterations (the loop's promise is "don't stop until the score reaches the
-  // target", and a keypress gate would defeat it).
-  let previous: RunResult = await runRun({ ...options, plan, goalContinues: true })
+  // The initial run is the first iteration of the loop. When more iterations
+  // are possible, it is flagged goalContinues so the runner never holds the
+  // finish screen between iterations (the loop's promise is "don't stop until
+  // the score reaches the target", and a keypress gate would defeat it). When
+  // maxIterations is 0 the initial run is the only run, so the finish screen
+  // is allowed to show the score and trajectory.
+  const initialContinues = config.maxIterations > 0
+  let previous: RunResult = await runRun({ ...options, plan, ...(initialContinues ? { goalContinues: true } : {}) })
+  lastHead = await currentHead(options.targetDir)
   let score = previous.qualityScore?.score
   if (score === undefined) {
     log.warn("goal loop: the run produced no machine-readable quality score; nothing to iterate on")
@@ -112,9 +121,15 @@ export async function runGoalLoop(
   let reason: GoalLoopOutcome["reason"] = "max-iterations"
   let restored = false
   for (let iteration = 1; iteration <= config.maxIterations; iteration++) {
-    const fixOptions = goalFixOptions(options, previous, scores)
+    // The last possible iteration must not set goalContinues: when the loop
+    // hits the iteration cap, the finish screen shows the final score and
+    // trajectory instead of silently advancing past it. Earlier iterations keep
+    // the flag so the loop runs unattended between fix rounds.
+    const continues = iteration < config.maxIterations
+    const fixOptions = goalFixOptions(options, previous, scores, continues)
     try {
       previous = await runRun({ ...fixOptions, plan: buildRunPlan(fixOptions) })
+      lastHead = await currentHead(options.targetDir)
     } catch (error) {
       // A user abort (Ctrl+C) is a deliberate stop, not a failure to recover
       // from: never roll the branch back under the operator's feet.
@@ -122,7 +137,7 @@ export async function runGoalLoop(
       // A failed fix iteration may have mutated the tree after the fixer ran;
       // put the branch back on the best measured state before surfacing it,
       // but only when the tree is clean so concurrent operator work survives.
-      restored = await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo)
+      restored = await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead)
       throw error
     }
     score = previous.qualityScore?.score
@@ -156,13 +171,13 @@ export async function runGoalLoop(
   // already there, so no restore is needed.
   const finalScore = scores[scores.length - 1]
   if (reason !== "goal" && best && (reason === "no-score" || finalScore === undefined || finalScore < best.score)) {
-    restored = await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo)
+    restored = await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead)
   }
 
   return summarize({ scores, reached: reason === "goal", reason, bestScore: best?.score, restored })
 }
 
-function goalFixOptions(options: RunOptions, prev: RunResult, trajectory: number[]): RunOptions {
+function goalFixOptions(options: RunOptions, prev: RunResult, trajectory: number[], continues: boolean): RunOptions {
   const base = options.goalFixPipeline
   if (!base) throw new Error("goal loop: the goal-fix pipeline is not resolved for this run")
   const brief = goalBriefFor(prev)
@@ -177,8 +192,10 @@ function goalFixOptions(options: RunOptions, prev: RunResult, trajectory: number
     pipeline,
     // The finish screen shows the trajectory building across iterations.
     goalTrajectory: [...trajectory],
-    // The loop continues after this fix iteration; never hold the finish screen.
-    goalContinues: true,
+    // When this iteration will be followed by another, never hold the finish
+    // screen (the loop runs unattended). On the last possible iteration, let
+    // the finish screen hold so the operator sees the final score and trajectory.
+    ...(continues ? { goalContinues: true } : {}),
     // Fix iterations must never re-enter goal mode or filter steps.
     goal: undefined,
     goalMaxIterations: undefined,
@@ -272,21 +289,46 @@ async function captureBestEffort(cwd: string, captureSnapshot: (cwd: string) => 
  * guarding against destroying concurrent operator work. Returns whether a
  * restore actually happened: false (no restore needed or attempted) must never
  * be reported as a successful best-state preservation.
+ *
+ * Two guards protect concurrent work:
+ * 1. Dirty tree: if the working tree has uncommitted or untracked changes, the
+ *    destructive `git reset --hard` + `git clean -fd` would erase them.
+ * 2. Branch advance: if the current HEAD differs from the HEAD the loop's last
+ *    run left behind, someone else committed on the branch during the loop
+ *    window — the restore would force-move the branch and discard those commits.
+ * Both guards skip the restore and warn, leaving the branch on the final
+ * iteration instead of destroying work the operator did not consent to lose.
  */
 async function restoreBestEffort(
   best: BestState | undefined,
   cwd: string,
   restoreSnapshot: (snapshot: RepoSnapshot, cwd: string) => Promise<void>,
   isCleanRepo: (cwd: string) => Promise<boolean>,
+  expectedHead: string | undefined,
+  currentHead: (cwd: string) => Promise<string | undefined>,
 ): Promise<boolean> {
   if (!best?.snapshot) {
     log.warn(`goal loop: no snapshot of the best measured state (score ${best?.score ?? "?"}/100) was captured; the branch stays where the last iteration left it`)
     return false
   }
-  // Never destroy concurrent operator work: if the tree is dirty (the operator
-  // made edits or added untracked files while a goal run was in flight), the
-  // destructive `git reset --hard` + `git clean -fd` would erase it. Warn and
-  // leave the branch on the final iteration instead.
+  // Guard 1 — branch advance: if the current HEAD is not the HEAD the loop's
+  // last run left behind, commits were made on the branch outside the loop
+  // (operator, git pull, cron, convoy finish). The restore would force-move
+  // the branch and discard them; refuse instead, same spirit as the dirty-tree
+  // guard. Recovery is reflog-only, so warn loudly.
+  if (expectedHead !== undefined) {
+    const actualHead = await currentHead(cwd)
+    if (actualHead !== undefined && actualHead !== expectedHead) {
+      log.warn(
+        `goal loop: the branch HEAD (${actualHead.slice(0, 12)}) advanced past the state the loop's last run left (${expectedHead.slice(0, 12)}); refusing to restore the best measured state (score ${best.score}/100) to avoid discarding concurrent commits. The branch stays where it is; the best state is reachable via git reflog.`,
+      )
+      return false
+    }
+  }
+  // Guard 2 — dirty tree: if the tree is dirty (the operator made edits or
+  // added untracked files while a goal run was in flight), the destructive
+  // `git reset --hard` + `git clean -fd` would erase them. Warn and leave the
+  // branch on the final iteration instead.
   if (!(await isCleanRepo(cwd))) {
     log.warn(`goal loop: the working tree is not clean; refusing to restore the best measured state (score ${best.score}/100) to avoid destroying concurrent changes. The branch stays where the last iteration left it.`)
     return false

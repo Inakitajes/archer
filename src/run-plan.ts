@@ -1,5 +1,5 @@
 import { resolveModel, type ModelGateway, type ModelRoutingOverrides } from "./model-routing"
-import { defaultGoalMaxIterations, defaultGoalPlateau } from "./goal-loop"
+import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { stepRunnerFor } from "./step-runners"
 import type { AgentStep, Pipeline, RunOptions, RunPlan, Step } from "./types"
 

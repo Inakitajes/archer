@@ -654,9 +654,7 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
 
 /** A pipeline's configured goal lives in the same 1–100 range the CLI enforces: 0 would make the goal loop a no-op. */
 function validatePipelineGoal(v: Validator, raw: unknown, path: string): number {
-  const goal = v.rangeInt(raw, path, 0, 100)
-  if (goal === 0) v.fail(path, "must be an integer from 1 to 100; 0 would make the goal loop a no-op")
-  return goal
+  return v.rangeInt(raw, path, 1, 100)
 }
 
 function validateStep(v: Validator, raw: unknown, path: string, context: { insideParallel?: boolean } = {}): StepSpec {

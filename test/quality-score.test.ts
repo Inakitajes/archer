@@ -123,6 +123,17 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
     expect(parseQualityScoreReport(bare)).toBeUndefined()
   })
 
+  test("parses a block whose JSON strings contain triple-backticks", () => {
+    // A gap description that references a ```fenced``` code block must not close
+    // the fence early: the parser finds the LAST ``` (the real closing fence)
+    // instead of the first one inside the JSON string.
+    const report = `\`\`\`quality-score\n${JSON.stringify({ score: 87, dimensions, gaps: { tests: "use a \`\`\`fenced\`\`\` block" }, mustFix: [] })}\n\`\`\`\n`
+    const parsed = parseQualityScoreReport(report)
+    expect(parsed).toBeDefined()
+    expect(parsed?.score).toBe(87)
+    expect(parsed?.gaps?.tests).toBe("use a ```fenced``` block")
+  })
+
   test("derives the score from dimensions when omitted", () => {
     const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions, verdict: "ready-with-caveats", mustFix: [] })}\n\`\`\`\n`
     expect(parseQualityScoreReport(report)?.score).toBe(87)
@@ -137,6 +148,43 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
 
     const wrong = `\`\`\`quality-score\n${JSON.stringify({ score: 55, dimensions, verdict: "ready", mustFix: [] })}\n\`\`\`\n`
     expect(parseQualityScoreReport(wrong)?.verdict).toBe("ready-with-caveats")
+  })
+
+  test("enforces the 80 floor for minor-only findings", () => {
+    // The rubric promises: "a change whose only findings are minor cannot
+    // score below 80." When every mustFix entry is tagged (minor), the score
+    // is floored at 80 even if the dimensions weigh below that. Here the
+    // dimensions are all 50 (weighted total 50), but the floor lifts it to 80.
+    const lowDims: QualityDimensionScores = { prd: 50, tests: 50, security: 50, maintainability: 50, operational: 50, scope: 50 }
+    const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions: lowDims, mustFix: ["SC-1: typo in comment (minor)", "SC-2: unused import (minor)"] })}\n\`\`\`\n`
+    const parsed = parseQualityScoreReport(report)
+    expect(parsed?.score).toBe(80)
+    expect(parsed?.verdict).toBe("ready-with-caveats")
+  })
+
+  test("does not apply the 80 floor when any finding is non-minor", () => {
+    // A single major finding means the floor does not apply; the score stays
+    // at the weighted total even if it's below 80.
+    const lowDims: QualityDimensionScores = { prd: 50, tests: 50, security: 50, maintainability: 50, operational: 50, scope: 50 }
+    const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions: lowDims, mustFix: ["SC-1: typo (minor)", "SC-2: real bug (major)"] })}\n\`\`\`\n`
+    const parsed = parseQualityScoreReport(report)
+    expect(parsed?.score).toBe(50)
+  })
+
+  test("does not apply the 80 floor when there are no findings", () => {
+    // The floor is about capping minor deductions, not inflating a clean
+    // score; no findings means the weighted total stands as-is.
+    const lowDims: QualityDimensionScores = { prd: 50, tests: 50, security: 50, maintainability: 50, operational: 50, scope: 50 }
+    const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions: lowDims, mustFix: [] })}\n\`\`\`\n`
+    expect(parseQualityScoreReport(report)?.score).toBe(50)
+  })
+
+  test("does not apply the 80 floor when a finding lacks a severity tag", () => {
+    // A finding without a parseable (minor) tag is treated as non-minor so
+    // a malformed report cannot exploit the floor.
+    const lowDims: QualityDimensionScores = { prd: 50, tests: 50, security: 50, maintainability: 50, operational: 50, scope: 50 }
+    const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions: lowDims, mustFix: ["SC-1: something without a tag"] })}\n\`\`\`\n`
+    expect(parseQualityScoreReport(report)?.score).toBe(50)
   })
 
   test("never trusts a declared score that contradicts the dimensions", () => {

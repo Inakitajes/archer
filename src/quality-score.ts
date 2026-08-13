@@ -37,6 +37,11 @@ export type QualityScore = {
   confidence?: "high" | "medium" | "low"
 }
 
+/** Default cap on goal-loop fix iterations after the initial run. */
+export const defaultGoalMaxIterations = 3
+/** Default goal-loop plateau: stop when a fix iteration improves by fewer points than this. */
+export const defaultGoalPlateau = 3
+
 /** The rubric v1 weights; a project rubric (.convoy/quality-rubric.md) may override them, but the parser must know the defaults. */
 export const qualityDimensionWeights: Record<QualityDimension, number> = {
   prd: 0.3,
@@ -144,18 +149,24 @@ export function parseQualityScoreReport(
   const dimensions = parseDimensions(parsed.dimensions)
   if (!dimensions) return undefined
 
+  const mustFix = Array.isArray(parsed.mustFix) ? parsed.mustFix.filter((item): item is string => typeof item === "string") : []
+
   // The score is always recomputed in code from the dimensions and the rubric
   // weights. An agent-declared score is at most informative: a report whose
   // declared score contradicts its own dimensions must not drive the loop.
-  const score = weightedQualityScore(dimensions, weights)
+  // Enforce the rubric's 80 floor: a change whose only findings are minor
+  // cannot score below 80, no matter how many minor deductions accumulate.
+  // The scorer tags each finding with its absolute severity in parentheses
+  // (e.g. "SC-3: ... (minor)"); when every surviving finding is minor, the
+  // score is floored at 80. Findings without a parseable severity tag are
+  // treated as non-minor so a malformed report cannot exploit the floor.
+  const score = allFindingsMinor(mustFix) ? Math.max(80, weightedQualityScore(dimensions, weights)) : weightedQualityScore(dimensions, weights)
   const declaredScore = typeof parsed.score === "number" && Number.isFinite(parsed.score) ? parsed.score : undefined
   if (declaredScore !== undefined && Math.abs(declaredScore - score) > 1) {
     log.warn(
       `quality score: declared score ${declaredScore} disagrees with the dimensions (weighted total ${score}); using the computed score`,
     )
   }
-
-  const mustFix = Array.isArray(parsed.mustFix) ? parsed.mustFix.filter((item): item is string => typeof item === "string") : []
 
   // The verdict is a pure function of the score: trusting an agent-supplied
   // verdict that contradicts its own numbers would let an inconsistent report
@@ -176,13 +187,26 @@ export function parseQualityScoreReport(
  * malformed rather than selecting a different candidate.
  */
 function extractQualityScoreBlock(markdown: string): string | undefined {
-  const fence = /```quality-score\s*\n([\s\S]*?)```/gi
-  let match: RegExpExecArray | null
-  let last: RegExpExecArray | null = null
-  while ((match = fence.exec(markdown)) !== null) last = match
-  if (!last) return undefined
-  if (markdown.slice(last.index + last[0].length).trim() !== "") return undefined
-  return last[1].trim()
+  // Find every opening fence with the same contract as before: the tag must be
+  // followed by optional whitespace and a newline. The last such fence is the
+  // authoritative block (earlier ones may be examples the scorer pasted).
+  const openings = [...markdown.matchAll(/```quality-score\s*\n/gi)]
+  if (openings.length === 0) return undefined
+  const lastOpening = openings[openings.length - 1]
+  if (lastOpening.index === undefined) return undefined
+  const afterOpening = markdown.slice(lastOpening.index + lastOpening[0].length)
+  // The closing fence is the LAST ``` in the remainder, not the first. A
+  // non-greedy regex would close early on triple-backticks inside JSON string
+  // values (e.g. a gap description that references a ```fenced``` code block),
+  // yielding invalid JSON and a silent no-score. Searching from the end and
+  // relying on the trailing-whitespace guard below is resilient to that: the
+  // real closing fence is the final ``` in the report.
+  const closingIndex = afterOpening.lastIndexOf("```")
+  if (closingIndex === -1) return undefined
+  const block = afterOpening.slice(0, closingIndex)
+  const trailing = afterOpening.slice(closingIndex + 3)
+  if (trailing.trim() !== "") return undefined
+  return block.trim()
 }
 
 function parseDimensions(value: unknown): QualityDimensionScores | undefined {
@@ -211,6 +235,19 @@ function parseGaps(value: unknown): Partial<Record<QualityDimension, string>> | 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Reports whether every surviving finding is tagged `minor`. The scorer
+ * tags each mustFix entry with its absolute severity in parentheses (e.g.
+ * "SC-3: ... (minor)"). A finding without a parseable severity tag is
+ * treated as non-minor so a malformed report cannot exploit the 80 floor.
+ * Returns false when there are no findings (the floor is about capping
+ * minor deductions, not inflating a clean score).
+ */
+export function allFindingsMinor(mustFix: string[]): boolean {
+  if (mustFix.length === 0) return false
+  return mustFix.every((finding) => /\(minor\)\s*$/i.test(finding))
 }
 
 function clampScore(value: number): number {

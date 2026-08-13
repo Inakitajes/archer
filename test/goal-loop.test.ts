@@ -69,13 +69,18 @@ type SnapshotFakes = {
   captures: number
   restores: RepoSnapshot[]
   isClean: boolean
+  /** The HEAD `currentHead` reports; defaults to matching the snapshot head. */
+  head: string
+  /** When set, `currentHead` returns these values in order, one per call (then `head`). */
+  headSequence?: string[]
 }
 
 function makeSnapshotFakes(overrides: Partial<SnapshotFakes> = {}): SnapshotFakes & {
-  deps: { captureSnapshot: (cwd: string) => Promise<RepoSnapshot | undefined>; restoreSnapshot: (snapshot: RepoSnapshot, cwd: string) => Promise<void>; isCleanRepo: (cwd: string) => Promise<boolean> }
+  deps: { captureSnapshot: (cwd: string) => Promise<RepoSnapshot | undefined>; restoreSnapshot: (snapshot: RepoSnapshot, cwd: string) => Promise<void>; isCleanRepo: (cwd: string) => Promise<boolean>; currentHead: (cwd: string) => Promise<string | undefined> }
 } {
-  const state: SnapshotFakes = { captures: 0, restores: [], isClean: true, ...overrides }
+  const state: SnapshotFakes = { captures: 0, restores: [], isClean: true, head: "sha-1", ...overrides }
   const snapshot: RepoSnapshot = { head: "sha-1" }
+  let headCalls = 0
   return {
     ...state,
     deps: {
@@ -87,6 +92,10 @@ function makeSnapshotFakes(overrides: Partial<SnapshotFakes> = {}): SnapshotFake
         state.restores.push(snap)
       },
       isCleanRepo: async () => state.isClean,
+      currentHead: async () => {
+        if (state.headSequence) return state.headSequence[headCalls++] ?? state.head
+        return state.head
+      },
     },
   }
 }
@@ -299,17 +308,36 @@ describe("runGoalLoop", () => {
     expect(plannedFixer?.type === "agent" && plannedFixer.goalBrief).toContain("71/100")
   })
 
-  test("flags every run goalContinues so the TUI never blocks between iterations", async () => {
+  test("flags every run goalContinues while the loop is still going", async () => {
     // The loop's promise is "don't stop until the score reaches the target"; a
     // finish-screen hold between iterations would defeat it, so every run the
-    // loop starts carries goalContinues: true.
+    // loop starts carries goalContinues: true — except the last possible
+    // iteration, which lets the finish screen hold so the operator sees the
+    // final score and trajectory.
     const { calls, deps } = await makeDeps([71, 84, 93], { isClean: true })
     await runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, deps)
 
     expect(calls).toHaveLength(3)
+    // The goal was met on iteration 2 (not the last possible), so all three
+    // runs carry goalContinues: the loop didn't know this was the last one.
     for (const call of calls) {
       expect(call.goalContinues).toBe(true)
     }
+  })
+
+  test("lets the finish screen hold on the last possible iteration", async () => {
+    // When the loop hits the iteration cap, the last iteration must NOT carry
+    // goalContinues so the TUI finish screen shows the final score/trajectory.
+    const { calls, deps } = await makeDeps([71, 80, 85, 88], { isClean: true })
+    await runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 1 }, deps)
+
+    expect(calls).toHaveLength(4)
+    // The initial run and the first two fix iterations carry goalContinues.
+    expect(calls[0]?.goalContinues).toBe(true)
+    expect(calls[1]?.goalContinues).toBe(true)
+    expect(calls[2]?.goalContinues).toBe(true)
+    // The last possible fix iteration (iteration 3 = maxIterations) does not.
+    expect(calls[3]?.goalContinues).toBeUndefined()
   })
 
   test("propagates a failing run", async () => {
@@ -377,10 +405,37 @@ describe("runGoalLoop", () => {
       captureSnapshot: async () => undefined,
       restoreSnapshot: async () => {},
       isCleanRepo: async () => true,
+      currentHead: async () => "sha-1",
     }
     const outcome = await runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 5, plateau: 3 }, deps)
     expect(calls).toHaveLength(3)
     expect(outcome.restored).toBe(false)
+  })
+
+  test("refuses to restore when the branch HEAD advanced past the loop's last run (concurrent commits survive)", async () => {
+    // 71 → 86 → 70: would normally restore to 86, but the branch HEAD moved
+    // after the loop's last run (someone committed on the branch), so the
+    // destructive reset --hard is skipped to avoid discarding those commits.
+    // The loop calls currentHead after each of the 3 runs (returning "sha-1"),
+    // then once more at restore time (returning "sha-concurrent").
+    const { deps, fakes } = await makeDeps([71, 86, 70], { isClean: true, headSequence: ["sha-1", "sha-1", "sha-1", "sha-concurrent"] })
+    const outcome = await runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 5, plateau: 3 }, deps)
+
+    expect(outcome.reason).toBe("plateau")
+    expect((outcome as { bestScore?: number }).bestScore).toBe(86)
+    // No restore: the concurrent commit was protected.
+    expect(outcome.restored).toBe(false)
+    expect(fakes.restores).toHaveLength(0)
+  })
+
+  test("restores normally when the branch HEAD matches the loop's last run", async () => {
+    // 71 → 86 → 70: the HEAD is the same the loop's last run left, so the
+    // restore proceeds to put the branch back on the 86 state.
+    const { deps, fakes } = await makeDeps([71, 86, 70], { isClean: true, head: "sha-1" })
+    const outcome = await runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 5, plateau: 3 }, deps)
+
+    expect(outcome.restored).toBe(true)
+    expect(fakes.restores).toHaveLength(1)
   })
 })
 

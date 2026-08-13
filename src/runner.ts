@@ -2409,10 +2409,21 @@ async function readRunQualityScore(
   try {
     text = await readFile(reportAbs, "utf8")
   } catch {
+    // A scored pipeline that produced no consensus report is a real failure
+    // mode (the consensus step crashed or was skipped); log it so a silent
+    // "no-score" stop in the goal loop has a cause instead of a mystery.
+    log.warn(`quality score: consensus report not found at ${step.reportPath}; the run produced no machine-readable score`)
     return undefined
   }
   const score = parseQualityScoreReport(text, weights)
-  if (!score) return undefined
+  if (!score) {
+    // The report exists but failed the strict contract (missing fence,
+    // invalid JSON, out-of-range dimensions, or trailing content after the
+    // block). An excerpt helps diagnose a misbehaving consensus agent.
+    const excerpt = text.slice(0, 120).replace(/\n/g, " ")
+    log.warn(`quality score: consensus report at ${step.reportPath} could not be parsed (malformed or incomplete); the run produced no machine-readable score. Excerpt: ${excerpt}…`)
+    return undefined
+  }
   return { score }
 }
 
