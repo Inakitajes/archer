@@ -11,6 +11,7 @@ import { startLimitsPoller } from "./limits"
 import { builtInPipelines, defaultPipelineName, resolvePipeline } from "./pipeline"
 import { stepRunnerFor } from "./step-runners"
 import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
+import { consensusStep } from "./quality-score"
 import { runReviewLines } from "./review-tui"
 import { hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
@@ -33,6 +34,8 @@ export type LaunchRunSelection = {
   yolo: boolean
   smart: boolean
   gateway: ModelGateway
+  /** Goal mode: keep fixing until the quality score reaches this value (1–100). Only set for scored pipelines when goal mode is on. */
+  goal?: number
   /** Worktree creation is intentionally deferred until after plan confirmation. */
   isolateWorktree?: boolean
   /** The branch confirmed in the branch step; the worktree is created with exactly this name. */
@@ -124,6 +127,8 @@ type PipelineChoice = {
   hooks: HookNode[]
   valid: boolean
   advisedSteps: number
+  /** True when the pipeline ends in a quality-score-report step, enabling goal mode. */
+  scored: boolean
   error?: string
 }
 
@@ -192,6 +197,14 @@ const toggles: readonly ToggleSpec[] = [
   },
 ]
 
+/** The default target a scored run aims for when goal mode is toggled on in the launcher. */
+export const defaultGoalTarget = 90
+
+/** Adjusts a goal target by delta, clamped to 1–100 (never 0: a 0 goal would make the loop a no-op). */
+export function adjustGoalTarget(current: number, delta: number): number {
+  return Math.max(1, Math.min(100, current + delta))
+}
+
 export async function launchRunTui(options: LaunchRunTuiOptions): Promise<LaunchRunTuiResult> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("convoy needs an interactive terminal to open the launcher")
@@ -249,6 +262,7 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
         hooks,
         valid: true,
         advisedSteps: pipeline.steps.filter((step) => step.type === "agent" && Boolean(step.resolvedAdvisor ?? step.advisor)).length,
+        scored: Boolean(consensusStep(pipeline)),
       }
     } catch (error) {
       return {
@@ -260,6 +274,7 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
         hooks,
         valid: false,
         advisedSteps: 0,
+        scored: false,
         error: error instanceof Error ? error.message : String(error),
       }
     }
@@ -344,6 +359,13 @@ class LaunchPicker {
     // Always overwritten in the constructor, from defaults.worktree or the branch.
     worktree: true,
   }
+
+  // Goal mode: only visible and toggleable for scored pipelines. The target
+  // persists across pipeline switches; runSelection gates it on the selected
+  // pipeline actually being scored, so a stale true never leaks into a
+  // non-scored run.
+  private goalEnabled = false
+  private goalTarget = defaultGoalTarget
 
   private readonly ticker: ReturnType<typeof setInterval>
   // When the screen was last rebuilt, so the ticker can hold its old 250ms pace
@@ -734,6 +756,18 @@ class LaunchPicker {
       case "space":
         this.toggleOption()
         return
+      case "left":
+        if (this.optionIndex >= toggles.length && this.goalEnabled) {
+          this.goalTarget = adjustGoalTarget(this.goalTarget, -5)
+          this.render()
+        }
+        return
+      case "right":
+        if (this.optionIndex >= toggles.length && this.goalEnabled) {
+          this.goalTarget = adjustGoalTarget(this.goalTarget, 5)
+          this.render()
+        }
+        return
       case "return":
       case "linefeed":
       case "s":
@@ -1047,6 +1081,7 @@ class LaunchPicker {
       yolo: this.toggleState.yolo,
       smart: this.toggleState.smart,
       gateway: this.gateway,
+      ...(this.goalEnabled && this.currentChoice().scored ? { goal: this.goalTarget } : {}),
       isolateWorktree: this.toggleState.worktree,
       ...(this.toggleState.worktree && this.branchName ? { branchName: this.branchName, worktreeDir: this.branchDir } : {}),
       ...(initializeGit ? { initializeGit: true } : {}),
@@ -1055,7 +1090,12 @@ class LaunchPicker {
 
   private toggleOption() {
     const key = toggles[this.optionIndex]?.key
-    if (!key) return
+    if (!key) {
+      // The goal row sits after the boolean toggles and only exists for scored pipelines.
+      if (this.currentChoice().scored) this.goalEnabled = !this.goalEnabled
+      this.render()
+      return
+    }
     const next = !this.toggleState[key]
     this.toggleState[key] = next
     if (key === "smart" && next) this.toggleState.yolo = false
@@ -1073,8 +1113,13 @@ class LaunchPicker {
   }
 
   private moveOption(delta: number) {
-    this.optionIndex = clamp(this.optionIndex + delta, 0, toggles.length - 1)
+    this.optionIndex = clamp(this.optionIndex + delta, 0, this.optionCount() - 1)
     this.render()
+  }
+
+  /** Number of selectable rows in the options step: the built-in toggles plus the goal row when the pipeline is scored. */
+  private optionCount(): number {
+    return toggles.length + (this.currentChoice().scored ? 1 : 0)
   }
 
   private currentChoice() {
@@ -1372,6 +1417,24 @@ class LaunchPicker {
       this.optionRows.push(index)
     }
 
+    // Goal mode toggle: only for scored pipelines. Sits after the boolean
+    // toggles and uses left/right to adjust the target by 5.
+    if (this.currentChoice().scored) {
+      const selected = this.optionIndex >= toggles.length
+      const enabled = this.goalEnabled
+      const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
+      const toggle = toggleSwitch(enabled)
+      const label = selected ? bold(fg(theme.text)("Goal mode")) : fg(theme.text)("Goal mode")
+      const flag = fg(enabled ? theme.green : theme.dim)(enabled ? `--goal ${this.goalTarget}` : "--goal 90")
+      lines.push(padBetween([marker, ...toggle, raw(" "), label], [flag], width))
+      this.optionRows.push(toggles.length)
+      const description = enabled
+        ? `Keep fixing until the quality score reaches ${this.goalTarget}/100. ←/→ adjust the target.`
+        : "Keep fixing until the quality score reaches a target (default 90). Only for scored pipelines."
+      lines.push(new StyledText([raw("        "), fg(theme.dim)(truncate(description, Math.max(8, width - 8)))]))
+      this.optionRows.push(toggles.length)
+    }
+
     const flags = this.enabledFlags()
     lines.push(plain(""))
     this.optionRows.push(undefined)
@@ -1437,6 +1500,7 @@ class LaunchPicker {
     if (!this.toggleState.keepRunDir) flags.push("--no-keep-run-dir")
     flags.push(this.toggleState.tui ? "--tui" : "--no-tui")
     flags.push(this.toggleState.worktree ? "--worktree" : "--no-worktree")
+    if (this.goalEnabled && this.currentChoice().scored) flags.push(`--goal ${this.goalTarget}`)
     return flags
   }
 
@@ -1505,7 +1569,7 @@ class LaunchPicker {
         { keys: "p", label: "prompt", priority: 6 },
         { keys: "q", label: "quit", priority: 1 },
       ],
-      [fg(theme.faint)(`${this.optionIndex + 1}/${toggles.length}`)],
+      [fg(theme.faint)(`${this.optionIndex + 1}/${this.optionCount()}`)],
     )
   }
 

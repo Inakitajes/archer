@@ -283,6 +283,7 @@ async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSele
   parsed.gateway = selection.gateway
   parsed.worktree = Boolean(selection.isolateWorktree)
   if (selection.branchName) parsed.branch = selection.branchName
+  if (selection.goal !== undefined) parsed.goal = selection.goal
 
   const options = { ...(await resolveRunOptions(parsed)), prompt: selection.prompt }
   // The branch was named and confirmed in the launcher's branch step, so the

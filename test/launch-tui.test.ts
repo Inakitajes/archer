@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
 
-import { branchActionForKey, branchProposalNote, cursorPosition, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
+import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
 
+import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
+import { consensusStep } from "../src/quality-score"
 import type { KeyEvent } from "@opentui/core"
 
 function key(partial: Partial<KeyEvent>): KeyEvent {
@@ -287,5 +289,54 @@ describe("launch TUI pipeline preview", () => {
       { stage: "pre", label: "very-long-hook-name-that-should-be-truncated" },
     ], 15))
     expect(lines.length).toBeGreaterThan(0)
+  })
+})
+
+describe("launch TUI goal mode", () => {
+  test("defaultGoalTarget is 90", () => {
+    expect(defaultGoalTarget).toBe(90)
+  })
+
+  test("adjustGoalTarget increases by delta", () => {
+    expect(adjustGoalTarget(90, 5)).toBe(95)
+    expect(adjustGoalTarget(85, 5)).toBe(90)
+    expect(adjustGoalTarget(50, 10)).toBe(60)
+  })
+
+  test("adjustGoalTarget decreases by delta", () => {
+    expect(adjustGoalTarget(90, -5)).toBe(85)
+    expect(adjustGoalTarget(95, -10)).toBe(85)
+  })
+
+  test("adjustGoalTarget clamps to 100 at the top", () => {
+    expect(adjustGoalTarget(98, 5)).toBe(100)
+    expect(adjustGoalTarget(100, 5)).toBe(100)
+  })
+
+  test("adjustGoalTarget clamps to 1 at the bottom and never returns 0", () => {
+    expect(adjustGoalTarget(3, -5)).toBe(1)
+    expect(adjustGoalTarget(1, -5)).toBe(1)
+    expect(adjustGoalTarget(1, -100)).toBe(1)
+  })
+
+  test("adjustGoalTarget with 0 delta returns the current value", () => {
+    expect(adjustGoalTarget(90, 0)).toBe(90)
+    expect(adjustGoalTarget(1, 0)).toBe(1)
+    expect(adjustGoalTarget(100, 0)).toBe(100)
+  })
+
+  test("consensusStep detects scored built-in pipelines", () => {
+    // Scored: pipelines that end in a quality-score-report step
+    for (const name of ["implement-scored", "review-scored", "goal-fix"]) {
+      const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
+      expect(consensusStep(pipeline)).toBeDefined()
+    }
+  })
+
+  test("consensusStep rejects non-scored built-in pipelines", () => {
+    for (const name of ["implement", "implement-lite", "review", "refine", "ultra-implement", "hunter"]) {
+      const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
+      expect(consensusStep(pipeline)).toBeUndefined()
+    }
   })
 })
