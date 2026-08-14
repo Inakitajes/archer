@@ -5,6 +5,7 @@ import { dirname, join } from "node:path"
 import { projectAgentPromptPath } from "./agents"
 import { builtInPrompts } from "./built-in-prompts"
 import { log } from "./log"
+import { type LoopGuardSettings } from "./loop-guard"
 import {
   agentAliases,
   builtInAgents,
@@ -50,6 +51,11 @@ export type ConvoyConfig = {
   /** Only the keys the user set; the rest fall back to defaultNotificationSettings. */
   notifications: Partial<NotificationSettings>
   modelRouting?: ModelRoutingConfig
+  /**
+   * Circuit breaker for an OpenCode phase that is repeating itself. Unset keys
+   * keep the built-in defaults; `enabled: false` turns the whole guard off.
+   */
+  loopGuard?: LoopGuardSettings
 }
 
 export type ConvoyDefaults = {
@@ -201,6 +207,7 @@ export function mergeConvoyConfigs(global: ConvoyConfig | undefined, project: Co
       ...(project.modelRouting?.gateway !== undefined ? { gateway: project.modelRouting.gateway } : {}),
       overrides: mergeRoutingOverrides(global.modelRouting?.overrides ?? {}, project.modelRouting?.overrides ?? {}),
     },
+    ...(global.loopGuard || project.loopGuard ? { loopGuard: { ...global.loopGuard, ...project.loopGuard } } : {}),
   }
 }
 
@@ -262,6 +269,18 @@ defaults:
   # advisor: anthropic/claude-opus-5 # optional: reviewing model consulted at phase decision points
   # advisorMaxCalls: 1000 # optional: consultation budget per phase attempt; the default is effectively unlimited, set this to put a real cap on it
   # advisorAuditPolicy: summary # summary (hashes), redacted (lengths), or full content retention
+
+# Stop a phase that is going nowhere before it burns the budget. Convoy watches
+# the live tool stream: OpenCode's own doom_loop detector only sees repeats
+# inside a single turn, which is not how Kimi/GLM loop (one identical call per
+# turn, forever). Unset keys use the built-in defaults below. enabled: false
+# turns the whole guard off. maxPhaseCost: false disables just the dollar cap.
+# loopGuard:
+#   enabled: true
+#   identicalCalls: 4      # same tool + same args in a row
+#   sameToolFailures: 6    # same tool failing in a row (args may drift)
+#   maxSteps: 80           # hard abort; OpenCode is asked to stop 5 steps earlier
+#   maxPhaseCost: 20       # USD; false to disable the cost fuse
 
 # Agents are matched by name with Markdown prompts next to this config:
 #   agents/<name>.md
@@ -467,7 +486,7 @@ export function parseConvoyConfig(body: string, source: string, targetDir: strin
   const root = v.record(raw, "")
   // Unknown keys warn instead of failing so configs written for a newer
   // convoy still load; typos surface in the warning either way.
-  v.knownKeys(root, "", ["version", "defaults", "agents", "pipelines", "permissions", "hooks", "attachments", "notifications", "modelRouting"])
+  v.knownKeys(root, "", ["version", "defaults", "agents", "pipelines", "permissions", "hooks", "attachments", "notifications", "modelRouting", "loopGuard"])
 
   if (root.version !== undefined && root.version !== 1) v.fail("version", `unsupported value ${JSON.stringify(root.version)}; this convoy reads version 1`)
 
@@ -479,6 +498,7 @@ export function parseConvoyConfig(body: string, source: string, targetDir: strin
   if (root.attachments !== undefined) config.attachments = v.stringArray(root.attachments, "attachments")
   if (root.notifications !== undefined) config.notifications = validateNotifications(v, root.notifications)
   if (root.modelRouting !== undefined) config.modelRouting = validateModelRouting(v, root.modelRouting)
+  if (root.loopGuard !== undefined) config.loopGuard = validateLoopGuard(v, root.loopGuard)
 
   return config
 }
@@ -544,6 +564,22 @@ function validateModelRouting(v: Validator, raw: unknown): ModelRoutingConfig {
     }
   }
   return routing
+}
+
+function validateLoopGuard(v: Validator, raw: unknown): LoopGuardSettings {
+  const record = v.record(raw, "loopGuard")
+  v.knownKeys(record, "loopGuard", ["enabled", "identicalCalls", "sameToolFailures", "maxSteps", "maxPhaseCost"])
+
+  const settings: LoopGuardSettings = {}
+  if (record.enabled !== undefined) settings.enabled = v.boolean(record.enabled, "loopGuard.enabled")
+  if (record.identicalCalls !== undefined) settings.identicalCalls = v.rangeInt(record.identicalCalls, "loopGuard.identicalCalls", 2, 500)
+  if (record.sameToolFailures !== undefined) settings.sameToolFailures = v.rangeInt(record.sameToolFailures, "loopGuard.sameToolFailures", 2, 500)
+  if (record.maxSteps !== undefined) settings.maxSteps = v.rangeInt(record.maxSteps, "loopGuard.maxSteps", 10, 1000)
+  if (record.maxPhaseCost !== undefined) {
+    if (record.maxPhaseCost === false) settings.maxPhaseCost = false
+    else settings.maxPhaseCost = v.positiveNumber(record.maxPhaseCost, "loopGuard.maxPhaseCost")
+  }
+  return settings
 }
 
 function mergeRoutingOverrides(global: ModelRoutingOverrides, project: ModelRoutingOverrides): ModelRoutingOverrides {
@@ -908,6 +944,7 @@ export function serializeConvoyConfig(config: ConvoyConfig): string {
   if (config.attachments.length > 0) out.attachments = config.attachments
   if (Object.keys(config.notifications).length > 0) out.notifications = config.notifications
   if (config.modelRouting && (config.modelRouting.gateway !== undefined || Object.keys(config.modelRouting.overrides).length > 0)) out.modelRouting = config.modelRouting
+  if (config.loopGuard && Object.keys(config.loopGuard).length > 0) out.loopGuard = config.loopGuard
   return Bun.YAML.stringify(out, null, 2)
 }
 
@@ -1054,6 +1091,11 @@ class Validator {
 
   positiveInt(value: unknown, path: string): number {
     if (typeof value !== "number" || !Number.isInteger(value) || value < 1) this.fail(path, "must be a positive integer")
+    return value
+  }
+
+  positiveNumber(value: unknown, path: string): number {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) this.fail(path, "must be a positive number")
     return value
   }
 

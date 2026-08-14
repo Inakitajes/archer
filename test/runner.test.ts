@@ -40,6 +40,7 @@ import {
 } from "../src/runner"
 import type { AgentStep, HumanStep, Pipeline, Step } from "../src/types"
 import type { Workspace } from "../src/workspace"
+import { LoopGuard, LoopGuardError, resolveLoopGuard } from "../src/loop-guard"
 
 const recoveryDirs: string[] = []
 
@@ -1563,6 +1564,48 @@ describe("watchSession turn scoping", () => {
 
     expect(result.assistantInfos.map((info) => info.id)).toEqual(["msg_1", "msg_2"])
     expect(result.parts).toHaveLength(2)
+  })
+
+  test("aborts the session when the loop guard sees the same tool call over and over", async () => {
+    const aborted: string[] = []
+    const activities: string[] = []
+    async function* stream() {
+      for (let index = 0; index < 4; index++) {
+        yield {
+          type: "session.next.tool.called",
+          properties: { sessionID: "ses_1", tool: "read", input: { filePath: "src/a.ts" } },
+        }
+      }
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        messages: async () => ({ data: [] }),
+        status: async () => ({ data: { ses_1: { type: "busy" } } }),
+        abort: async (args: { sessionID: string }) => {
+          aborted.push(args.sessionID)
+          return {}
+        },
+      },
+    } as never
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress: {
+        ...noopProgress,
+        phaseActivity: (_name, detail) => void activities.push(detail),
+      },
+      signal: new AbortController().signal,
+      loopGuard: new LoopGuard(resolveLoopGuard({ identicalCalls: 4 })),
+    })
+
+    await expect(watcher.result).rejects.toBeInstanceOf(LoopGuardError)
+    await Promise.resolve()
+    expect(aborted).toEqual(["ses_1"])
+    expect(activities.some((line) => line.includes("read called 4 times"))).toBe(true)
+    await watcher.stop()
   })
 
   test("waits for the follow-up turn instead of resolving on the previous one", async () => {
