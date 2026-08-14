@@ -20,6 +20,7 @@ import type { OpencodeHandle } from "../src/opencode"
 const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")
 const originalTerminal = process.env.CONVOY_TERMINAL
 const originalZellij = process.env.ZELLIJ
+const originalHerdrEnv = process.env.HERDR_ENV
 const originalPath = process.env.PATH
 const originalSpawn = Bun.spawn
 const originalWhich = Bun.which
@@ -39,17 +40,33 @@ type SpawnMock = {
   mockRestore(): void
 }
 
-function mockSpawnResult(exitCode = 0, stderr = ""): SpawnMock {
-  const spawn = spyOn(Bun, "spawn")
-  spawn.mockImplementation((() => ({
-    exited: Promise.resolve(exitCode),
-    stderr: new ReadableStream({
+type SpawnResult = {
+  exitCode?: number
+  stderr?: string
+  stdout?: string
+}
+
+function spawnProc(result: SpawnResult) {
+  return {
+    exited: Promise.resolve(result.exitCode ?? 0),
+    stdout: new ReadableStream({
       start(controller) {
-        if (stderr) controller.enqueue(Buffer.from(stderr))
+        if (result.stdout) controller.enqueue(Buffer.from(result.stdout))
         controller.close()
       },
     }),
-  })) as unknown as typeof Bun.spawn)
+    stderr: new ReadableStream({
+      start(controller) {
+        if (result.stderr) controller.enqueue(Buffer.from(result.stderr))
+        controller.close()
+      },
+    }),
+  }
+}
+
+function mockSpawnResult(exitCode = 0, stderr = "", stdout = ""): SpawnMock {
+  const spawn = spyOn(Bun, "spawn")
+  spawn.mockImplementation((() => spawnProc({ exitCode, stderr, stdout })) as unknown as typeof Bun.spawn)
   return spawn as unknown as SpawnMock
 }
 
@@ -59,15 +76,22 @@ function mockSpawnFailing(binary: string): SpawnMock {
   const spawn = spyOn(Bun, "spawn")
   spawn.mockImplementation(((cmd: string[]) => {
     const failed = cmd[0] === binary
-    return {
-      exited: Promise.resolve(failed ? 1 : 0),
-      stderr: new ReadableStream({
-        start(controller) {
-          if (failed) controller.enqueue(Buffer.from(`${binary}: no active session`))
-          controller.close()
-        },
-      }),
-    }
+    return spawnProc(failed ? { exitCode: 1, stderr: `${binary}: no active session` } : {})
+  }) as unknown as typeof Bun.spawn)
+  return spawn as unknown as SpawnMock
+}
+
+// Returns the result for each spawn call in order, clamping to the last entry
+// for any further calls — a Herdr split answers JSON once, then the rename and
+// run that follow are fire-and-forget (or deliberately fail a set number of
+// times to exercise the retry loop).
+function mockSpawnResults(results: SpawnResult[]): SpawnMock {
+  const spawn = spyOn(Bun, "spawn")
+  let index = 0
+  spawn.mockImplementation((() => {
+    const result = results[Math.min(index, results.length - 1)] ?? {}
+    index++
+    return spawnProc(result)
   }) as unknown as typeof Bun.spawn)
   return spawn as unknown as SpawnMock
 }
@@ -76,10 +100,17 @@ function spawnedBinaries(mockSpawn: SpawnMock): string[] {
   return mockSpawn.mock.calls.map((call) => call[0]![0]!)
 }
 
+const HERDR_SPLIT_JSON = JSON.stringify({ result: { pane: { pane_id: "pane-42" } } })
+
+beforeEach(() => {
+  delete process.env.HERDR_ENV
+})
+
 afterEach(() => {
   if (originalPlatformDescriptor) Object.defineProperty(process, "platform", originalPlatformDescriptor)
   restoreEnv("CONVOY_TERMINAL", originalTerminal)
   restoreEnv("ZELLIJ", originalZellij)
+  restoreEnv("HERDR_ENV", originalHerdrEnv)
   restoreEnv("PATH", originalPath)
   Bun.spawn = originalSpawn
   Bun.which = originalWhich
@@ -308,6 +339,7 @@ describe("openSessionCommand", () => {
         "sh",
       ])
       expect(args[9]).toBe("-lc")
+      expect(args[10]).toContain("export PATH=")
       expect(args[10]).toContain("opencode attach http://127.0.0.1:1234")
     } finally {
       mockSpawn.mockRestore()
@@ -445,6 +477,276 @@ describe("openSessionCommand", () => {
     await expect(openSessionCommand("opencode /repo", "/repo")).rejects.toThrow("couldn't find the zellij binary on PATH")
   })
 
+  test("opens a Herdr pane when HERDR_ENV is set and the binary is present", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = ((name: string) => (name === "herdr" ? "/usr/bin/herdr" : null)) as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
+
+    try {
+      const backend = await openSessionCommand("opencode attach http://127.0.0.1:1234", "/my repo", "opencode session")
+
+      expect(backend).toBe("herdr")
+      expect(mockSpawn.mock.calls[0]![0]).toEqual([
+        "herdr", "pane", "split", "--current", "--direction", "right",
+        "--cwd", "/my repo",
+        "--env", `PATH=${process.env.PATH}`,
+        "--env", "ZDOTDIR=/var/empty",
+        "--focus",
+      ])
+      expect(mockSpawn.mock.calls[1]![0]).toEqual(["herdr", "pane", "rename", "pane-42", "opencode session"])
+      expect(mockSpawn.mock.calls[2]![0]).toEqual([
+        "herdr", "pane", "wait-output", "pane-42", "--regex", ".", "--timeout", "1500",
+      ])
+      const runArgs = mockSpawn.mock.calls[3]![0] as string[]
+      expect(runArgs).toEqual(["herdr", "pane", "run", "pane-42", "opencode attach http://127.0.0.1:1234"])
+      expect(runArgs[4]).not.toContain("export PATH")
+      expect(runArgs[4]).not.toContain("cd ")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // `pane run` sends keystrokes, so a multi-kilobyte `export PATH=...` wraps
+  // across the pane and never reaches `opencode`. PATH goes on the split.
+  test("does not type PATH into a Herdr pane", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    process.env.PATH = `${"/very/long/bin:".repeat(80)}/usr/bin`
+    Bun.which = ((name: string) => (name === "herdr" ? "/usr/bin/herdr" : null)) as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
+
+    try {
+      await openSessionCommand("opencode attach http://127.0.0.1:1234", "/repo", "opencode session")
+      const splitArgs = mockSpawn.mock.calls[0]![0] as string[]
+      expect(splitArgs).toContain("--env")
+      expect(splitArgs).toContain("ZDOTDIR=/var/empty")
+      expect(splitArgs[splitArgs.indexOf("--env") + 1]).toBe(`PATH=${process.env.PATH}`)
+      const runCall = mockSpawn.mock.calls.find((call) => (call[0] as string[])[2] === "run")
+      expect(runCall?.[0]).toEqual(["herdr", "pane", "run", "pane-42", "opencode attach http://127.0.0.1:1234"])
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("can force the Herdr backend without HERDR_ENV", async () => {
+    setPlatform("linux")
+    process.env.CONVOY_TERMINAL = "herdr"
+    delete process.env.HERDR_ENV
+    const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).resolves.toBe("herdr")
+      // No cwd and no label: the split omits --cwd and no rename is issued.
+      expect(mockSpawn.mock.calls[0]![0]).toEqual([
+        "herdr", "pane", "split", "--current", "--direction", "right",
+        "--env", `PATH=${process.env.PATH}`,
+        "--env", "ZDOTDIR=/var/empty",
+        "--focus",
+      ])
+      expect(mockSpawn.mock.calls[1]![0]).toEqual([
+        "herdr", "pane", "wait-output", "pane-42", "--regex", ".", "--timeout", "1500",
+      ])
+      expect(mockSpawn.mock.calls[2]![0]).toEqual(["herdr", "pane", "run", "pane-42", "opencode /repo"])
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("falls back to a macOS window when the herdr binary is missing", async () => {
+    setPlatform("darwin")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    process.env.ZELLIJ = "0"
+    Bun.which = ((name: string) => (name === "zellij" ? "/usr/bin/zellij" : null)) as typeof Bun.which
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      const backend = await openSessionCommand("opencode /repo", "/repo")
+      expect(backend).not.toBe("herdr")
+      expect(backend).not.toBe("zellij")
+      expect(spawnedBinaries(mockSpawn)).not.toContain("herdr")
+      expect(spawnedBinaries(mockSpawn)).not.toContain("zellij")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("falls back to a macOS window when an auto-detected Herdr split fails", async () => {
+    setPlatform("darwin")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    process.env.ZELLIJ = "0"
+    Bun.which = ((name: string) =>
+      name === "herdr" ? "/usr/bin/herdr" : name === "zellij" ? "/usr/bin/zellij" : null) as typeof Bun.which
+    const mockSpawn = mockSpawnFailing("herdr")
+
+    try {
+      const backend = await openSessionCommand("opencode /repo", "/repo")
+      expect(backend).not.toBe("herdr")
+      expect(backend).not.toBe("zellij")
+      expect(spawnedBinaries(mockSpawn)[0]).toBe("herdr")
+      expect(spawnedBinaries(mockSpawn)).not.toContain("zellij")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("propagates a failed Herdr split off macOS, where nothing can take over", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = (() => "/usr/bin/herdr") as typeof Bun.which
+    const mockSpawn = mockSpawnFailing("herdr")
+
+    try {
+      await expect(openSessionCommand("opencode /repo", "/repo")).rejects.toThrow("no active session")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("ignores an empty HERDR_ENV export rather than treating it as a live session", async () => {
+    setPlatform("darwin")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = ""
+    Bun.which = (() => "/usr/bin/herdr") as typeof Bun.which
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await expect(openSessionCommand("opencode /repo", "/repo")).resolves.not.toBe("herdr")
+      expect(spawnedBinaries(mockSpawn)).not.toContain("herdr")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("throws the server message when a Herdr split response carries an error", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = (() => "/usr/bin/herdr") as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", JSON.stringify({ error: { message: "no active session" } }))
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).rejects.toThrow("no active session")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("throws a clear error when a Herdr split response is not JSON", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = (() => "/usr/bin/herdr") as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", "not json at all")
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).rejects.toThrow("unparseable output")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("throws a clear error when a Herdr split response lacks a pane id", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = (() => "/usr/bin/herdr") as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", JSON.stringify({ result: { pane: {} } }))
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).rejects.toThrow("no pane_id")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("prefers Herdr over Zellij when both sessions are detected", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    process.env.ZELLIJ = "0"
+    Bun.which = ((name: string) =>
+      name === "herdr" ? "/usr/bin/herdr" : name === "zellij" ? "/usr/bin/zellij" : null) as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
+
+    try {
+      await expect(openSessionCommand("opencode /repo", "/repo")).resolves.toBe("herdr")
+      expect(spawnedBinaries(mockSpawn)[0]).toBe("herdr")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("retries pane run on a transient failure, succeeding on the second attempt", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = (() => "/usr/bin/herdr") as typeof Bun.which
+    const mockSpawn = mockSpawnResults([
+      { stdout: HERDR_SPLIT_JSON },
+      {},
+      { exitCode: 1, stderr: "herdr: pane not ready" },
+      {},
+    ])
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).resolves.toBe("herdr")
+      const runs = mockSpawn.mock.calls
+        .map((call) => call[0] as string[])
+        .filter((args) => args[0] === "herdr" && args[2] === "run")
+      expect(runs).toHaveLength(2)
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("gives up on pane run after three failed attempts", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = (() => "/usr/bin/herdr") as typeof Bun.which
+    const mockSpawn = mockSpawnResults([
+      { stdout: HERDR_SPLIT_JSON },
+      {},
+      { exitCode: 1, stderr: "herdr: pane not ready" },
+      { exitCode: 1, stderr: "herdr: pane not ready" },
+      { exitCode: 1, stderr: "herdr: pane not ready" },
+    ])
+
+    try {
+      await expect(openSessionCommand("opencode /repo")).rejects.toThrow("pane not ready")
+      const runs = mockSpawn.mock.calls
+        .map((call) => call[0] as string[])
+        .filter((args) => args[0] === "herdr" && args[2] === "run")
+      expect(runs).toHaveLength(3)
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("names the missing herdr binary off macOS instead of advising a multiplexer", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = (() => null) as typeof Bun.which
+
+    await expect(openSessionCommand("opencode /repo", "/repo")).rejects.toThrow("couldn't find the herdr binary on PATH")
+  })
+
+  test("reports macOS-only when no multiplexer is detected off macOS", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    delete process.env.ZELLIJ
+    Bun.which = (() => null) as typeof Bun.which
+
+    await expect(openSessionCommand("opencode /repo", "/repo")).rejects.toThrow("macOS only")
+  })
+
   test("rejects an unknown CONVOY_TERMINAL instead of silently ignoring it", async () => {
     setPlatform("linux")
     process.env.CONVOY_TERMINAL = "kitty"
@@ -569,6 +871,32 @@ describe("openOpencodeSessionWindow", () => {
       expect(backend).toBe("zellij")
       const args = mockSpawn.mock.calls[0]![0] as string[]
       expect(args.slice(0, 5)).toEqual(["zellij", "action", "new-pane", "--name", "opencode session"])
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // [o] is documented as opening a pane under Herdr too, so the entry point —
+  // not just openSessionCommand — has to reach that backend and name its pane.
+  test("opens a named Herdr pane when running inside Herdr", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = ((name: string) => (name === "herdr" ? "/usr/bin/herdr" : null)) as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
+
+    try {
+      const backend = await openOpencodeSessionWindow({
+        url: "http://127.0.0.1:12345",
+        targetDir: "/repo",
+        sessionID: "sess-1",
+      })
+      expect(backend).toBe("herdr")
+      const splitArgs = mockSpawn.mock.calls[0]![0] as string[]
+      expect(splitArgs.slice(0, 6)).toEqual(["herdr", "pane", "split", "--current", "--direction", "right"])
+      expect(splitArgs).toContain("--cwd")
+      // The pane is named "opencode session", matching the Zellij backend.
+      expect(mockSpawn.mock.calls[1]![0]).toEqual(["herdr", "pane", "rename", "pane-42", "opencode session"])
     } finally {
       mockSpawn.mockRestore()
     }
@@ -743,6 +1071,26 @@ describe("openIterateOpencodeWindow", () => {
       expect(backend).toBe("zellij")
       const args = mockSpawn.mock.calls[0]![0] as string[]
       expect(args.slice(0, 5)).toEqual(["zellij", "action", "new-pane", "--name", "opencode iterate"])
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // [i] is documented alongside [o] as opening a pane under Herdr.
+  test("opens a named Herdr pane when running inside Herdr", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = ((name: string) => (name === "herdr" ? "/usr/bin/herdr" : null)) as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
+
+    try {
+      const backend = await openIterateOpencodeWindow({ targetDir: "/repo", prompt: "hello" })
+      expect(backend).toBe("herdr")
+      const splitArgs = mockSpawn.mock.calls[0]![0] as string[]
+      expect(splitArgs.slice(0, 6)).toEqual(["herdr", "pane", "split", "--current", "--direction", "right"])
+      // The pane is named "opencode iterate", matching the Zellij backend.
+      expect(mockSpawn.mock.calls[1]![0]).toEqual(["herdr", "pane", "rename", "pane-42", "opencode iterate"])
     } finally {
       mockSpawn.mockRestore()
     }
