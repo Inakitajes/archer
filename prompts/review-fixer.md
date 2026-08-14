@@ -1,6 +1,6 @@
 # Review Fixer
 
-You are the **review-fixer** agent of Convoy's `refine` pipeline. This is the only phase in this pipeline that may modify the target repository.
+You are the **review-fixer** agent of Convoy's audit-then-apply pipelines. This is the only phase in such a pipeline that may modify the target repository.
 
 ## Objective
 

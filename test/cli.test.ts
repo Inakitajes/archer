@@ -501,11 +501,11 @@ describe("resolveRunOptions", () => {
 
 describe("goalModeFor", () => {
   // A pipeline is goal-eligible only when it has a quality-score-report step
-  // (consensus) AND a writable step. report-only scored pipelines (review-scored)
-  // have the consensus step but no writable step, so --goal is refused — the
+  // (consensus) AND a writable step. report-only scored pipelines (review) have
+  // the consensus step but no writable step, so --goal is refused — the
   // goal-fixer would mutate a pipeline whose contract says "makes no changes".
-  const implementScored = resolvePipeline({ name: "implement-scored", spec: builtInPipelines["implement-scored"]!, agents: builtInAgents })
-  const reviewScored = resolvePipeline({ name: "review-scored", spec: builtInPipelines["review-scored"]!, agents: builtInAgents })
+  const ship = resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents })
+  const reviewScored = resolvePipeline({ name: "review", spec: builtInPipelines.review!, agents: builtInAgents })
   const implement = resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents })
   const goalFix = resolvePipeline({ name: "goal-fix", spec: builtInPipelines["goal-fix"]!, agents: builtInAgents })
 
@@ -514,16 +514,16 @@ describe("goalModeFor", () => {
   }
 
   test("is off when no goal is set", () => {
-    expect(goalModeFor({}, planWith(implementScored))).toEqual({ mode: "off" })
+    expect(goalModeFor({}, planWith(ship))).toEqual({ mode: "off" })
   })
 
   test("is on for a scored pipeline with a writable step and a resolved fix pipeline", () => {
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(implementScored))
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(ship))
     expect(decision).toEqual({ mode: "on", goal: 90 })
   })
 
   test("rejects --goal on a report-only scored pipeline (no writable step)", () => {
-    // review-scored ends in a quality-score-report step but every step is
+    // review ends in a quality-score-report step but every step is
     // read-only, so --goal would run the writable goal-fixer against a pipeline
     // documented as "makes no changes" — refuse it with a clear reason.
     const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(reviewScored))
@@ -538,7 +538,7 @@ describe("goalModeFor", () => {
   })
 
   test("rejects --goal when the goal-fix pipeline could not be resolved", () => {
-    const decision = goalModeFor({ goal: 90 }, planWith(implementScored))
+    const decision = goalModeFor({ goal: 90 }, planWith(ship))
     expect(decision.mode).toBe("rejected")
     if (decision.mode === "rejected") expect(decision.reason).toBe("no-fix-pipeline")
   })
@@ -548,23 +548,23 @@ describe("goalModeFor", () => {
     // the fixer running blind (no brief reaches it); reject so the
     // misconfiguration is surfaced, not silently swallowed.
     const badFix = { ...goalFix, steps: goalFix.steps.filter((s) => !(s.type === "agent" && s.agentName === "goal-fixer")) }
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(implementScored))
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(ship))
     expect(decision.mode).toBe("rejected")
     if (decision.mode === "rejected") expect(decision.reason).toBe("bad-fix-pipeline")
   })
 
   test("rejects --goal when the fix pipeline lacks a consensus step", () => {
     const noConsensus = { ...goalFix, steps: goalFix.steps.filter((s) => !(s.type === "agent" && s.agentName === "quality-score-report")) }
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: noConsensus }, planWith(implementScored))
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: noConsensus }, planWith(ship))
     expect(decision.mode).toBe("rejected")
     if (decision.mode === "rejected") expect(decision.reason).toBe("bad-fix-pipeline")
   })
 
   test("the bad-fix-pipeline rejection error mentions the project override", () => {
     const badFix = { ...goalFix, steps: [] }
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(implementScored))
+    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(ship))
     if (decision.mode === "rejected") {
-      const error = goalModeRejectionError(decision, planWith(implementScored))
+      const error = goalModeRejectionError(decision, planWith(ship))
       expect(error.message).toContain("goal-fixer step")
       expect(error.message).toContain("quality-score-report step")
     }

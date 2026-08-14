@@ -263,8 +263,8 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
         valid: true,
         advisedSteps: pipeline.steps.filter((step) => step.type === "agent" && Boolean(step.resolvedAdvisor ?? step.advisor)).length,
         // Goal mode needs both a consensus score step and a writable step: a
-        // report-only scored pipeline (review-scored) would be mutated by the
-        // goal-fixer, contradicting its "makes no changes" contract.
+        // report-only scored pipeline (review, review-lite) would be mutated by
+        // the goal-fixer, contradicting its "makes no changes" contract.
         scored: Boolean(consensusStep(pipeline)) && hasWritableStep(pipeline),
       }
     } catch (error) {

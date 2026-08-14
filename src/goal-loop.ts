@@ -22,8 +22,11 @@
 import { buildRunPlan } from "./run-plan"
 import { log } from "./log"
 import { createCleanRepoSnapshot, currentHead, restoreRepoSnapshot, statusPorcelain, type RepoSnapshot } from "./git"
+import { hooksForPipeline, runHooks, type GoalHookOutcome } from "./hooks"
+import { noopProgress } from "./progress"
 import { isUserAbortError, run, type RunResult } from "./runner"
 import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
+import { cleanupWorkspace, type Workspace } from "./workspace"
 import type { RunOptions, RunPlan } from "./types"
 
 export type GoalLoopConfig = {
@@ -49,7 +52,7 @@ export type GoalLoopOutcome = {
   restored: boolean
 }
 
-type GoalLoopDeps = {
+export type GoalLoopDeps = {
   run: typeof run
   /** Captures the repository's clean state; returns undefined when the tree is dirty. */
   captureSnapshot: (cwd: string) => Promise<RepoSnapshot | undefined>
@@ -59,6 +62,10 @@ type GoalLoopDeps = {
   isCleanRepo: (cwd: string) => Promise<boolean>
   /** Returns the current HEAD commit SHA, or undefined when git fails. */
   currentHead: (cwd: string) => Promise<string | undefined>
+  /** Runs a stage's hooks; the loop uses it for the post-hooks its runs deferred. */
+  runHooks: typeof runHooks
+  /** Deletes a run workspace the loop kept alive for the deferred post-hooks. */
+  cleanupWorkspace: (workspace: Workspace) => Promise<void>
 }
 
 /**
@@ -72,6 +79,8 @@ const defaultGoalLoopDeps: GoalLoopDeps = {
   restoreSnapshot: restoreRepoSnapshot,
   isCleanRepo: async (cwd) => (await statusPorcelain(cwd)).trim() === "",
   currentHead,
+  runHooks,
+  cleanupWorkspace,
 }
 
 /** The best measured state: the score and the repo state it was measured on. */
@@ -80,11 +89,96 @@ type BestState = {
   snapshot?: RepoSnapshot
 }
 
+/**
+ * Owns the post-hooks its runs deferred. A loop is one piece of work spread over
+ * several runs, so the pipeline's post-hooks fire once — after the last
+ * iteration, against the *base* pipeline's hook set rather than goal-fix's, and
+ * carrying the loop's outcome. That outcome is the part a hook cannot otherwise
+ * see: a loop that plateaus below the target still ends as a successful run, so
+ * `when: success` alone cannot tell "cleared the bar" from "gave up short of
+ * it". CONVOY_GOAL_REACHED can.
+ *
+ * Nothing fires when a run throws: the runner already ran the failure hooks on
+ * its way out, and it did so without CONVOY_GOAL_*, so a gated hook stays inert.
+ */
 export async function runGoalLoop(
   options: RunOptions,
   plan: RunPlan,
   config: GoalLoopConfig,
   deps: GoalLoopDeps = defaultGoalLoopDeps,
+): Promise<GoalLoopOutcome> {
+  const kept = new KeptWorkspaces()
+  try {
+    const outcome = await runGoalIterations(options, plan, config, deps, kept)
+    await runDeferredPostHooks(options, plan, config, deps, kept.latest, outcome)
+    return outcome
+  } finally {
+    await kept.cleanup(deps.cleanupWorkspace)
+  }
+}
+
+/**
+ * Holds the workspace of the most recent deferred run, deleting each one it
+ * supersedes. Only the last survives the loop, because only the last is the one
+ * the post-hooks resolve CONVOY_RUN_DIR against.
+ */
+class KeptWorkspaces {
+  latest?: Workspace
+  private stale: Workspace[] = []
+
+  adopt(result: RunResult): void {
+    if (this.latest) this.stale.push(this.latest)
+    this.latest = result.workspace
+  }
+
+  async cleanup(remove: (workspace: Workspace) => Promise<void>): Promise<void> {
+    const all = [...this.stale, ...(this.latest ? [this.latest] : [])]
+    this.stale = []
+    this.latest = undefined
+    for (const workspace of all) {
+      await remove(workspace).catch((error) => log.warn(`goal loop: couldn't clean ${workspace.dir}: ${String(error)}`))
+    }
+  }
+}
+
+async function runDeferredPostHooks(
+  options: RunOptions,
+  plan: RunPlan,
+  config: GoalLoopConfig,
+  deps: GoalLoopDeps,
+  workspace: Workspace | undefined,
+  outcome: GoalLoopOutcome,
+): Promise<void> {
+  // No workspace means every run was mocked or none produced one; there is
+  // nothing to resolve CONVOY_RUN_DIR against, so there is nothing to run.
+  if (!workspace) return
+  const hookSet = hooksForPipeline(options.hooks, plan.pipeline.name)
+  if (hookSet.post.length === 0) return
+  const goal: GoalHookOutcome = {
+    reached: outcome.reached,
+    target: config.goal,
+    ...(outcome.bestScore !== undefined ? { score: outcome.bestScore } : {}),
+  }
+  await deps.runHooks("post", hookSet.post, {
+    workspace,
+    targetDir: options.targetDir,
+    pipelineName: plan.pipeline.name,
+    prompt: options.prompt,
+    status: "success",
+    // The dashboard is gone by the time the loop finishes, so these hooks report
+    // through the log rather than as pipeline rows.
+    progress: noopProgress,
+    goal,
+    ...(outcome.bestScore !== undefined ? { score: outcome.bestScore } : {}),
+  })
+}
+
+async function runGoalIterations(
+  options: RunOptions,
+  plan: RunPlan,
+  config: GoalLoopConfig,
+  deps: GoalLoopDeps,
+  kept: KeptWorkspaces,
 ): Promise<GoalLoopOutcome> {
   const { run: runRun, captureSnapshot, restoreSnapshot, isCleanRepo, currentHead } = deps
   const scores: number[] = []
@@ -101,7 +195,8 @@ export async function runGoalLoop(
   // maxIterations is 0 the initial run is the only run, so the finish screen
   // is allowed to show the score and trajectory.
   const initialContinues = config.maxIterations > 0
-  let previous: RunResult = await runRun({ ...options, plan, ...(initialContinues ? { goalContinues: true } : {}) })
+  let previous: RunResult = await runRun({ ...options, plan, deferPostHooks: true, ...(initialContinues ? { goalContinues: true } : {}) })
+  kept.adopt(previous)
   lastHead = await currentHead(options.targetDir)
   let score = previous.qualityScore?.score
   if (score === undefined) {
@@ -129,6 +224,7 @@ export async function runGoalLoop(
     const fixOptions = goalFixOptions(options, previous, scores, continues)
     try {
       previous = await runRun({ ...fixOptions, plan: buildRunPlan(fixOptions) })
+      kept.adopt(previous)
       lastHead = await currentHead(options.targetDir)
     } catch (error) {
       // A user abort (Ctrl+C) is a deliberate stop, not a failure to recover
@@ -190,6 +286,9 @@ function goalFixOptions(options: RunOptions, prev: RunResult, trajectory: number
   return {
     ...options,
     pipeline,
+    // Like the initial run: the loop, not the iteration, decides when the work
+    // is finished and the post-hooks may fire.
+    deferPostHooks: true,
     // The finish screen shows the trajectory building across iterations.
     goalTrajectory: [...trajectory],
     // When this iteration will be followed by another, never hold the finish

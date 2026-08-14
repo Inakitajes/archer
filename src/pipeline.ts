@@ -7,8 +7,6 @@ export const defaultOpusModel = "anthropic/claude-opus-5"
 
 const fallbackModel = `${defaultGptModel}#${defaultGptVariant}`
 
-/** Second model the built-in ultra pipelines fan their audits across; a project can override per step. */
-const sonnetModel = "openrouter/anthropic/claude-sonnet-5"
 /** Lower-cost replacement for the GPT xhigh phases in the lightweight pipelines. */
 const glmModel = "openrouter/z-ai/glm-5.2"
 /** GLM 5.2 with its reasoning turned up: what the audit phases of `implement` run on. */
@@ -20,13 +18,15 @@ const grokModel = "openrouter/x-ai/grok-4.5"
 const kimiModel = "openrouter/moonshotai/kimi-k3"
 /** Kimi K3 with reasoning raised one notch: the design and adversarial passes earn it, the cheap fan-outs don't. */
 const kimiHighModel = `${kimiModel}#high`
-/** GPT 5.6 Sol: the implementation workhorse, and at xhigh the consensus reporter for the review/hunter pipelines. */
+/** GPT 5.6 Sol: the advisor `implement` consults, and at xhigh the consensus reporter for the review/ship/hunter pipelines. */
 const solModel = "openai/gpt-5.6-sol"
 const solXhighModel = `${solModel}#xhigh`
 
 // Per-step models the built-in `implement` pipeline pins. Exported so `convoy init`'s
 // inlined copy of that pipeline stays in sync with the built-in it claims to mirror.
-export const defaultImplementerModel = solXhighModel
+export const defaultImplementerModel = fallbackModel
+/** The model `implement`'s implementer consults at its decision points. */
+export const defaultImplementAdvisorModel = solXhighModel
 export const defaultImplementAuditModel = glmXhighModel
 export const defaultImplementReviewModel = kimiHighModel
 export const defaultAdversarialModel = kimiHighModel
@@ -79,7 +79,9 @@ export const builtInAgents: readonly AgentSpec[] = [
     temperature: 0.1,
     builtIn: true,
   },
-  // Review pipelines: shared audit agents (report-only `review` and change-applying `refine`/`ultra-refine`).
+  // Review pipelines: shared audit agents. The triage/fix/validate trio below is
+  // no longer wired into a built-in, but stays in the catalogue for the project
+  // pipelines that compose an audit-then-apply run of their own.
   {
     name: "review-scope",
     description: "Audit-only collector for branch scope and repository patterns",
@@ -153,7 +155,8 @@ export const builtInAgents: readonly AgentSpec[] = [
     temperature: 0.1,
     builtIn: true,
   },
-  // ultra-implement: final-review stage over the whole PR.
+  // Final-review stage over the whole PR: unused by the built-ins, kept for
+  // project pipelines that want a triage/fix/validate tail after implementation.
   {
     name: "implementation-triage",
     description: "Synthesizes parallel pattern/security/adversarial findings into one action plan",
@@ -389,39 +392,20 @@ export const defaultPipelineName = "implement"
 export const builtInPipelines: Record<string, PipelineSpec> = {
   // The audits are pinned to GLM 5.2 xhigh rather than left to inherit the run's
   // model: they read a diff that already exists, which is the work GLM does at
-  // parity with the expensive models, so the budget belongs in the phases that
-  // write (Sol xhigh) and judge (Kimi K3 high).
+  // parity with the expensive models, so the budget belongs in the phase that
+  // writes (Terra xhigh, advised) and the one that judges (Kimi K3 high).
+  //
+  // The advisor←executor pattern is the default, aimed at the one phase that
+  // earns it: Terra xhigh writes the code and consults Sol xhigh at its decision
+  // points, pairing the two GPT 5.6 variants that disagree most usefully. Every
+  // other phase runs unadvised, so the implementation step is where the second
+  // opinion is spent. Measurement deliberately lives in `ship`, not here: this
+  // pipeline's job is a first draft worth shaping by hand, and grading a draft
+  // you already intend to rework buys nothing.
   implement: {
-    description: "Implementation, pattern/security audits, design polish, tests, and adversarial review",
+    description: "Advised implementation on Terra xhigh consulting Sol, then pattern/security audits, design polish, tests, and adversarial review",
     steps: [
-      { agent: "implementer", model: defaultImplementerModel, reports: "none" },
-      { agent: "patterns", model: defaultImplementAuditModel },
-      { agent: "security", model: defaultImplementAuditModel },
-      { agent: "design", model: defaultImplementReviewModel },
-      { agent: "tests", model: defaultImplementAuditModel, reports: "none" },
-      { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
-    ],
-  },
-  "implement-lite": {
-    description: "Like implement, but drops every code-writing phase to GLM 5.2 to reduce cost; design runs on Kimi K3 and adversarial on Opus",
-    steps: [
-      { agent: "implementer", model: glmModel, reports: "none" },
-      { agent: "patterns", model: glmModel },
-      { agent: "security", model: glmModel },
-      { agent: "design", model: kimiModel },
-      { agent: "tests", model: glmModel, reports: "none" },
-      { agent: "adversarial", model: defaultOpusModel, reports: "all" },
-    ],
-  },
-  // The advisor←executor pattern as a runnable default, aimed at the one phase
-  // that earns it: Terra xhigh writes the code and consults Sol xhigh at its
-  // decision points, pairing the two GPT 5.6 variants that disagree most
-  // usefully. Every other phase is `implement`'s, unchanged and unadvised, so
-  // the advised implementation step is the single variable between the two.
-  "implement-advised": {
-    description: "Like implement, but the implementation phase runs on Terra xhigh and consults Sol as an advisor at its decision points; the audits run unadvised",
-    steps: [
-      { agent: "implementer", model: fallbackModel, advisor: solXhighModel, reports: "none" },
+      { agent: "implementer", model: defaultImplementerModel, advisor: defaultImplementAdvisorModel, reports: "none" },
       // `false` rather than an absent key: absent would inherit a project's
       // defaults.advisor and quietly re-advise these phases.
       { agent: "patterns", model: defaultImplementAuditModel, advisor: false },
@@ -431,36 +415,28 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" },
     ],
   },
-  // implement + the measurement layer: the final diff is graded by two
-  // independent quality-scorers (fresh agents, no shared context with the
-  // builder) against the fixed rubric, and a consensus step reconciles them and
-  // verifies their claims by running the checks itself. The result lands in
-  // reports/score-report.md with a machine-readable score block that a goal
-  // loop (--goal) can act on.
-  "implement-scored": {
-    description: "Like implement, then measures the result: two independent quality-scorers grade the final diff against the rubric and a consensus step reconciles and verifies the score",
+  // implement's shape on low-cost models, advisor included: the second opinion
+  // is what makes a cheap implementer worth running, so it is the last thing to
+  // drop. Kimi advises rather than a second GLM: it is already in this pipeline
+  // as the design model, so the cross-vendor disagreement costs no new provider.
+  "implement-lite": {
+    description: "Like implement, but drops every code-writing phase to GLM 5.2 to reduce cost; Kimi K3 advises the implementer and polishes design, and adversarial runs on Opus",
     steps: [
-      { agent: "implementer", model: defaultImplementerModel, reports: "none" },
-      { agent: "patterns", model: defaultImplementAuditModel },
-      { agent: "security", model: defaultImplementAuditModel },
-      { agent: "design", model: defaultImplementReviewModel },
-      { agent: "tests", model: defaultImplementAuditModel, reports: "none" },
-      { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
-      {
-        parallel: [
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
-        ],
-      },
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
+      { agent: "implementer", model: glmModel, advisor: kimiHighModel, reports: "none" },
+      { agent: "patterns", model: glmModel, advisor: false },
+      { agent: "security", model: glmModel, advisor: false },
+      { agent: "design", model: kimiModel, advisor: false },
+      { agent: "tests", model: glmModel, advisor: false, reports: "none" },
+      { agent: "adversarial", model: defaultOpusModel, advisor: false, reports: "all" },
     ],
   },
   // The goal loop's fix iteration: applies exactly the gaps the previous
   // scoring round reported (delivered as a per-step phase brief on the fixer),
   // then re-scores with the same independent scorer fan-out and consensus. The
   // loop keeps the same worktree, so the diff accumulates; nothing here is run
-  // directly by a user, only by --goal.
+  // directly by a user, only by the loop `ship` starts (or an explicit --goal).
   "goal-fix": {
-    description: "The goal loop's fix iteration: apply exactly the gaps from the previous scoring round, then re-score. Not run directly; use --goal.",
+    description: "The goal loop's fix iteration: apply exactly the gaps from the previous scoring round, then re-score. Not run directly; ship's goal or --goal drives it.",
     steps: [
       { agent: "goal-fixer", name: "fix", reports: "none", diff: true },
       {
@@ -476,9 +452,14 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: ["score"] },
     ],
   },
+  // Report-only review + the measurement layer: after the parallel audits, two
+  // independent quality-scorers grade the same diff against the rubric and a
+  // consensus step reconciles and verifies. The score block is the deliverable
+  // alongside the findings report — a review that ends in a findings list ends
+  // in an open-ended question, so every review here also ends in a number.
   review: {
     description:
-      "Report-only PR review: scope, then parallel bug/clean-code/security audits across two models, then one prioritized findings report. Makes no changes.",
+      "Report-only PR review plus a verified quality score: scope, parallel bug/clean-code/security audits across two models, a prioritized findings report, then two independent quality-scorers and a consensus step. Makes no changes.",
     steps: [
       { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true },
       {
@@ -489,11 +470,21 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
         ],
       },
       { agent: "review-report", name: "report", model: defaultOpusModel, reports: "all" },
+      {
+        parallel: [
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+        ],
+      },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
     ],
   },
+  // review's shape with nothing on Opus. The scorer models are pinned rather
+  // than left to the agent defaults precisely because those defaults are Opus:
+  // omitting them here would quietly reintroduce the cost this pipeline exists
+  // to avoid.
   "review-lite": {
     description:
-      "Like review, but every phase runs on a low-cost model: GLM 5.2 scopes and writes the report, and the audit fan-out pairs GLM 5.2 with Kimi K3 instead of Opus.",
+      "Like review, but every phase runs on a low-cost model: GLM 5.2 scopes, writes the report and reconciles the score, and the audit and scorer fan-outs pair GLM 5.2 with Kimi K3 instead of Opus.",
     steps: [
       { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true },
       {
@@ -504,77 +495,43 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
         ],
       },
       { agent: "review-report", name: "report", model: glmModel, reports: "all" },
+      {
+        parallel: [
+          { agent: "quality-scorer", name: "score", models: [glmXhighModel, kimiHighModel], reports: "all" },
+        ],
+      },
+      { agent: "quality-score-report", name: "score-report", model: glmXhighModel, reports: "all" },
     ],
   },
-  refine: {
-    description: "Audit-only PR review, adversarial finding triage, targeted fixes, and final validation — applies changes.",
-    steps: [
-      { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true },
-      { agent: "bug-auditor", name: "bugs", model: fallbackModel, reports: ["scope"] },
-      { agent: "clean-code-auditor", name: "clean-code", model: fallbackModel, reports: ["scope"] },
-      { agent: "security-reviewer", name: "security", model: fallbackModel, reports: ["scope"] },
-      { agent: "review-adversary", name: "triage", model: defaultOpusModel, reports: ["scope", "bugs", "clean-code", "security"] },
-      { agent: "review-fixer", name: "fixes", model: fallbackModel, reports: ["triage"] },
-      { agent: "review-validator", name: "validator", model: fallbackModel, reports: "all" },
-    ],
-  },
-  // refine's audits, but against the branch as it will actually merge: the sync
-  // phase lands the advanced base first, so the auditors read the merged result
-  // instead of a diff that no longer describes what lands.
+  // The close of the process: the branch is already shaped the way you want it,
+  // and what is left is proving it merges and clears the bar. Sync lands the
+  // advanced base first, so the scorers grade the branch as it will actually
+  // merge rather than a diff that no longer describes what lands. Then the
+  // measurement, and — because `goal` is declared here rather than left to the
+  // caller — the fix/re-score loop runs on its own until the score clears 85.
+  //
+  // There are no separate audit phases: the scorer already grades bugs,
+  // security, maintainability and scope against the rubric, and an open-ended
+  // audit in front of it only produces findings the score then has to re-weigh.
   //
   // Two things it expects from config rather than shipping itself, because both
   // are machine-local. Conflict resolution needs `git merge*`, `git add*` and
   // `git checkout --ours*|--theirs*` in `permissions.allow` — without them those
   // commands fall through to "ask" rather than failing. And fetching the base
   // beforehand or opening the PR afterwards belongs in `hooks.pipelines.ship`,
-  // since Convoy never runs remote git itself.
+  // since Convoy never runs remote git itself; post-hooks receive
+  // CONVOY_GOAL_REACHED so the PR step can require the bar to have been met.
   ship: {
-    description: "Sync the branch with its base (merge + conflict resolution), then audit the merged diff, triage, fix, and validate",
+    description: "Sync the branch with its base (merge + conflict resolution), measure the merged result against the quality rubric, and iterate until it clears 85/100",
+    goal: 85,
     steps: [
       { agent: "sync-with-base", name: "sync", model: fallbackModel, reports: "none" },
-      { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true },
-      { agent: "bug-auditor", name: "bugs", model: fallbackModel, reports: ["scope"] },
-      { agent: "clean-code-auditor", name: "clean-code", model: fallbackModel, reports: ["scope"] },
-      { agent: "security-reviewer", name: "security", model: fallbackModel, reports: ["scope"] },
-      { agent: "review-adversary", name: "triage", model: defaultOpusModel, reports: ["scope", "bugs", "clean-code", "security"] },
-      { agent: "review-fixer", name: "fixes", model: fallbackModel, reports: ["triage"] },
-      { agent: "review-validator", name: "validator", model: fallbackModel, reports: "all" },
-    ],
-  },
-  "ultra-refine": {
-    description: "Like refine, but every read-only audit runs in parallel across two models before triage, targeted fixes, and validation.",
-    steps: [
-      { agent: "review-scope", name: "scope", models: [sonnetModel, fallbackModel], reports: "none", diff: true },
       {
         parallel: [
-          { agent: "bug-auditor", name: "bugs", models: [sonnetModel, fallbackModel], reports: ["scope"] },
-          { agent: "clean-code-auditor", name: "clean-code", models: [sonnetModel, fallbackModel], reports: ["scope"] },
-          { agent: "security-reviewer", name: "security", models: [sonnetModel, fallbackModel], reports: ["scope"] },
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
         ],
       },
-      { agent: "review-adversary", name: "triage", model: defaultOpusModel, reports: ["scope", "bugs", "clean-code", "security"] },
-      { agent: "review-fixer", name: "fixes", model: sonnetModel, reports: ["triage"] },
-      { agent: "review-validator", name: "validator", model: defaultOpusModel, reports: "all" },
-    ],
-  },
-  "ultra-implement": {
-    description:
-      "Like implement, but pattern/security/adversarial reviews of the initial diff run in parallel across two models feeding a triage step, then design and tests, then an audit-only final review, a fixer that applies only blocking findings, and a final validator.",
-    steps: [
-      { agent: "implementer", reports: "none" },
-      {
-        parallel: [
-          { agent: "patterns", models: [sonnetModel, fallbackModel] },
-          { agent: "security", models: [sonnetModel, fallbackModel] },
-          { agent: "adversarial", models: [sonnetModel, fallbackModel] },
-        ],
-      },
-      { agent: "implementation-triage", name: "triage", model: defaultOpusModel },
-      { agent: "design", model: kimiModel },
-      { agent: "tests", reports: "none" },
-      { agent: "implementation-final-review", name: "final-review", model: defaultOpusModel, reports: "all" },
-      { agent: "implementation-fixer", name: "fixes", reports: ["final-review"] },
-      { agent: "implementation-validator", name: "validator", model: defaultOpusModel, reports: "all" },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
     ],
   },
   // The follow-up to a report-only run: feed it the findings (as the prompt or an
@@ -610,31 +567,6 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
         ],
       },
       { agent: "review-report", name: "report", model: solXhighModel, reports: "all" },
-    ],
-  },
-  // Report-only review + the measurement layer: after the parallel audits, two
-  // independent quality-scorers grade the same diff against the rubric and a
-  // consensus step reconciles and verifies. The score block is the deliverable
-  // alongside the findings report.
-  "review-scored": {
-    description:
-      "Report-only PR review plus a verified quality score: scope, parallel bug/clean-code/security audits across two models, a prioritized findings report, then two independent quality-scorers and a consensus step. Makes no changes.",
-    steps: [
-      { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true },
-      {
-        parallel: [
-          { agent: "clean-code-auditor", name: "clean-code", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
-          { agent: "security-reviewer", name: "security", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
-          { agent: "bug-auditor", name: "bugs", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
-        ],
-      },
-      { agent: "review-report", name: "report", model: defaultOpusModel, reports: "all" },
-      {
-        parallel: [
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
-        ],
-      },
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
     ],
   },
   hunter: {

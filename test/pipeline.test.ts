@@ -66,19 +66,58 @@ describe("default pipeline", () => {
     ])
   })
 
-  test("pins Sol xhigh for implementation, GLM 5.2 xhigh for the audits, and Kimi K3 high for design and adversarial", () => {
+  test("pins Terra xhigh for implementation, GLM 5.2 xhigh for the audits, and Kimi K3 high for design and adversarial", () => {
     const byName = Object.fromEntries(
       defaultPipeline()
         .steps.filter((step): step is AgentStep => step.type === "agent")
         .map((step) => [step.name, step]),
     )
 
-    expect(byName.implementer).toMatchObject({ model: "openai/gpt-5.6-sol", variant: "xhigh" })
+    expect(byName.implementer).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
     expect(byName.patterns).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
     expect(byName.security).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
     expect(byName.design).toMatchObject({ model: "openrouter/moonshotai/kimi-k3", variant: "high" })
     expect(byName.tests).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
     expect(byName.adversarial).toMatchObject({ model: "openrouter/moonshotai/kimi-k3", variant: "high" })
+  })
+
+  test("advises the implementation phase only: Sol xhigh at Terra's decision points", () => {
+    const byName = Object.fromEntries(
+      defaultPipeline()
+        .steps.filter((step): step is AgentStep => step.type === "agent")
+        .map((step) => [step.name, step]),
+    )
+
+    expect(byName.implementer).toMatchObject({ advisor: "openai/gpt-5.6-sol", advisorVariant: "xhigh" })
+    for (const name of ["patterns", "security", "design", "tests", "adversarial"]) {
+      expect(byName[name]?.advisor).toBeUndefined()
+    }
+    // Exactly one step carries the advisor cost.
+    expect(defaultPipeline().steps.filter((step) => step.type === "agent" && step.advisor).length).toBe(1)
+  })
+
+  test("the audits opt out of the advisor explicitly, so defaults.advisor cannot re-advise them", () => {
+    // `advisor: false` and an omitted key resolve identically until a project
+    // sets defaults.advisor — which is exactly the case this pins down.
+    const byName = Object.fromEntries(
+      resolvePipeline({
+        name: "implement",
+        spec: builtInPipelines.implement!,
+        agents: builtInAgents,
+        defaultAdvisor: "openrouter/anthropic/claude-opus-5",
+      })
+        .steps.filter((step): step is AgentStep => step.type === "agent")
+        .map((step) => [step.name, step]),
+    )
+
+    expect(byName.implementer).toMatchObject({ advisor: "openai/gpt-5.6-sol", advisorVariant: "xhigh" })
+    for (const name of ["patterns", "security", "design", "tests", "adversarial"]) {
+      expect(byName[name]?.advisor).toBeUndefined()
+    }
+  })
+
+  test("does not score: measurement belongs to ship, not to the first draft", () => {
+    expect(stepNames(defaultPipeline())).not.toContain("score-report")
   })
 
   test("keeps every implement step on its own model even when defaults.model is GPT", () => {
@@ -164,87 +203,35 @@ describe("built-in implement-lite pipeline", () => {
   })
 })
 
-describe("built-in implement-advised pipeline", () => {
-  const advised = () =>
-    resolvePipeline({ name: "implement-advised", spec: builtInPipelines["implement-advised"]!, agents: builtInAgents }).steps.filter(
-      (step): step is AgentStep => step.type === "agent",
-    )
 
-  test("advises the implementation phase only: Terra xhigh writing, Sol xhigh at its decision points", () => {
-    const implementer = advised().find((step) => step.name === "implementer")
+describe("built-in ship pipeline", () => {
+  const ship = () => resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents })
+  const shipSteps = () => ship().steps.filter((step): step is AgentStep => step.type === "agent")
 
-    expect(implementer).toMatchObject({
-      model: "openai/gpt-5.6-terra",
-      variant: "xhigh",
-      advisor: "openai/gpt-5.6-sol",
-      advisorVariant: "xhigh",
-    })
-  })
-
-  test("leaves every phase after the implementer unadvised, so only one step carries the advisor cost", () => {
-    const steps = advised()
-    const rest = steps.filter((step) => step.name !== "implementer")
-
-    expect(rest.length).toBeGreaterThan(0)
-    for (const step of rest) {
-      expect(step.advisor).toBeUndefined()
-    }
-    expect(steps.filter((step) => step.advisor).length).toBe(1)
-  })
-
-  test("is implement with one advised step: every other phase matches model for model", () => {
-    const implement = resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents }).steps.filter(
-      (step): step is AgentStep => step.type === "agent",
-    )
-    const byName = Object.fromEntries(implement.map((step) => [step.name, step]))
-
-    // The advised implementation step is the only variable between the two, so a
-    // difference anywhere else would make the comparison meaningless.
-    expect(advised().map((step) => step.name)).toEqual(implement.map((step) => step.name))
-    for (const step of advised()) {
-      if (step.name === "implementer") continue
-      expect({ model: step.model, variant: step.variant }).toEqual({
-        model: byName[step.name]!.model,
-        variant: byName[step.name]!.variant,
-      })
-    }
-  })
-})
-
-describe("built-in implement-scored pipeline", () => {
-  const scored = () =>
-    resolvePipeline({ name: "implement-scored", spec: builtInPipelines["implement-scored"]!, agents: builtInAgents }).steps.filter(
-      (step): step is AgentStep => step.type === "agent",
-    )
-
-  test("is implement plus the measurement layer: scorer fan-out and a consensus step", () => {
-    expect(scored().map((step) => step.name)).toEqual([
-      "implementer",
-      "patterns",
-      "security",
-      "design",
-      "tests",
-      "adversarial",
+  test("is sync then the measurement layer: no open-ended audits in between", () => {
+    expect(shipSteps().map((step) => step.name)).toEqual([
+      "sync",
       "score__openai-gpt-5-6-sol-xhigh",
       "score__anthropic-claude-opus-5",
       "score-report",
     ])
   })
 
-  test("keeps implement's six phases exactly, model for model", () => {
-    const implement = resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents }).steps.filter(
-      (step): step is AgentStep => step.type === "agent",
-    )
-    const byName = Object.fromEntries(implement.map((step) => [step.name, step]))
+  test("syncs the base in before anything reads the diff, so the score describes the merged result", () => {
+    const [sync] = shipSteps()
 
-    expect(scored().slice(0, 6).map((step) => step.name)).toEqual(implement.map((step) => step.name))
-    for (const step of scored().slice(0, 6)) {
-      expect({ model: step.model, variant: step.variant }).toEqual({ model: byName[step.name]!.model, variant: byName[step.name]!.variant })
-    }
+    expect(sync).toMatchObject({ agentName: "sync-with-base", model: "openai/gpt-5.6-terra", variant: "xhigh" })
+    // The merge writes to the repository: goal mode refuses a report-only
+    // pipeline, so this step is also what makes ship goal-eligible.
+    expect(sync?.readOnly).toBeFalsy()
   })
 
-  test("fans the scorers across Sol xhigh + opus as forced read-only, grading with all reports", () => {
-    const scorers = scored().filter((step) => step.stepName === "score")
+  test("declares its own goal, so the fix/re-score loop runs without --goal", () => {
+    expect(ship().goal).toBe(85)
+  })
+
+  test("fans the scorers across Sol xhigh + opus as forced read-only", () => {
+    const scorers = shipSteps().filter((step) => step.stepName === "score")
 
     expect(scorers).toHaveLength(2)
     expect(scorers.map((step) => ({ model: step.model, variant: step.variant }))).toEqual([
@@ -256,21 +243,15 @@ describe("built-in implement-scored pipeline", () => {
       expect(step.agentName).toBe("quality-scorer__ro")
       expect(step.readOnly).toBe(true)
       expect(step.verify).toBeUndefined()
-      expect(step.inputFiles).toEqual([
-        "prd.md",
-        "reports/implementer.md",
-        "reports/patterns.md",
-        "reports/security.md",
-        "reports/design.md",
-        "reports/tests.md",
-        "reports/adversarial.md",
-      ])
+      // No review-scope step feeds these, so the diff has to arrive by the
+      // "every step after the first gets it" default.
       expect(step.inputDiff).toBe(true)
+      expect(step.inputFiles).toEqual(["prd.md", "reports/sync.md"])
     }
   })
 
   test("consensus step keeps bash to verify the scorers' claims and reads every report", () => {
-    const report = scored().find((step) => step.name === "score-report")
+    const report = shipSteps().find((step) => step.name === "score-report")
 
     expect(report).toMatchObject({
       agentName: "quality-score-report",
@@ -281,20 +262,15 @@ describe("built-in implement-scored pipeline", () => {
     })
     expect(report?.inputFiles).toEqual([
       "prd.md",
-      "reports/implementer.md",
-      "reports/patterns.md",
-      "reports/security.md",
-      "reports/design.md",
-      "reports/tests.md",
-      "reports/adversarial.md",
+      "reports/sync.md",
       "reports/score__openai-gpt-5-6-sol-xhigh.md",
       "reports/score__anthropic-claude-opus-5.md",
     ])
   })
 })
 
-describe("built-in review-scored pipeline", () => {
-  const scored = () => resolvePipeline({ name: "review-scored", spec: builtInPipelines["review-scored"]!, agents: builtInAgents })
+describe("built-in review pipeline", () => {
+  const scored = () => resolvePipeline({ name: "review", spec: builtInPipelines.review!, agents: builtInAgents })
 
   test("is report-only: every step is read-only and there is no human gate", () => {
     const pipeline = scored()
@@ -353,71 +329,6 @@ describe("built-in review-scored pipeline", () => {
   })
 })
 
-describe("built-in ship pipeline", () => {
-  const ship = () =>
-    resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents }).steps.filter(
-      (step): step is AgentStep => step.type === "agent",
-    )
-
-  test("syncs the base in before anything reads the diff", () => {
-    const steps = ship()
-
-    expect(steps[0]).toMatchObject({ name: "sync", agentName: "sync-with-base" })
-    // The sync phase writes: it resolves conflicts and Convoy's phase commit
-    // concludes the merge.
-    expect(steps[0]?.readOnly).toBeUndefined()
-    expect(steps[0]?.inputFiles).toEqual(["prd.md"])
-    // scope is what first reads the diff, and by then it is the merged diff.
-    expect(steps[1]).toMatchObject({ name: "scope", inputDiff: true })
-  })
-
-  test("runs refine's audit chain after the sync", () => {
-    const refine = resolvePipeline({ name: "refine", spec: builtInPipelines.refine!, agents: builtInAgents }).steps.filter(
-      (step): step is AgentStep => step.type === "agent",
-    )
-
-    expect(ship().slice(1).map((step) => step.name)).toEqual(refine.map((step) => step.name))
-  })
-})
-
-describe("built-in review pipeline", () => {
-  const review = () => resolvePipeline({ name: "review", spec: builtInPipelines.review!, agents: builtInAgents })
-
-  test("is report-only: every step is read-only and there is no human gate", () => {
-    const pipeline = review()
-    const agents = pipeline.steps.filter((step): step is AgentStep => step.type === "agent")
-    expect(agents.length).toBeGreaterThan(0)
-    expect(agents.every((step) => step.readOnly)).toBe(true)
-    expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
-  })
-
-  test("fans each audit across GPT 5.6 Terra xhigh + opus and feeds a single report step with every audit", () => {
-    const pipeline = review()
-    expect(stepNames(pipeline)).toEqual([
-      "scope",
-      "clean-code__openai-gpt-5-6-terra-xhigh",
-      "clean-code__anthropic-claude-opus-5",
-      "security__openai-gpt-5-6-terra-xhigh",
-      "security__anthropic-claude-opus-5",
-      "bugs__openai-gpt-5-6-terra-xhigh",
-      "bugs__anthropic-claude-opus-5",
-      "report",
-    ])
-
-    const report = pipeline.steps.find((step): step is AgentStep => step.type === "agent" && step.stepName === "report")
-    expect(report?.inputFiles).toEqual([
-      "prd.md",
-      "reports/scope.md",
-      "reports/clean-code__openai-gpt-5-6-terra-xhigh.md",
-      "reports/clean-code__anthropic-claude-opus-5.md",
-      "reports/security__openai-gpt-5-6-terra-xhigh.md",
-      "reports/security__anthropic-claude-opus-5.md",
-      "reports/bugs__openai-gpt-5-6-terra-xhigh.md",
-      "reports/bugs__anthropic-claude-opus-5.md",
-    ])
-  })
-})
-
 describe("built-in review-lite pipeline", () => {
   const reviewLite = () => resolvePipeline({ name: "review-lite", spec: builtInPipelines["review-lite"]!, agents: builtInAgents })
 
@@ -440,6 +351,9 @@ describe("built-in review-lite pipeline", () => {
       "bugs__openrouter-z-ai-glm-5-2",
       "bugs__openrouter-moonshotai-kimi-k3",
       "report",
+      "score__openrouter-z-ai-glm-5-2-xhigh",
+      "score__openrouter-moonshotai-kimi-k3-high",
+      "score-report",
     ])
 
     const byName = Object.fromEntries(
@@ -460,25 +374,20 @@ describe("built-in review-lite pipeline", () => {
   })
 
   test("never reaches for Opus, which is what separates it from review", () => {
+    // The scorer agents default to Opus, so the scorer steps have to pin their
+    // models explicitly; an omitted `models:` would reintroduce exactly the cost
+    // this pipeline exists to avoid.
     expect(JSON.stringify(builtInPipelines["review-lite"])).not.toContain("opus")
+    const scorers = reviewLite().steps.filter((step): step is AgentStep => step.type === "agent" && step.stepName === "score")
+    expect(scorers).toHaveLength(2)
+    for (const step of scorers) {
+      expect(step.model).not.toContain("opus")
+    }
   })
-})
 
-describe("built-in refine pipeline", () => {
-  test("scopes with GLM 5.2, audits/fixes/validates with GPT 5.6 Terra xhigh, and triages with opus", () => {
-    const byName = Object.fromEntries(
-      resolvePipeline({ name: "refine", spec: builtInPipelines.refine!, agents: builtInAgents })
-        .steps.filter((step): step is AgentStep => step.type === "agent")
-        .map((step) => [step.name, step]),
-    )
-
-    expect(byName.scope).toMatchObject({ model: "openrouter/z-ai/glm-5.2" })
-    expect(byName.bugs).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName["clean-code"]).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName.security).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName.triage).toMatchObject({ model: "anthropic/claude-opus-5" })
-    expect(byName.fixes).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName.validator).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
+  test("measures like review does, on its own models", () => {
+    const report = reviewLite().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")
+    expect(report).toMatchObject({ agentName: "quality-score-report", model: "openrouter/z-ai/glm-5.2", variant: "xhigh", readOnly: true, verify: true })
   })
 })
 

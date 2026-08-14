@@ -32,6 +32,7 @@ import {
   defaultGptModel,
   defaultGptVariant,
   defaultImplementAuditModel,
+  defaultImplementAdvisorModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
   defaultOpusModel,
@@ -462,7 +463,7 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: fixer, goal-fix, hunter, hunter-max, implement, implement-advised, implement-lite, implement-scored, quick, refine, review, review-cc, review-lite, review-scored, ship, ultra-implement, ultra-refine)',
+      'unknown pipeline "ghost" (available: fixer, goal-fix, hunter, hunter-max, implement, implement-lite, quick, review, review-cc, review-lite, ship)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
   })
@@ -693,8 +694,8 @@ describe("serialization", () => {
     const template = defaultConfigTemplate()
     expect(template.defaults.model).toBe(`${defaultGptModel}#${defaultGptVariant}`)
     const steps = template.pipelines.implement!.steps
-    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "design")).toEqual({ agent: "design", model: defaultImplementReviewModel })
-    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "adversarial")).toEqual({ agent: "adversarial", model: defaultAdversarialModel, reports: "all" })
+    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "design")).toEqual({ agent: "design", model: defaultImplementReviewModel, advisor: false })
+    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "adversarial")).toEqual({ agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" })
     const reparsed = parse(serializeConvoyConfig(template))
     expect(reparsed.defaults).toEqual(template.defaults)
     expect(reparsed.pipelines).toEqual(template.pipelines)
@@ -801,13 +802,16 @@ describe("default config init", () => {
     expect(config.agents).toEqual({})
     // Seeding prompts would shadow every built-in for good, so init writes none.
     expect(existsSync(join(dir, "agents"))).toBe(false)
+    // The inlined copy mirrors the built-in exactly, advisor opt-outs included:
+    // without them, a project that later sets defaults.advisor would advise
+    // phases the built-in deliberately leaves unadvised.
     expect(config.pipelines.implement?.steps).toEqual([
-      { agent: "implementer", model: defaultImplementerModel, reports: "none" },
-      { agent: "patterns", model: defaultImplementAuditModel },
-      { agent: "security", model: defaultImplementAuditModel },
-      { agent: "design", model: defaultImplementReviewModel },
-      { agent: "tests", model: defaultImplementAuditModel, reports: "none" },
-      { agent: "adversarial", model: defaultAdversarialModel, reports: "all" },
+      { agent: "implementer", model: defaultImplementerModel, advisor: defaultImplementAdvisorModel, reports: "none" },
+      { agent: "patterns", model: defaultImplementAuditModel, advisor: false },
+      { agent: "security", model: defaultImplementAuditModel, advisor: false },
+      { agent: "design", model: defaultImplementReviewModel, advisor: false },
+      { agent: "tests", model: defaultImplementAuditModel, advisor: false, reports: "none" },
+      { agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" },
     ])
     expect(config.permissions).toEqual({ allow: [], deny: [] })
     expect(config.hooks).toEqual({ pre: [], post: [], pipelines: {} })
@@ -1022,10 +1026,16 @@ describe("materializing built-in pipelines", () => {
     if (originalGroup === undefined || !isParallelSpec(originalGroup)) throw new Error("expected a parallel block")
     const originalMember = originalGroup.parallel[0]
     if (typeof originalMember === "string") throw new Error("expected a member object")
-    expect(original.steps).toHaveLength(3)
+    expect(original.steps).toHaveLength(5)
     expect(originalGroup.parallel).toHaveLength(3)
     expect(originalMember.models).toHaveLength(2)
     expect(originalMember.name).toBe("clean-code")
+  })
+
+  test("carries the goal settings into the copy, so customizing ship does not disable its loop", () => {
+    const spec = { description: "d", goal: 85, goalMaxIterations: 4, goalPlateau: 2, steps: ["patterns"] }
+    expect(materializePipelineSpec(spec)).toMatchObject({ goal: 85, goalMaxIterations: 4, goalPlateau: 2 })
+    expect(materializePipelineSpec(builtInPipelines.ship!).goal).toBe(85)
   })
 
   test("inlines built-in agent model preferences only when a default model would shadow them", () => {

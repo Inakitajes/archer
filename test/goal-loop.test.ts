@@ -2,16 +2,18 @@ import { describe, expect, test } from "bun:test"
 
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import { buildRunPlan } from "../src/run-plan"
-import { goalBriefFor, runGoalLoop } from "../src/goal-loop"
+import { goalBriefFor, runGoalLoop, type GoalLoopDeps } from "../src/goal-loop"
 import { UserAbortError } from "../src/runner"
-import type { AgentStep, RunOptions, RunPlan } from "../src/types"
+import type { AgentStep, HookSpec, RunOptions, RunPlan } from "../src/types"
+import type { RunHookContext } from "../src/hooks"
 import type { RunResult } from "../src/runner"
 import type { RepoSnapshot } from "../src/git"
 import type { QualityScore } from "../src/quality-score"
+import type { Workspace } from "../src/workspace"
 
 const dimensions: QualityScore["dimensions"] = { prd: 92, tests: 70, security: 95, maintainability: 88, operational: 90, scope: 85 }
 
-const initialPipeline = resolvePipeline({ name: "implement-scored", spec: builtInPipelines["implement-scored"]!, agents: builtInAgents })
+const initialPipeline = resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents })
 const goalFixPipeline = resolvePipeline({ name: "goal-fix", spec: builtInPipelines["goal-fix"]!, agents: builtInAgents })
 
 function makeOptions(overrides: Partial<RunOptions> = {}): RunOptions {
@@ -100,14 +102,45 @@ function makeSnapshotFakes(overrides: Partial<SnapshotFakes> = {}): SnapshotFake
   }
 }
 
+/** Hook deps for the cases that assert on runs and snapshots rather than hooks. */
+const inertHookDeps: Pick<GoalLoopDeps, "runHooks" | "cleanupWorkspace"> = {
+  runHooks: (async () => {}) as GoalLoopDeps["runHooks"],
+  cleanupWorkspace: async () => {},
+}
+
+/** Records the post-hooks the loop runs and the workspaces it cleans up. */
+type HookFakes = {
+  posts: { hooks: readonly HookSpec[]; context: RunHookContext }[]
+  cleaned: Workspace[]
+}
+
+function makeHookFakes(): HookFakes & { deps: Pick<GoalLoopDeps, "runHooks" | "cleanupWorkspace"> } {
+  const state: HookFakes = { posts: [], cleaned: [] }
+  return {
+    ...state,
+    posts: state.posts,
+    cleaned: state.cleaned,
+    deps: {
+      runHooks: (async (stage, hooks, context) => {
+        if (stage === "post") state.posts.push({ hooks, context })
+      }) as GoalLoopDeps["runHooks"],
+      cleanupWorkspace: async (workspace) => {
+        state.cleaned.push(workspace)
+      },
+    },
+  }
+}
+
 /** Builds deps from a fake run queue and the snapshot fakes, wired through a shared state object. */
 async function makeDeps(scores: (number | undefined)[], snapshotFakes: Partial<SnapshotFakes> = {}) {
   const { calls, fakeRun } = await fakeRunQueue(scores)
   const fakes = makeSnapshotFakes(snapshotFakes)
+  const hooks = makeHookFakes()
   return {
     calls,
-    deps: { run: fakeRun, ...fakes.deps },
+    deps: { run: fakeRun, ...fakes.deps, ...hooks.deps },
     fakes,
+    hooks,
   }
 }
 
@@ -346,7 +379,7 @@ describe("runGoalLoop", () => {
     }
     const fakes = makeSnapshotFakes({ isClean: true })
     await expect(
-      runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, { run: failingRun, ...fakes.deps }),
+      runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, { run: failingRun, ...fakes.deps, ...inertHookDeps }),
     ).rejects.toThrow("boom")
   })
 
@@ -362,7 +395,7 @@ describe("runGoalLoop", () => {
     }
     const fakes = makeSnapshotFakes({ isClean: true })
     await expect(
-      runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, { run: abortingRun, ...fakes.deps }),
+      runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, { run: abortingRun, ...fakes.deps, ...inertHookDeps }),
     ).rejects.toThrow("Ctrl+C")
     expect(fakes.restores).toHaveLength(0)
   })
@@ -376,7 +409,7 @@ describe("runGoalLoop", () => {
     }
     const fakes = makeSnapshotFakes({ isClean: true })
     await expect(
-      runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, { run: failingFixRun, ...fakes.deps }),
+      runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, { run: failingFixRun, ...fakes.deps, ...inertHookDeps }),
     ).rejects.toThrow("fix iteration exploded")
     // A non-abort failure after a measured initial run restores to the best state.
     expect(fakes.restores).toHaveLength(1)
@@ -406,6 +439,7 @@ describe("runGoalLoop", () => {
       restoreSnapshot: async () => {},
       isCleanRepo: async () => true,
       currentHead: async () => "sha-1",
+      ...inertHookDeps,
     }
     const outcome = await runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 5, plateau: 3 }, deps)
     expect(calls).toHaveLength(3)
@@ -476,5 +510,85 @@ describe("goal-fix re-scoring is blind to the previous score", () => {
     expect(consensus?.inputFiles).not.toContain("reports/fix.md")
     expect(consensus?.inputFiles).toContain("reports/score__openai-gpt-5-6-sol-xhigh.md")
     expect(consensus?.inputFiles).toContain("reports/score__anthropic-claude-opus-5.md")
+  })
+})
+
+describe("post-hooks deferred past the loop", () => {
+  const workspaceAt = (runID: string): Workspace => ({ runID, dir: `/runs/${runID}` }) as Workspace
+
+  /** A run queue whose results carry workspaces, as a deferred real run would. */
+  function deferringRunQueue(scores: number[]) {
+    const calls: RunOptions[] = []
+    const queue = [...scores]
+    let n = 0
+    const fakeRun = async (options: RunOptions): Promise<RunResult> => {
+      calls.push(options)
+      const next = queue.shift()
+      const workspace = workspaceAt(`run-${n++}`)
+      return { runID: workspace.runID, dir: workspace.dir, workspace, ...(next === undefined ? {} : { qualityScore: scoreAt(next) }) }
+    }
+    return { calls, fakeRun }
+  }
+
+  async function loopWith(scores: number[], goal: number, post: HookSpec[] = [{ command: "open-pr" }]) {
+    const { calls, fakeRun } = deferringRunQueue(scores)
+    const hooks = makeHookFakes()
+    const options = makeOptions({ hooks: { pre: [], post: [], pipelines: { ship: { pre: [], post } } } })
+    const outcome = await runGoalLoop(options, buildRunPlan(options), { goal, maxIterations: 3, plateau: 3 }, {
+      run: fakeRun,
+      ...makeSnapshotFakes().deps,
+      ...hooks.deps,
+    })
+    return { calls, hooks, outcome }
+  }
+
+  test("every run defers its post-hooks, so nothing fires between iterations", async () => {
+    const { calls } = await loopWith([71, 86, 92], 90)
+
+    expect(calls).toHaveLength(3)
+    for (const call of calls) expect(call.deferPostHooks).toBe(true)
+  })
+
+  test("the base pipeline's post-hooks run exactly once, after the loop", async () => {
+    const { hooks } = await loopWith([71, 92], 90)
+
+    expect(hooks.posts).toHaveLength(1)
+    // ship's hooks, not the goal-fix iteration's, even though goal-fix ran last.
+    expect(hooks.posts[0]?.context.pipelineName).toBe("ship")
+    expect(hooks.posts[0]?.hooks.map((hook) => hook.command)).toEqual(["open-pr"])
+  })
+
+  test("reports the goal as reached, with the score, when the loop cleared the bar", async () => {
+    const { hooks, outcome } = await loopWith([71, 92], 90)
+
+    expect(outcome.reached).toBe(true)
+    expect(hooks.posts[0]?.context.goal).toEqual({ reached: true, target: 90, score: 92 })
+  })
+
+  test("reports the goal as NOT reached when the loop ran out of road below it", async () => {
+    // The run still succeeds — that is exactly why a hook cannot gate on run
+    // status alone, and must read CONVOY_GOAL_REACHED instead.
+    const { hooks, outcome } = await loopWith([40, 50, 60, 70], 90)
+
+    expect(outcome.reached).toBe(false)
+    expect(hooks.posts[0]?.context.status).toBe("success")
+    expect(hooks.posts[0]?.context.goal).toMatchObject({ reached: false, target: 90 })
+  })
+
+  test("the hooks resolve against the last run's workspace, and every kept workspace is cleaned up", async () => {
+    const { hooks } = await loopWith([71, 92], 90)
+
+    expect(hooks.posts[0]?.context.workspace.runID).toBe("run-1")
+    // Both the initial run's workspace and the final one, once the hooks that
+    // needed the latter have run.
+    expect(hooks.cleaned.map((workspace) => workspace.runID)).toEqual(["run-0", "run-1"])
+  })
+
+  test("skips the hook stage entirely when the pipeline has no post-hooks", async () => {
+    const { hooks } = await loopWith([71, 92], 90, [])
+
+    expect(hooks.posts).toHaveLength(0)
+    // The workspaces are still cleaned up: nothing needed them.
+    expect(hooks.cleaned).toHaveLength(2)
   })
 })

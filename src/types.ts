@@ -74,6 +74,16 @@ export type RunOptions = {
    * of blocking on a keypress between every iteration.
    */
   goalContinues?: boolean
+  /**
+   * Goal loop: hand this run's post-hooks back to the caller instead of running
+   * them. A loop is one piece of work spread over several runs, so post-hooks —
+   * which mean "the work is finished" — must fire once, after the last
+   * iteration, with the loop's outcome available to them. Deferring also keeps
+   * the run workspace alive so the caller can still resolve CONVOY_RUN_DIR; the
+   * caller owns cleaning it up. Pre-hooks are unaffected: they run before work,
+   * and running them ahead of each fix round is harmless.
+   */
+  deferPostHooks?: boolean
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */
