@@ -4,3 +4,4 @@ dist/
 coverage/
 .*.bun-build
 .DS_Store
+docs/plans/
