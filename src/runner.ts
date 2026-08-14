@@ -22,6 +22,7 @@ import { askHumanAction, phaseGatePrompt, runHumanReviewGate } from "./human"
 import { log } from "./log"
 import { openRunMetadata, recordProgress, type RunMetadataStore } from "./metadata"
 import { openOpencodeSessionWindow, startOpencode } from "./opencode"
+import { HerdrReporter } from "./herdr"
 import { defaultNotificationSettings, Notifier } from "./notifications"
 import { startPermissionGate, type PermissionGate } from "./permissions"
 import { splitModelVariant, synthesizeReadOnlyAgents, validateStepFilters } from "./pipeline"
@@ -418,6 +419,7 @@ export async function run(options: RunOptions) {
   let control: RunControl | undefined
   let caffeinate: Caffeinate | undefined
   let notifier: Notifier | undefined
+  let herdr: HerdrReporter | undefined
   let titleSaved = false
   let releaseLease: (() => Promise<void>) | undefined
   let hookSet = options.plan?.hooks ?? hooksForPipeline(options.hooks, options.pipeline.name)
@@ -480,6 +482,9 @@ export async function run(options: RunOptions) {
       ...(options.notify === undefined ? {} : { enabled: options.notify }),
     }
     notifier = new Notifier({ settings: notificationSettings })
+    // Outside a Herdr pane this is a silent no-op; inside one it claims the
+    // pane as agent "convoy" and publishes the live pipeline state.
+    herdr = new HerdrReporter({ runID: workspace.runID })
     const statusTracker = new RunStatusTracker({
       phases,
       identity,
@@ -488,6 +493,9 @@ export async function run(options: RunOptions) {
         // Replaced by bind() below when the UI offers its own title channel;
         // this fallback is what --no-tui runs use.
         ...(notificationSettings.terminalTitle ? { title: (status) => void writeTerminalTitle(formatTerminalTitle(status)) } : {}),
+        // The reporter dedupes identical statuses, so the tracker can fire on
+        // every publish without flooding Herdr.
+        herdr: (status) => void herdr?.report(status),
       },
     })
     // Saved before the renderer exists so the pop in the finally block hands the
@@ -784,6 +792,10 @@ export async function run(options: RunOptions) {
     await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
     await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
     progress.stop()
+    // The tracker's stop() above publishes the final stopped snapshot (idle /
+    // blocked); release the Herdr lifecycle authority right after so the
+    // release-agent command is the last one for this source.
+    await herdr?.stop()
     // After the renderer is gone: restoring the title while it still owns the
     // alternate screen would be overwritten by its teardown.
     if (titleSaved) popTerminalTitle()

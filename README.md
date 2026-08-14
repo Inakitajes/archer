@@ -401,6 +401,18 @@ In interactive terminals, Convoy shows a full-screen OpenTUI dashboard headed by
 
 When Convoy runs inside Herdr or Zellij (including over SSH), `o` and `i` open OpenCode in a focused sibling pane rather than a macOS window, named for what it holds (`opencode session`, `opencode iterate`, `claude session`). Inside Herdr the pane splits the current one to the right; inside Zellij it is a new pane. The multiplexer's normal focus shortcut returns to Convoy without closing the pane. When OpenCode exits the pane deliberately stays, showing the exit code — so a session that failed to start is readable instead of vanishing; press `Ctrl+C` there to close the pane, or `Enter` to run it again. Set `CONVOY_TERMINAL=herdr`, `zellij`, `ghostty`, or `terminal` to override automatic backend selection — any other value is rejected with an error rather than silently ignored. When both multiplexers are detected, Herdr wins because the session runs inside it — and a failed Herdr open never falls through to Zellij, which would talk to the outer session and hang or open a pane you cannot see. If Convoy is inside a multiplexer but can't find its binary on its own `PATH`, it falls back to a macOS window rather than losing session opening altogether.
 
+Inside Herdr the sidebar agent is **Convoy** — the live pipeline name, the `N/M` step counter, and the current step label — not the underlying OpenCode session. A Herdr config can render those with the sidebar agents block:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "agent", "$pipeline"],
+  ["$progress", "$step"],
+]
+```
+
+The available tokens are `$pipeline`, `$progress` (`N/M`, counting a `parallel:` or `models:` fan-out as one step), `$step`, `$summary`, and `$run_id` (the Convoy run id, never an OpenCode session id). `rows_by_agent.convoy` is not available until Herdr knows Convoy's canonical id; custom agents use the plain `rows` form above.
+
 A failed step opens a `step failed` gate instead of retrying: `r` restores its clean baseline and launches a new attempt, `o` opens the session so you can fix it by hand (then `c` is available to continue), and `a` aborts the run without reverting the tree.
 
 During a live run, `Ctrl+P` opens the command palette for operational controls such as pause/resume, permission policy, interactive takeover, and keyboard help. On macOS it also offers **Keep Mac awake**, which starts `caffeinate` only for the current Convoy process to prevent display and idle sleep; it is off by default, never written to run metadata, and is released when the pipeline ends, fails, or is aborted.

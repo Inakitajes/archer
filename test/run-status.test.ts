@@ -53,12 +53,13 @@ function mixedPhases(): ProgressPhase[] {
 function trackerWith(phases: ProgressPhase[]) {
   const events: NotificationEvent[] = []
   const titles: RunStatus[] = []
+  const herdrs: RunStatus[] = []
   const tracker = new RunStatusTracker({
     phases,
     identity,
-    sinks: { notify: (event) => events.push(event), title: (status) => titles.push(status) },
+    sinks: { notify: (event) => events.push(event), title: (status) => titles.push(status), herdr: (status) => herdrs.push(status) },
   })
-  return { tracker, events, titles }
+  return { tracker, events, titles, herdrs }
 }
 
 describe("statusSteps", () => {
@@ -282,6 +283,51 @@ describe("RunStatusTracker", () => {
     tracker.phaseStarted("not-in-this-pipeline")
     tracker.phaseEnded("not-in-this-pipeline", "completed")
     expect(events).toEqual([])
+  })
+
+  test("snapshot exposes the logical step label, counting the pre-hook as step one", () => {
+    const { tracker } = trackerWith(mixedPhases())
+    tracker.phaseEnded("pre-hook-1", "completed")
+    tracker.phaseStarted("plan")
+    expect(tracker.snapshot().step).toBe(2)
+    expect(tracker.snapshot().stepLabel).toBe("plan")
+  })
+
+  test("a fan-out collapses to one step label and counts as one step", () => {
+    const { tracker } = trackerWith(mixedPhases())
+    tracker.phaseEnded("pre-hook-1", "completed")
+    tracker.phaseEnded("plan", "completed")
+    for (const name of ["review__opus", "review__gpt", "review__gemini"]) tracker.phaseStarted(name)
+
+    expect(tracker.snapshot().stepLabel).toBe("review")
+    expect(tracker.snapshot().stepLabel).not.toContain("opus")
+    expect(tracker.snapshot().totalSteps).toBe(4)
+  })
+
+  test("waiting exposes the first wait reason and drops it once cleared", () => {
+    const { tracker } = trackerWith(mixedPhases())
+    tracker.waitBegan("permission:1", "waiting for your permission")
+    expect(tracker.snapshot().activity).toBe("waiting")
+    expect(tracker.snapshot().waitReason).toBe("waiting for your permission")
+
+    tracker.waitEnded("permission:1")
+    expect(tracker.snapshot().waitReason).toBeUndefined()
+  })
+
+  test("the herdr sink fires even when the rendered title is unchanged", () => {
+    const { tracker, titles, herdrs } = trackerWith(mixedPhases())
+    tracker.phaseEnded("pre-hook-1", "completed")
+    tracker.phaseEnded("plan", "completed")
+    tracker.phaseStarted("review__opus")
+    const herdrsAfterFirst = herdrs.length
+    const titlesAfterFirst = titles.length
+
+    // Same N/M, same activity, same step label: the title has nothing new to
+    // say, but Herdr still wants the current step label published.
+    tracker.phaseStarted("review__gpt")
+    expect(titles.length).toBe(titlesAfterFirst)
+    expect(herdrs.length).toBe(herdrsAfterFirst + 1)
+    expect(tracker.snapshot().stepLabel).toBe("review")
   })
 })
 

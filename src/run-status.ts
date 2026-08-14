@@ -108,7 +108,7 @@ export function cleanText(value: string): string {
     .trim()
 }
 
-function truncateText(value: string, max: number): string {
+export function truncateText(value: string, max: number): string {
   if (max <= 1) return ""
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`
 }
@@ -188,6 +188,14 @@ export type RunStatusSinks = {
   /** Receives the whole status on every change that alters the rendered title. */
   title?(status: RunStatus): void
   notify?(event: NotificationEvent): void
+  /**
+   * Receives the live status on every publish. Unlike `title`, it is not gated
+   * on the rendered title changing: Herdr wants the current step label even
+   * when `N/M` is stable (a parallel member starting mid-step). Deduplication
+   * of truly identical statuses is the sink's job (the HerdrReporter already
+   * does it), not the tracker's.
+   */
+  herdr?(status: RunStatus): void
 }
 
 export type RunStatusTrackerOptions = {
@@ -250,11 +258,19 @@ export class RunStatusTracker {
   }
 
   snapshot(): RunStatus {
+    const activity = this.activity()
+    const index = this.currentIndex()
+    const step = this.steps[index]
     return {
-      activity: this.activity(),
-      step: this.currentIndex() + 1,
+      activity,
+      step: index + 1,
       totalSteps: this.steps.length,
       identity: this.identity,
+      ...(step ? { stepLabel: step.label } : {}),
+      // The first active wait names the gate the run is stuck on. Only surfaced
+      // while actually waiting: a pause outranks a pending prompt, and the
+      // paused label must not leak a stale permission reason.
+      ...(activity === "waiting" ? { waitReason: this.waits.values().next().value } : {}),
       ...(this.outcome ? { outcome: this.outcome } : {}),
     }
   }
@@ -387,9 +403,15 @@ export class RunStatusTracker {
     })
   }
 
-  /** Writes the title only when it would actually read differently. */
+  /**
+   * Writes the title only when it would actually read differently. The herdr
+   * sink is intentionally NOT gated on that equality: Herdr's step token needs
+   * the label even when the title's `N/M` is stable across parallel members,
+   * and the HerdrReporter drops genuinely identical statuses itself.
+   */
   private publish() {
     const status = this.snapshot()
+    this.sinks.herdr?.(status)
     const title = formatTerminalTitle(status)
     if (title === this.lastTitle) return
     this.lastTitle = title

@@ -235,6 +235,10 @@ export type RunStatus = {
   identity: RunIdentity
   /** Set once the run reaches its finish screen. */
   outcome?: "completed" | "failed"
+  /** Logical step label (a `parallel:` / `models:` group is one label). */
+  stepLabel?: string
+  /** First active wait reason, when `activity === "waiting"`. */
+  waitReason?: string
 }
 
 export type ProgressUI = {

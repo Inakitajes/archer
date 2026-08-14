@@ -8,6 +8,8 @@ import { createOpencodeClient, createOpencodeServer } from "@opencode-ai/sdk/v2"
 
 import type { Config, OpencodeClient } from "@opencode-ai/sdk/v2"
 
+import { withoutHerdrEnv } from "./herdr"
+
 export type OpencodeHandle = {
   client: OpencodeClient
   url: string
@@ -26,19 +28,60 @@ export async function startOpencode(
   deps?: Partial<StartOpencodeDeps>,
 ): Promise<OpencodeHandle> {
   const port = await (deps?.getFreePort ?? freePort)()
-  const server = await (deps?.createServer ?? createOpencodeServer)({
-    hostname: "127.0.0.1",
-    port,
-    timeout: 30_000,
-    signal,
-    config,
-  })
+  // The SDK hands the server child Convoy's environment at spawn time, and
+  // ServerOptions has no env override (confirmed against @opencode-ai/sdk).
+  // A global `herdr integration install opencode` plugin would otherwise
+  // inherit HERDR_PANE_ID and claim the pane as an "opencode" agent.
+  //
+  // This wrapper is synchronous: `finally` restores process.env when `fn`
+  // returns, which for an async createOpencodeServer is when the Promise is
+  // *created*, not when it settles. That is enough because @opencode-ai/sdk
+  // spreads `{...process.env}` in launch()/cross-spawn before its first
+  // `await`. Re-verify that on SDK upgrades — if spawn moves past an await,
+  // the child would inherit the restored HERDR_* keys. Do not make this
+  // helper async: awaiting would widen the global-mutation window.
+  const server = await withProcessHerdrEnvStripped(() =>
+    (deps?.createServer ?? createOpencodeServer)({
+      hostname: "127.0.0.1",
+      port,
+      timeout: 30_000,
+      signal,
+      config,
+    }),
+  )
   const client = (deps?.createClient ?? createOpencodeClient)({ baseUrl: server.url, fetch: fetchWithoutIdleTimeout as typeof fetch })
 
   return {
     client,
     url: server.url,
     close: server.close,
+  }
+}
+
+/**
+ * Runs `fn` with every `HERDR_*` key removed from `process.env`, then restores
+ * them when `fn` returns (not when a returned Promise settles). See the
+ * call-site comment: the strip only covers the SDK's synchronous spawn.
+ */
+function withProcessHerdrEnvStripped<T>(fn: () => T): T {
+  // Reuses the same filter as the reporter's env injection so the set of
+  // stripped keys stays in one place. The kept object is a shallow copy of the
+  // non-HERDR entries; any key absent from it is a HERDR_* key to save/delete.
+  const kept = withoutHerdrEnv(process.env)
+  const saved = new Map<string, string | undefined>()
+  for (const key of Object.keys(process.env)) {
+    if (!(key in kept)) {
+      saved.set(key, process.env[key])
+      delete process.env[key]
+    }
+  }
+  try {
+    return fn()
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
   }
 }
 

@@ -1150,4 +1150,31 @@ describe("startOpencode", () => {
     handle.close()
     expect(closed).toBe(true)
   })
+
+  test("strips HERDR_* from process.env around the server call and restores them after", async () => {
+    process.env.HERDR_ENV = "1"
+    process.env.HERDR_PANE_ID = "w1:p1"
+    const client = { session: {} } as unknown as OpencodeHandle["client"]
+    let observed: Record<string, string | undefined> | undefined
+
+    try {
+      const handle = await startOpencode({}, undefined, {
+        createServer: async () => {
+          observed = { ...process.env }
+          return { url: "http://127.0.0.1:1", close() {} }
+        },
+        createClient: () => client,
+      })
+
+      expect(observed).toBeDefined()
+      expect(observed).not.toHaveProperty("HERDR_ENV")
+      expect(observed).not.toHaveProperty("HERDR_PANE_ID")
+      // The caller's environment is untouched once the server exists.
+      expect(process.env.HERDR_ENV).toBe("1")
+      expect(process.env.HERDR_PANE_ID).toBe("w1:p1")
+      handle.close()
+    } finally {
+      delete process.env.HERDR_PANE_ID
+    }
+  })
 })
