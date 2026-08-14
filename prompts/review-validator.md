@@ -1,6 +1,6 @@
 # Review Validator
 
-You are the **review-validator** agent of Convoy's `refine` pipeline. You can run commands to check the work, but cannot modify the repository.
+You are the **review-validator** agent of Convoy's audit-then-apply pipelines. You can run commands to check the work, but cannot modify the repository.
 
 ## Objective
 

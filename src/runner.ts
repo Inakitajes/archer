@@ -375,6 +375,12 @@ export type RunResult = {
   dir: string
   /** Parsed consensus score when the pipeline ended in a quality-score-report step. */
   qualityScore?: QualityScore
+  /**
+   * Set only under `deferPostHooks`: the workspace was left on disk so the
+   * caller can run this run's post-hooks against it, and is the caller's to
+   * clean up afterwards.
+   */
+  workspace?: Workspace
 }
 
 export async function run(options: RunOptions) {
@@ -693,16 +699,27 @@ export async function run(options: RunOptions) {
     if (runScoreResult) {
       log.info(`quality score: ${runScoreResult.score.score}/100 (${runScoreResult.score.verdict})`)
     }
-    postHooksStarted = true
-    await runHooks("post", hookSet.post, {
-      workspace,
-      targetDir: options.targetDir,
-      pipelineName: pipeline.name,
-      prompt: options.prompt,
-      status: "success",
-      progress,
-      signal: shutdown.signal,
-    })
+    // Under a goal loop the run is one iteration of a longer piece of work, so
+    // "the work finished" is the loop's call to make, not this run's.
+    if (!options.deferPostHooks) {
+      postHooksStarted = true
+      await runHooks("post", hookSet.post, {
+        workspace,
+        targetDir: options.targetDir,
+        pipelineName: pipeline.name,
+        prompt: options.prompt,
+        status: "success",
+        progress,
+        signal: shutdown.signal,
+        ...(runScoreResult ? { score: runScoreResult.score.score } : {}),
+      })
+    } else if (hookSet.post.length > 0) {
+      // Their dashboard rows exist either way, so resolve them here rather than
+      // leaving them pending forever — the same treatment pre-hooks get on a
+      // resume. The caller runs them once the loop is done.
+      for (const name of hookPhaseNames("post", hookSet.post)) progress.phaseSkipped(name)
+      log.info("post-hooks deferred to the end of the goal loop")
+    }
     await caffeinate.stop()
     await holdFinishScreen(progress, shutdown, {
       status: "completed",
@@ -715,9 +732,18 @@ export async function run(options: RunOptions) {
       // finish screen: the loop runs unattended instead of waiting on a keypress.
       ...(options.goalContinues ? { goalContinues: true } : {}),
     })
-    return { runID: workspace.runID, dir: workspace.dir, ...(runScoreResult ? { qualityScore: runScoreResult.score } : {}) }
+    return {
+      runID: workspace.runID,
+      dir: workspace.dir,
+      ...(runScoreResult ? { qualityScore: runScoreResult.score } : {}),
+      ...(options.deferPostHooks ? { workspace } : {}),
+    }
   } catch (error) {
     let failure = error
+    // Deferral does not apply here: a failed run ends the loop, so there is no
+    // later point to defer to, and the failure hooks must still fire. They run
+    // without CONVOY_GOAL_* — the loop never reached an outcome — so a hook that
+    // gates on CONVOY_GOAL_REACHED correctly stays inert.
     if (!postHooksStarted && !isUserAbortError(failure)) {
       postHooksStarted = true
       try {
@@ -765,6 +791,10 @@ export async function run(options: RunOptions) {
 
     if (runErr) {
       log.warn(`Run dir preserved at ${workspace.dir}`)
+    } else if (options.deferPostHooks) {
+      // The deferred post-hooks still resolve CONVOY_RUN_DIR and `cwd: run`
+      // against this workspace, so it outlives the run; the caller deletes it
+      // once it has run them.
     } else if (options.keepRunDir || progress.keepRunDirRequested?.()) {
       log.info(`Run dir kept at ${workspace.dir}`)
     } else {

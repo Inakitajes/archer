@@ -18,6 +18,23 @@ export type RunHookContext = {
   status?: HookRunStatus
   progress: ProgressUI
   signal?: AbortSignal
+  /** Consensus quality score, when the pipeline ended in a quality-score-report step. */
+  score?: number
+  /** Outcome of the goal loop, when these post-hooks run after one. */
+  goal?: GoalHookOutcome
+}
+
+/**
+ * What a goal loop leaves for its post-hooks. `reached` is the distinction the
+ * run status cannot make: a loop that plateaus or exhausts its iterations below
+ * the target still *succeeds*, so a hook that gates on success alone would treat
+ * "scored 62, needed 85" as a pass.
+ */
+export type GoalHookOutcome = {
+  reached: boolean
+  target: number
+  /** Best measured score; absent when no iteration produced a parseable one. */
+  score?: number
 }
 
 type HookCommandResult = {
@@ -142,6 +159,14 @@ async function runHookCommand(stage: HookStage, hook: HookSpec, context: RunHook
     CONVOY_TARGET_DIR: context.targetDir,
     CONVOY_PROMPT_FILE: join(context.workspace.dir, "prd.md"),
     ...(context.status ? { CONVOY_RUN_STATUS: context.status } : {}),
+    ...(context.score !== undefined ? { CONVOY_RUN_SCORE: String(context.score) } : {}),
+    ...(context.goal
+      ? {
+          CONVOY_GOAL_REACHED: context.goal.reached ? "true" : "false",
+          CONVOY_GOAL_TARGET: String(context.goal.target),
+          ...(context.goal.score !== undefined ? { CONVOY_GOAL_SCORE: String(context.goal.score) } : {}),
+        }
+      : {}),
   }
 
   const proc = Bun.spawn([shell, "-lc", hook.command], {

@@ -12,6 +12,7 @@ import {
   defaultGptModel,
   defaultGptVariant,
   defaultAdversarialModel,
+  defaultImplementAdvisorModel,
   defaultImplementAuditModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
@@ -279,42 +280,47 @@ defaults:
 #     model: openai/gpt-5.6-terra#xhigh
 
 # Convoy ships these pipelines built in; pick one with -p/--pipeline without redeclaring it here:
-#   implement            the default: build the feature, then audit, polish, test, and adversarial review
-#   implement-lite       like implement, but swaps GPT 5.6 Terra xhigh phases for GLM 5.2
-#   implement-scored     like implement, then measures the result: two independent scorers + a verified consensus score
-#   implement-advised    like implement, but the implementer consults GPT 5.6 Sol as an advisor
-#   ultra-implement      like implement, with dual-model parallel audits and a final review/fix/validate stage
-#   goal-fix             the goal loop's fix iteration (not run directly; --goal drives it)
-#   refine               audit the current diff, then apply the triaged fixes (changes code)
-#   ultra-refine         like refine, with every audit fanned out across two models
-#   ship                 merge the advanced base in (resolving conflicts), then refine the merged branch
+#   implement            the default: advised implementation, then audit, polish, test, and adversarial review
+#   implement-lite       like implement, but drops the code-writing phases to GLM 5.2 (Kimi K3 advises)
+#   ship                 the close: merge the advanced base in (resolving conflicts), score the merged
+#                        result against the rubric, and loop until it clears 85/100
 #                        wants permissions.allow: git merge*, git add*, git checkout --ours*|--theirs*
 #                        and, optionally, hooks.pipelines.ship to fetch the base first / open the PR after
-#   review               report-only: parallel audits across two models plus one prioritized report (no changes)
-#   review-lite          like review, but swaps GPT 5.6 Terra xhigh for GLM 5.2 (scope + audit fan-out); report stays on Opus
-#   review-scored        like review, then scores the result against the quality rubric (report-only)
+#                        (post-hooks get CONVOY_GOAL_REACHED, so the PR step can require the bar was met)
+#   goal-fix             the goal loop's fix iteration (not run directly; ship's goal or --goal drives it)
+#   fixer                turn a list of findings into proven regression tests, minimal fixes, and a verdict each
+#   review               report-only: parallel audits across two models, one prioritized report, then a verified score
+#   review-lite          like review, but every phase runs on GLM 5.2 / Kimi K3 instead of Opus
 #   review-cc            like review, but pairs each audit with a Claude Code run (needs the \`claude\` CLI on PATH)
 #   hunter               report-only repo audit: six specialty tracks on two models each, then one consensus report
 #   hunter-max           like hunter, with every track fanned across all five models (30 audits — slow and expensive)
 # The default \`implement\` pipeline is inlined below as an editable starting point; redefining a name here overrides the built-in.
 pipelines:
   implement:
-    description: Implementation, pattern/security audits, design polish, tests, and adversarial review
+    description: Advised implementation, pattern/security audits, design polish, tests, and adversarial review
     steps:
       - agent: implementer
         model: ${defaultImplementerModel}
+        advisor: ${defaultImplementAdvisorModel}
         reports: none
+      # advisor: false rather than an omitted key — omitting it would inherit
+      # defaults.advisor and quietly re-advise phases that don't want it.
       - agent: patterns
         model: ${defaultImplementAuditModel}
+        advisor: false
       - agent: security
         model: ${defaultImplementAuditModel}
+        advisor: false
       - agent: design
         model: ${defaultImplementReviewModel}
+        advisor: false
       - agent: tests
         model: ${defaultImplementAuditModel}
+        advisor: false
         reports: none
       - agent: adversarial
         model: ${defaultAdversarialModel}
+        advisor: false
         reports: all
 
 # Optional shell hooks. Top-level hooks run for every pipeline; hooks under
@@ -959,7 +965,17 @@ export function defaultConfigTemplate(): ConvoyConfig {
  */
 export function materializePipelineSpec(spec: PipelineSpec, effectiveDefaultModel?: string): PipelineSpec {
   const steps = spec.steps.map<StepSpec>((raw) => materializeStep(raw, effectiveDefaultModel))
-  return { ...(spec.description ? { description: spec.description } : {}), steps }
+  // The goal settings travel with the copy: `ship` carries its target in its
+  // spec, so dropping them here would turn "customize this built-in" into
+  // "silently disable its loop".
+  return {
+    ...(spec.description ? { description: spec.description } : {}),
+    ...(spec.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: spec.maxConcurrentAgents } : {}),
+    ...(spec.goal !== undefined ? { goal: spec.goal } : {}),
+    ...(spec.goalMaxIterations !== undefined ? { goalMaxIterations: spec.goalMaxIterations } : {}),
+    ...(spec.goalPlateau !== undefined ? { goalPlateau: spec.goalPlateau } : {}),
+    steps,
+  }
 }
 
 function materializeStep(raw: StepSpec, effectiveDefaultModel: string | undefined): StepSpec {

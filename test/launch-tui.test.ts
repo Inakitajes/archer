@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 
 import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
 
-import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
+import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
 import { consensusStep } from "../src/quality-score"
 import type { KeyEvent } from "@opentui/core"
 
@@ -327,16 +327,29 @@ describe("launch TUI goal mode", () => {
 
   test("consensusStep detects scored built-in pipelines", () => {
     // Scored: pipelines that end in a quality-score-report step
-    for (const name of ["implement-scored", "review-scored", "goal-fix"]) {
+    for (const name of ["ship", "review", "review-lite", "goal-fix"]) {
       const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
       expect(consensusStep(pipeline)).toBeDefined()
     }
   })
 
   test("consensusStep rejects non-scored built-in pipelines", () => {
-    for (const name of ["implement", "implement-lite", "review", "refine", "ultra-implement", "hunter"]) {
+    for (const name of ["implement", "implement-lite", "fixer", "review-cc", "hunter"]) {
       const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
       expect(consensusStep(pipeline)).toBeUndefined()
     }
+  })
+
+  test("only ship is goal-eligible: review scores but cannot be fixed, implement can be fixed but is not scored", () => {
+    // Goal mode needs both halves; the launcher's `scored` flag is the AND of them.
+    const eligible = (name: string) => {
+      const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
+      return Boolean(consensusStep(pipeline)) && hasWritableStep(pipeline)
+    }
+
+    expect(eligible("ship")).toBe(true)
+    expect(eligible("review")).toBe(false)
+    expect(eligible("review-lite")).toBe(false)
+    expect(eligible("implement")).toBe(false)
   })
 })

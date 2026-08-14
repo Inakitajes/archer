@@ -163,7 +163,7 @@ export async function parseAndRun(argv: string[]) {
   // running it directly gives the goal-fixer no work order (no brief, no
   // previous score). Refuse it here so the contract is enforced, not just documented.
   if (plan.pipeline.name === "goal-fix") {
-    throw new Error("goal-fix is the goal loop's internal fix pipeline and is not run directly; use --goal with a scored pipeline (e.g. convoy -p implement-scored --goal 90) instead.")
+    throw new Error("goal-fix is the goal loop's internal fix pipeline and is not run directly; run a scored pipeline that drives it instead (convoy -p ship, or --goal with another scored pipeline).")
   }
   // Refuse an ineligible --goal before the plan is reviewed, preflighted, or a
   // worktree is created — the operator must not consent to a plan that cannot
@@ -227,12 +227,12 @@ export function goalModeFor(options: { goal?: number; goalFixPipeline?: Pipeline
 export function goalModeRejectionError(decision: GoalModeDecision & { mode: "rejected" }, plan: RunPlan): Error {
   if (decision.reason === "no-consensus") {
     return new Error(
-      `--goal ${decision.goal} requires a scored pipeline: the pipeline must end in a quality-score-report step (implement-scored or a custom scored pipeline).`,
+      `--goal ${decision.goal} requires a scored pipeline: the pipeline must end in a quality-score-report step (ship, review, review-lite, or a custom scored pipeline).`,
     )
   }
   if (decision.reason === "not-writable") {
     return new Error(
-      `--goal ${decision.goal} requires a pipeline that can edit the repository: "${plan.pipeline.name}" is report-only (every step is read-only), but goal mode runs the writable goal-fixer. Use a scored pipeline with a writing step (e.g. implement-scored), or drop --goal to review without fixing.`,
+      `--goal ${decision.goal} requires a pipeline that can edit the repository: "${plan.pipeline.name}" is report-only (every step is read-only), but goal mode runs the writable goal-fixer. Use a scored pipeline with a writing step (e.g. ship), or drop --goal to review without fixing.`,
     )
   }
   if (decision.reason === "bad-fix-pipeline") {
@@ -1017,8 +1017,10 @@ Flags:
                            (default: worktree on a trunk branch, current tree on any other)
   --branch <name>          Name for the worktree branch, instead of asking the naming model
   --goal <1-100>           Goal mode: keep fixing until the quality score reaches this value.
-                           Requires a writable scored pipeline (implement-scored, or any
-                           pipeline ending in a quality-score-report step with a writing step).
+                           Requires a writable scored pipeline (any pipeline ending in a
+                           quality-score-report step with a writing step). The ship pipeline
+                           declares its own goal of 85, so it loops without this flag; pass
+                           --goal to override that target.
                            Each fix iteration applies exactly the gaps the previous scoring
                            round reported and re-scores; the loop stops at the goal, at a
                            plateau, or at the iteration cap. See the Quality scoring section.
