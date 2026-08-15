@@ -555,5 +555,10 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
   // Forwarded so tracker.bind() finds the UI's title channel through the
   // composed object, the same way control and caffeinate bind to it.
   if (progress.runStatus) tracked.runStatus = progress.runStatus.bind(progress)
+  // Goal-loop hosting methods: purely forwarded, never tracked.
+  if (progress.setGoalLoop) tracked.setGoalLoop = progress.setGoalLoop.bind(progress)
+  if (progress.resetPipeline) tracked.resetPipeline = progress.resetPipeline.bind(progress)
+  if (progress.setAbortHandler) tracked.setAbortHandler = progress.setAbortHandler.bind(progress)
+  if (progress.setHostControls) tracked.setHostControls = progress.setHostControls.bind(progress)
   return tracked
 }

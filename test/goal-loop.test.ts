@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import { buildRunPlan } from "../src/run-plan"
 import { goalBriefFor, runGoalLoop, type GoalLoopDeps } from "../src/goal-loop"
+import { noopProgress, type GoalLoopView, type ProgressUI, type RunOutcome } from "../src/progress"
 import { UserAbortError } from "../src/runner"
 import type { AgentStep, HookSpec, RunOptions, RunPlan } from "../src/types"
 import type { RunHookContext } from "../src/hooks"
@@ -344,9 +345,8 @@ describe("runGoalLoop", () => {
   test("flags every run goalContinues while the loop is still going", async () => {
     // The loop's promise is "don't stop until the score reaches the target"; a
     // finish-screen hold between iterations would defeat it, so every run the
-    // loop starts carries goalContinues: true — except the last possible
-    // iteration, which lets the finish screen hold so the operator sees the
-    // final score and trajectory.
+    // loop starts carries goalContinues: true — even the last possible one. The
+    // loop itself holds the finish screen exactly once, at the very end.
     const { calls, deps } = await makeDeps([71, 84, 93], { isClean: true })
     await runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, deps)
 
@@ -358,19 +358,16 @@ describe("runGoalLoop", () => {
     }
   })
 
-  test("lets the finish screen hold on the last possible iteration", async () => {
-    // When the loop hits the iteration cap, the last iteration must NOT carry
-    // goalContinues so the TUI finish screen shows the final score/trajectory.
+  test("flags the last possible iteration goalContinues too", async () => {
+    // The old "last possible iteration lets the finish screen hold" trick is
+    // gone: the loop owns the hold, so no run may gate on a keypress.
     const { calls, deps } = await makeDeps([71, 80, 85, 88], { isClean: true })
     await runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 1 }, deps)
 
     expect(calls).toHaveLength(4)
-    // The initial run and the first two fix iterations carry goalContinues.
-    expect(calls[0]?.goalContinues).toBe(true)
-    expect(calls[1]?.goalContinues).toBe(true)
-    expect(calls[2]?.goalContinues).toBe(true)
-    // The last possible fix iteration (iteration 3 = maxIterations) does not.
-    expect(calls[3]?.goalContinues).toBeUndefined()
+    for (const call of calls) {
+      expect(call.goalContinues).toBe(true)
+    }
   })
 
   test("propagates a failing run", async () => {
@@ -470,6 +467,254 @@ describe("runGoalLoop", () => {
 
     expect(outcome.restored).toBe(true)
     expect(fakes.restores).toHaveLength(1)
+  })
+})
+
+describe("runGoalLoop hosting", () => {
+  /** A fake dashboard recording every goal-loop host call; runFinished can be dismissed. */
+  function fakeProgress() {
+    const events: string[] = []
+    const views: GoalLoopView[] = []
+    const finishCalls: RunOutcome[] = []
+    const dismissers: (() => void)[] = []
+    const progress: ProgressUI = {
+      ...noopProgress,
+      message: (text) => void events.push(`message:${text}`),
+      setGoalLoop: (view) => void views.push(view),
+      resetPipeline: () => void events.push("resetPipeline"),
+      setAbortHandler: () => void events.push("setAbortHandler"),
+      setHostControls: () => void events.push("setHostControls"),
+      stop: () => void events.push("stop"),
+      runFinished: (outcome) => {
+        finishCalls.push(outcome)
+        return new Promise<void>((resolve) => dismissers.push(resolve))
+      },
+    }
+    return {
+      progress,
+      views,
+      events,
+      finishCalls,
+      /** Resolves the loop's finish hold once it is waiting on it. */
+      async dismiss() {
+        const deadline = Date.now() + 1_000
+        while (dismissers.length === 0 && Date.now() < deadline) await Bun.sleep(1)
+        dismissers.shift()?.()
+      },
+    }
+  }
+
+  /** Runs the loop with the fake dashboard, dismissing the finish hold it reaches. */
+  async function runHosted(
+    options: RunOptions,
+    config: { goal: number; maxIterations: number; plateau: number },
+    deps: GoalLoopDeps,
+    fake: ReturnType<typeof fakeProgress>,
+  ) {
+    const promise = runGoalLoop(options, buildRunPlan(options), config, deps)
+    const deadline = Date.now() + 1_000
+    while (fake.finishCalls.length === 0 && Date.now() < deadline) await Bun.sleep(1)
+    fake.dismiss()
+    return promise
+  }
+
+  test("reuses a caller-provided progress and never stops it", async () => {
+    const fake = fakeProgress()
+    const { deps } = await makeDeps([95], { isClean: true })
+    const outcome = await runHosted(makeOptions({ progress: fake.progress }), { goal: 90, maxIterations: 3, plateau: 3 }, deps, fake)
+
+    expect(outcome.reached).toBe(true)
+    expect(outcome.reason).toBe("goal")
+    // The loop reused the caller's dashboard instead of creating its own, so
+    // the teardown belongs to the caller too.
+    expect(fake.events).not.toContain("stop")
+  })
+
+  test("resets the pipeline for every hosted run", async () => {
+    const fake = fakeProgress()
+    let runCount = 0
+    // The runner seam: each hosted run() resets the shared dashboard's pipeline.
+    const recordingRun = async (): Promise<RunResult> => {
+      runCount++
+      fake.progress.resetPipeline?.([{ name: "fix", description: "" }], { runID: `run-${runCount}`, targetDir: "/repo", runDir: "", pipeline: { name: "goal-fix", steps: [] } })
+      return runCount === 1 ? resultAt(71) : resultAt(92)
+    }
+    const fakes = makeSnapshotFakes({ isClean: true })
+    const hooks = makeHookFakes()
+    await runHosted(makeOptions({ progress: fake.progress }), { goal: 90, maxIterations: 3, plateau: 3 }, {
+      run: recordingRun,
+      ...fakes.deps,
+      ...hooks.deps,
+    }, fake)
+
+    // Initial run + one fix iteration.
+    expect(fake.events.filter((event) => event === "resetPipeline")).toHaveLength(2)
+  })
+
+  test("publishes a goal-loop view after every score, the last carrying the outcome", async () => {
+    const fake = fakeProgress()
+    const { deps } = await makeDeps([71, 84, 93], { isClean: true })
+    await runHosted(makeOptions({ progress: fake.progress }), { goal: 90, maxIterations: 3, plateau: 3 }, deps, fake)
+
+    // Pre-run, after the initial score, after each fix score, then the hold.
+    expect(fake.views.map((view) => view.scores)).toEqual([[], [71], [71, 84], [71, 84, 93], [71, 84, 93]])
+    expect(fake.views.map((view) => view.iteration)).toEqual([1, 2, 3, 4, 4])
+    expect(fake.views.map((view) => view.maxRuns)).toEqual([4, 4, 4, 4, 4])
+    for (const view of fake.views.slice(0, -1)) expect(view.outcome).toBeUndefined()
+    expect(fake.views.at(-1)?.outcome).toEqual({ reason: "goal", reached: true, restored: false })
+  })
+
+  test("holds the finish screen exactly once, even when the goal is met on iteration 2 of 4", async () => {
+    const fake = fakeProgress()
+    const { deps } = await makeDeps([71, 84, 92], { isClean: true })
+    const outcome = await runHosted(makeOptions({ progress: fake.progress }), { goal: 90, maxIterations: 3, plateau: 3 }, deps, fake)
+
+    expect(outcome.reached).toBe(true)
+    expect(fake.finishCalls).toHaveLength(1)
+    expect(fake.finishCalls[0]?.status).toBe("completed")
+    // The finish outcome carries the verdict and the full trajectory.
+    expect(fake.finishCalls[0]?.goalLoop?.outcome).toEqual({ reason: "goal", reached: true, restored: false })
+    expect(fake.finishCalls[0]?.goalLoop?.scores).toEqual([71, 84, 92])
+  })
+
+  test("announces each iteration in the feed with the last score", async () => {
+    const fake = fakeProgress()
+    const { deps } = await makeDeps([71, 84, 92], { isClean: true })
+    await runHosted(makeOptions({ progress: fake.progress }), { goal: 90, maxIterations: 3, plateau: 3 }, deps, fake)
+
+    expect(fake.events.filter((event) => event.startsWith("message:goal loop:"))).toEqual([
+      "message:goal loop: iteration 2/4 · last 71/100",
+      "message:goal loop: iteration 3/4 · last 84/100",
+    ])
+  })
+
+  test("releases run 1 before run 2 starts and the last run after the finish hold", async () => {
+    const order: string[] = []
+    const queue = [
+      { id: "run-1", score: 71 },
+      { id: "run-2", score: 92 },
+    ]
+    const fakeRun = async (): Promise<RunResult> => {
+      const next = queue.shift()!
+      order.push(`start:${next.id}`)
+      return {
+        runID: next.id,
+        dir: `/runs/${next.id}`,
+        qualityScore: scoreAt(next.score),
+        workspace: { runID: next.id, dir: `/runs/${next.id}` } as Workspace,
+        release: async () => {
+          order.push(`release:${next.id}`)
+        },
+      }
+    }
+    const fakes = makeSnapshotFakes({ isClean: true })
+    const hooks = makeHookFakes()
+    const fake = fakeProgress()
+    const outcome = await runHosted(makeOptions({ progress: fake.progress }), { goal: 90, maxIterations: 3, plateau: 3 }, {
+      run: fakeRun,
+      ...fakes.deps,
+      ...hooks.deps,
+    }, fake)
+
+    expect(outcome.reached).toBe(true)
+    // Run 1 is released as run 2 begins; the last run only after the finish
+    // screen is dismissed.
+    expect(order).toEqual(["start:run-1", "release:run-1", "start:run-2", "release:run-2"])
+  })
+
+  test("a user abort never holds the finish screen and never restores", async () => {
+    const fake = fakeProgress()
+    let call = 0
+    const abortingRun = async (): Promise<RunResult> => {
+      call++
+      if (call === 1) return resultAt(71)
+      throw new UserAbortError("Ctrl+C received")
+    }
+    const fakes = makeSnapshotFakes({ isClean: true })
+    const hooks = makeHookFakes()
+    await expect(
+      runGoalLoop(makeOptions({ progress: fake.progress }), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, {
+        run: abortingRun,
+        ...fakes.deps,
+        ...hooks.deps,
+      }),
+    ).rejects.toThrow("Ctrl+C")
+
+    expect(fake.finishCalls).toHaveLength(0)
+    expect(fakes.restores).toHaveLength(0)
+  })
+
+  test("an abort between iterations releases the previous run before rethrowing", async () => {
+    // The loop's shutdown is requested (as an OS signal would request it) right
+    // after the initial score lands. The next iteration's guard must release
+    // the previous run's deferred server/lease teardown before the abort
+    // propagates: the loop exits with no hold, so nothing else would release it.
+    const fake = fakeProgress()
+    const progress: ProgressUI = {
+      ...fake.progress,
+      setGoalLoop: (view) => {
+        fake.progress.setGoalLoop?.(view)
+        // Emitting manually forwards the listener argument a real OS signal
+        // would deliver (the signal name), so the abort reason reads like prod.
+        if (view.scores.length === 1) process.emit("SIGTERM", "SIGTERM")
+      },
+    }
+    const released: string[] = []
+    let call = 0
+    const releasingRun = async (): Promise<RunResult> => {
+      call++
+      return { ...resultAt(71), release: async () => void released.push(`release:${call}`) }
+    }
+    const fakes = makeSnapshotFakes({ isClean: true })
+    const hooks = makeHookFakes()
+    await expect(
+      runGoalLoop(makeOptions({ progress }), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, {
+        run: releasingRun,
+        ...fakes.deps,
+        ...hooks.deps,
+      }),
+    ).rejects.toThrow("SIGTERM")
+
+    // Run 1's teardown was released on the way out, and iteration 2 never started.
+    expect(released).toEqual(["release:1"])
+    expect(fake.finishCalls).toHaveLength(0)
+    expect(fakes.restores).toHaveLength(0)
+  })
+
+  test("tui: false runs the whole loop without a dashboard exploding", async () => {
+    const { calls, deps } = await makeDeps([71, 92], { isClean: true })
+    const outcome = await runGoalLoop(makeOptions({ tui: false }), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, deps)
+
+    expect(outcome.reached).toBe(true)
+    expect(calls).toHaveLength(2)
+  })
+
+  test("a failed run holds a failed screen with the trajectory accumulated so far", async () => {
+    const fake = fakeProgress()
+    let call = 0
+    const failingRun = async (): Promise<RunResult> => {
+      call++
+      if (call === 1) return resultAt(71)
+      throw new Error("fix iteration exploded")
+    }
+    const fakes = makeSnapshotFakes({ isClean: true })
+    const hooks = makeHookFakes()
+    const promise = runGoalLoop(makeOptions({ progress: fake.progress }), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, {
+      run: failingRun,
+      ...fakes.deps,
+      ...hooks.deps,
+    })
+    const deadline = Date.now() + 1_000
+    while (fake.finishCalls.length === 0 && Date.now() < deadline) await Bun.sleep(1)
+    fake.dismiss()
+    await expect(promise).rejects.toThrow("fix iteration exploded")
+
+    // The failed screen shows the error and the trajectory from the scores the
+    // loop measured before the failure.
+    expect(fake.finishCalls).toHaveLength(1)
+    expect(fake.finishCalls[0]?.status).toBe("failed")
+    expect(fake.finishCalls[0]?.error).toContain("fix iteration exploded")
+    expect(fake.finishCalls[0]?.goalLoop?.scores).toEqual([71])
   })
 })
 

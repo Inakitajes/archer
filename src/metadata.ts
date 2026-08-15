@@ -361,6 +361,11 @@ export function recordProgress(progress: ProgressUI, store: RunMetadataStore): P
   // Same probing contract: the runner only holds the finish screen when the UI offers one.
   if (progress.runFinished) recorder.runFinished = progress.runFinished.bind(progress)
   if (progress.keepRunDirRequested) recorder.keepRunDirRequested = progress.keepRunDirRequested.bind(progress)
+  // Goal-loop hosting methods: purely forwarded, never recorded.
+  if (progress.setGoalLoop) recorder.setGoalLoop = progress.setGoalLoop.bind(progress)
+  if (progress.resetPipeline) recorder.resetPipeline = progress.resetPipeline.bind(progress)
+  if (progress.setAbortHandler) recorder.setAbortHandler = progress.setAbortHandler.bind(progress)
+  if (progress.setHostControls) recorder.setHostControls = progress.setHostControls.bind(progress)
   return recorder
 }
 

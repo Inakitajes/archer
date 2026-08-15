@@ -1,5 +1,5 @@
 import { log } from "./log"
-import type { StepRunner } from "./types"
+import type { Pipeline, StepRunner } from "./types"
 import type { AdvisorEvent, AdvisorPhaseAggregate } from "./advisor-events"
 
 export type ProgressPhase = {
@@ -101,6 +101,28 @@ export type PermissionReply = "once" | "always" | "reject"
 export type AutoAcceptMode = "off" | "all" | "smart"
 export type AutoAccept = { mode: AutoAcceptMode }
 
+/**
+ * The goal loop's live state, as the dashboard header shows it. One loop is one
+ * piece of work spread over several runs, so this is owned by the loop (via
+ * `ProgressUI.setGoalLoop`) and copied into `RunOutcome.goalLoop` when the loop
+ * holds its finish screen.
+ */
+export type GoalLoopView = {
+  target: number
+  /** 1-based iteration the header should advertise right now. */
+  iteration: number
+  /** 1 + maxIterations: every run the loop may perform (initial + fixes). */
+  maxRuns: number
+  plateau: number
+  /** Completed scores, oldest first. */
+  scores: number[]
+  outcome?: {
+    reason: "goal" | "plateau" | "max-iterations" | "no-score"
+    reached: boolean
+    restored: boolean
+  }
+}
+
 export type ProgressPhaseSnapshot = {
   status: "completed" | "skipped" | "failed"
   sessionID?: string
@@ -158,6 +180,11 @@ export type RunOutcome = {
    * keypress between iterations.
    */
   goalContinues?: boolean
+  /**
+   * The goal loop's live view, copied onto the hold so the finish screen keeps
+   * the verdict and trajectory the header painted. Absent outside goal mode.
+   */
+  goalLoop?: GoalLoopView
 }
 
 export type RunControlState = "running" | "pausing" | "paused"
@@ -205,6 +232,18 @@ export type FinishSeam = {
 export type KeepAwakeState = {
   status: "off" | "on" | "unavailable"
   detail?: string
+}
+
+/**
+ * Host callbacks a live UI can be pointed at per run. The runner refreshes them
+ * on every hosted run (each iteration gets its own workspace/run-control pair),
+ * so the dashboard's pause / keep-awake keys and the [f] finish seam always act
+ * on the run currently on screen.
+ */
+export type ProgressHostControls = {
+  onPauseToggle?: () => void
+  onKeepAwakeToggle?: () => void
+  finish?: FinishSeam
 }
 
 /**
@@ -289,6 +328,39 @@ export type ProgressUI = {
   suspend(): void
   resume(): void
   stop(): void
+  /**
+   * The goal loop owns the dashboard across iterations; this replaces the
+   * header's goal segment live. The view the loop holds at the end (with an
+   * `outcome`) is also copied into `RunOutcome.goalLoop` so the finish screen
+   * keeps the verdict. SetGoalLoop only stores the view and schedules a
+   * repaint — it never resets any other state.
+   */
+  setGoalLoop?(view: GoalLoopView): void
+  /**
+   * One goal-loop iteration is over and the next run is about to start: swap in
+   * its pending phases, ids and pipeline name, and clear everything that belongs
+   * to the previous iteration's run (feed, transcripts, reports, queues,
+   * finish). `startedAt` and the accumulated usage survive, so the header's
+   * clock and cost keep running across iterations.
+   */
+  resetPipeline?(
+    phases: readonly ProgressPhase[],
+    next: { runID: string; targetDir: string; runDir: string; pipeline: Pipeline },
+  ): void
+  /**
+   * Points Ctrl+C (and the dashboard's abort key) at a new handler. `undefined`
+   * restores the UI's own constructor handler. The goal loop swaps this per
+   * run — each iteration's shutdown while it runs, the loop's own between runs
+   * and during its finish hold.
+   */
+  setAbortHandler?(handler?: () => void): void
+  /**
+   * Repoints the host callbacks (pause, keep-awake, finish seam) at a new run's
+   * objects, since each goal-loop iteration creates its own.
+   */
+  setHostControls?(controls: ProgressHostControls): void
+  /** The shared auto-accept reference the gate uses; the dashboard cycles it with shift+tab. */
+  autoAccept?: AutoAccept
 }
 
 export const noopProgress: ProgressUI = {
@@ -320,7 +392,7 @@ export async function createProgressUI(
   enabled: boolean,
   onAbort?: () => void,
   autoAccept?: AutoAccept,
-  controls?: { onPauseToggle?: () => void; onKeepAwakeToggle?: () => void; finish?: FinishSeam },
+  controls?: ProgressHostControls,
 ): Promise<ProgressUI> {
   if (!enabled || !process.stdout.isTTY) return noopProgress
 

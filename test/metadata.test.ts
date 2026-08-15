@@ -7,7 +7,7 @@ import { readRunMetadata, openRunMetadata, recordProgress, type RunMetadataStore
 import type { RepoSnapshot } from "../src/git"
 import type { Pipeline, AgentStep, HumanStep } from "../src/types"
 import type { Workspace } from "../src/workspace"
-import type { ProgressUI } from "../src/progress"
+import type { ProgressUI, GoalLoopView } from "../src/progress"
 import type { AdvisorEvent } from "../src/advisor-events"
 
 function validAgentStep(name: string): AgentStep {
@@ -906,6 +906,37 @@ describe("recordProgress", () => {
     }
   })
 
+  test("goal-loop hosting methods are bound when present", async () => {
+    const calls: string[] = []
+    const fakeUI = makeFakeUI(calls)
+    const view: GoalLoopView = { target: 90, iteration: 2, maxRuns: 4, plateau: 3, scores: [71] }
+    fakeUI.setGoalLoop = function (v: GoalLoopView) { calls.push(`setGoalLoop(${v.iteration})`) }
+    fakeUI.resetPipeline = function () { calls.push("resetPipeline()") }
+    fakeUI.setAbortHandler = function () { calls.push("setAbortHandler()") }
+    fakeUI.setHostControls = function () { calls.push("setHostControls()") }
+    const recorder = recordProgress(fakeUI, makeMockStore([]))
+
+    expect(typeof recorder.setGoalLoop).toBe("function")
+    if (recorder.setGoalLoop) recorder.setGoalLoop(view)
+    if (recorder.resetPipeline) recorder.resetPipeline([], { runID: "r", targetDir: "/t", runDir: "", pipeline: { name: "goal-fix", steps: [] } })
+    if (recorder.setAbortHandler) recorder.setAbortHandler(undefined)
+    if (recorder.setHostControls) recorder.setHostControls({})
+
+    expect(calls).toContain("setGoalLoop(2)")
+    expect(calls).toContain("resetPipeline()")
+    expect(calls).toContain("setAbortHandler()")
+    expect(calls).toContain("setHostControls()")
+  })
+
+  test("goal-loop hosting methods are absent when UI lacks them", async () => {
+    const fakeUI = makeFakeUI([])
+    const recorder = recordProgress(fakeUI, makeMockStore([]))
+    expect(recorder.setGoalLoop).toBeUndefined()
+    expect(recorder.resetPipeline).toBeUndefined()
+    expect(recorder.setAbortHandler).toBeUndefined()
+    expect(recorder.setHostControls).toBeUndefined()
+  })
+
   test("optional methods are absent when UI lacks them", async () => {
     const fakeUI = makeFakeUI([])
     const recorder = recordProgress(fakeUI, makeMockStore([]))
@@ -917,5 +948,9 @@ describe("recordProgress", () => {
     expect(recorder.runControlState).toBeUndefined()
     expect(recorder.runStatus).toBeUndefined()
     expect(recorder.keepRunDirRequested).toBeUndefined()
+    expect(recorder.setGoalLoop).toBeUndefined()
+    expect(recorder.resetPipeline).toBeUndefined()
+    expect(recorder.setAbortHandler).toBeUndefined()
+    expect(recorder.setHostControls).toBeUndefined()
   })
 })

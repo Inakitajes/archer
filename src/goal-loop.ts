@@ -23,8 +23,8 @@ import { buildRunPlan } from "./run-plan"
 import { log } from "./log"
 import { createCleanRepoSnapshot, currentHead, restoreRepoSnapshot, statusPorcelain, type RepoSnapshot } from "./git"
 import { hooksForPipeline, runHooks, type GoalHookOutcome } from "./hooks"
-import { noopProgress } from "./progress"
-import { isUserAbortError, run, type RunResult } from "./runner"
+import { noopProgress, createProgressUI, type AutoAccept, type GoalLoopView, type ProgressUI } from "./progress"
+import { holdFinishScreen, hostedTeardownFromError, installShutdownSignals, isUserAbortError, progressPhases, run, RunShutdown, type RunResult } from "./runner"
 import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { cleanupWorkspace, type Workspace } from "./workspace"
 import type { RunOptions, RunPlan } from "./types"
@@ -108,11 +108,28 @@ export async function runGoalLoop(
   deps: GoalLoopDeps = defaultGoalLoopDeps,
 ): Promise<GoalLoopOutcome> {
   const kept = new KeptWorkspaces()
+  // The loop owns the dashboard, not any single run: one auto-accept reference,
+  // one shared progress UI, one shutdown that covers the gaps between runs.
+  const autoAccept: AutoAccept = { mode: options.yolo ? "all" : options.smart ? "smart" : "off" }
+  const shutdown = new RunShutdown()
+  // OS signals must reach the loop's shutdown, not only the active run's: while
+  // no run is in flight — between iterations, and during the loop-owned finish
+  // hold — the run's handlers are gone, and a default-action SIGTERM there
+  // would orphan every hosted server and lease the loop deferred teardown for.
+  // Each run installs its own alongside; the closures are distinct, so both
+  // remove exactly their own handlers on the way out.
+  const removeSignalHandlers = installShutdownSignals(shutdown)
+  const phases = progressPhases(plan.pipeline, plan.hooks ?? hooksForPipeline(options.hooks, plan.pipeline.name))
+  const progress = options.progress ?? (await createProgressUI(phases, options.tui, () => shutdown.request("Ctrl+C"), autoAccept))
+  const owns = !options.progress
   try {
-    const outcome = await runGoalIterations(options, plan, config, deps, kept)
+    const outcome = await runGoalIterations(options, plan, config, deps, kept, progress, shutdown, autoAccept)
     await runDeferredPostHooks(options, plan, config, deps, kept.latest, outcome)
     return outcome
   } finally {
+    removeSignalHandlers()
+    if (owns) progress.stop()
+    shutdown.dispose()
     await kept.cleanup(deps.cleanupWorkspace)
   }
 }
@@ -179,36 +196,121 @@ async function runGoalIterations(
   config: GoalLoopConfig,
   deps: GoalLoopDeps,
   kept: KeptWorkspaces,
+  progress: ProgressUI,
+  shutdown: RunShutdown,
+  autoAccept: AutoAccept,
 ): Promise<GoalLoopOutcome> {
   const { run: runRun, captureSnapshot, restoreSnapshot, isCleanRepo, currentHead } = deps
+  const maxRuns = 1 + config.maxIterations
+  // Every run the loop starts is hosted by the shared dashboard: the runner
+  // never creates, holds, or stops it, and never decides when the server dies.
+  const hosted: RunOptions = { ...options, progress, autoAccept, goalContinues: true, deferPostHooks: true }
   const scores: number[] = []
   let best: BestState | undefined
   // Track the HEAD the loop's own runs leave behind, so the restore can refuse
   // when someone else committed on the branch between the last run and the
   // restore — that committed work would be silently discarded by a reset --hard.
   let lastHead: string | undefined
+  let previous: RunResult | undefined
 
-  // The initial run is the first iteration of the loop. When more iterations
-  // are possible, it is flagged goalContinues so the runner never holds the
-  // finish screen between iterations (the loop's promise is "don't stop until
-  // the score reaches the target", and a keypress gate would defeat it). When
-  // maxIterations is 0 the initial run is the only run, so the finish screen
-  // is allowed to show the score and trajectory.
-  const initialContinues = config.maxIterations > 0
-  let previous: RunResult = await runRun({ ...options, plan, deferPostHooks: true, ...(initialContinues ? { goalContinues: true } : {}) })
+  // The header's live view: the next iteration about to run (scores so far,
+  // plus a pending marker until that iteration scores) — or, with an outcome,
+  // the verdict and the full trajectory the finish screen freezes.
+  const viewFor = (outcome?: GoalLoopView["outcome"]): GoalLoopView => ({
+    target: config.goal,
+    iteration: scores.length + 1,
+    maxRuns,
+    plateau: config.plateau,
+    scores: [...scores],
+    ...(outcome ? { outcome } : {}),
+  })
+  const outcomeView = (outcome: GoalLoopOutcome): GoalLoopView["outcome"] => ({
+    reason: outcome.reason,
+    reached: outcome.reached,
+    restored: outcome.restored,
+  })
+
+  /**
+   * The loop's single finish hold. Paints the verdict live first, makes sure
+   * the [f] finish seam resolves against the last run's workspace, points Ctrl+C
+   * at the loop's shutdown, holds the dashboard once, and finally releases the
+   * last run's server. Called exactly once per loop — also when the loop stops
+   * short of the cap (goal met or plateau) — and never on a user abort.
+   */
+  const hold = async (
+    status: "completed" | "failed",
+    error?: string,
+    outcome?: GoalLoopView["outcome"],
+    runDir = previous?.dir ?? "",
+  ): Promise<void> => {
+    // The view travels with the hold so the finish screen keeps the verdict
+    // (when there is one) and the trajectory the loop measured.
+    const view = viewFor(outcome)
+    progress.setGoalLoop?.(view)
+    if (status === "completed" && previous?.workspace) {
+      const { createFinishSeam } = await import("./finish")
+      progress.setHostControls?.({ finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: previous.workspace.dir }) })
+    }
+    progress.setAbortHandler?.(() => shutdown.request("Ctrl+C"))
+    await holdFinishScreen(progress, shutdown, {
+      status,
+      runDir,
+      ...(error !== undefined ? { error } : {}),
+      goalLoop: view,
+    })
+    // Each run releases exactly once: run N as N+1 starts, the last after the
+    // hold. On the failure path `previous` was already released (the failed
+    // run's own teardown rides on the error, released by onRunFailure).
+    if (status === "completed") await previous?.release?.()
+  }
+
+  // A failed run is a hard stop: restore the best measured state if the guards
+  // allow it, hold the failed screen with whatever trajectory accumulated, then
+  // release the failed run's server and surface the error. A user abort never
+  // holds and never restores — it is a deliberate stop, not a failure — but it
+  // still releases the aborted run's deferred teardown: the server (localhost),
+  // the coordinator lease, and the metadata attach entry must not outlive the
+  // process just because the operator pressed Ctrl+C.
+  const onRunFailure = async (error: unknown): Promise<never> => {
+    if (isUserAbortError(error)) {
+      await hostedTeardownFromError(error)?.release?.()
+      throw error
+    }
+    // Nothing measured yet (the initial run failed): there is no best state to
+    // put back, so skip the restore attempt and its warning entirely.
+    if (best) await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead)
+    const teardown = hostedTeardownFromError(error)
+    await hold("failed", error instanceof Error ? error.message : String(error), undefined, teardown?.runDir)
+    await teardown?.release?.()
+    throw error
+  }
+
+  // The initial run is the first iteration of the loop.
+  progress.setGoalLoop?.(viewFor())
+  try {
+    previous = await runRun({ ...hosted, plan })
+  } catch (error) {
+    await onRunFailure(error)
+    throw error
+  }
   kept.adopt(previous)
   lastHead = await currentHead(options.targetDir)
   let score = previous.qualityScore?.score
   if (score === undefined) {
     log.warn("goal loop: the run produced no machine-readable quality score; nothing to iterate on")
-    return { scores, reached: false, reason: "no-score", restored: false }
+    const outcome = summarize({ scores, reached: false, reason: "no-score", restored: false })
+    await hold("completed", undefined, outcomeView(outcome))
+    return outcome
   }
   scores.push(score)
   best = { score, snapshot: await captureBestEffort(options.targetDir, captureSnapshot) }
   logIteration(0, score, config, undefined)
   if (score >= config.goal) {
-    return summarize({ scores, reached: true, reason: "goal", bestScore: best.score, restored: false })
+    const outcome = summarize({ scores, reached: true, reason: "goal", bestScore: best.score, restored: false })
+    await hold("completed", undefined, outcomeView(outcome))
+    return outcome
   }
+  progress.setGoalLoop?.(viewFor())
 
   // Each stop reason is set explicitly at the decision point that produces it;
   // the iteration cap is the default so an exhaust loop always lands on a real
@@ -216,24 +318,26 @@ async function runGoalIterations(
   let reason: GoalLoopOutcome["reason"] = "max-iterations"
   let restored = false
   for (let iteration = 1; iteration <= config.maxIterations; iteration++) {
-    // The last possible iteration must not set goalContinues: when the loop
-    // hits the iteration cap, the finish screen shows the final score and
-    // trajectory instead of silently advancing past it. Earlier iterations keep
-    // the flag so the loop runs unattended between fix rounds.
-    const continues = iteration < config.maxIterations
-    const fixOptions = goalFixOptions(options, previous, scores, continues)
+    if (shutdown.aborted) {
+      // An abort landing between runs must still release the previous run's
+      // server/lease: the loop exits without a hold, so nothing else would.
+      await previous?.release?.()
+      shutdown.throwIfRequested()
+    }
+    // The feed resets for the new run but keeps this announcement, so the
+    // dashboard always says which iteration is on and what the last score was.
+    const lastScore = scores[scores.length - 1]
+    if (lastScore !== undefined) {
+      progress.message?.(`goal loop: iteration ${iteration + 1}/${maxRuns} · last ${lastScore}/100`)
+    }
+    await previous.release?.()
+    const fixOptions = goalFixOptions(hosted, previous, scores)
     try {
       previous = await runRun({ ...fixOptions, plan: buildRunPlan(fixOptions) })
       kept.adopt(previous)
       lastHead = await currentHead(options.targetDir)
     } catch (error) {
-      // A user abort (Ctrl+C) is a deliberate stop, not a failure to recover
-      // from: never roll the branch back under the operator's feet.
-      if (isUserAbortError(error)) throw error
-      // A failed fix iteration may have mutated the tree after the fixer ran;
-      // put the branch back on the best measured state before surfacing it,
-      // but only when the tree is clean so concurrent operator work survives.
-      restored = await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead)
+      await onRunFailure(error)
       throw error
     }
     score = previous.qualityScore?.score
@@ -248,6 +352,7 @@ async function runGoalIterations(
     }
     const improvement = score - scores[scores.length - 2]!
     logIteration(iteration, score, config, improvement)
+    progress.setGoalLoop?.(viewFor())
 
     if (score >= config.goal) {
       reason = "goal"
@@ -270,10 +375,12 @@ async function runGoalIterations(
     restored = await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead)
   }
 
-  return summarize({ scores, reached: reason === "goal", reason, bestScore: best?.score, restored })
+  const outcome = summarize({ scores, reached: reason === "goal", reason, bestScore: best?.score, restored })
+  await hold("completed", undefined, outcomeView(outcome))
+  return outcome
 }
 
-function goalFixOptions(options: RunOptions, prev: RunResult, trajectory: number[], continues: boolean): RunOptions {
+function goalFixOptions(options: RunOptions, prev: RunResult, trajectory: number[]): RunOptions {
   const base = options.goalFixPipeline
   if (!base) throw new Error("goal loop: the goal-fix pipeline is not resolved for this run")
   const brief = goalBriefFor(prev)
@@ -291,10 +398,10 @@ function goalFixOptions(options: RunOptions, prev: RunResult, trajectory: number
     deferPostHooks: true,
     // The finish screen shows the trajectory building across iterations.
     goalTrajectory: [...trajectory],
-    // When this iteration will be followed by another, never hold the finish
-    // screen (the loop runs unattended). On the last possible iteration, let
-    // the finish screen hold so the operator sees the final score and trajectory.
-    ...(continues ? { goalContinues: true } : {}),
+    // The loop, not this run, holds the finish screen — even on the last
+    // possible iteration. `goalContinues` stays true so the runner never holds
+    // between iterations.
+    goalContinues: true,
     // Fix iterations must never re-enter goal mode or filter steps.
     goal: undefined,
     goalMaxIterations: undefined,

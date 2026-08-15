@@ -1149,6 +1149,195 @@ describe("pipeline group selection", () => {
   })
 })
 
+describe("goal loop header", () => {
+  test("paints the live goal, iteration, and pending trajectory", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.setGoalLoop({ target: 90, iteration: 2, maxRuns: 4, plateau: 3, scores: [71] })
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("goal 90")
+      expect(frame).toContain("iter 2/4")
+      // The current iteration hasn't scored yet: the trajectory trails off.
+      expect(frame).toContain("71 → …")
+      expect(frame).not.toContain("run completed")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a scored iteration shows the trajectory and the signed delta", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
+    try {
+      dashboard.setGoalLoop({ target: 90, iteration: 2, maxRuns: 4, plateau: 3, scores: [71, 84] })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("71 → 84")
+      expect(captureCharFrame()).toContain("+13")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("without setGoalLoop the header never mentions goal or iteration", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.phaseStarted("implement")
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).not.toContain("goal ")
+      expect(frame).not.toContain("iter ")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("the first iteration shows no trajectory at all", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.setGoalLoop({ target: 90, iteration: 1, maxRuns: 4, plateau: 3, scores: [] })
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("goal 90")
+      expect(frame).toContain("iter 1/4")
+      expect(frame).not.toContain(" → ")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a falling score paints a negative delta", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
+    try {
+      dashboard.setGoalLoop({ target: 90, iteration: 2, maxRuns: 4, plateau: 3, scores: [84, 82] })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("-2")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("finish verdicts: goal, plateau, cap, and no-score", async () => {
+    const cases: Array<{ outcome: NonNullable<Parameters<TuiProgress["setGoalLoop"]>[0]["outcome"]>; scores: number[]; verdict: string; trajectory: string }> = [
+      { outcome: { reason: "goal", reached: true, restored: false }, scores: [71, 84, 92], verdict: "✓ goal 92/100", trajectory: "71 → 84 → 92" },
+      { outcome: { reason: "plateau", reached: false, restored: true }, scores: [71, 86, 70], verdict: "plateau 86/100", trajectory: "71 → 86 → 70" },
+      { outcome: { reason: "max-iterations", reached: false, restored: false }, scores: [71, 80, 85, 88], verdict: "cap 88/100", trajectory: "71 → 80 → 85 → 88" },
+      { outcome: { reason: "no-score", reached: false, restored: true }, scores: [71], verdict: "no score", trajectory: "71" },
+    ]
+    for (const testCase of cases) {
+      const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
+      try {
+        void dashboard.runFinished({
+          status: "completed",
+          runDir: "",
+          goalLoop: { target: 90, iteration: 3, maxRuns: 4, plateau: 3, scores: testCase.scores, outcome: testCase.outcome },
+        })
+        await renderOnce()
+        const frame = captureCharFrame()
+        expect(frame, testCase.outcome.reason).toContain(testCase.verdict)
+        expect(frame, testCase.outcome.reason).toContain(testCase.trajectory)
+        expect(frame, testCase.outcome.reason).not.toContain("run completed")
+      } finally {
+        dashboard.stop()
+      }
+    }
+  })
+
+  test("a restored plateau announces restored to best", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
+    try {
+      void dashboard.runFinished({
+        status: "completed",
+        runDir: "",
+        goalLoop: { target: 90, iteration: 3, maxRuns: 4, plateau: 3, scores: [71, 86, 70], outcome: { reason: "plateau", reached: false, restored: true } },
+      })
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("plateau 86/100")
+      expect(frame).toContain("restored to best")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a failed goal run keeps the failed indicator and the trajectory", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
+    try {
+      void dashboard.runFinished({
+        status: "failed",
+        runDir: "",
+        error: "boom",
+        goalLoop: { target: 90, iteration: 3, maxRuns: 4, plateau: 3, scores: [71, 84] },
+      })
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("✗ run failed")
+      expect(frame).toContain("71 → 84")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("resetPipeline swaps phases and the pipeline title to the new pipeline name", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40, [{ name: "plan", description: "" }])
+    try {
+      dashboard.phaseStarted("plan")
+      await renderOnce()
+      expect(captureCharFrame()).toContain("plan")
+
+      dashboard.resetPipeline(
+        [
+          { name: "fix", description: "" },
+          { name: "score__gpt", description: "" },
+        ],
+        { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "goal-fix", steps: [] } },
+      )
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("pipeline · goal-fix")
+      expect(frame).toContain("fix")
+      expect(frame).toContain("score__gpt")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("prior usage survives resetPipeline in the header totals", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40, [{ name: "implement", description: "" }])
+    try {
+      dashboard.phaseStarted("implement")
+      dashboard.phaseUsageTotal("implement", { cost: 1.82, tokens: { input: 120000, output: 40000, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 160000 }, model: "openai/gpt-5" })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("$1.82")
+
+      dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "goal-fix", steps: [] } })
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("$1.82")
+      expect(frame).toContain("↑120.0k ↓40.0k")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("elapsed does not reset to zero when resetPipeline swaps the iteration", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40, [{ name: "implement", description: "" }])
+    try {
+      dashboard.phaseStarted("implement")
+      await Bun.sleep(1100)
+      await renderOnce()
+      // The header clock has advanced past zero.
+      expect(captureCharFrame()).not.toContain("·  0:00")
+
+      dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "goal-fix", steps: [] } })
+      await renderOnce()
+      // The clock kept running from the loop's start rather than the new run's.
+      expect(captureCharFrame()).not.toContain("·  0:00")
+    } finally {
+      dashboard.stop()
+    }
+  })
+})
+
 describe("permission modal [e] explain and [i] inspect", () => {
   test("[e] without explain callback reports that no safety judge is configured", async () => {
     const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(200, 40)

@@ -37,6 +37,7 @@ import {
   type ProgressDiffSummary,
   type ProgressMessage,
   type ProgressPhase,
+  type ProgressHostControls,
   type ProgressStepUsage,
   type ProgressTodo,
   type ProgressTokens,
@@ -358,7 +359,7 @@ export function createGitLock(): GitLock {
   }
 }
 
-function installShutdownSignals(shutdown: RunShutdown) {
+export function installShutdownSignals(shutdown: RunShutdown) {
   // Bun delivers the numeric signal value to handlers; normalize for logs.
   const handler = (signal: NodeJS.Signals | number) =>
     shutdown.request(typeof signal === "number" ? (signal === 15 ? "SIGTERM" : signal === 2 ? "SIGINT" : `signal ${signal}`) : signal)
@@ -382,6 +383,32 @@ export type RunResult = {
    * clean up afterwards.
    */
   workspace?: Workspace
+  /**
+   * Present on a hosted run (options.progress set): closes the run's opencode
+   * server, releases its coordinator lease, and clears its metadata server
+   * entry — everything the finally defers so the caller (the goal loop) decides
+   * when the previous iteration's run may shut down.
+   */
+  release?: () => Promise<void>
+}
+
+/**
+ * Runs under a hosted `options.progress` defer their server/lease cleanup to a
+ * `RunResult.release`. A failed run throws instead of returning a result, so the
+ * teardown (and the run dir, which the loop's failed finish screen needs) rides
+ * on the error object itself; the goal loop fetches it with this helper in its
+ * failure path.
+ */
+export type HostedRunTeardown = {
+  release: () => Promise<void>
+  runDir: string
+}
+
+const hostedTeardowns = new WeakMap<object, HostedRunTeardown>()
+
+export function hostedTeardownFromError(error: unknown): HostedRunTeardown | undefined {
+  if (error && typeof error === "object") return hostedTeardowns.get(error)
+  return undefined
 }
 
 export async function run(options: RunOptions) {
@@ -425,10 +452,13 @@ export async function run(options: RunOptions) {
   let hookSet = options.plan?.hooks ?? hooksForPipeline(options.hooks, options.pipeline.name)
   let pipelineNameForHooks = options.pipeline.name
   let postHooksStarted = false
+  // Hosted runs defer the server/lease teardown here; the loop calls it between
+  // iterations and after its finish hold.
+  let deferredRelease: (() => Promise<void>) | undefined
   const shutdown = new RunShutdown()
   const removeSignalHandlers = installShutdownSignals(shutdown)
 
-  const autoAccept: AutoAccept = { mode: options.yolo ? "all" : options.smart ? "smart" : "off" }
+  const autoAccept: AutoAccept = options.autoAccept ?? options.progress?.autoAccept ?? { mode: options.yolo ? "all" : options.smart ? "smart" : "off" }
   // cli.ts always resolves a concrete model string (--smart-model → config →
   // --model → defaults.model), so smart mode never lacks a judge.
   const judgeModel = parseModel(splitModelVariant(options.smartJudgeModel).model)
@@ -505,21 +535,31 @@ export async function run(options: RunOptions) {
     // Imported lazily: finish pulls in the commit-message writer (and through it
     // opencode), which a run that never reaches its finish screen shouldn't pay for.
     const { createFinishSeam } = await import("./finish")
-    progress = trackRunStatus(
-      recordProgress(
-        await createProgressUI(phases, options.tui, () => shutdown.request("Ctrl+C"), autoAccept, {
-          onPauseToggle: () => {
-            void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
-          },
-          onKeepAwakeToggle: () => {
-            void caffeinate?.toggle().catch((error) => log.warn(`couldn't toggle Caffeinate: ${formatSdkError(error)}`))
-          },
-          finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: workspace.dir }),
-        }),
-        metadata,
-      ),
-      statusTracker,
-    )
+    const hostControls: ProgressHostControls = {
+      onPauseToggle: () => {
+        void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
+      },
+      onKeepAwakeToggle: () => {
+        void caffeinate?.toggle().catch((error) => log.warn(`couldn't toggle Caffeinate: ${formatSdkError(error)}`))
+      },
+      finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: workspace.dir }),
+    }
+    if (options.progress) {
+      // Hosted by the goal loop: reuse its dashboard, repoint it at this run's
+      // controls and shutdown, and let this run's finally never tear it down.
+      options.progress.setHostControls?.(hostControls)
+      options.progress.setAbortHandler?.(() => shutdown.request("Ctrl+C"))
+      options.progress.resetPipeline?.(phases, { runID: workspace.runID, targetDir: options.targetDir, runDir: workspace.dir, pipeline })
+      progress = trackRunStatus(recordProgress(options.progress, metadata), statusTracker)
+    } else {
+      progress = trackRunStatus(
+        recordProgress(
+          await createProgressUI(phases, options.tui, () => shutdown.request("Ctrl+C"), autoAccept, hostControls),
+          metadata,
+        ),
+        statusTracker,
+      )
+    }
     control.bind(progress)
     caffeinate.bind(progress)
     if (notificationSettings.terminalTitle) statusTracker.bind(progress)
@@ -739,12 +779,15 @@ export async function run(options: RunOptions) {
       // A goal-loop iteration that will be followed by another must not hold the
       // finish screen: the loop runs unattended instead of waiting on a keypress.
       ...(options.goalContinues ? { goalContinues: true } : {}),
-    })
+    }, Boolean(options.progress))
     return {
       runID: workspace.runID,
       dir: workspace.dir,
       ...(runScoreResult ? { qualityScore: runScoreResult.score } : {}),
       ...(options.deferPostHooks ? { workspace } : {}),
+      // The release closure is built by the finally below; the arrow reads the
+      // variable afterwards, so it is always ready by the time the loop calls it.
+      ...(options.progress ? { release: async () => { await deferredRelease?.() } } : {}),
     }
   } catch (error) {
     let failure = error
@@ -771,7 +814,7 @@ export async function run(options: RunOptions) {
     runErr = failure
     if (!isUserAbortError(failure)) {
       await caffeinate?.stop()
-      await holdFinishScreen(progress, shutdown, { status: "failed", error: formatSdkError(failure), runDir: workspace.dir })
+      await holdFinishScreen(progress, shutdown, { status: "failed", error: formatSdkError(failure), runDir: workspace.dir }, Boolean(options.progress))
     }
     throw failure
   } finally {
@@ -780,18 +823,41 @@ export async function run(options: RunOptions) {
     await caffeinate?.stop()
     await notifier?.stop()
     await permissions?.stop()
-    // Before the server: a tool call still in flight would otherwise hang on a
-    // socket nobody is going to answer. The bridge goes first — the tool source
-    // carries the URL and token embedded as string literals (not process.env),
-    // and they point at a bridge that no longer exists. The tool's execute will
-    // fail with a fetch error, which it handles gracefully.
-    advisorBridge?.close()
-    // The server dies at the end of this block; clear its metadata entry now so
-    // `convoy runs` stops offering to attach to a run that's shutting down.
-    await metadata?.serverStopped().catch((error) => log.warn(`couldn't persist server-stopped metadata: ${String(error)}`))
-    await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
-    await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
-    progress.stop()
+    if (options.progress) {
+      // The goal loop owns the dashboard and decides when this run's server may
+      // shut down: hand the teardown back as a release, and never stop the
+      // shared UI or restore the constructor abort handler yet.
+      options.progress.setAbortHandler?.(undefined)
+      deferredRelease = async () => {
+        // Before the server: a tool call still in flight would otherwise hang on
+        // a socket nobody is going to answer. The bridge goes first — the tool
+        // source carries the URL and token embedded as string literals (not
+        // process.env), and they point at a bridge that no longer exists.
+        advisorBridge?.close()
+        // The server dies at the end of this block; clear its metadata entry now
+        // so `convoy runs` stops offering to attach to a run that's shutting down.
+        await metadata?.serverStopped().catch((error) => log.warn(`couldn't persist server-stopped metadata: ${String(error)}`))
+        await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
+        await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
+        opencode?.close()
+      }
+      if (runErr && typeof runErr === "object") {
+        hostedTeardowns.set(runErr, { release: deferredRelease, runDir: workspace.dir })
+      }
+    } else {
+      // Before the server: a tool call still in flight would otherwise hang on a
+      // socket nobody is going to answer. The bridge goes first — the tool source
+      // carries the URL and token embedded as string literals (not process.env),
+      // and they point at a bridge that no longer exists. The tool's execute will
+      // fail with a fetch error, which it handles gracefully.
+      advisorBridge?.close()
+      // The server dies at the end of this block; clear its metadata entry now so
+      // `convoy runs` stops offering to attach to a run that's shutting down.
+      await metadata?.serverStopped().catch((error) => log.warn(`couldn't persist server-stopped metadata: ${String(error)}`))
+      await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
+      await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
+      progress.stop()
+    }
     // The tracker's stop() above publishes the final stopped snapshot (idle /
     // blocked); release the Herdr lifecycle authority right after so the
     // release-agent command is the last one for this source.
@@ -815,8 +881,9 @@ export async function run(options: RunOptions) {
 
     // Kill the server last and return immediately: once it dies, any event
     // stream still held open by the SDK starts failing, and those failures
-    // must not get a chance to surface mid-cleanup.
-    opencode?.close()
+    // must not get a chance to surface mid-cleanup. Hosted runs defer this to
+    // their release so the goal loop's finish hold can still serve [o].
+    if (!options.progress) opencode?.close()
   }
 }
 
@@ -829,9 +896,10 @@ export async function run(options: RunOptions) {
 // loop's promise is "don't stop until the score reaches the target", and
 // blocking on a keypress between every iteration would defeat it. The run's
 // phases were already shown live in the TUI; the trajectory is logged when the
-// loop ends.
-async function holdFinishScreen(progress: ProgressUI, shutdown: RunShutdown, outcome: RunOutcome) {
-  if (!progress.runFinished || shutdown.aborted || outcome.goalContinues) return
+// loop ends. A hosted run (options.progress set) never holds either: the loop
+// holds exactly once, at the very end, through this same helper.
+export async function holdFinishScreen(progress: ProgressUI, shutdown: RunShutdown, outcome: RunOutcome, hosted = false) {
+  if (!progress.runFinished || shutdown.aborted || outcome.goalContinues || hosted) return
   await Promise.race([
     progress.runFinished(outcome),
     new Promise<void>((resolve) => shutdown.signal.addEventListener("abort", () => resolve(), { once: true })),

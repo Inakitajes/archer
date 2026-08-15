@@ -1,5 +1,6 @@
 import type { AdvisorAuditPolicy } from "./advisor-events"
 import type { NotificationSettings } from "./notifications"
+import type { AutoAccept, ProgressUI } from "./progress"
 import type { StepRunnerId } from "./step-runners"
 import type { ModelGateway, ModelRoutingOverrides, ResolvedModel } from "./model-routing"
 
@@ -84,6 +85,19 @@ export type RunOptions = {
    * and running them ahead of each fix round is harmless.
    */
   deferPostHooks?: boolean
+  /**
+   * A shared progress UI the caller owns (the goal loop's dashboard). When set,
+   * the runner does not create or stop its own UI, does not hold the finish
+   * screen, and hands the server/lease cleanup back via `RunResult.release`
+   * instead of doing it in the finally.
+   */
+  progress?: ProgressUI
+  /**
+   * The shared auto-accept reference to use for the permission gate. When set,
+   * the gate uses exactly this object (so a dashboard shift+tab toggle reaches
+   * it); otherwise it derives one from `yolo`/`smart`.
+   */
+  autoAccept?: AutoAccept
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */
