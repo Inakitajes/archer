@@ -645,8 +645,39 @@ describe("model routing config", () => {
     const project = parse("modelRouting:\n  overrides:\n    zai/glm-5.2:\n      vercel: vercel/zai/glm-5.2")
 
     expect(mergeConvoyConfigs(global, project)?.modelRouting?.overrides).toEqual({
-      "zai/glm-5.2": { openrouter: "openrouter/z-ai/glm-5.2", vercel: "vercel/zai/glm-5.2" },
+      "zai/glm-5.2": {
+        openrouter: "openrouter/z-ai/glm-5.2",
+        vercel: "vercel/zai/glm-5.2",
+      },
     })
+  })
+})
+
+describe("loopGuard config", () => {
+  test("parses a partial override and leaves the rest unset", () => {
+    const config = parse("loopGuard:\n  identicalCalls: 8\n  maxPhaseCost: 12.5")
+    expect(config.loopGuard).toEqual({ identicalCalls: 8, maxPhaseCost: 12.5 })
+  })
+
+  test("accepts maxPhaseCost: false to disable the cost fuse", () => {
+    expect(parse("loopGuard:\n  maxPhaseCost: false").loopGuard).toEqual({ maxPhaseCost: false })
+  })
+
+  test("rejects values that would trip on the first call", () => {
+    expect(() => parse("loopGuard:\n  identicalCalls: 1")).toThrow("loopGuard.identicalCalls")
+    expect(() => parse("loopGuard:\n  maxSteps: 3")).toThrow("loopGuard.maxSteps")
+    expect(() => parse("loopGuard:\n  maxPhaseCost: 0")).toThrow("loopGuard.maxPhaseCost")
+  })
+
+  test("project keys win over global keys", () => {
+    const global = parse("loopGuard:\n  identicalCalls: 8\n  maxPhaseCost: 30")
+    const project = parse("loopGuard:\n  maxPhaseCost: false")
+    expect(mergeConvoyConfigs(global, project)?.loopGuard).toEqual({ identicalCalls: 8, maxPhaseCost: false })
+  })
+
+  test("round-trips through serialize", () => {
+    const config = parse("loopGuard:\n  enabled: false\n  maxSteps: 40\n  maxPhaseCost: false")
+    expect(parse(serializeConvoyConfig(config)).loopGuard).toEqual(config.loopGuard)
   })
 })
 
@@ -798,6 +829,9 @@ describe("default config init", () => {
     expect(body).toContain("#   implementer:")
     expect(body).toContain("#   design-polisher:")
     expect(body).toContain("#   api-reviewer:")
+    expect(body).toContain("# loopGuard:")
+    expect(body).toContain("#   identicalCalls: 4")
+    expect(body).toContain("#   maxPhaseCost: 20")
     expect(config.defaults).toEqual({})
     expect(config.agents).toEqual({})
     // Seeding prompts would shadow every built-in for good, so init writes none.

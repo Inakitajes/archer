@@ -1,4 +1,5 @@
 import type { AdvisorAuditPolicy } from "./advisor-events"
+import type { LoopGuardSettings } from "./loop-guard"
 import type { NotificationSettings } from "./notifications"
 import type { StepRunnerId } from "./step-runners"
 import type { ModelGateway, ModelRoutingOverrides, ResolvedModel } from "./model-routing"
@@ -92,6 +93,11 @@ export type RunOptions = {
   permissions: PermissionAdditions
   /** Shell hooks configured globally and/or per pipeline. */
   hooks: HooksConfig
+  /**
+   * Circuit breaker for an OpenCode phase that is repeating itself. Unset keys
+   * keep the built-in defaults; `enabled: false` turns the whole guard off.
+   */
+  loopGuard?: LoopGuardSettings
 }
 
 export type PermissionAdditions = {

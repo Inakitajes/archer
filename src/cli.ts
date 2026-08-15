@@ -723,6 +723,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     agents,
     permissions: config?.permissions ?? { allow: [], deny: [] },
     hooks: config?.hooks ?? emptyHooksConfig(),
+    ...(config?.loopGuard ? { loopGuard: config.loopGuard } : {}),
   }
 
   // Fast feedback for typos; a resumed run validates again in the runner

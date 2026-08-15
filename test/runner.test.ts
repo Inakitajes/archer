@@ -30,6 +30,8 @@ import {
   parseModel,
   planBatches,
   progressPhases,
+  promptPhase,
+  applyCompletionCheckpoint,
   runPhaseUntilResolved,
   restorePhaseFromPreviousRun,
   selectInterruptedPhase,
@@ -40,6 +42,7 @@ import {
 } from "../src/runner"
 import type { AgentStep, HumanStep, Pipeline, Step } from "../src/types"
 import type { Workspace } from "../src/workspace"
+import { LoopGuard, LoopGuardError, resolveLoopGuard } from "../src/loop-guard"
 
 const recoveryDirs: string[] = []
 
@@ -434,6 +437,7 @@ describe("run phase gate", () => {
     attachments: [],
     prompt: "test prompt",
     model: { providerID: "openai", modelID: "gpt-5.5" },
+    loopGuard: resolveLoopGuard(),
   }
   async function retryWorkspace(): Promise<Workspace> {
     const dir = await mkdtemp(join(tmpdir(), "convoy-retry-"))
@@ -522,6 +526,57 @@ describe("run phase gate", () => {
     expect(result).toBe("")
     expect(attempts).toEqual([1])
     expect(restores).toBe(0)
+    expect(prompts[0]?.kind).toBe("failure")
+    expect(prompts[0]?.canRetry).toBe(true)
+  })
+
+  test("a loop-guard trip reaches the decision gate instead of being swallowed", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("continue")
+      },
+    }
+
+    // The follow-up turn's guard trip surfaces as a LoopGuardError from the
+    // attempt. Like any other attempt failure it must open the normal failure
+    // gate (retry / iterate / abort) rather than quietly keeping the phase.
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      agentStep("implementer"),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          throw new LoopGuardError({
+            reason: "identical-calls",
+            message: "read called 4 times in a row. The phase was aborted to stop a runaway session.",
+            count: 4,
+            tool: "read",
+          })
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    expect(result).toBe("")
+    expect(attempts).toEqual([1])
+    expect(restores).toBe(0)
+    expect(prompts).toHaveLength(1)
     expect(prompts[0]?.kind).toBe("failure")
     expect(prompts[0]?.canRetry).toBe(true)
   })
@@ -1565,6 +1620,48 @@ describe("watchSession turn scoping", () => {
     expect(result.parts).toHaveLength(2)
   })
 
+  test("aborts the session when the loop guard sees the same tool call over and over", async () => {
+    const aborted: string[] = []
+    const activities: string[] = []
+    async function* stream() {
+      for (let index = 0; index < 4; index++) {
+        yield {
+          type: "session.next.tool.called",
+          properties: { sessionID: "ses_1", tool: "read", input: { filePath: "src/a.ts" } },
+        }
+      }
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        messages: async () => ({ data: [] }),
+        status: async () => ({ data: { ses_1: { type: "busy" } } }),
+        abort: async (args: { sessionID: string }) => {
+          aborted.push(args.sessionID)
+          return {}
+        },
+      },
+    } as never
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress: {
+        ...noopProgress,
+        phaseActivity: (_name, detail) => void activities.push(detail),
+      },
+      signal: new AbortController().signal,
+      loopGuard: new LoopGuard(resolveLoopGuard({ identicalCalls: 4 })),
+    })
+
+    await expect(watcher.result).rejects.toBeInstanceOf(LoopGuardError)
+    await Promise.resolve()
+    expect(aborted).toEqual(["ses_1"])
+    expect(activities.some((line) => line.includes("read called 4 times"))).toBe(true)
+    await watcher.stop()
+  })
+
   test("waits for the follow-up turn instead of resolving on the previous one", async () => {
     // Only the first turn exists: the anchored watcher has nothing of its own
     // yet, and resolving here would report an empty turn as a finished one.
@@ -1587,6 +1684,154 @@ describe("watchSession turn scoping", () => {
     expect(settled).toBe("pending")
     close()
     await watcher.stop()
+  })
+})
+
+describe("loopGuard seam regressions", () => {
+  const completedMessage = (id: string, cost: number, text: string) => ({
+    info: {
+      id,
+      sessionID: "ses_1",
+      role: "assistant" as const,
+      time: { created: 1, completed: 2 },
+      parentID: "p",
+      modelID: "gpt-5.5",
+      providerID: "openai",
+      mode: "primary",
+      agent: "implementer",
+      path: { cwd: "/repo", root: "/repo" },
+      cost,
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+    parts: [{ id: `${id}_p`, sessionID: "ses_1", messageID: id, type: "text" as const, text }],
+  })
+
+  // A fake opencode client whose event stream yields `updates` then idles, and
+  // whose session.messages hands back `messages` for completion verification.
+  function watcherClient(updates: unknown[], messages: unknown[], loopGuard?: LoopGuard) {
+    async function* stream() {
+      for (const update of updates) yield update
+      yield { type: "session.idle", properties: { sessionID: "ses_1" } }
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        messages: async () => ({ data: messages }),
+        status: async () => ({ data: {} }),
+        abort: async () => ({}),
+      },
+    } as never
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress: noopProgress,
+      signal: new AbortController().signal,
+      ...(loopGuard ? { loopGuard } : {}),
+    })
+    return { watcher }
+  }
+
+  test("SC-1: maxPhaseCost: false survives promptPhase without a re-armed $20 cap", async () => {
+    const costOfTurn = 25 // well above the built-in $20 cap
+    const messages = [completedMessage("msg_1", costOfTurn, "# report")]
+    async function* stream() {
+      yield messageUpdated(assistantInfo("msg_1", costOfTurn, 2_000, 400))
+      yield { type: "session.idle", properties: { sessionID: "ses_1" } }
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        create: async () => ({ data: { id: "ses_1" } }),
+        promptAsync: async () => ({}),
+        messages: async () => ({ data: messages }),
+        status: async () => ({ data: {} }),
+        abort: async () => ({}),
+      },
+    } as never
+
+    // The config is resolved once by preparePhaseRun; promptPhase must not
+    // resolve it again (which would re-arm the $20 default over `false`).
+    const result = await promptPhase(client, {
+      phase: agentStep("implementer"),
+      workspace: { dir: "/run", runID: "test-run" } as Workspace,
+      targetDir: "/repo",
+      prompt: "do the thing",
+      model: { providerID: "openai", modelID: "gpt-5.5" },
+      attachments: [],
+      progress: noopProgress,
+      shutdown: new RunShutdown(),
+      attempt: 1,
+      loopGuardConfig: resolveLoopGuard({ maxPhaseCost: false }),
+    })
+
+    expect(result.info.id).toBe("msg_1")
+  })
+
+  test("SC-2: a follow-up watcher's spend accumulates into the shared cost cap", async () => {
+    const guard = new LoopGuard(resolveLoopGuard({ maxPhaseCost: 20 }))
+
+    // Turn 1: two messages totalling $15 stay under the $20 cap.
+    const first = watcherClient(
+      [messageUpdated(assistantInfo("msg_1", 10, 1_000, 200)), messageUpdated(assistantInfo("msg_2", 5, 500, 100))],
+      [completedMessage("msg_1", 10, "part one"), completedMessage("msg_2", 5, "part two")],
+      guard,
+    )
+    const turn1 = await first.watcher.result
+    await first.watcher.stop()
+    expect(turn1.assistantInfos.map((info) => info.id)).toEqual(["msg_1", "msg_2"])
+
+    // Turn 2: a NEW watcher (fresh state) sees only its own message, but the
+    // shared guard carries the turn-1 spend, so $7 on top trips the $20 cap.
+    const second = watcherClient([messageUpdated(assistantInfo("msg_3", 7, 700, 100))], [completedMessage("msg_3", 7, "follow-up")], guard)
+    await expect(second.watcher.result).rejects.toBeInstanceOf(LoopGuardError)
+    await second.watcher.stop()
+  })
+
+  test("SC-3: a loop-guard trip in the follow-up turn rejects instead of keeping the phase", async () => {
+    const loopGuard = new LoopGuard(resolveLoopGuard({ identicalCalls: 2 }))
+    const advisor = {
+      consult: async () => ({ text: "redo the tests", ok: true as const, callId: "call_1" }),
+      delivered: async () => {},
+    }
+    async function* stream() {
+      yield { type: "session.next.tool.called", properties: { sessionID: "ses_1", tool: "read", input: { filePath: "a.ts" } } }
+      yield { type: "session.next.tool.called", properties: { sessionID: "ses_1", tool: "read", input: { filePath: "a.ts" } } }
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        messages: async () => ({ data: [] }),
+        status: async () => ({ data: {} }),
+        promptAsync: async () => ({}),
+        abort: async () => ({}),
+      },
+    } as never
+    const first = {
+      info: { id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1, completed: 2 } },
+      parts: [],
+      assistantInfos: [],
+    } as never
+
+    await expect(
+      applyCompletionCheckpoint(
+        client,
+        {
+          phase: agentStep("implementer"),
+          targetDir: "/repo",
+          model: { providerID: "openai", modelID: "gpt-5.5" },
+          progress: noopProgress,
+          shutdown: new RunShutdown(),
+          sessionID: "ses_1",
+          loopGuard,
+        },
+        first,
+        advisor as never,
+      ),
+    ).rejects.toBeInstanceOf(LoopGuardError)
   })
 })
 

@@ -5,6 +5,7 @@ import type { AgentConfig, Config } from "@opencode-ai/sdk/v2"
 import { advisorFeedbackToolName, advisorProviderOverride, advisorToolName, type ModelSelection } from "./advisor"
 import { bashPolicy, noAdditions } from "./bash-policy"
 import { builtInPrompts } from "./built-in-prompts"
+import { resolveLoopGuard, softAgentSteps, type LoopGuardSettings } from "./loop-guard"
 import { builtInAgents, readOnlyAgentSuffix } from "./pipeline"
 import type { AgentSpec, PermissionAdditions } from "./types"
 import { globalAgentsDir } from "./workspace"
@@ -28,6 +29,11 @@ export type OpencodeConfigOptions = {
   advisorModels?: readonly ModelSelection[]
   /** Output cap for those aliases. */
   advisorMaxTokens?: number
+  /**
+   * Circuit-breaker settings for this run. Drives the soft OpenCode `steps`
+   * budget; the hard abort lives in the session watcher.
+   */
+  loopGuard?: LoopGuardSettings
 }
 
 export function opencodeConfig(
@@ -38,6 +44,10 @@ export function opencodeConfig(
   options: OpencodeConfigOptions = {},
 ): Config {
   const advisorAgents = options.advisorAgents ?? new Set<string>()
+  const loopGuard = resolveLoopGuard(options.loopGuard)
+  // Soft prompt only: current OpenCode still advertises tools after this. The
+  // watcher is what actually stops a model that ignores it.
+  const steps = loopGuard.enabled ? softAgentSteps(loopGuard.maxSteps) : undefined
   const agent: Record<string, AgentConfig> = {}
   for (const spec of agents) {
     // Synthesized forced-read-only variants (name suffixed "__ro", see
@@ -56,6 +66,7 @@ export function opencodeConfig(
       false,
       permissions,
       advised,
+      steps,
     )
   }
 
@@ -64,6 +75,10 @@ export function opencodeConfig(
     provider: mergeProviders(providerTimeouts(), advisorProviderOverride(options.advisorModels ?? [], options.advisorMaxTokens)),
     permission: {
       question: "deny",
+      // OpenCode's detector only sees repeats inside one assistant message, so
+      // this almost never fires for the real loop. Deny anyway: if it does
+      // fire, stop. YOLO cannot override a deny.
+      doom_loop: "deny",
     },
   }
 }
@@ -157,12 +172,14 @@ function agentConfig(
   webfetch: boolean,
   permissions: PermissionAdditions,
   advisor = false,
+  steps?: number,
 ): AgentConfig {
   if (readOnly) {
     return {
       description,
       mode: "primary",
       ...(temperature === undefined ? {} : { temperature }),
+      ...(steps === undefined ? {} : { steps }),
       tools: {
         read: true,
         list: true,
@@ -188,6 +205,7 @@ function agentConfig(
         question: "deny",
         webfetch: webfetch ? "allow" : "deny",
         websearch: "deny",
+        doom_loop: "deny",
         external_directory: {
           "*": "deny",
           [join(runDir, "**")]: "allow",
@@ -201,6 +219,7 @@ function agentConfig(
     description,
     mode: "primary",
     ...(temperature === undefined ? {} : { temperature }),
+    ...(steps === undefined ? {} : { steps }),
     tools: {
       read: true,
       write: true,
@@ -217,6 +236,7 @@ function agentConfig(
       // immediately, so no new human prompt appears.
       edit: advisor ? "ask" : "allow",
       question: "deny",
+      doom_loop: "deny",
       bash: bashPolicy(targetDir, permissions),
       external_directory: {
         "*": "deny",
