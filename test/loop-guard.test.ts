@@ -8,6 +8,7 @@ import {
   observationFromSessionEvent,
   resolveLoopGuard,
   softAgentSteps,
+  type LoopGuardObservation,
 } from "../src/loop-guard"
 
 const tight = resolveLoopGuard({ identicalCalls: 3, sameToolFailures: 3, maxSteps: 5, maxPhaseCost: 2 })
@@ -98,6 +99,83 @@ describe("LoopGuard same-tool failures", () => {
   })
 })
 
+describe("LoopGuard callID tool correlation (SDK contract)", () => {
+  // QSR-1/QSR-2: session.next.tool.success/failed carry callID but no tool or
+  // name. The guard must remember each call's tool from the called event and
+  // resolve result identity through callID, or distinct tools' failures
+  // collapse into one synthetic "tool" and false-trip the same-tool fuse.
+  // These three event types always map to an observation, so the helpers assert
+  // non-undefined to keep `observe`'s `LoopGuardObservation` parameter happy.
+  const called = (tool: string, callID: string, input: Record<string, unknown> = {}): LoopGuardObservation =>
+    observationFromSessionEvent("session.next.tool.called", { tool, input, callID }) as LoopGuardObservation
+  const failed = (callID: string): LoopGuardObservation =>
+    observationFromSessionEvent("session.next.tool.failed", { callID }) as LoopGuardObservation
+  const success = (callID: string): LoopGuardObservation =>
+    observationFromSessionEvent("session.next.tool.success", { callID }) as LoopGuardObservation
+
+  test("does not trip when distinct tools fail (callID keeps their identities apart)", () => {
+    const guard = new LoopGuard(tight)
+    guard.observe(called("read", "c1"))
+    guard.observe(called("edit", "c2"))
+    expect(guard.observe(failed("c1"))).toBeUndefined()
+    expect(guard.observe(failed("c2"))).toBeUndefined()
+    // Alternating failures of two different tools never accumulate a streak.
+    guard.observe(called("read", "c3"))
+    guard.observe(called("edit", "c4"))
+    expect(guard.observe(failed("c3"))).toBeUndefined()
+    expect(guard.observe(failed("c4"))).toBeUndefined()
+  })
+
+  test("trips when the same tool fails repeatedly, resolved through callID", () => {
+    const guard = new LoopGuard(tight)
+    guard.observe(called("bash", "c1"))
+    expect(guard.observe(failed("c1"))).toBeUndefined()
+    guard.observe(called("bash", "c2"))
+    expect(guard.observe(failed("c2"))).toBeUndefined()
+    guard.observe(called("bash", "c3"))
+    expect(guard.observe(failed("c3"))).toMatchObject({ reason: "same-tool-failures", count: 3, tool: "bash" })
+  })
+
+  test("ignores a failure whose callID was never seen — no synthetic tool merge", () => {
+    // Before the fix, a nameless failure collapsed to "tool"; two unrelated
+    // failures would then share the streak and false-trip. Now each
+    // unidentified failure is ignored on its own.
+    const guard = new LoopGuard(tight)
+    expect(guard.observe(failed("unknown_1"))).toBeUndefined()
+    expect(guard.observe(failed("unknown_2"))).toBeUndefined()
+    expect(guard.observe(failed("unknown_3"))).toBeUndefined()
+    // A later identified failure starts its own streak from zero.
+    guard.observe(called("edit", "c1"))
+    expect(guard.observe(failed("c1"))).toBeUndefined()
+  })
+
+  test("a success resolved through callID resets the failure streak", () => {
+    const guard = new LoopGuard(tight)
+    guard.observe(called("bash", "c1"))
+    guard.observe(failed("c1"))
+    guard.observe(called("bash", "c2"))
+    guard.observe(failed("c2"))
+    guard.observe(called("bash", "c3"))
+    guard.observe(success("c3")) // success resets the streak
+    guard.observe(called("bash", "c4"))
+    expect(guard.observe(failed("c4"))).toBeUndefined() // streak restarted at 1
+  })
+
+  test("a nameless failure after an identified one does not inherit its streak", () => {
+    // An identified "bash" failure must not be followed by an unidentified
+    // failure adding onto bash's count.
+    const guard = new LoopGuard(tight)
+    guard.observe(called("bash", "c1"))
+    guard.observe(failed("c1"))
+    guard.observe(called("bash", "c2"))
+    guard.observe(failed("c2"))
+    // Unidentified failure: ignored, does NOT make it 3.
+    expect(guard.observe(failed("missing_callID"))).toBeUndefined()
+    guard.observe(called("bash", "c3"))
+    expect(guard.observe(failed("c3"))).toMatchObject({ reason: "same-tool-failures", count: 3, tool: "bash" })
+  })
+})
+
 describe("LoopGuard ceilings", () => {
   test("trips on the configured step count", () => {
     const guard = new LoopGuard(tight)
@@ -144,23 +222,44 @@ describe("LoopGuard ceilings", () => {
 
 describe("observationFromSessionEvent", () => {
   test("maps the OpenCode tool/step events the watcher already sees", () => {
-    expect(observationFromSessionEvent("session.next.tool.called", { tool: "read", input: { filePath: "a.ts" } })).toEqual({
+    // SDK contract (v2): the called event carries tool+callID+input; the
+    // success/failed events carry callID only — no tool or name. Pinning the
+    // callID on the call is what lets the guard correlate results back.
+    expect(observationFromSessionEvent("session.next.tool.called", { tool: "read", input: { filePath: "a.ts" }, callID: "call_1" })).toEqual({
       kind: "call",
       name: "read",
       input: { filePath: "a.ts" },
+      callID: "call_1",
     })
-    expect(observationFromSessionEvent("session.next.tool.failed", { name: "bash" })).toEqual({
+    expect(observationFromSessionEvent("session.next.tool.failed", { callID: "call_2" })).toEqual({
       kind: "result",
-      name: "bash",
       failed: true,
+      callID: "call_2",
     })
-    expect(observationFromSessionEvent("session.next.tool.success", { tool: "edit" })).toEqual({
+    expect(observationFromSessionEvent("session.next.tool.success", { callID: "call_3" })).toEqual({
       kind: "result",
-      name: "edit",
       failed: false,
+      callID: "call_3",
     })
     expect(observationFromSessionEvent("session.next.step.started", {})).toEqual({ kind: "step" })
     expect(observationFromSessionEvent("session.next.reasoning.delta", { delta: "hmm" })).toBeUndefined()
+  })
+
+  test("a called event without a callID still maps to a call observation", () => {
+    // Malformed called event: no callID to pin. The call still feeds the
+    // identical-calls detector; results just won't be able to correlate.
+    expect(observationFromSessionEvent("session.next.tool.called", { tool: "read", input: {} })).toEqual({
+      kind: "call",
+      name: "read",
+      input: {},
+    })
+  })
+
+  test("a result event with no callID yields a result observation with no identity", () => {
+    // No callID means the guard can't correlate and must ignore it rather than
+    // merge it into a synthetic "tool".
+    expect(observationFromSessionEvent("session.next.tool.failed", {})).toEqual({ kind: "result", failed: true })
+    expect(observationFromSessionEvent("session.next.tool.success", {})).toEqual({ kind: "result", failed: false })
   })
 
   test("maps assistant message updates to per-message cost observations", () => {

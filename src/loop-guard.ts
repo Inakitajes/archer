@@ -104,8 +104,8 @@ export class LoopGuardError extends Error {
 }
 
 export type LoopGuardObservation =
-  | { kind: "call"; name: string; input?: unknown }
-  | { kind: "result"; name: string; failed: boolean }
+  | { kind: "call"; name: string; input?: unknown; callID?: string }
+  | { kind: "result"; name?: string; failed: boolean; callID?: string }
   | { kind: "step" }
   | { kind: "cost"; messageID: string; cost: number }
 
@@ -117,6 +117,14 @@ export class LoopGuard {
   private steps = 0
   private readonly messageCosts = new Map<string, number>()
   private totalCost = 0
+  /**
+   * Tool name for each in-flight callID. The OpenCode SDK pins a `callID` on
+   * every tool event but only the `called` event carries the tool name, so
+   * success/failed results must be correlated back through the call that
+   * started them. Without this, distinct tools' failures collapse into one
+   * synthetic `"tool"` and false-trip the same-tool fuse.
+   */
+  private readonly callIDToTool = new Map<string, string>()
 
   constructor(private readonly config: LoopGuardConfig) {}
 
@@ -124,9 +132,9 @@ export class LoopGuard {
     if (!this.config.enabled) return undefined
     switch (observation.kind) {
       case "call":
-        return this.observeCall(observation.name, observation.input)
+        return this.observeCall(observation.name, observation.input, observation.callID)
       case "result":
-        return this.observeResult(observation.name, observation.failed)
+        return this.observeResult(observation.name, observation.callID, observation.failed)
       case "step":
         return this.observeStep()
       case "cost":
@@ -134,7 +142,8 @@ export class LoopGuard {
     }
   }
 
-  private observeCall(name: string, input: unknown): LoopGuardTrip | undefined {
+  private observeCall(name: string, input: unknown, callID: string | undefined): LoopGuardTrip | undefined {
+    if (callID) this.callIDToTool.set(callID, name)
     const signature = `${name}\0${canonicalInput(input)}`
     if (signature === this.identicalSignature) this.identicalCount++
     else {
@@ -150,24 +159,43 @@ export class LoopGuard {
     )
   }
 
-  private observeResult(name: string, failed: boolean): LoopGuardTrip | undefined {
+  private observeResult(name: string | undefined, callID: string | undefined, failed: boolean): LoopGuardTrip | undefined {
+    // Resolve tool identity: an explicit name wins (a direct observation or a
+    // called event that carried the tool); otherwise correlate through the
+    // callID the SDK pins on every tool event. A result we cannot identify is
+    // ignored rather than merged into a synthetic "tool", so unidentified
+    // failures from distinct tools can't false-trip the same-tool fuse.
+    const tool = this.resolveToolName(name, callID)
     if (!failed) {
       this.failedTool = ""
       this.failedCount = 0
       return undefined
     }
-    if (name === this.failedTool) this.failedCount++
+    if (!tool) return undefined
+    if (tool === this.failedTool) this.failedCount++
     else {
-      this.failedTool = name
+      this.failedTool = tool
       this.failedCount = 1
     }
     if (this.failedCount < this.config.sameToolFailures) return undefined
     return trip(
       "same-tool-failures",
-      `${name} failed ${this.failedCount} times in a row. The phase was aborted to stop a runaway session.`,
+      `${tool} failed ${this.failedCount} times in a row. The phase was aborted to stop a runaway session.`,
       this.failedCount,
-      name,
+      tool,
     )
+  }
+
+  private resolveToolName(name: string | undefined, callID: string | undefined): string | undefined {
+    if (name) return name
+    if (callID) {
+      // Consume the mapping: a call resolves to exactly one terminal result,
+      // so dropping it here bounds the map to in-flight calls.
+      const mapped = this.callIDToTool.get(callID)
+      this.callIDToTool.delete(callID)
+      return mapped
+    }
+    return undefined
   }
 
   private observeStep(): LoopGuardTrip | undefined {
@@ -245,11 +273,16 @@ function targetHint(name: string, input: unknown): string {
 export function observationFromSessionEvent(type: string, properties: Record<string, unknown>): LoopGuardObservation | undefined {
   switch (type) {
     case "session.next.tool.called":
-      return { kind: "call", name: toolName(properties), input: properties.input }
+      // The called event carries the tool name; pin it to the callID so the
+      // result events (which only carry callID) can resolve back to it.
+      return { kind: "call", name: toolName(properties), input: properties.input, callID: pickCallID(properties) }
     case "session.next.tool.failed":
-      return { kind: "result", name: toolName(properties), failed: true }
+      // SDK contract: success/failed carry callID but no tool/name. The guard
+      // correlates through callID; a result with no seen callID is ignored
+      // rather than merged into a synthetic "tool".
+      return { kind: "result", failed: true, callID: pickCallID(properties) }
     case "session.next.tool.success":
-      return { kind: "result", name: toolName(properties), failed: false }
+      return { kind: "result", failed: false, callID: pickCallID(properties) }
     case "session.next.step.started":
       return { kind: "step" }
     case "message.updated":
@@ -278,4 +311,9 @@ function toolName(properties: Record<string, unknown>): string {
   if (typeof properties.tool === "string" && properties.tool) return properties.tool
   if (typeof properties.name === "string" && properties.name) return properties.name
   return "tool"
+}
+
+/** The callID the SDK pins on every tool event; empty for malformed payloads. */
+function pickCallID(properties: Record<string, unknown>): string | undefined {
+  return typeof properties.callID === "string" && properties.callID ? properties.callID : undefined
 }
