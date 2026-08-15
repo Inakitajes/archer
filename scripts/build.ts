@@ -34,12 +34,17 @@ if (typeof manifest.version !== "string" || !parseSemVer(manifest.version)) {
 
 const commit = await gitCommit()
 if (release) await mkdir("dist", { recursive: true })
+// Local builds must never read as the release that shares their number: the
+// injected version carries a `-local` prerelease suffix so the TUI header and
+// `--version` show e.g. `v0.6.0-local`. It is still valid SemVer, so update
+// checks compare correctly (prerelease < stable).
+const injectedVersion = release ? manifest.version : `${manifest.version}-local`
 for (const target of release ? releaseTargets : [localTarget]) {
   const result = await Bun.build({
     entrypoints: [resolve("src/main.ts")],
     compile: { target: target.bunTarget, outfile: resolve(target.output) },
     define: {
-      __CONVOY_VERSION__: JSON.stringify(manifest.version),
+      __CONVOY_VERSION__: JSON.stringify(injectedVersion),
       __CONVOY_COMMIT__: JSON.stringify(commit),
       __CONVOY_PLATFORM__: JSON.stringify(target.platform),
     },
@@ -47,7 +52,7 @@ for (const target of release ? releaseTargets : [localTarget]) {
   if (!result.success) {
     throw new Error(`failed to build ${target.output}:\n${result.logs.map((log) => log.message).join("\n")}`)
   }
-  process.stdout.write(`built ${target.output} (${target.platform})\n`)
+  process.stdout.write(`built ${target.output} (${target.platform}) v${injectedVersion}\n`)
 }
 
 async function gitCommit() {
