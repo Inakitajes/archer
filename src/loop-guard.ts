@@ -12,6 +12,13 @@
  */
 
 export type LoopGuardConfig = {
+  /**
+   * Set by resolveLoopGuard and absent from user settings, so a resolved
+   * config is not assignable to LoopGuardSettings: feeding one back into
+   * resolveLoopGuard (which would re-arm the defaults over `false`) is a
+   * compile error, not a silent bug.
+   */
+  readonly resolved: true
   enabled: boolean
   /** Consecutive calls of the same tool with the same arguments. */
   identicalCalls: number
@@ -21,7 +28,7 @@ export type LoopGuardConfig = {
   maxSteps: number
   /**
    * USD spent by the executor in one phase attempt. `undefined` means no cost
-   * fuse. `false` in user config resolves to `undefined`.
+   * fuse. `false` in user config resolves to `undefined` exactly once, here.
    */
   maxPhaseCost?: number
 }
@@ -34,9 +41,15 @@ export type LoopGuardSettings = Partial<{
   maxSteps: number
   /** Number to cap, `false` to disable the cost fuse even when the default is on. */
   maxPhaseCost: number | false
+  /**
+   * Marks a resolved config so it can't be passed back to resolveLoopGuard.
+   * User settings never carry it (validation rejects unknown keys).
+   */
+  resolved?: false
 }>
 
 export const defaultLoopGuard: LoopGuardConfig = {
+  resolved: true,
   enabled: true,
   identicalCalls: 4,
   sameToolFailures: 6,
@@ -46,6 +59,7 @@ export const defaultLoopGuard: LoopGuardConfig = {
 
 export function resolveLoopGuard(settings?: LoopGuardSettings): LoopGuardConfig {
   return {
+    resolved: true,
     enabled: settings?.enabled ?? defaultLoopGuard.enabled,
     identicalCalls: settings?.identicalCalls ?? defaultLoopGuard.identicalCalls,
     sameToolFailures: settings?.sameToolFailures ?? defaultLoopGuard.sameToolFailures,
@@ -93,7 +107,7 @@ export type LoopGuardObservation =
   | { kind: "call"; name: string; input?: unknown }
   | { kind: "result"; name: string; failed: boolean }
   | { kind: "step" }
-  | { kind: "cost"; cost: number }
+  | { kind: "cost"; messageID: string; cost: number }
 
 export class LoopGuard {
   private identicalSignature = ""
@@ -101,6 +115,8 @@ export class LoopGuard {
   private failedTool = ""
   private failedCount = 0
   private steps = 0
+  private readonly messageCosts = new Map<string, number>()
+  private totalCost = 0
 
   constructor(private readonly config: LoopGuardConfig) {}
 
@@ -114,7 +130,7 @@ export class LoopGuard {
       case "step":
         return this.observeStep()
       case "cost":
-        return this.observeCost(observation.cost)
+        return this.observeCost(observation.messageID, observation.cost)
     }
   }
 
@@ -164,13 +180,24 @@ export class LoopGuard {
     )
   }
 
-  private observeCost(cost: number): LoopGuardTrip | undefined {
+  private observeCost(messageID: string, cost: number): LoopGuardTrip | undefined {
     const cap = this.config.maxPhaseCost
-    if (cap === undefined || !Number.isFinite(cost) || cost < cap) return undefined
+    if (cap === undefined || !Number.isFinite(cost) || cost < 0) return undefined
+    // Costs arrive per assistant message, refreshed in place as a message
+    // streams and again when it completes. Accumulating the per-message delta
+    // is what makes the fuse span watchers: the advisor follow-up turn runs
+    // through a NEW watcher whose observations restart near zero, so the guard
+    // itself must hold the running total or the turn-1 spend is lost.
+    const previous = this.messageCosts.get(messageID) ?? 0
+    const delta = cost - previous
+    if (delta <= 0) return undefined
+    this.messageCosts.set(messageID, cost)
+    this.totalCost += delta
+    if (this.totalCost < cap) return undefined
     return trip(
       "max-cost",
-      `phase cost reached $${cost.toFixed(2)} (cap $${cap}). The phase was aborted to stop a runaway session.`,
-      cost,
+      `phase cost reached $${this.totalCost.toFixed(2)} (cap $${cap}). The phase was aborted to stop a runaway session.`,
+      this.totalCost,
     )
   }
 }
@@ -225,9 +252,26 @@ export function observationFromSessionEvent(type: string, properties: Record<str
       return { kind: "result", name: toolName(properties), failed: false }
     case "session.next.step.started":
       return { kind: "step" }
+    case "message.updated":
+      return costFromMessageUpdate(properties)
     default:
       return undefined
   }
+}
+
+/**
+ * Assistant messages carry the cost of their own generation, refreshed in
+ * place as opencode updates them. Feeding the per-message cost (not a
+ * watcher-scoped total) lets the guard accumulate exactly across the advisor's
+ * follow-up watcher, whose totals restart near zero.
+ */
+function costFromMessageUpdate(properties: Record<string, unknown>): LoopGuardObservation | undefined {
+  const info = properties.info
+  if (!info || typeof info !== "object") return undefined
+  const message = info as { role?: unknown; id?: unknown; cost?: unknown }
+  if (message.role !== "assistant" || typeof message.id !== "string") return undefined
+  const cost = typeof message.cost === "number" && Number.isFinite(message.cost) ? message.cost : 0
+  return { kind: "cost", messageID: message.id, cost }
 }
 
 function toolName(properties: Record<string, unknown>): string {

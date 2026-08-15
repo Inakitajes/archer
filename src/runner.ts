@@ -1029,7 +1029,8 @@ type PreparedPhaseRun = {
   attachments: FilePartInput[]
   prompt: string
   model: ModelSelection
-  loopGuard?: LoopGuardConfig
+  /** Resolved exactly once, here, and threaded through unchanged: re-resolving would re-arm defaults over `maxPhaseCost: false`. */
+  loopGuard: LoopGuardConfig
 }
 
 async function preparePhaseRun(
@@ -1377,7 +1378,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     shutdown: input.shutdown,
     sessionRef: input.sessionRef,
     attempt: input.attempt,
-    loopGuard: input.prepared.loopGuard,
+    loopGuardConfig: input.prepared.loopGuard,
     ...(input.advisors ? { advisors: input.advisors } : {}),
   })
   const assistantText = extractAssistantText(result.parts)
@@ -1554,7 +1555,7 @@ export async function assertPendingReadOnlyResumeBaselines(metadata: RunMetadata
   }
 }
 
-async function promptPhase(
+export async function promptPhase(
   client: OpencodeClient,
   input: {
     phase: AgentStep
@@ -1568,7 +1569,8 @@ async function promptPhase(
     sessionRef?: SessionRef
     advisors?: AdvisorRuntime
     attempt: number
-    loopGuard?: LoopGuardConfig
+    /** The resolved guard configuration; already resolved by preparePhaseRun, never re-resolved here. */
+    loopGuardConfig: LoopGuardConfig
   },
 ): Promise<SessionResult> {
   input.shutdown.throwIfRequested()
@@ -1589,8 +1591,11 @@ async function promptPhase(
   log.info(`[${input.phase.name}] session: ${session.data.id}`)
 
   // One guard for the whole attempt, including the advisor's follow-up turn:
-  // that turn is the same session still spending money.
-  const loopGuard = new LoopGuard(resolveLoopGuard(input.loopGuard))
+  // that turn is the same session still spending money. The config is already
+  // resolved (preparePhaseRun) — resolving again would re-arm the defaults over
+  // a user's `maxPhaseCost: false`, which is why LoopGuardConfig can't be fed
+  // back into resolveLoopGuard.
+  const loopGuard = new LoopGuard(input.loopGuardConfig)
 
   // The prompt is fired asynchronously and completion is detected through the
   // event stream plus status polling. A single blocking HTTP request can't
@@ -1674,7 +1679,7 @@ const noChangesReply = "NO CHANGES"
  * would corrupt it. They are asked to either re-emit the whole report or reply
  * with the sentinel, and the sentinel case keeps the original text.
  */
-async function applyCompletionCheckpoint(
+export async function applyCompletionCheckpoint(
   client: OpencodeClient,
   input: {
     phase: AgentStep
@@ -1683,7 +1688,8 @@ async function applyCompletionCheckpoint(
     progress: ProgressUI
     shutdown: RunShutdown
     sessionID: string
-    loopGuard?: LoopGuard
+    /** The live guard from the first turn; the follow-up watcher shares it so cost and repeats accumulate. */
+    loopGuard: LoopGuard
   },
   first: SessionResult,
   advisor: AdvisorPhaseHandle,
@@ -1700,7 +1706,7 @@ async function applyCompletionCheckpoint(
     sessionID: input.sessionID,
     progress: input.progress,
     signal: input.shutdown.signal,
-    ...(input.loopGuard ? { loopGuard: input.loopGuard } : {}),
+    loopGuard: input.loopGuard,
     // Second turn of a session that already has one: anchored so the result is
     // this turn alone, which is what the composition below assumes.
     sinceMessageID: first.info.id,
@@ -1735,7 +1741,11 @@ async function applyCompletionCheckpoint(
       assistantInfos: [...first.assistantInfos, ...second.assistantInfos],
     }
   } catch (error) {
-    if (input.shutdown.aborted || isUserAbortError(error)) throw error
+    // A guard trip in the follow-up turn is the same decision a trip in the
+    // first turn makes: the attempt must fail through the normal decision gate.
+    // Only genuine review-turn failures (a dead provider, a wedged session) are
+    // absorbed, because the phase already produced a durable deliverable.
+    if (input.shutdown.aborted || isUserAbortError(error) || error instanceof LoopGuardError) throw error
     return keepCompletedPhase(input.phase.name, first, error instanceof Error ? error.message : String(error))
   } finally {
     await watcher.stop()
@@ -1808,8 +1818,10 @@ export function watchSession(
     progress: ProgressUI
     signal: AbortSignal
     /**
-     * Circuit breaker for this attempt. Shared across the first turn and the
-     * advisor follow-up so cost and repeats accumulate instead of resetting.
+     * Circuit breaker for this attempt. The live instance is shared across the
+     * first turn and the advisor follow-up; the guard holds the running totals
+     * (repeats, steps, and per-message cost), so a fresh watcher for the
+     * follow-up turn observes its own events but cannot reset the fuse.
      */
     loopGuard?: LoopGuard
     /**
@@ -1907,8 +1919,10 @@ export function watchSession(
         input.progress.phaseActivity(input.phaseName, signal.message, signal.kind, signal.pulse)
         return
       case "usage":
+        // Display only. The guard's cost fuse is fed per assistant message in
+        // observationFromSessionEvent, not from this summed total, so a shared
+        // guard can accumulate across the advisor's follow-up watcher.
         input.progress.phaseUsageTotal(input.phaseName, signal.usage)
-        tripLoopGuard({ kind: "cost", cost: signal.usage.cost ?? 0 })
         return
       case "todos":
         input.progress.phaseTodos(input.phaseName, signal.todos)
