@@ -587,7 +587,21 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   }
 
   if (!prompt && !parsed.resumeRunID) {
-    throw new Error("need a prompt (positional or --prompt-file) or --resume <id>")
+    // NEW: a concrete-action pipeline (review, ship, hunter, ...) may carry a
+    // defaultPrompt so `convoy -p review` runs without typing one. Anything
+    // that counts as an explicit prompt source (positional, --prompt-file)
+    // was already read above, so only a genuinely empty invocation falls back.
+    if (!parsed.prompt && !parsed.promptFile) {
+      const config = await loadMergedConvoyConfig(parsed.targetDir)
+      const pipelineName = parsed.pipeline ?? config?.defaults.pipeline ?? defaultPipelineName
+      const spec = selectPipelineSpec(config, pipelineName)
+      if (spec.defaultPrompt) {
+        prompt = spec.defaultPrompt
+      }
+    }
+    if (!prompt) {
+      throw new Error("need a prompt (positional or --prompt-file) or --resume <id>, or the selected pipeline must provide a defaultPrompt")
+    }
   }
 
   const options: RunOptions = { ...(await resolveRunOptions(parsed)), prompt }
@@ -610,7 +624,7 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   validateStepFilters(options.pipeline, options)
   options.plan = buildRunPlan({
     ...options,
-    promptSource: parsed.resumeRunID ? "resume" : parsed.promptFile ? "file" : "inline",
+    promptSource: parsed.resumeRunID ? "resume" : parsed.promptFile ? "file" : parsed.prompt ? "inline" : "default",
     ...(resumeGateway ? { resumeGateway } : {}),
   })
   return { type: "run", options }

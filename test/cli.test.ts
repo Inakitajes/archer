@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { beforeEach } from "bun:test"
 
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
 import { goalModeFor, goalModeRejectionError, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import type { Pipeline, RunPlan } from "../src/types"
@@ -470,6 +474,50 @@ describe("parseCommand", () => {
   test("parses a run command with prompt", async () => {
     const cmd = await parseCommand(["add login"])
     expect(cmd.type).toBe("run")
+  })
+})
+
+describe("parseCommand default prompt fallback", () => {
+  test("uses the pipeline's defaultPrompt when no prompt is given", async () => {
+    const cmd = await parseCommand(["-p", "review"])
+    expect(cmd.type).toBe("run")
+    if (cmd.type === "run") {
+      expect(cmd.options.prompt).toBe(
+        "Review the current branch against its base and report prioritized findings with a verified quality score.",
+      )
+      expect(cmd.options.plan?.prompt.source).toBe("default")
+    }
+  })
+
+  test("falls back through defaults.pipeline when -p is omitted", async () => {
+    // implement (the default) has no defaultPrompt, so a bare invocation still errors.
+    await expect(parseCommand([])).rejects.toThrow("need a prompt")
+  })
+
+  test("still errors when the selected pipeline has no defaultPrompt", async () => {
+    await expect(parseCommand(["-p", "implement"])).rejects.toThrow("need a prompt")
+  })
+
+  test("a positional prompt beats the defaultPrompt", async () => {
+    const cmd = await parseCommand(["-p", "review", "my own prompt"])
+    expect(cmd.type).toBe("run")
+    if (cmd.type === "run") {
+      expect(cmd.options.prompt).toBe("my own prompt")
+      expect(cmd.options.plan?.prompt.source).toBe("inline")
+    }
+  })
+
+  test("--prompt-file beats the defaultPrompt and is marked as file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-prompt-"))
+    const promptFile = join(dir, "prd.md")
+    await writeFile(promptFile, "from file")
+    const cmd = await parseCommand(["-p", "review", "--prompt-file", promptFile])
+    expect(cmd.type).toBe("run")
+    if (cmd.type === "run") {
+      expect(cmd.options.prompt).toBe("from file")
+      expect(cmd.options.plan?.prompt.source).toBe("file")
+    }
+    await rm(dir, { recursive: true, force: true })
   })
 })
 

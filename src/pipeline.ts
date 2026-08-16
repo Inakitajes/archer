@@ -380,6 +380,19 @@ export type PipelineSpec = {
   goalMaxIterations?: number
   /** Goal loop: stop when a fix iteration improves the score by less than this many points. CLI --goal-plateau wins. */
   goalPlateau?: number
+  /**
+   * Prompt text used when the pipeline runs without an explicit prompt: the
+   * TUI prefills its prompt field with it and the CLI falls back to it. Set on
+   * concrete-action pipelines (review, ship, hunter); absent on pipelines where
+   * the prompt IS the feature description (implement, fixer, ...).
+   */
+  defaultPrompt?: string
+  /**
+   * Alternative prompts the TUI can Tab-cycle through while the prompt field
+   * is clean (empty or still holding a default). Empty or absent means no
+   * suggestions.
+   */
+  suggestedPrompts?: string[]
   steps: StepSpec[]
 }
 
@@ -460,6 +473,8 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   review: {
     description:
       "Report-only PR review plus a verified quality score: scope, parallel bug/clean-code/security audits across two models, a prioritized findings report, then two independent quality-scorers and a consensus step. Makes no changes.",
+    defaultPrompt: "Review the current branch against its base and report prioritized findings with a verified quality score.",
+    suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
       { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true },
       {
@@ -485,6 +500,8 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   "review-lite": {
     description:
       "Like review, but every phase runs on a low-cost model: GLM 5.2 scopes, writes the report and reconciles the score, and the audit and scorer fan-outs pair GLM 5.2 with Kimi K3 instead of Opus.",
+    defaultPrompt: "Review the current branch against its base and report prioritized findings with a verified quality score.",
+    suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
       { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true },
       {
@@ -524,6 +541,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   ship: {
     description: "Sync the branch with its base (merge + conflict resolution), measure the merged result against the quality rubric, and iterate until it clears 85/100",
     goal: 85,
+    defaultPrompt: "Sync this branch with its base and iterate until it clears the quality bar.",
     steps: [
       { agent: "sync-with-base", name: "sync", model: fallbackModel, reports: "none" },
       {
@@ -554,6 +572,8 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   "review-cc": {
     description:
       "Report-only PR review: Terra scope, parallel audits on Terra + Claude Code (subscription), then one prioritized findings report. Makes no changes.",
+    defaultPrompt: "Review the current branch against its base and report prioritized findings.",
+    suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
       { agent: "review-scope", name: "scope", model: fallbackModel, reports: "none", diff: true },
       {
@@ -572,6 +592,8 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   hunter: {
     description:
       "Balanced report-only audit: Terra plus one specialty model on each of six audit tracks, followed by a Sol xhigh consensus report. Makes no changes.",
+    defaultPrompt: "Audit this branch across correctness, memory, performance, security, reliability, and supply-chain tracks.",
+    suggestedPrompts: ["Audit the entire repository", "Audit only files changed since the base"],
     steps: [
       {
         parallel: [
@@ -589,6 +611,8 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   "hunter-max": {
     description:
       "Maximum-coverage report-only audit: all five API models on each of six audit tracks, followed by a Sol xhigh consensus report. Makes no changes.",
+    defaultPrompt: "Audit this branch across correctness, memory, performance, security, reliability, and supply-chain tracks with maximum coverage.",
+    suggestedPrompts: ["Audit the entire repository", "Audit only files changed since the base"],
     steps: [
       { parallel: hunterMaxTracks() },
       { agent: "hunter-max-report", model: solXhighModel, reports: "previous", diff: true },
@@ -743,6 +767,8 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
     ...(input.spec.goal !== undefined ? { goal: input.spec.goal } : {}),
     ...(input.spec.goalMaxIterations !== undefined ? { goalMaxIterations: input.spec.goalMaxIterations } : {}),
     ...(input.spec.goalPlateau !== undefined ? { goalPlateau: input.spec.goalPlateau } : {}),
+    ...(input.spec.defaultPrompt ? { defaultPrompt: input.spec.defaultPrompt } : {}),
+    ...(input.spec.suggestedPrompts?.length ? { suggestedPrompts: input.spec.suggestedPrompts } : {}),
     steps,
   }
 }

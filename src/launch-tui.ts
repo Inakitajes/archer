@@ -118,7 +118,7 @@ type HookNode = {
   when?: "failure" | "always"
 }
 
-type PipelineChoice = {
+export type PipelineChoice = {
   name: string
   description: string
   source: "built-in" | "configured"
@@ -130,6 +130,10 @@ type PipelineChoice = {
   /** True when the pipeline ends in a quality-score-report step, enabling goal mode. */
   scored: boolean
   error?: string
+  /** Prompt text to prefill when launching this pipeline without a prompt; undefined when the prompt stays mandatory. */
+  defaultPrompt?: string
+  /** Alternative prompts Tab can cycle through while the prompt field is clean. */
+  suggestedPrompts?: string[]
 }
 
 type ToggleKey = "smart" | "yolo" | "humanReview" | "includeDirty" | "keepRunDir" | "tui" | "worktree"
@@ -145,6 +149,78 @@ type Mode = "pipelines" | "prompt" | "options" | "branch" | "review"
 
 /** The two editable fields of the branch step. */
 type BranchField = "name" | "guidance"
+
+/**
+ * The prompt field's clean/dirty state: whether its text came from a default or
+ * suggestion (`fromDefault`), which default/suggestion it is currently showing
+ * (`lastDefault`), and where the Tab suggestion cycle stands. Extracted as a
+ * plain value so the prefill/swap/cycle decisions are unit-testable without a
+ * renderer; `LaunchPicker` applies the returned states to its own fields.
+ */
+export type PromptFieldState = {
+  prompt: string
+  fromDefault: boolean
+  lastDefault?: string
+  suggestionIndex: number
+  hasCycledSuggestions: boolean
+}
+
+export function emptyPromptField(): PromptFieldState {
+  return { prompt: "", fromDefault: false, suggestionIndex: 0, hasCycledSuggestions: false }
+}
+
+/**
+ * What opening the prompt step does to a clean field: an empty field adopts the
+ * pipeline's defaultPrompt; any existing text (typed, or preserved from another
+ * pipeline) is left untouched.
+ */
+export function prefillPromptField(state: PromptFieldState, defaultPrompt: string | undefined): PromptFieldState {
+  if (!state.prompt.trim() && defaultPrompt) {
+    return { prompt: defaultPrompt, fromDefault: true, lastDefault: defaultPrompt, suggestionIndex: 0, hasCycledSuggestions: false }
+  }
+  return state
+}
+
+/**
+ * What the field becomes after switching to a pipeline with the given default.
+ * A clean field (empty, or still holding the previous default) adopts the new
+ * default — or clears when the new pipeline has none. User-typed text is
+ * preserved across the switch.
+ */
+export function promptAfterPipelineSwitch(state: PromptFieldState, nextDefaultPrompt: string | undefined): PromptFieldState {
+  if (state.fromDefault && state.lastDefault !== undefined) {
+    if (state.prompt === "" || state.prompt === state.lastDefault) {
+      if (nextDefaultPrompt) {
+        return { prompt: nextDefaultPrompt, fromDefault: true, lastDefault: nextDefaultPrompt, suggestionIndex: 0, hasCycledSuggestions: false }
+      }
+      return { prompt: "", fromDefault: false, suggestionIndex: 0, hasCycledSuggestions: false }
+    }
+    // The prompt was edited after a default was applied: it is user text now.
+    return { ...state, fromDefault: false, lastDefault: undefined }
+  }
+  if (state.prompt.trim() === "" && nextDefaultPrompt) {
+    return { prompt: nextDefaultPrompt, fromDefault: true, lastDefault: nextDefaultPrompt, suggestionIndex: 0, hasCycledSuggestions: false }
+  }
+  return state
+}
+
+/** A user edit marks the field dirty: text is preserved but no longer swappable or cycleable. */
+export function markPromptEdited(state: PromptFieldState): PromptFieldState {
+  return { ...state, fromDefault: false, lastDefault: undefined, suggestionIndex: 0, hasCycledSuggestions: false }
+}
+
+/**
+ * Tab while the field is clean (empty or holding a default/suggestion): the
+ * next suggestedPrompt, wrapping around — the first press shows the first
+ * suggestion, repeats advance. Returns undefined when Tab does nothing.
+ */
+export function nextPromptSuggestion(state: PromptFieldState, suggestions: readonly string[] | undefined): PromptFieldState | undefined {
+  if (!suggestions || suggestions.length === 0) return undefined
+  if (!state.fromDefault && state.prompt.trim() !== "") return undefined
+  const index = state.hasCycledSuggestions ? (state.suggestionIndex + 1) % suggestions.length : 0
+  const prompt = suggestions[index]!
+  return { prompt, fromDefault: true, lastDefault: prompt, suggestionIndex: index, hasCycledSuggestions: true }
+}
 
 type Modal =
   | { kind: "message"; title: string; message: string; footer?: string }
@@ -233,7 +309,7 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
   return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options).result
 }
 
-function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly AgentSpec[]): PipelineChoice[] {
+export function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly AgentSpec[]): PipelineChoice[] {
   const configured = config?.pipelines ?? {}
   const defaultName = config?.defaults.pipeline ?? defaultPipelineName
   const hooksConfig = config?.hooks ?? emptyHooksConfig()
@@ -266,6 +342,8 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
         // report-only scored pipeline (review, review-lite) would be mutated by
         // the goal-fixer, contradicting its "makes no changes" contract.
         scored: Boolean(consensusStep(pipeline)) && hasWritableStep(pipeline),
+        defaultPrompt: pipeline.defaultPrompt,
+        suggestedPrompts: pipeline.suggestedPrompts,
       }
     } catch (error) {
       return {
@@ -328,6 +406,14 @@ class LaunchPicker {
   private cursor = 0
   private promptScroll = 0
   private promptError = ""
+  /** True while the prompt text came from a default or suggestion, not the user. */
+  private promptFromDefault = false
+  /** The default/suggestion currently in the field, for clean/dirty swap detection. */
+  private lastDefaultPrompt?: string
+  /** Index into the selected pipeline's suggestedPrompts the Tab cycle is showing. */
+  private suggestionIndex = 0
+  /** True once Tab has been used at all, so a repeat press advances past the first suggestion. */
+  private hasCycledSuggestions = false
   private optionIndex = 0
   private message = ""
   private modal?: Modal
@@ -408,6 +494,7 @@ class LaunchPicker {
       return
     }
     this.insertPromptText(text)
+    this.markPromptDirty()
     this.promptError = ""
     this.render()
   }
@@ -678,6 +765,7 @@ class LaunchPicker {
     const enterAction = promptEnterAction(key)
     if (enterAction === "newline") {
       this.insertPromptText("\n")
+      this.markPromptDirty()
       this.promptError = ""
       this.render()
       return
@@ -695,10 +783,15 @@ class LaunchPicker {
       this.render()
       return
     }
+    if (key.name === "tab") {
+      this.cycleSuggestion()
+      return
+    }
     if (key.name === "backspace" || (key.ctrl && key.name === "h")) {
       if (this.cursor > 0) {
         this.prompt = this.prompt.slice(0, this.cursor - 1) + this.prompt.slice(this.cursor)
         this.cursor -= 1
+        this.markPromptDirty()
       }
       this.promptError = ""
       this.render()
@@ -707,6 +800,7 @@ class LaunchPicker {
     if (key.ctrl && key.name === "u") {
       this.prompt = ""
       this.cursor = 0
+      this.markPromptDirty()
       this.promptError = ""
       this.render()
       return
@@ -735,14 +829,55 @@ class LaunchPicker {
     const text = typedText(key)
     if (text) {
       this.insertPromptText(text)
+      this.markPromptDirty()
       this.promptError = ""
       this.render()
     }
   }
 
+  /**
+   * Tab while the prompt field is clean (empty or still holding a default or
+   * previous suggestion) inserts the next suggestedPrompt, wrapping around.
+   * The first press shows the first suggestion; repeats advance through the
+   * list. A user-edited prompt is left alone.
+   */
+  private cycleSuggestion() {
+    const choice = this.currentChoice()
+    const next = nextPromptSuggestion(this.promptFieldState(), choice.suggestedPrompts)
+    if (!next) return
+    this.applyPromptFieldState(next)
+    this.cursor = this.prompt.length
+    this.promptError = ""
+    this.render()
+  }
+
   private insertPromptText(text: string) {
     this.prompt = this.prompt.slice(0, this.cursor) + text + this.prompt.slice(this.cursor)
     this.cursor += text.length
+  }
+
+  /** Marks the field as user-owned: the text is preserved across switches and Tab stops cycling. */
+  private markPromptDirty() {
+    const state = markPromptEdited(this.promptFieldState())
+    this.applyPromptFieldState(state)
+  }
+
+  private promptFieldState(): PromptFieldState {
+    return {
+      prompt: this.prompt,
+      fromDefault: this.promptFromDefault,
+      lastDefault: this.lastDefaultPrompt,
+      suggestionIndex: this.suggestionIndex,
+      hasCycledSuggestions: this.hasCycledSuggestions,
+    }
+  }
+
+  private applyPromptFieldState(state: PromptFieldState) {
+    this.prompt = state.prompt
+    this.promptFromDefault = state.fromDefault
+    this.lastDefaultPrompt = state.lastDefault
+    this.suggestionIndex = state.suggestionIndex
+    this.hasCycledSuggestions = state.hasCycledSuggestions
   }
 
   private handleOptionsKey(key: KeyEvent) {
@@ -946,6 +1081,10 @@ class LaunchPicker {
       return
     }
     this.message = ""
+    // A clean field adopts the pipeline's default prompt on first open, so a
+    // concrete-action pipeline launches without typing. An already-typed prompt
+    // (returning from options, or a previous pipeline's preserved text) is kept.
+    this.applyPromptFieldState(prefillPromptField(this.promptFieldState(), choice.defaultPrompt))
     this.mode = "prompt"
     this.cursor = this.prompt.length
     this.promptScroll = 0
@@ -1110,7 +1249,19 @@ class LaunchPicker {
   }
 
   private moveSelection(delta: number) {
-    this.selected = clamp(this.selected + delta, 0, this.choices.length - 1)
+    const newIndex = clamp(this.selected + delta, 0, this.choices.length - 1)
+    if (newIndex === this.selected) {
+      this.render()
+      return
+    }
+    this.selected = newIndex
+    const newChoice = this.currentChoice()
+
+    // Swap the default prompt cleanly when the field is empty or still holds
+    // the previous pipeline's default; a user-typed prompt is preserved across
+    // the switch so moving away and back never discards work.
+    this.applyPromptFieldState(promptAfterPipelineSwitch(this.promptFieldState(), newChoice.defaultPrompt))
+
     this.message = ""
     this.render()
   }
@@ -1382,7 +1533,12 @@ class LaunchPicker {
     }
     lines.push(plain(""))
     const hint = "shift+enter newline · enter options · ←/→ move · ctrl+U clear · esc back"
-    if (wrapped.length > 1) {
+    const suggestions = choice.suggestedPrompts
+    if (suggestions && suggestions.length > 0 && (this.promptFromDefault || this.prompt.trim() === "")) {
+      const count = suggestions.length
+      const preview = truncate(suggestions[0]!, Math.max(10, Math.min(30, width - 40)))
+      lines.push(new StyledText([fg(theme.faint)(hint + " · "), fg(theme.accent)(`tab: suggestions (${count}), first: "${preview}"`)]))
+    } else if (wrapped.length > 1) {
       lines.push(new StyledText([fg(theme.faint)(hint + " · "), fg(theme.accent)(`${wrapped.length} lines`)]))
     } else {
       lines.push(t`${fg(theme.faint)(hint)}`)

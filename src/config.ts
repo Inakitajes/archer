@@ -317,6 +317,16 @@ defaults:
 pipelines:
   implement:
     description: Advised implementation, pattern/security audits, design polish, tests, and adversarial review
+    # defaultPrompt and suggestedPrompts are optional. A defaultPrompt is used
+    # when the pipeline runs without an explicit prompt — the launcher prefills
+    # its field and \`convoy -p <pipeline>\` falls back to it — and the
+    # suggestedPrompts list is Tab-cycled through while that field is still
+    # clean. Concrete-action pipelines (review, ship, hunter) ship with one; the
+    # prompt IS the description here, so implement deliberately has none.
+    # defaultPrompt: "Implement the described change and leave it ready for review."
+    # suggestedPrompts:
+    #   - "Implement the described change and leave it ready for review"
+    #   - "Implement it and add tests for the new behavior"
     steps:
       - agent: implementer
         model: ${defaultImplementerModel}
@@ -677,10 +687,26 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
   for (const [name, value] of Object.entries(record)) {
     const path = `pipelines.${name}`
     const entry = v.record(value, path)
-    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "goal", "goalMaxIterations", "goalPlateau", "steps"])
+    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "goal", "goalMaxIterations", "goalPlateau", "defaultPrompt", "suggestedPrompts", "steps"])
 
     if (!Array.isArray(entry.steps) || entry.steps.length === 0) v.fail(`${path}.steps`, "must be a non-empty list of steps")
     const steps = (entry.steps as unknown[]).map((step, index) => validateStep(v, step, `${path}.steps[${index}]`))
+
+    // The default prompt and its Tab-cycleable suggestions are optional; when
+    // present they must be non-empty so a pipeline can never silently fall back
+    // to a blank prompt.
+    const defaultPrompt =
+      entry.defaultPrompt !== undefined ? v.nonEmptyString(entry.defaultPrompt, `${path}.defaultPrompt`) : undefined
+
+    let suggestedPrompts: string[] | undefined
+    if (entry.suggestedPrompts !== undefined) {
+      if (!Array.isArray(entry.suggestedPrompts)) v.fail(`${path}.suggestedPrompts`, "must be a list of non-empty strings")
+      suggestedPrompts = (entry.suggestedPrompts as unknown[]).map((suggestion, index) => {
+        const suggestionPath = `${path}.suggestedPrompts[${index}]`
+        const value = v.nonEmptyString(suggestion, suggestionPath)
+        return value.trim()
+      })
+    }
 
     pipelines[name] = {
       ...(entry.description !== undefined ? { description: v.nonEmptyString(entry.description, `${path}.description`) } : {}),
@@ -688,6 +714,8 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
       ...(entry.goal !== undefined ? { goal: validatePipelineGoal(v, entry.goal, `${path}.goal`) } : {}),
       ...(entry.goalMaxIterations !== undefined ? { goalMaxIterations: v.positiveInt(entry.goalMaxIterations, `${path}.goalMaxIterations`) } : {}),
       ...(entry.goalPlateau !== undefined ? { goalPlateau: v.positiveInt(entry.goalPlateau, `${path}.goalPlateau`) } : {}),
+      ...(defaultPrompt !== undefined ? { defaultPrompt } : {}),
+      ...(suggestedPrompts !== undefined && suggestedPrompts.length > 0 ? { suggestedPrompts } : {}),
       steps,
     }
   }
@@ -1011,6 +1039,8 @@ export function materializePipelineSpec(spec: PipelineSpec, effectiveDefaultMode
     ...(spec.goal !== undefined ? { goal: spec.goal } : {}),
     ...(spec.goalMaxIterations !== undefined ? { goalMaxIterations: spec.goalMaxIterations } : {}),
     ...(spec.goalPlateau !== undefined ? { goalPlateau: spec.goalPlateau } : {}),
+    ...(spec.defaultPrompt ? { defaultPrompt: spec.defaultPrompt } : {}),
+    ...(spec.suggestedPrompts?.length ? { suggestedPrompts: spec.suggestedPrompts } : {}),
     steps,
   }
 }

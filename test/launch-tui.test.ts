@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
+import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
 
 import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
 import { consensusStep } from "../src/quality-score"
@@ -289,6 +289,103 @@ describe("launch TUI pipeline preview", () => {
       { stage: "pre", label: "very-long-hook-name-that-should-be-truncated" },
     ], 15))
     expect(lines.length).toBeGreaterThan(0)
+  })
+})
+
+describe("launch TUI pipeline choices", () => {
+  test("carries defaultPrompt and suggestedPrompts through from the resolved pipeline", () => {
+    const choices = pipelineChoices(undefined, builtInAgents)
+    const review = choices.find((choice) => choice.name === "review")
+    expect(review?.defaultPrompt).toBe(
+      "Review the current branch against its base and report prioritized findings with a verified quality score.",
+    )
+    expect(review?.suggestedPrompts).toEqual(["Review the open PR for this branch", "Review only the last commit's diff"])
+  })
+
+  test("leaves defaultPrompt and suggestedPrompts unset for pipelines without them", () => {
+    const choices = pipelineChoices(undefined, builtInAgents)
+    const implement = choices.find((choice) => choice.name === "implement")
+    expect(implement?.defaultPrompt).toBeUndefined()
+    expect(implement?.suggestedPrompts).toBeUndefined()
+  })
+})
+
+describe("launch TUI prompt prefill and clean/dirty tracking", () => {
+  test("openPrompt prefills an empty field with the pipeline's defaultPrompt", () => {
+    const prefilled = prefillPromptField(emptyPromptField(), "Review the branch.")
+    expect(prefilled).toMatchObject({ prompt: "Review the branch.", fromDefault: true, lastDefault: "Review the branch." })
+  })
+
+  test("openPrompt keeps an already-typed prompt instead of overwriting it", () => {
+    const typed = { ...emptyPromptField(), prompt: "my prompt", fromDefault: false }
+    expect(prefillPromptField(typed, "Review the branch.")).toBe(typed)
+  })
+
+  test("openPrompt leaves a clean empty field alone when the pipeline has no default", () => {
+    expect(prefillPromptField(emptyPromptField(), undefined)).toEqual(emptyPromptField())
+  })
+
+  test("moveSelection swaps a clean default for the new pipeline's default", () => {
+    const clean = { ...emptyPromptField(), prompt: "old default", fromDefault: true, lastDefault: "old default" }
+    const swapped = promptAfterPipelineSwitch(clean, "new default")
+    expect(swapped).toMatchObject({ prompt: "new default", fromDefault: true, lastDefault: "new default" })
+  })
+
+  test("moveSelection clears a clean default when the new pipeline has none", () => {
+    const clean = { ...emptyPromptField(), prompt: "old default", fromDefault: true, lastDefault: "old default" }
+    const swapped = promptAfterPipelineSwitch(clean, undefined)
+    expect(swapped).toMatchObject({ prompt: "", fromDefault: false })
+  })
+
+  test("moveSelection preserves user-typed text across pipeline switches", () => {
+    const dirty = { ...emptyPromptField(), prompt: "my typed prompt", fromDefault: false }
+    const swapped = promptAfterPipelineSwitch(dirty, "new default")
+    expect(swapped.prompt).toBe("my typed prompt")
+    expect(swapped.fromDefault).toBe(false)
+  })
+
+  test("typing marks the field dirty so it is no longer swapped or cycleable", () => {
+    const clean = { prompt: "default", fromDefault: true, lastDefault: "default", suggestionIndex: 0, hasCycledSuggestions: true }
+    const dirty = markPromptEdited(clean)
+    expect(dirty).toMatchObject({ prompt: "default", fromDefault: false, lastDefault: undefined, suggestionIndex: 0, hasCycledSuggestions: false })
+  })
+})
+
+describe("launch TUI Tab suggestions", () => {
+  const suggestions = ["suggestion one", "suggestion two"]
+
+  test("Tab inserts the first suggestion when the prompt is clean", () => {
+    const clean = emptyPromptField()
+    const next = nextPromptSuggestion(clean, suggestions)
+    expect(next?.prompt).toBe("suggestion one")
+    expect(next).toMatchObject({ fromDefault: true, lastDefault: "suggestion one", suggestionIndex: 0, hasCycledSuggestions: true })
+  })
+
+  test("Tab cycles through suggestions on repeated press", () => {
+    let state = emptyPromptField()
+    state = nextPromptSuggestion(state, suggestions)!
+    expect(state.prompt).toBe("suggestion one")
+    state = nextPromptSuggestion(state, suggestions)!
+    expect(state.prompt).toBe("suggestion two")
+    state = nextPromptSuggestion(state, suggestions)!
+    expect(state.prompt).toBe("suggestion one")
+  })
+
+  test("Tab does nothing when the pipeline has no suggestions", () => {
+    expect(nextPromptSuggestion(emptyPromptField(), undefined)).toBeUndefined()
+    expect(nextPromptSuggestion(emptyPromptField(), [])).toBeUndefined()
+  })
+
+  test("Tab does nothing when the prompt is dirty (user-typed)", () => {
+    const dirty = { ...emptyPromptField(), prompt: "typed", fromDefault: false }
+    expect(nextPromptSuggestion(dirty, suggestions)).toBeUndefined()
+  })
+
+  test("an inserted suggestion stays swappable on the next pipeline switch", () => {
+    const inserted = nextPromptSuggestion(emptyPromptField(), suggestions)!
+    expect(inserted.fromDefault).toBe(true)
+    const swapped = promptAfterPipelineSwitch(inserted, "new default")
+    expect(swapped.prompt).toBe("new default")
   })
 })
 

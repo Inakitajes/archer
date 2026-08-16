@@ -253,11 +253,24 @@ export type Pipeline = {
   goalMaxIterations?: number
   /** Goal loop: stop when a fix iteration improves the score by less than this many points. */
   goalPlateau?: number
+  /**
+   * Prompt text used when the pipeline runs without an explicit prompt: the
+   * TUI prefills its prompt field with it and the CLI falls back to it. Set on
+   * concrete-action pipelines (review, ship, hunter); absent on pipelines where
+   * the prompt IS the feature description (implement, fixer, ...).
+   */
+  defaultPrompt?: string
+  /**
+   * Alternative prompts the TUI can Tab-cycle through while the prompt field
+   * is clean (empty or still holding a default). Empty or absent means no
+   * suggestions.
+   */
+  suggestedPrompts?: string[]
   steps: Step[]
 }
 
 export type RunPlan = {
-  prompt: { source: "inline" | "file" | "resume" | "retry"; text: string }
+  prompt: { source: "inline" | "file" | "resume" | "retry" | "default"; text: string }
   target: {
     directory: string
     baseRef: string

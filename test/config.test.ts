@@ -40,6 +40,7 @@ import {
   isParallelSpec,
   resolvePipeline,
 } from "../src/pipeline"
+import type { PipelineSpec } from "../src/pipeline"
 
 const dirs: string[] = []
 
@@ -493,6 +494,91 @@ describe("pipeline selection", () => {
     // the configured goal must live in the same 1–100 range the CLI enforces.
     const dir = await projectDir()
     expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    goal: 0", dir)).toThrow("between 1 and 100")
+  })
+
+  test("parses defaultPrompt and suggestedPrompts and resolves them onto the pipeline", async () => {
+    const dir = await projectDir()
+    const config = parse(
+      [
+        "pipelines:",
+        "  quick:",
+        "    steps:",
+        "      - implementer",
+        "    defaultPrompt: Review the current branch against its base.",
+        "    suggestedPrompts:",
+        "      - Review the open PR",
+        "      - Review only the last commit",
+      ].join("\n"),
+      dir,
+    )
+    const spec = selectPipelineSpec(config, "quick")
+    expect(spec.defaultPrompt).toBe("Review the current branch against its base.")
+    expect(spec.suggestedPrompts).toEqual(["Review the open PR", "Review only the last commit"])
+
+    const resolved = resolvePipeline({ name: "quick", spec, agents: builtInAgents })
+    expect(resolved.defaultPrompt).toBe("Review the current branch against its base.")
+    expect(resolved.suggestedPrompts).toEqual(["Review the open PR", "Review only the last commit"])
+  })
+
+  test("accepts a pipeline without defaultPrompt or suggestedPrompts, and with only one of them", async () => {
+    const dir = await projectDir()
+    const bare = parse("pipelines:\n  bare:\n    steps:\n      - implementer", dir)
+    expect(selectPipelineSpec(bare, "bare").defaultPrompt).toBeUndefined()
+    expect(selectPipelineSpec(bare, "bare").suggestedPrompts).toBeUndefined()
+
+    const onlyDefault = parse(
+      "pipelines:\n  only-default:\n    steps:\n      - implementer\n    defaultPrompt: Run the default thing.",
+      dir,
+    )
+    expect(selectPipelineSpec(onlyDefault, "only-default").defaultPrompt).toBe("Run the default thing.")
+    expect(selectPipelineSpec(onlyDefault, "only-default").suggestedPrompts).toBeUndefined()
+
+    const onlySuggestions = parse(
+      "pipelines:\n  only-suggestions:\n    steps:\n      - implementer\n    suggestedPrompts:\n      - Suggestion one",
+      dir,
+    )
+    expect(selectPipelineSpec(onlySuggestions, "only-suggestions").defaultPrompt).toBeUndefined()
+    expect(selectPipelineSpec(onlySuggestions, "only-suggestions").suggestedPrompts).toEqual(["Suggestion one"])
+  })
+
+  test("rejects an empty defaultPrompt", async () => {
+    const dir = await projectDir()
+    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    defaultPrompt: ''", dir)).toThrow(
+      "defaultPrompt must be a non-empty string",
+    )
+  })
+
+  test("rejects suggestedPrompts with empty strings in the array", async () => {
+    const dir = await projectDir()
+    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    suggestedPrompts:\n      - ''", dir)).toThrow(
+      "suggestedPrompts[0] must be a non-empty string",
+    )
+  })
+
+  test("rejects suggestedPrompts that is not a list", async () => {
+    const dir = await projectDir()
+    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    suggestedPrompts: nope", dir)).toThrow(
+      "suggestedPrompts must be a list of non-empty strings",
+    )
+  })
+
+  test("trims suggestedPrompts values on parse", async () => {
+    const dir = await projectDir()
+    const config = parse("pipelines:\n  quick:\n    steps:\n      - implementer\n    suggestedPrompts:\n      - '  padded  '", dir)
+    expect(selectPipelineSpec(config, "quick").suggestedPrompts).toEqual(["padded"])
+  })
+
+  test("materializePipelineSpec carries defaultPrompt and suggestedPrompts into the editable copy", async () => {
+    const spec: PipelineSpec = {
+      description: "x",
+      defaultPrompt: "Do the thing.",
+      suggestedPrompts: ["A", "B"],
+      steps: ["implementer"],
+    }
+    const materialized = materializePipelineSpec(spec)
+    expect(materialized.defaultPrompt).toBe("Do the thing.")
+    expect(materialized.suggestedPrompts).toEqual(["A", "B"])
+    expect(materialized.steps).toEqual(["implementer"])
   })
 })
 
