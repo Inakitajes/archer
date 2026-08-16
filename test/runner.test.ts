@@ -845,6 +845,98 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
     expect(attempts).toEqual([1])
   })
 
+  test("an empty markdown report reaches the human failure gate instead of failing terminally", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("continue")
+      },
+    }
+    const phase = { ...agentStep("scope"), readOnly: true, deliverableContract: { kind: "markdown-report" } as const }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          return ""
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    // SC-1: an empty read-only report is an ordinary attempt failure — the human
+    // gate decides ([r]/[o]/[a]) instead of a terminal throw with no recourse.
+    expect(result).toBe("")
+    expect(attempts).toEqual([1])
+    expect(restores).toBe(0)
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("failure")
+    expect(prompts[0]?.canRetry).toBe(true)
+  })
+
+  test("an armed takeover owns an invalid deliverable and presents it interactively", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      isInteractiveTakeover: () => true,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("continue")
+      },
+    }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      qualityScorePhase(),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          return "# no score block"
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    // SC-2: armed means the step is the user's — an invalid deliverable is shown
+    // to them interactively, not auto-retried or terminally thrown behind their back.
+    expect(result).toBe("")
+    expect(attempts).toEqual([1])
+    expect(restores).toBe(0)
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("interactive")
+    expect(prompts[0]?.canRetry).toBe(false)
+  })
+
   test("abort throws UserAbortError and requests a run-wide shutdown", async () => {
     const workspace = await retryWorkspace()
     const progress: ProgressUI = {
@@ -2114,7 +2206,7 @@ describe("applyCompletionCheckpoint lastAssistantParts", () => {
     expect((result.lastAssistantParts[0] as { text: string }).text).toBe("# corrected report")
   })
 
-  test("a writable phase always reports from the second turn's last parts", async () => {
+  test("a writable phase with an unchanged follow-up keeps the first turn's last parts", async () => {
     const second = completedMessage("msg_2", "NO CHANGES")
     const result = await applyCompletionCheckpoint(
       checkpointClient(second),
@@ -2123,10 +2215,11 @@ describe("applyCompletionCheckpoint lastAssistantParts", () => {
       advisor,
     )
 
-    // a writing phase keeps both turns' parts (fallback report) but the report
-    // extract comes from the second turn only.
+    // A writing phase keeps both turns' parts (fallback report), but the report
+    // extract comes from the first turn: the NO CHANGES sentinel must never
+    // become the phase report through the text-fallback channel.
     expect(result.lastAssistantParts).toHaveLength(1)
-    expect((result.lastAssistantParts[0] as { text: string }).text).toBe("NO CHANGES")
+    expect((result.lastAssistantParts[0] as { text: string }).text).toBe("first report")
     expect(result.parts).toHaveLength(2)
   })
 })

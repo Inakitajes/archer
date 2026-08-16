@@ -1128,8 +1128,13 @@ async function runPhase(
     })
     if (phase.readOnly && baseline) await metadata.phaseRepositoryBaseline(phase.name, baseline)
     const reportAbs = await withReadOnlyRepositoryBoundary(phase, options.targetDir, baseline, gitLock, async () => {
-      const assistantText = await runPhaseUntilResolved(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors)
-      return persistPhaseReport(workspace, phase, assistantText)
+      const contract = deliverableContractForPhase(phase)
+      // One rubric read shared by the phase loop and the persist step, so the
+      // artifact that persists is always validated with the same weights the
+      // loop accepted it with.
+      const rubricWeights = contract.kind === "quality-score-report" ? ((await loadQualityRubricWeights(options.targetDir)) ?? qualityDimensionWeights) : qualityDimensionWeights
+      const assistantText = await runPhaseUntilResolved(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors, rubricWeights)
+      return persistPhaseReport(workspace, phase, assistantText, contract, rubricWeights)
     })
     await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline))
     progress.phaseCompleted(phase.name, "report saved and commit checked")
@@ -1222,11 +1227,14 @@ export async function runPhaseUntilResolved(
   takeover?: TakeoverContext,
   deps: PhaseRetryDeps = { runPhaseAttempt, restorePhaseBaseline },
   advisors?: AdvisorRuntime,
+  /** The rubric weights used for score validation; shared with persistPhaseReport so both sites agree. */
+  rubricWeights?: Record<QualityDimension, number>,
 ) {
   const sessionRef: SessionRef = {}
   const deliverableContract = deliverableContractForPhase(phase)
-  const rubricWeights =
-    deliverableContract.kind === "quality-score-report" ? ((await loadQualityRubricWeights(targetDir)) ?? qualityDimensionWeights) : qualityDimensionWeights
+  const weights =
+    rubricWeights ??
+    (deliverableContract.kind === "quality-score-report" ? ((await loadQualityRubricWeights(targetDir)) ?? qualityDimensionWeights) : qualityDimensionWeights)
   let automaticDeliverableRetries = 0
   // Read fresh at each decision point: the user can arm/disarm [i] mid-attempt.
   const armed = () => Boolean(takeover && progress.isInteractiveTakeover?.(phase.name))
@@ -1237,22 +1245,49 @@ export async function runPhaseUntilResolved(
     log.info(`[${phase.name}] attempt ${attempt} with ${formatModel(prepared.model)}`)
     try {
       const text = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors)
-      const validation = validateDeliverable(deliverableContract, text, rubricWeights)
+      const validation = validateDeliverable(deliverableContract, text, weights)
       if (!validation.valid) {
         await persistInvalidPhaseReport(workspace, phase, attempt, text)
+        // An armed takeover owns the step even when its deliverable fails
+        // validation: hand it to the user instead of auto-retrying or failing
+        // terminally behind their back.
+        if (armed()) {
+          const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
+            kind: "interactive",
+            canRetry: false,
+            error: validation.error,
+            signal: shutdown.signal,
+            onAbort: () => {
+              if (!shutdown.aborted) shutdown.request("phase gate abort")
+            },
+            runner: phase.runner,
+            runDir: workspace.dir,
+          })
+          // "continue": the user owns the tree and accepts it as-is, so nothing
+          // is committed from this attempt. "unavailable": nobody can take over,
+          // so the automatic policy below applies.
+          if (outcome === "continue") return ""
+        }
+        const totalAttempts = deliverableContract.kind === "quality-score-report" ? deliverableContract.retryOnMissingOrInvalid + 1 : undefined
+        const attemptContext = totalAttempts === undefined ? `attempt ${attempt}` : `attempt ${attempt} of ${totalAttempts}`
         const canRetryAutomatically =
           deliverableContract.kind === "quality-score-report" && automaticDeliverableRetries < deliverableContract.retryOnMissingOrInvalid
         if (canRetryAutomatically) {
           automaticDeliverableRetries++
           log.warn(
-            `[${phase.name}] deliverable validation failed (attempt ${attempt}/${deliverableContract.retryOnMissingOrInvalid + 1}): ${validation.error}; retrying automatically`,
+            `[${phase.name}] deliverable validation failed (${attemptContext}): ${validation.error}; retrying automatically`,
           )
           await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, new DeliverableValidationError(validation.error)))
           await removePhaseReport(workspace, phase)
           continue
         }
-        log.error(`[${phase.name}] deliverable validation failed: ${validation.error}`)
-        throw new DeliverableValidationError(validation.error)
+        log.error(`[${phase.name}] deliverable validation failed (${attemptContext}): ${validation.error}`)
+        // Only the scored contract is terminal by policy: accepting a missing
+        // score through the human failure gate would complete a scored run with
+        // no machine-readable result. A markdown-report failure is an ordinary
+        // attempt failure — the human gate ([r]/[o]/[a]) decides.
+        if (deliverableContract.kind === "quality-score-report") throw new DeliverableValidationError(validation.error)
+        throw new Error(validation.error)
       }
       if (armed()) {
         // Armed means "this step is mine": even a clean finish waits for the
@@ -1272,10 +1307,12 @@ export async function runPhaseUntilResolved(
       return text
     } catch (error) {
       if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
-      // A report-contract failure is terminal after its bounded automatic retry;
-      // accepting it through the human failure gate would turn a missing score
-      // into a successful scored run with no machine-readable result.
-      if (error instanceof DeliverableValidationError) throw error
+      // A scored-contract failure is terminal after its bounded automatic retry:
+      // accepting a missing score through the human failure gate would turn a
+      // missing score into a successful scored run with no machine-readable
+      // result. Other contract failures (empty markdown) are ordinary attempt
+      // failures and reach the gate like any other failed attempt.
+      if (error instanceof DeliverableValidationError && deliverableContract.kind === "quality-score-report") throw error
       if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
       progress.phaseRunning(phase.name, "step failed — waiting for your decision")
       log.warn(`[${phase.name}] attempt ${attempt} failed: ${formatSdkError(error)}`)
@@ -1543,7 +1580,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     loopGuardConfig: input.prepared.loopGuard,
     ...(input.advisors ? { advisors: input.advisors } : {}),
   })
-  const assistantText = extractAssistantText(result.lastAssistantParts ?? result.parts)
+  const assistantText = extractAssistantText(result.lastAssistantParts)
   // Totals for the whole attempt, not the final message: the attempt log's
   // executor figures are what the advisor split is measured against, and a
   // headline ratio computed from one message of a many-message phase would
@@ -1590,6 +1627,21 @@ async function executeClaudeCodePhaseAttempt(input: PhaseAttemptInput): Promise<
   }
 }
 
+/** Validates a candidate deliverable; on failure keeps it as forensics and throws. */
+async function ensureValidDeliverable(
+  workspace: Workspace,
+  phase: AgentStep,
+  contract: DeliverableContract,
+  weights: Record<QualityDimension, number>,
+  candidate: string,
+) {
+  const validation = validateDeliverable(contract, candidate, weights)
+  if (!validation.valid) {
+    await persistInvalidPhaseReport(workspace, phase, undefined, candidate)
+    throw new DeliverableValidationError(validation.error)
+  }
+}
+
 async function persistPhaseReport(
   workspace: Workspace,
   phase: AgentStep,
@@ -1598,28 +1650,25 @@ async function persistPhaseReport(
   weights: Record<QualityDimension, number> = qualityDimensionWeights,
 ) {
   const reportAbs = join(workspace.dir, phase.reportPath)
-  // Empty text is the human-continue signal ("accept the tree as-is"), not a
-  // report to validate. The phase loop already rejected empty markdown and
-  // invalid scores on the success path; re-checking a blank continue here
-  // would turn an explicit operator accept into a hard failure.
-  if (assistantText.trim() !== "") {
-    const validation = validateDeliverable(contract, assistantText, weights)
-    if (!validation.valid) {
-      await persistInvalidPhaseReport(workspace, phase, undefined, assistantText)
-      throw new DeliverableValidationError(validation.error)
-    }
-    if (!(await exists(reportAbs))) {
-      await mkdir(dirname(reportAbs), { recursive: true })
-      // Write to a temporary path then rename atomically, matching the
-      // metadata.ts pattern (tmp+rename). A crash mid-write must never leave
-      // a truncated report that phaseNeedsRun would treat as complete.
-      const tmpPath = `${reportAbs}.tmp`
-      await writeFile(tmpPath, assistantText)
-      await rename(tmpPath, reportAbs)
-    }
-  }
-
-  if (!(await exists(reportAbs))) {
+  // Validate exactly what will persist. An existing report file is the artifact
+  // — a writable phase wrote it itself, or an earlier run left it — so the file
+  // is validated, not the fallback text: a stale or malformed file must never
+  // stand as the phase's deliverable just because the fallback happened to pass.
+  if (await exists(reportAbs)) {
+    await ensureValidDeliverable(workspace, phase, contract, weights, await readFile(reportAbs, "utf8"))
+  } else if (assistantText.trim() !== "") {
+    // No report yet: the fallback text becomes the report, so validate it first.
+    await ensureValidDeliverable(workspace, phase, contract, weights, assistantText)
+    await mkdir(dirname(reportAbs), { recursive: true })
+    // Write to a temporary path then rename atomically, matching the
+    // metadata.ts pattern (tmp+rename). A crash mid-write must never leave
+    // a truncated report that phaseNeedsRun would treat as complete.
+    const tmpPath = `${reportAbs}.tmp`
+    await writeFile(tmpPath, assistantText)
+    await rename(tmpPath, reportAbs)
+  } else {
+    // Empty text is the human-continue signal ("accept the tree as-is") and no
+    // report exists either: there is nothing to validate or persist.
     log.warn(`[${phase.name}] agent didn't write the expected report at ${reportAbs}`)
   }
 
@@ -1919,7 +1968,7 @@ export async function applyCompletionCheckpoint(
     // Propagating it would fail the attempt and roll the finished phase back.
     if (second.info.error) return keepCompletedPhase(input.phase.name, first, formatSdkError(second.info.error))
 
-    const secondText = extractAssistantText(second.lastAssistantParts ?? second.parts).trim()
+    const secondText = extractAssistantText(second.lastAssistantParts).trim()
     const unchanged = secondText.length === 0 || secondText.toUpperCase().startsWith(noChangesReply)
 
     return {
@@ -1928,7 +1977,10 @@ export async function applyCompletionCheckpoint(
       // is only a fallback report, so both turns are kept.
       parts: input.phase.readOnly ? (unchanged ? first.parts : second.parts) : [...first.parts, ...second.parts],
       assistantInfos: [...first.assistantInfos, ...second.assistantInfos],
-      lastAssistantParts: input.phase.readOnly ? (unchanged ? first.lastAssistantParts : second.lastAssistantParts) : second.lastAssistantParts,
+      // An unchanged follow-up means the first turn still holds the report, for
+      // a writing phase too: the NO CHANGES sentinel must never become the phase
+      // report through the text-fallback channel.
+      lastAssistantParts: unchanged ? first.lastAssistantParts : second.lastAssistantParts,
     }
   } catch (error) {
     // A guard trip in the follow-up turn is the same decision a trip in the
