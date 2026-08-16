@@ -104,24 +104,25 @@ export function paletteForMode(mode: "dark" | "light" | null | undefined): Palet
 }
 
 /**
- * Palette tuned to the terminal's own background: borders are subtle
- * elevations of it and modals repaint it exactly, so nothing reads as a
- * foreign skin. Accents still come from the static palettes (picked by the
- * background's brightness, which is the same inference opentui uses for the
- * mode). Without a reported background this falls back to paletteForMode.
+ * Palette tuned to the terminal's own background: only the modal overlay and
+ * chip text follow the reported background, so modals mask what's beneath
+ * them and never read as a foreign skin. Borders stay on the static palette:
+ * deriving them from the reported background turned the designed border colors
+ * into neutral grays under multiplexers that answer the background query with
+ * their own host theme instead of the real terminal. Accents still come from
+ * the static palettes (picked by the background's brightness, which is the
+ * same inference opentui uses for the mode). Without a reported background
+ * this falls back to paletteForMode.
  */
 export function paletteForTerminal(mode: "dark" | "light" | null | undefined, backgroundHex?: string): Palette {
   const rgb = backgroundHex ? parseHex(backgroundHex) : undefined
   if (!rgb) return paletteForMode(mode)
   const isDark = (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) / 1000 <= 128
-  const pole: Rgb = isDark ? [255, 255, 255] : [0, 0, 0]
   return {
     ...(isDark ? darkPalette : lightPalette),
     // The reported color, not transparent: a modal must mask what's beneath
     // it, and repainting the terminal's own background makes that invisible.
     overlay: backgroundHex!,
-    borderDim: mixToward(rgb, pole, 0.16),
-    border: mixToward(rgb, pole, 0.26),
     chipText: backgroundHex!,
   }
 }
@@ -145,14 +146,6 @@ function parseHex(hex: string): Rgb | undefined {
   if (!match) return undefined
   const value = Number.parseInt(match[1]!, 16)
   return [(value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff]
-}
-
-function mixToward(rgb: Rgb, pole: Rgb, amount: number): string {
-  const hex = (index: number) =>
-    Math.round(rgb[index]! + (pole[index]! - rgb[index]!) * amount)
-      .toString(16)
-      .padStart(2, "0")
-  return `#${hex(0)}${hex(1)}${hex(2)}`
 }
 
 export type PhaseStatus = "pending" | "running" | "completed" | "skipped" | "failed"
