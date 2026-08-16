@@ -200,6 +200,9 @@ const toggles: readonly ToggleSpec[] = [
 /** The default target a scored run aims for when goal mode is toggled on in the launcher. */
 export const defaultGoalTarget = 90
 
+/** The terminal width at or below which the launcher stacks its two panels. */
+export const compactLaunchMaxWidth = 84
+
 /** Adjusts a goal target by delta, clamped to 1–100 (never 0: a 0 goal would make the loop a no-op). */
 export function adjustGoalTarget(current: number, delta: number): number {
   return Math.max(1, Math.min(100, current + delta))
@@ -317,7 +320,7 @@ function shortModelLabel(model: string, variant?: string): string {
   return variant ? `${base} ${variant}` : base
 }
 
-class LaunchPicker {
+export class LaunchPicker {
   readonly result: Promise<LaunchRunTuiResult>
 
   private resolveResult!: (selection: LaunchRunTuiResult) => void
@@ -377,6 +380,7 @@ class LaunchPicker {
   private readonly stopLimits: () => void
   private limits?: LimitsSnapshot
   private readonly headerText: TextRenderable
+  private readonly bodyBox: BoxRenderable
   private readonly pipelineText: TextRenderable
   private readonly pipelineBox: BoxRenderable
   private readonly detailText: TextRenderable
@@ -561,6 +565,7 @@ class LaunchPicker {
     const footer = this.panel({ id: "convoy-launch-footer", height: 3, borderColor: theme.borderDim, backgroundColor: theme.bg })
 
     this.headerText = header.text
+    this.bodyBox = body
     this.pipelineText = pipeline.text
     this.pipelineBox = pipeline.box
     this.detailText = detail.text
@@ -640,10 +645,10 @@ class LaunchPicker {
         this.moveSelection(1)
         return
       case "pageup":
-        this.moveSelection(-this.listHeight())
+        this.moveSelection(-this.pipelineVisibleRows())
         return
       case "pagedown":
-        this.moveSelection(this.listHeight())
+        this.moveSelection(this.pipelineVisibleRows())
         return
       case "home":
         this.moveSelection(-this.choices.length)
@@ -898,17 +903,17 @@ class LaunchPicker {
         this.scrollReview(1)
         return
       case "page-back":
-        this.scrollReview(-this.listHeight())
+        this.scrollReview(-this.reviewVisibleRows())
         return
       case "page-forward":
-        this.scrollReview(this.listHeight())
+        this.scrollReview(this.reviewVisibleRows())
         return
       case "top":
         this.reviewScroll = 0
         this.render()
         return
       case "bottom":
-        this.reviewScroll = Math.max(0, this.reviewTotalLines - this.listHeight())
+        this.reviewScroll = Math.max(0, this.reviewTotalLines - this.reviewVisibleRows())
         this.render()
         return
       case "toggle-prompt":
@@ -933,7 +938,7 @@ class LaunchPicker {
   }
 
   private scrollReview(delta: number) {
-    const maxScroll = Math.max(0, this.reviewTotalLines - this.listHeight())
+    const maxScroll = Math.max(0, this.reviewTotalLines - this.reviewVisibleRows())
     this.reviewScroll = clamp(this.reviewScroll + delta, 0, maxScroll)
     this.render()
   }
@@ -1164,14 +1169,23 @@ class LaunchPicker {
     this.lastRenderAt = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const reviewing = this.mode === "review"
+    const compact = this.usesCompactLayout()
     // The Review step owns the whole screen: the pipeline list would only
     // repeat what the plan already freezes, and the plan needs the width.
     this.pipelineBox.visible = !reviewing
-    const pipelineWidth = this.pipelineWidth()
-    const detailWidth = reviewing ? innerWidth : Math.max(40, this.renderer.width - pipelineWidth - 7)
+    const pipelineWidth = compact ? innerWidth + 4 : this.pipelineWidth()
+    // In compact mode both panels occupy the shell's full inner width. Wide
+    // screens retain the sidebar, but measure the detail panel from the actual
+    // inner width rather than a fixed 40-column floor that could overflow.
+    const detailWidth = reviewing || compact ? innerWidth : Math.max(34, innerWidth - pipelineWidth - 1)
+    const bodyHeight = this.compactBodyHeight()
+    const pipelineHeight = compact ? this.compactPipelineHeight(bodyHeight) : bodyHeight
 
-    this.pipelineBox.width = pipelineWidth
-    this.detailBox.width = detailWidth
+    this.bodyBox.flexDirection = compact ? "column" : "row"
+    this.pipelineBox.width = compact ? "100%" : pipelineWidth
+    this.pipelineBox.height = compact ? pipelineHeight : "100%"
+    this.detailBox.width = compact || reviewing ? "100%" : detailWidth
+    this.detailBox.height = compact ? "auto" : "100%"
     this.detailBox.title = reviewing ? " review " : " run setup "
     // Mirror the dashboard focus cue: the accented border marks where Enter,
     // Esc, and the navigation keys apply in the current setup step.
@@ -1183,7 +1197,7 @@ class LaunchPicker {
     // below. Passing the full box width made every right-aligned badge overflow
     // and wrap onto its own line.
     this.pipelineText.content = this.pipelineContent(pipelineWidth - 4)
-    this.detailText.content = this.detailContent(detailWidth - 4)
+    this.detailText.content = this.detailContent(compact || reviewing ? innerWidth : detailWidth - 4)
     this.footerText.content = this.footerContent(innerWidth)
     this.renderModal()
     this.renderer.requestRender()
@@ -1216,7 +1230,7 @@ class LaunchPicker {
   }
 
   private modalWidth() {
-    return Math.max(46, Math.min(80, this.renderer.width - 10))
+    return clamp(this.renderer.width - 8, 34, 80)
   }
 
   // No "◆ convoy" branding here: the launcher is convoy's own front door, so
@@ -1236,16 +1250,21 @@ class LaunchPicker {
       { label: "review", mode: "review" },
     ]
     const stage: TextChunk[] = []
-    for (const [index, step] of steps.entries()) {
-      if (index > 0) stage.push(fg(theme.faint)(" → "))
-      stage.push(this.mode === step.mode ? bold(fg(theme.accent)(step.label)) : fg(theme.dim)(step.label))
+    const currentStep = steps.find((step) => step.mode === this.mode)
+    if (width < 60 && currentStep) {
+      stage.push(bold(fg(theme.accent)(currentStep.label)))
+    } else {
+      for (const [index, step] of steps.entries()) {
+        if (index > 0) stage.push(fg(theme.faint)(" → "))
+        stage.push(this.mode === step.mode ? bold(fg(theme.accent)(step.label)) : fg(theme.dim)(step.label))
+      }
     }
     const line1 = padBetween(title, stage, width)
     return joinLines([line1, limitsRow(this.limits, Date.now(), width)])
   }
 
   private pipelineContent(width: number) {
-    const visible = this.listHeight()
+    const visible = this.pipelineVisibleRows()
     if (this.selected < this.scroll) this.scroll = this.selected
     if (this.selected >= this.scroll + visible) this.scroll = this.selected - visible + 1
     this.scroll = clamp(this.scroll, 0, Math.max(0, this.choices.length - visible))
@@ -1269,7 +1288,7 @@ class LaunchPicker {
   // state is carried by the badge so unselected dots stay visually uniform.
   private pipelineRow(choice: PipelineChoice, selected: boolean, width: number) {
     const dot = choice.valid ? fg(selected ? theme.accent : theme.dim)(selected ? "●" : "○") : fg(theme.red)("!")
-    const badgeText = choice.isDefault ? "default" : choice.source === "configured" ? "custom" : ""
+    const badgeText = width >= 30 && (choice.isDefault ? "default" : choice.source === "configured" ? "custom" : "")
     const badge: TextChunk[] = badgeText ? [fg(choice.isDefault ? theme.green : theme.teal)(badgeText)] : []
     // Prefix is dot (1) + space (1); reserve the badge plus a
     // 1-cell gap so a long name truncates instead of wrapping into the badge.
@@ -1331,7 +1350,7 @@ class LaunchPicker {
 
     const fieldWidth = Math.max(10, width - 2)
     const contentWidth = Math.max(1, fieldWidth)
-    const inputHeight = Math.max(5, Math.min(20, this.listHeight() - 6))
+    const inputHeight = Math.max(5, Math.min(20, this.detailContentHeight() - 6))
     const visibleRows = Math.max(1, inputHeight - 2)
     const wrapped = wrapPromptLines(this.prompt, contentWidth)
     const { row: cursorRow, col: cursorCol } = cursorPosition(this.prompt, this.cursor, contentWidth)
@@ -1383,9 +1402,10 @@ class LaunchPicker {
     lines.push(plain(""))
     const hint = "shift+enter newline · enter options · ←/→ move · ctrl+U clear · esc back"
     if (wrapped.length > 1) {
-      lines.push(new StyledText([fg(theme.faint)(hint + " · "), fg(theme.accent)(`${wrapped.length} lines`)]))
+      const suffix = ` · ${wrapped.length} lines`
+      lines.push(new StyledText([fg(theme.faint)(truncate(hint, Math.max(0, width - suffix.length))), fg(theme.accent)(suffix)]))
     } else {
-      lines.push(t`${fg(theme.faint)(hint)}`)
+      lines.push(t`${fg(theme.faint)(truncate(hint, width))}`)
     }
     return joinLines(lines)
   }
@@ -1441,7 +1461,9 @@ class LaunchPicker {
     const flags = this.enabledFlags()
     lines.push(plain(""))
     this.optionRows.push(undefined)
-    lines.push(new StyledText([fg(theme.faint)("will run with "), fg(theme.text)(flags.length ? flags.join(" ") : "no extra flags")]))
+    const flagsPrefix = "will run with "
+    const flagsText = flags.length ? flags.join(" ") : "no extra flags"
+    lines.push(new StyledText([fg(theme.faint)(flagsPrefix), fg(theme.text)(truncate(flagsText, Math.max(1, width - flagsPrefix.length)))]))
     this.optionRows.push(undefined)
     return joinLines(lines)
   }
@@ -1483,7 +1505,7 @@ class LaunchPicker {
     if (!prepared) return joinLines([t`${fg(theme.red)("Unable to load the run review.")}`])
 
     const reviewRows = runReviewLines(prepared.plan, width, { fullPrompt: this.reviewFullPrompt })
-    const visible = this.listHeight()
+    const visible = this.reviewVisibleRows()
     const maxScroll = Math.max(0, reviewRows.length - visible)
     this.reviewScroll = clamp(this.reviewScroll, 0, maxScroll)
     this.reviewTotalLines = reviewRows.length
@@ -1550,7 +1572,7 @@ class LaunchPicker {
       )
     }
     if (this.mode === "review") {
-      const end = Math.min(this.reviewScroll + this.listHeight(), this.reviewTotalLines)
+      const end = Math.min(this.reviewScroll + this.reviewVisibleRows(), this.reviewTotalLines)
       return row(
         [
           { keys: "↑/↓", label: "scroll", priority: 3, tone: "dim" },
@@ -1584,8 +1606,37 @@ class LaunchPicker {
     return clamp(Math.floor(inner / 3), 22, 44)
   }
 
+  private usesCompactLayout() {
+    return this.renderer.width <= compactLaunchMaxWidth
+  }
+
+  // Enough rows to browse a short list without crowding out the selected
+  // pipeline's setup form below it.
+  private compactPipelineHeight(bodyHeight: number) {
+    return Math.max(5, Math.min(9, Math.floor(bodyHeight * 0.35)))
+  }
+
+  private compactBodyHeight() {
+    // Header (4), footer (3), and the detail panel's top/bottom borders (2).
+    return Math.max(8, this.renderer.height - 9)
+  }
+
+  private pipelineVisibleRows() {
+    return this.usesCompactLayout() ? Math.max(1, this.compactPipelineHeight(this.compactBodyHeight()) - 2) : this.listHeight()
+  }
+
+  private detailContentHeight() {
+    if (!this.usesCompactLayout()) return this.listHeight()
+    const bodyHeight = this.compactBodyHeight()
+    return bodyHeight - this.compactPipelineHeight(bodyHeight) - 1
+  }
+
+  private reviewVisibleRows() {
+    return Math.max(3, this.detailContentHeight())
+  }
+
   private listHeight() {
-    // header (4) + footer (3) + list panel borders (2).
+    // Header (4) + footer (3) + list panel borders (2).
     return Math.max(3, this.renderer.height - 9)
   }
 }

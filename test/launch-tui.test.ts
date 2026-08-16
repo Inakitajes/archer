@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test"
+import { createTestRenderer } from "@opentui/core/testing"
 
-import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
+import { LaunchPicker, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultGoalTarget, adjustGoalTarget, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
 
 import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
 import { consensusStep } from "../src/quality-score"
+import { displayWidth } from "../src/tui-theme"
 import type { KeyEvent } from "@opentui/core"
 
 function key(partial: Partial<KeyEvent>): KeyEvent {
@@ -13,6 +15,163 @@ function key(partial: Partial<KeyEvent>): KeyEvent {
 function plainLines(lines: ReturnType<typeof stepTree>): string[] {
   return lines.map((line) => line.chunks.map((chunk) => chunk.text).join(""))
 }
+
+function launcherChoices(count = 1) {
+  return Array.from({ length: count }, (_, index) => ({
+    name: `pipeline-${index + 1}`,
+    description: "A test pipeline.",
+    source: "built-in" as const,
+    isDefault: index === 0,
+    steps: [],
+    hooks: [],
+    valid: true,
+    advisedSteps: 0,
+    scored: false,
+  }))
+}
+
+async function createLauncher(width: number, height = 30, choiceCount = 1) {
+  const testRenderer = await createTestRenderer({ width, height })
+  const picker = new LaunchPicker(
+    testRenderer.renderer,
+    process.cwd(),
+    launcherChoices(choiceCount),
+    "configured",
+    { isolate: false, reason: "test" },
+    {} as never,
+  )
+  return { ...testRenderer, picker }
+}
+
+async function closeLauncher(launcher: Awaited<ReturnType<typeof createLauncher>>) {
+  launcher.mockInput.pressKey("c", { ctrl: true })
+  await expect(launcher.picker.result).resolves.toBeUndefined()
+}
+
+type LaunchPickerView = {
+  mode: string
+  prompt: string
+  modalWidth(): number
+  pipelineRow(choice: never, selected: boolean, width: number): { chunks: Array<{ text: string }> }
+  promptDetail(width: number): { chunks: Array<{ text: string }> }
+  optionsDetail(width: number): { chunks: Array<{ text: string }> }
+}
+
+function launchView(picker: LaunchPicker): LaunchPickerView {
+  return picker as unknown as LaunchPickerView
+}
+
+function panelRow(frame: string, title: string) {
+  const row = frame.split("\n").findIndex((line) => line.includes(title))
+  expect(row, `missing ${title} panel`).toBeGreaterThanOrEqual(0)
+  return row
+}
+
+describe("launch TUI compact layout", () => {
+  test("switches panels at the 84-column breakpoint", async () => {
+    const compact = await createLauncher(compactLaunchMaxWidth)
+    const wide = await createLauncher(compactLaunchMaxWidth + 1)
+    try {
+      await compact.renderOnce()
+      await wide.renderOnce()
+      const compactFrame = compact.captureCharFrame()
+      const wideFrame = wide.captureCharFrame()
+      const compactPipelines = panelRow(compactFrame, "pipelines")
+      const compactDetail = panelRow(compactFrame, "run setup")
+      const widePipelines = panelRow(wideFrame, "pipelines")
+      const wideDetail = panelRow(wideFrame, "run setup")
+
+      expect(compactPipelines).toBeLessThan(compactDetail)
+      expect(compactDetail - compactPipelines - 1).toBeGreaterThanOrEqual(5)
+      expect(compactDetail - compactPipelines - 1).toBeLessThanOrEqual(9)
+      expect(displayWidth(compactFrame.split("\n")[compactPipelines]!)).toBe(compactLaunchMaxWidth)
+      expect(displayWidth(compactFrame.split("\n")[compactDetail]!)).toBe(compactLaunchMaxWidth)
+
+      expect(widePipelines).toBe(wideDetail)
+      expect(wideFrame.split("\n")[wideDetail]!.indexOf("run setup")).toBeGreaterThan(wideFrame.split("\n")[widePipelines]!.indexOf("pipelines"))
+    } finally {
+      await closeLauncher(compact)
+      await closeLauncher(wide)
+    }
+  })
+
+  test("updates the layout and preserves scrolling after a resize", async () => {
+    const launcher = await createLauncher(90, 24, 10)
+    try {
+      await launcher.renderOnce()
+      expect(panelRow(launcher.captureCharFrame(), "pipelines")).toBe(panelRow(launcher.captureCharFrame(), "run setup"))
+
+      launcher.resize(80, 24)
+      launcher.mockInput.pressKey("j")
+      await launcher.renderOnce()
+      expect(panelRow(launcher.captureCharFrame(), "pipelines")).toBeLessThan(panelRow(launcher.captureCharFrame(), "run setup"))
+
+      for (let index = 0; index < 7; index++) launcher.mockInput.pressKey("j")
+      await launcher.renderOnce()
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("pipeline-9")
+      expect(frame).not.toContain("pipeline-1")
+
+      launcher.resize(90, 24)
+      launcher.mockInput.pressKey("k")
+      await launcher.renderOnce()
+      expect(panelRow(launcher.captureCharFrame(), "pipelines")).toBe(panelRow(launcher.captureCharFrame(), "run setup"))
+
+      launcher.resize(80, 24)
+      launcher.mockInput.pressEnter()
+      await launcher.renderOnce()
+      const promptField = launcher.captureCharFrame().split("\n").find((line) => line.includes("┌"))!
+      expect(displayWidth(promptField)).toBe(80)
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("keeps detail content and narrow affordances within their row budgets", async () => {
+    const launcher = await createLauncher(80)
+    try {
+      const view = launchView(launcher.picker)
+      const choice = launcherChoices()[0]!
+
+      expect(view.pipelineRow(choice as never, true, 32).chunks.map((chunk) => chunk.text).join("")).toContain("default")
+      expect(view.pipelineRow(choice as never, true, 28).chunks.map((chunk) => chunk.text).join("")).not.toContain("default")
+
+      view.mode = "prompt"
+      view.prompt = "first\nsecond"
+      const promptHint = view.promptDetail(40).chunks.map((chunk) => chunk.text).join("").split("\n").find((line) => line.includes("shift+enter"))!
+      expect(displayWidth(promptHint)).toBeLessThanOrEqual(40)
+
+      view.mode = "options"
+      const flags = view.optionsDetail(40).chunks.map((chunk) => chunk.text).join("").split("\n").find((line) => line.includes("will run with"))!
+      expect(displayWidth(flags)).toBeLessThanOrEqual(40)
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("degrades the stage trail and clamps modal widths on narrow renderers", async () => {
+    const narrow = await createLauncher(55)
+    const wide = await createLauncher(80)
+    const modal = await createLauncher(100)
+    try {
+      await narrow.renderOnce()
+      await wide.renderOnce()
+      expect(narrow.captureCharFrame()).not.toContain("→")
+      expect(wide.captureCharFrame()).toContain("→")
+
+      const view = launchView(modal.picker)
+      expect(view.modalWidth()).toBe(80)
+      modal.resize(50, 30)
+      expect(view.modalWidth()).toBe(42)
+      modal.resize(40, 30)
+      expect(view.modalWidth()).toBe(34)
+    } finally {
+      await closeLauncher(narrow)
+      await closeLauncher(wide)
+      await closeLauncher(modal)
+    }
+  })
+})
 
 describe("launch TUI prompt input", () => {
   test("sanitizes pasted prompt text while preserving unlimited multi-line content", () => {
