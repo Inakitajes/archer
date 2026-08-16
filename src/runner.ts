@@ -422,7 +422,22 @@ export function hostedTeardownFromError(error: unknown): HostedRunTeardown | und
   return undefined
 }
 
-export async function run(options: RunOptions) {
+/**
+ * Injected dependencies for `run()`, mirroring the goal loop's `default*Deps`
+ * pattern: a named constant covering every member so the seam is discoverable
+ * and every override replaces the whole surface at once. The hosted-run tests
+ * override `startOpencode` to exercise `run()` without spawning a real SDK
+ * server — this keeps that fake out of `mock.module`, which is process-global
+ * and would otherwise poison `test/opencode.test.ts`'s import of the real
+ * module whenever test load order puts the hosted tests first.
+ */
+export type RunDeps = {
+  startOpencode: typeof startOpencode
+}
+
+const defaultRunDeps: RunDeps = { startOpencode }
+
+export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
   // CLI callers hand the exact reviewed plan to the runner. Keep accepting
   // legacy programmatic RunOptions for API/tests, but never re-resolve a plan.
   const modelOverride = options.modelOverride
@@ -637,7 +652,7 @@ export async function run(options: RunOptions) {
       await installAdvisorTool({ url: advisorBridge.url, token: advisorBridge.token })
     }
     try {
-      opencode = await startOpencode(
+      opencode = await deps.startOpencode(
         opencodeConfig(workspace.dir, options.targetDir, agents, options.permissions, {
           advisorAgents: advisorNeeds.agents,
           advisorModels: advisorNeeds.models,

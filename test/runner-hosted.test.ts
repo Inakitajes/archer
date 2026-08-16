@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, mock, test } from "bun:test"
+import { afterAll, describe, expect, test } from "bun:test"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -6,9 +6,18 @@ import { join } from "node:path"
 import type { ProgressUI, RunOutcome } from "../src/progress"
 import type { RunOptions } from "../src/types"
 
-// The runner's run() spawns a real opencode server; mock that module boundary
-// before anything imports it so the hosted-progress contract is exercised
-// against a fake handle.
+import { run as realRun, hostedTeardownFromError, type RunDeps } from "../src/runner"
+import { noopProgress } from "../src/progress"
+import { builtInAgents } from "../src/pipeline"
+
+// The runner's run() spawns a real opencode server. Inject the fake through
+// run()'s deps seam rather than `mock.module("../src/opencode", …)`: that mock
+// is process-global under bun:test and would replace the *whole* opencode
+// module for every other test file in the run, so test/opencode.test.ts would
+// import the stub's identity `shellQuote`/empty `sessionShellCommand` instead
+// of the real ones whenever test load order put this file first (which is
+// exactly what flipped the ubuntu CI red while macOS stayed green). The deps
+// seam keeps the fake local: only `startOpencode` is swapped, and only here.
 const fakeClient = {
   event: { subscribe: async () => ({ stream: (async function* () {})() }) },
   session: { status: async () => ({ data: {} }), messages: async () => ({ data: [] }) },
@@ -19,31 +28,18 @@ const fakeClient = {
 // so the runner's catch-block wrapping can be tested against a real run().
 let throwPrimitiveFromStart = false
 
-mock.module("../src/opencode", () => ({
-  // The run path only ever calls startOpencode; the rest of the surface just
-  // has to exist as bindings so the modules that import it load cleanly.
-  startOpencode: async () => {
-    if (throwPrimitiveFromStart) throw "primitive boom"
-    return {
-      client: fakeClient as never,
-      url: "http://127.0.0.1:41234",
-      close: () => {},
-    }
-  },
-  connectOpencode: () => fakeClient as never,
-  openOpencodeSessionWindow: async () => "test-window",
-  openInteractiveOpencodeWindow: async () => "test-window",
-  openStoredSessionWindow: async () => "test-window",
-  openIterateOpencodeWindow: async () => "test-window",
-  openSessionCommand: async (coreCommand: string) => `echo ${coreCommand}`,
-  sessionShellCommand: () => "",
-  shellQuote: (value: string) => value,
-}))
+const fakeStartOpencode: RunDeps["startOpencode"] = async () => {
+  if (throwPrimitiveFromStart) throw "primitive boom"
+  return {
+    client: fakeClient as never,
+    url: "http://127.0.0.1:41234",
+    close: () => {},
+  }
+}
 
-// Imported after the mock so run() binds the fake opencode handle.
-const { run, hostedTeardownFromError } = await import("../src/runner")
-const { noopProgress } = await import("../src/progress")
-const { builtInAgents } = await import("../src/pipeline")
+// Bind the fake opencode handle so every test in this file exercises the
+// hosted-progress contract without spawning a real SDK server.
+const run = (options: RunOptions) => realRun(options, { startOpencode: fakeStartOpencode })
 
 const hostedHome = await mkdtemp(join(tmpdir(), "convoy-hosted-home-"))
 
