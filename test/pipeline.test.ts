@@ -280,6 +280,19 @@ describe("built-in review pipeline", () => {
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
   })
 
+  test("scope verifies: review-scope is a standalone read-only step with bash, so it runs the checks once", () => {
+    const pipeline = scored()
+    const scope = pipeline.steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
+
+    expect(scope).toMatchObject({
+      agentName: "review-scope",
+      readOnly: true,
+      verify: true,
+    })
+    // Not fanned out, so it keeps its own name (no __ro suffix).
+    expect(scope?.agentName.endsWith("__ro")).toBe(false)
+  })
+
   test("scopes, runs the three audits fanned across two models, synthesizes a findings report, then scores", () => {
     expect(stepNames(scored())).toEqual([
       "scope",
@@ -338,6 +351,11 @@ describe("built-in review-lite pipeline", () => {
     expect(agents.length).toBeGreaterThan(0)
     expect(agents.every((step) => step.readOnly)).toBe(true)
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
+  })
+
+  test("scope verifies on the cheap model too, so the checks run once per review", () => {
+    const scope = reviewLite().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
+    expect(scope).toMatchObject({ agentName: "review-scope", readOnly: true, verify: true })
   })
 
   test("runs entirely on low-cost models: GLM 5.2 scopes and reports, and the fan-out pairs GLM 5.2 with Kimi K3", () => {
@@ -440,6 +458,11 @@ describe("built-in review-cc pipeline", () => {
     expect(agents.length).toBeGreaterThan(0)
     expect(agents.every((step) => step.readOnly)).toBe(true)
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
+  })
+
+  test("scope verifies on the Terra leg too, and the claude-code audits stay bash-less", () => {
+    const scope = reviewCc().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
+    expect(scope).toMatchObject({ agentName: "review-scope", readOnly: true, verify: true })
   })
 
   test("pairs each Terra audit with a Claude Code audit and feeds every report to one Sol report step", () => {

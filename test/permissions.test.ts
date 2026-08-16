@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
 import { askHumanAction } from "../src/human"
-import { startPermissionGate, type AdvisorCheckpoint } from "../src/permissions"
+import { readOnlyBashRefusalMessage, startPermissionGate, type AdvisorCheckpoint, type BashCheckpoint } from "../src/permissions"
 import { noopProgress, type AutoAcceptMode, type HumanReviewAction, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "../src/progress"
 import type { TerminalInput, TerminalPrompt } from "../src/terminal-input"
 
@@ -90,6 +90,7 @@ async function drive(opts: {
   askReply?: PermissionReply
   permission?: string
   advisorCheckpoint?: AdvisorCheckpoint
+  bashCheckpoint?: BashCheckpoint
 }): Promise<{ replies: ReplyCall[]; asked: PermissionPromptInfo[] }> {
   const h = harness({ judgeAnswer: opts.judgeAnswer, askReply: opts.askReply, permission: opts.permission })
   const gate = startPermissionGate({
@@ -100,6 +101,7 @@ async function drive(opts: {
     autoAccept: { mode: opts.mode },
     judgeModel: { providerID: "openai", modelID: "gpt-5.5" },
     ...(opts.advisorCheckpoint ? { advisorCheckpoint: opts.advisorCheckpoint } : {}),
+    ...(opts.bashCheckpoint ? { bashCheckpoint: opts.bashCheckpoint } : {}),
   })
   try {
     await waitFor(() => h.replies.length > 0)
@@ -272,6 +274,60 @@ describe("permission gate advisor checkpoint", () => {
   })
 })
 
+describe("permission gate bash checkpoint", () => {
+  const checkpoint = (decisions: Awaited<ReturnType<BashCheckpoint>>[]) => {
+    const seen: { sessionID: string; permission: string }[] = []
+    const queue = [...decisions]
+    const fn: BashCheckpoint = async ({ sessionID, permission }) => {
+      seen.push({ sessionID, permission })
+      return queue.shift() ?? { action: "defer" }
+    }
+    return { fn, seen }
+  }
+
+  test("a 'reject' decision refuses the bash command carrying the informative message", async () => {
+    const { fn, seen } = checkpoint([{ action: "reject", message: readOnlyBashRefusalMessage }])
+    const { replies, asked } = await drive({ mode: "off", permission: "bash", bashCheckpoint: fn })
+
+    expect(replies).toEqual([{ reply: "reject", message: readOnlyBashRefusalMessage }])
+    // Held by Convoy, not escalated: the human is never involved.
+    expect(asked).toHaveLength(0)
+    expect(seen).toEqual([{ sessionID: "sess-1", permission: "bash" }])
+  })
+
+  test("an 'allow' decision permits the bash command without prompting", async () => {
+    const { fn } = checkpoint([{ action: "allow" }])
+    const { replies, asked } = await drive({ mode: "off", permission: "bash", bashCheckpoint: fn })
+
+    expect(replies).toEqual([{ reply: "once" }])
+    expect(asked).toHaveLength(0)
+  })
+
+  test("a 'defer' decision falls through to normal handling", async () => {
+    const { fn } = checkpoint([{ action: "defer" }])
+    const { replies, asked } = await drive({ mode: "off", permission: "bash", askReply: "always", bashCheckpoint: fn })
+
+    expect(asked).toHaveLength(1)
+    expect(replies).toEqual([{ reply: "always" }])
+  })
+
+  test("runs ahead of --yolo, so auto-accept cannot grant a refused read-only command", async () => {
+    const { fn, seen } = checkpoint([{ action: "reject", message: readOnlyBashRefusalMessage }])
+    const { replies } = await drive({ mode: "all", permission: "bash", bashCheckpoint: fn })
+
+    expect(seen).toHaveLength(1)
+    expect(replies).toEqual([{ reply: "reject", message: readOnlyBashRefusalMessage }])
+  })
+
+  test("is not consulted for anything but bash, so an edit never spends the checkpoint", async () => {
+    const { fn, seen } = checkpoint([{ action: "reject", message: "should never be used" }])
+    const { replies } = await drive({ mode: "all", permission: "edit", bashCheckpoint: fn })
+
+    expect(seen).toHaveLength(0)
+    expect(replies).toEqual([{ reply: "once" }])
+  })
+})
+
 /**
  * A stream the test pushes events into on demand, so a single gate can see
  * requests from several sessions (a failed member plus its live siblings).
@@ -376,6 +432,39 @@ describe("permission gate session-scoped pause", () => {
     await waitFor(() => replies.has("pB"))
     expect(replies.get("pB")).toBe("once")
     expect(replies.has("pA")).toBe(false)
+
+    await gate.stop()
+  })
+
+  test("a paused interactive session still enforces structural bash refusals but leaves deferred requests to its owner", async () => {
+    const { client, replies, push } = multiHarness()
+    const seen: string[] = []
+    const bashCheckpoint: BashCheckpoint = async ({ sessionID }) => {
+      seen.push(sessionID)
+      return sessionID === "sess-verify" ? { action: "reject", message: readOnlyBashRefusalMessage } : { action: "defer" }
+    }
+    const gate = startPermissionGate({
+      client,
+      progress: noopProgress,
+      interactive: true,
+      directory: "/tmp",
+      autoAccept: { mode: "all" },
+      bashCheckpoint,
+    })
+
+    gate.pause("sess-verify")
+    gate.pause("sess-writable")
+    push(permAsked("p-verify", "sess-verify", "npm install left-pad"))
+    push(permAsked("p-writable", "sess-writable", "custom-check"))
+
+    await waitFor(() => seen.length === 2)
+    expect(replies.get("p-verify")).toBe("reject")
+    expect(replies.has("p-writable")).toBe(false)
+
+    gate.resume("sess-writable")
+    push(permAsked("p-writable", "sess-writable", "custom-check"))
+    await waitFor(() => replies.has("p-writable"))
+    expect(replies.get("p-writable")).toBe("once")
 
     await gate.stop()
   })

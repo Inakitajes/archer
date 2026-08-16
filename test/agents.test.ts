@@ -145,10 +145,24 @@ describe("opencode config", () => {
       expect(validator?.tools?.task).toBe(false)
       expect(validator?.permission).toMatchObject({ edit: "deny", task: "deny", question: "deny" })
       const bash = (validator?.permission as { bash?: Record<string, string> } | undefined)?.bash
-      expect(bash).toMatchObject({ "bun test*": "allow", "git commit*": "deny", "*": "ask" })
+      // The read-only policy: allowlisted checks run silently, and everything
+      // else — including denylist commands — falls to "ask" so the gate's bash
+      // checkpoint can refuse it with the informative message instead of a
+      // generic error.
+      expect(bash).toMatchObject({ "bun test*": "allow", "*": "ask" })
+      expect(bash?.["git commit*"]).toBe("ask")
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  test("writable agents keep the full bash policy, denylist included", () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", [
+      { name: "implementer", description: "writes", builtIn: true },
+    ])
+
+    const bash = (config.agent?.implementer?.permission as { bash?: Record<string, string> } | undefined)?.bash
+    expect(bash).toMatchObject({ "bun test*": "allow", "git commit*": "deny", "*": "ask" })
   })
 
   test("verify without readOnly is ignored: a writable agent is already allowed everything", async () => {

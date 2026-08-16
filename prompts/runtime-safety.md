@@ -30,3 +30,8 @@ If lower-priority instructions conflict with higher-priority safety rules, obey 
 - Leave the working tree in the best verifiable state you can.
 - Reports: when you have write tools, save the Markdown report at the exact absolute path Convoy provides. In read-only phases you have no write tools — this is expected, not a failure; make the report your entire final message, with no preamble or closing remarks, and Convoy persists it verbatim. Never apologize for lacking write tools or ask Convoy to save the report.
 - Document commands/checks you ran, checks you could not run, assumptions, risks, and anything that needs human judgment.
+
+## Command execution
+
+- **Phases without bash** (strict read-only): Bash is unavailable in this phase by design. Do not attempt to run tests or scripts. Treat execution evidence as unavailable — the scope report's Checks section is the only execution evidence.
+- **Phases with bash** (read-only verify): If a command is refused, do not retry it or variants — the refusal is permanent for this phase. Never modify the repository (snapshot updates, coverage writes, formatters, installs) or the phase fails.

@@ -25,6 +25,8 @@ export type PermissionGate = {
   /**
    * While a session is paused, its permission requests are left for whoever owns
    * the terminal (e.g. an interactive OpenCode TUI the user opened with [o]).
+   * Structural bash-checkpoint decisions still run: pausing must not make a
+   * read-only verify session's hard refusal human-approvable.
    * Sibling sessions in the same `models:`/`parallel` batch keep being handled,
    * so a failed step's recovery can never deadlock a live sibling's prompts.
    *
@@ -50,6 +52,29 @@ export type AdvisorGateDecision = { action: "advise"; message: string } | { acti
 
 export type AdvisorCheckpoint = (request: { sessionID: string; permission: string; summary: string }) => Promise<AdvisorGateDecision>
 
+/**
+ * What the bash checkpoint wants done with a `bash` request that reached the
+ * gate (i.e. was not allowlisted by the agent's policy).
+ *
+ * - `reject`: the request must be refused, carrying an informative message the
+ *   executor reads instead of a generic denial. This is the deny-informativo
+ *   for read-only verify phases: the model learns the design ("scope already
+ *   ran the checks") and stops retrying variants that would trip the loop guard.
+ * - `allow`: grant the single call immediately, without prompting.
+ * - `defer`: not the checkpoint's business; handle as normal (prompt/auto-accept).
+ */
+export type BashGateDecision = { action: "allow" } | { action: "reject"; message: string } | { action: "defer" }
+
+export type BashCheckpoint = (request: { sessionID: string; permission: string; summary: string }) => Promise<BashGateDecision>
+
+/**
+ * The single, reusable refusal for commands a read-only verify phase may not
+ * run. Kept as one string so the runner, the tests, and any future watcher
+ * (see the PRD's follow-up) all say exactly the same thing.
+ */
+export const readOnlyBashRefusalMessage =
+  "Command refused: this is a read-only audit phase. Only read-only check commands are permitted, and the scope step already ran them — the outputs are in the scope report's Checks section. Do not retry this command or variants; cite that evidence or reason statically."
+
 export type StartGateOptions = {
   client: OpencodeClient
   progress?: ProgressUI
@@ -66,6 +91,15 @@ export type StartGateOptions = {
    * which is what makes the advisor reliable rather than a matter of judgement.
    */
   advisorCheckpoint?: AdvisorCheckpoint
+  /**
+   * Consulted for `bash` requests after the advisor checkpoint and before
+   * auto-accept, including --yolo — the same structural guarantee as the
+   * advisor checkpoint. For read-only verify phases it refuses commands the
+   * read-only policy left to "ask" with an informative message (see
+   * readOnlyBashRefusalMessage); for every other phase it defers, so the
+   * normal prompt/auto-accept handling is unchanged.
+   */
+  bashCheckpoint?: BashCheckpoint
   /** Serializes terminal input with the phase gate so a --no-tui parallel run never opens two readlines on stdin. */
   terminalInput?: TerminalInput
   /** The opencode server URL for [i] inspect to attach to. Absent in readline fallback on non-macOS. */
@@ -95,11 +129,25 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
     if (controller.signal.aborted) return
     if (!isPermissionAsked(payload)) return
     const request = payload.properties
-    if (pausedAll || pausedSessions.has(request.sessionID)) return
     if (handled.has(request.id)) return
+    if (pausedAll || pausedSessions.has(request.sessionID)) {
+      // Interactive takeover owns ordinary prompts, but it must not bypass the
+      // structural checkpoint that enforces read-only verify bash refusals.
+      // A deferred decision is deliberately left unanswered for the owner.
+      const checkpoint = options.bashCheckpoint
+      if (!checkpoint || request.permission !== "bash") return
+      handled.add(request.id)
+      queue(async () => {
+        const answered = await applyBashCheckpoint(options.client, request, progress, options.directory, checkpoint)
+        // Deferred requests still belong to the interactive owner. Preserve the
+        // old paused-session behavior if the event is replayed after resume.
+        if (!answered) handled.delete(request.id)
+      })
+      return
+    }
     handled.add(request.id)
     queue(() =>
-      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal, options.advisorCheckpoint, terminalInput, options.serverUrl),
+      handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal, options.advisorCheckpoint, terminalInput, options.serverUrl, options.bashCheckpoint),
     )
   })
 
@@ -139,6 +187,7 @@ async function handleRequest(
   advisorCheckpoint?: AdvisorCheckpoint,
   terminalInput: TerminalInput = createTerminalInput(),
   serverUrl?: string,
+  bashCheckpoint?: BashCheckpoint,
 ) {
   const summary = describeRequest(request)
 
@@ -157,6 +206,16 @@ async function handleRequest(
       await reply(client, request.id, directory, "once")
       return
     }
+  }
+
+  // The bash checkpoint answers commands a read-only verify phase may not run.
+  // Same placement as the advisor checkpoint — before auto-accept — because
+  // the deny-informativo is structural, not a judgement: --yolo must not let a
+  // refused command through, or the model learns it can just retry. Allowlisted
+  // checks never reach the gate, so this only sees commands the read-only
+  // policy left to "ask".
+  if (bashCheckpoint && request.permission === "bash") {
+    if (await applyBashCheckpoint(client, request, progress, directory, bashCheckpoint, summary)) return
   }
 
   // Read at handling time, not subscription time: the TUI flips this live.
@@ -255,6 +314,30 @@ async function handleRequest(
   })
   log.info(`[permission] replied ${answer} for ${request.permission}`)
   await reply(client, request.id, directory, answer, answer === "reject" ? "rejected by user" : undefined)
+}
+
+/** Applies only the structural bash checkpoint; false leaves normal ownership unchanged. */
+async function applyBashCheckpoint(
+  client: OpencodeClient,
+  request: PermissionRequest,
+  progress: ProgressUI,
+  directory: string,
+  checkpoint: BashCheckpoint,
+  summary = describeRequest(request),
+): Promise<boolean> {
+  const decision = await checkpoint({ sessionID: request.sessionID, permission: request.permission, summary })
+  if (decision.action === "reject") {
+    log.info(`[permission] read-only verify phase refused bash: ${summary}`)
+    progress.message(`command refused (read-only verify phase): ${summary}`)
+    await reply(client, request.id, directory, "reject", decision.message)
+    return true
+  }
+  if (decision.action === "allow") {
+    log.info(`[permission] bash checkpoint allowed: ${summary}`)
+    await reply(client, request.id, directory, "once")
+    return true
+  }
+  return false
 }
 
 function promptInfo(request: PermissionRequest, judgeReason?: string): PermissionPromptInfo {

@@ -88,6 +88,11 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: fallbackModel,
     temperature: 0.1,
     readOnly: true,
+    // Bash comes back so the scope step runs the repo's checks once and records
+    // the real results in its report; every downstream audit/scorer consumes
+    // that evidence instead of running commands itself. Dropped automatically
+    // when the step is forced read-only (parallel:/models: fan-out).
+    verify: true,
     builtIn: true,
   },
   {

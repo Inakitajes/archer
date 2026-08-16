@@ -4,7 +4,7 @@ import { join } from "node:path"
 
 import { describe, expect, test } from "bun:test"
 
-import { bashPolicy, denyBashPatterns, projectScriptAllowPatterns } from "../src/bash-policy"
+import { bashPolicy, denyBashPatterns, projectScriptAllowPatterns, readOnlyBashPolicy } from "../src/bash-policy"
 
 describe("bash policy", () => {
   test("includes web checks and keeps dangerous operations denied", () => {
@@ -122,5 +122,49 @@ describe("bash policy", () => {
     // A config allow can never resurrect a denied pattern.
     expect(policy["git push*"]).toBe("deny")
     expect(policy["*"]).toBe("ask")
+  })
+})
+
+describe("read-only bash policy", () => {
+  test("allowlists read-only check commands silently and sends everything else to the gate", () => {
+    const policy = readOnlyBashPolicy()
+
+    expect(policy["bun test*"]).toBe("allow")
+    expect(policy["tsc --noEmit*"]).toBe("allow")
+    expect(policy["git diff*"]).toBe("allow")
+    expect(policy["make test"]).toBe("allow")
+    // Denylist patterns are not hard-denied here: they fall through to "ask"
+    // so the permission gate's bash checkpoint can refuse them with the
+    // informative message instead of opencode's generic error.
+    expect(policy["git push*"]).toBe("ask")
+    expect(policy["git commit"]).toBe("ask")
+    expect(policy["npm install*"]).toBe("ask")
+    expect(policy["*"]).toBe("ask")
+  })
+
+  test("a project allow can never resurrect a denied pattern, which stays ask", () => {
+    const policy = readOnlyBashPolicy("/tmp/non-existent-convoy-target", {
+      allow: ["git push*", "supabase gen types*"],
+      deny: ["stripe *"],
+    })
+
+    expect(policy["git push*"]).toBe("ask")
+    expect(policy["supabase gen types*"]).toBe("allow")
+    expect(policy["*"]).toBe("ask")
+  })
+
+  test("project package.json check scripts join the read-only allowlist", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-ro-scripts-"))
+    try {
+      await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { "test:unit": "vitest run", deploy: "vercel deploy" } }))
+
+      const policy = readOnlyBashPolicy(dir)
+      expect(policy["npm run test:unit"]).toBe("allow")
+      // A deploy-looking script is not a check and stays out of the allowlist.
+      expect(policy["npm run deploy"]).toBeUndefined()
+      expect(policy["*"]).toBe("ask")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

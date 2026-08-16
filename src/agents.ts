@@ -3,7 +3,7 @@ import { join } from "node:path"
 
 import type { AgentConfig, Config } from "@opencode-ai/sdk/v2"
 import { advisorFeedbackToolName, advisorProviderOverride, advisorToolName, type ModelSelection } from "./advisor"
-import { bashPolicy, noAdditions } from "./bash-policy"
+import { bashPolicy, noAdditions, readOnlyBashPolicy } from "./bash-policy"
 import { builtInPrompts } from "./built-in-prompts"
 import { resolveLoopGuard, softAgentSteps, type LoopGuardSettings } from "./loop-guard"
 import { builtInAgents, readOnlyAgentSuffix } from "./pipeline"
@@ -200,7 +200,12 @@ function agentConfig(
         glob: "allow",
         grep: "allow",
         edit: "deny",
-        bash: verify ? bashPolicy(targetDir, permissions) : "deny",
+        // A verifying agent gets the read-only policy: allowlisted checks run
+        // silently and everything else reaches the gate, whose bash checkpoint
+        // refuses it with an informative message (see readOnlyBashPolicy). The
+        // writable branch below keeps the full bashPolicy, where the denylist
+        // is enforced by OpenCode before the gate.
+        bash: verify ? readOnlyBashPolicy(targetDir, permissions) : "deny",
         task: "deny",
         question: "deny",
         webfetch: webfetch ? "allow" : "deny",
