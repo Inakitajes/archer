@@ -355,6 +355,30 @@ describe("trackRunStatus", () => {
     expect(wrapped.runControlState).toBeDefined()
   })
 
+  test("forwards the goal-loop hosting methods when the wrapped UI has them", () => {
+    const bare = trackRunStatus(noopProgress, new RunStatusTracker({ phases: [], identity }))
+    expect(bare.setGoalLoop).toBeUndefined()
+    expect(bare.resetPipeline).toBeUndefined()
+    expect(bare.setAbortHandler).toBeUndefined()
+    expect(bare.setHostControls).toBeUndefined()
+
+    const calls: string[] = []
+    const hosting: ProgressUI = {
+      ...noopProgress,
+      setGoalLoop: (view) => calls.push(`setGoalLoop:${view.iteration}`),
+      resetPipeline: () => calls.push("resetPipeline"),
+      setAbortHandler: () => calls.push("setAbortHandler"),
+      setHostControls: () => calls.push("setHostControls"),
+    }
+    const wrapped = trackRunStatus(hosting, new RunStatusTracker({ phases: [], identity }))
+    wrapped.setGoalLoop?.({ target: 90, iteration: 2, maxRuns: 4, plateau: 3, scores: [71] })
+    wrapped.resetPipeline?.([], { runID: "r", targetDir: "/t", runDir: "", pipeline: { name: "goal-fix", steps: [] } })
+    wrapped.setAbortHandler?.(undefined)
+    wrapped.setHostControls?.({})
+
+    expect(calls).toEqual(["setGoalLoop:2", "resetPipeline", "setAbortHandler", "setHostControls"])
+  })
+
   test("a pending permission prompt uses a generic notification and releases waiting on reply", async () => {
     const phases = [agentPhase("plan")]
     const { tracker, events } = trackerWith(phases)
