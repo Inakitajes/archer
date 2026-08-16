@@ -13,7 +13,7 @@ import { stepRunnerFor } from "./step-runners"
 import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { consensusStep } from "./quality-score"
 import { runReviewLines } from "./review-tui"
-import { hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { clipChunks, hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
 
 import type { ConvoyConfig } from "./config"
@@ -1532,15 +1532,19 @@ class LaunchPicker {
     lines.push(plain(""))
     const hint = "shift+enter newline · enter options · ←/→ move · ctrl+U clear · esc back"
     const suggestions = choice.suggestedPrompts
-    if (suggestions && suggestions.length > 0 && (this.promptFromDefault || this.prompt.trim() === "")) {
-      const count = suggestions.length
-      const preview = truncate(suggestions[0]!, Math.max(10, Math.min(30, width - 40)))
-      lines.push(new StyledText([fg(theme.faint)(hint + " · "), fg(theme.accent)(`tab: suggestions (${count}), first: "${preview}"`)]))
-    } else if (wrapped.length > 1) {
-      lines.push(new StyledText([fg(theme.faint)(hint + " · "), fg(theme.accent)(`${wrapped.length} lines`)]))
-    } else {
-      lines.push(t`${fg(theme.faint)(hint)}`)
-    }
+    // The accent slot carries one status: while Tab can cycle suggestions it
+    // says how many, otherwise a multi-line prompt owns up to its height. The
+    // row is clipped rather than wrapped, so a narrow panel degrades to an
+    // ellipsis instead of spilling extra lines into the fixed-height box.
+    const status =
+      suggestions && suggestions.length > 0 && (this.promptFromDefault || this.prompt.trim() === "")
+        ? `tab: ${suggestions.length} suggestion${suggestions.length === 1 ? "" : "s"}`
+        : wrapped.length > 1
+          ? `${wrapped.length} lines`
+          : ""
+    const hintChunks: TextChunk[] = [fg(theme.faint)(hint)]
+    if (status) hintChunks.push(fg(theme.faint)(" · "), fg(theme.accent)(status))
+    lines.push(new StyledText(clipChunks(hintChunks, width)))
     return joinLines(lines)
   }
 
