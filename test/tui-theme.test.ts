@@ -17,26 +17,26 @@ describe("palette derivation from the terminal background", () => {
     expect(wrapLines(["éé"], 1)).toEqual(["é", "é"])
   })
 
-  test("dark background: transparent canvas, borders lifted toward white, overlay repaints the terminal", () => {
+  test("dark background: transparent canvas, static borders, overlay repaints the terminal", () => {
     const palette = paletteForTerminal("dark", "#1a1b26")
 
     expect(palette.bg).toBe("transparent")
     expect(palette.overlay).toBe("#1a1b26")
     expect(palette.chipText).toBe("#1a1b26")
-    // 16% / 26% toward white from #1a1b26.
-    expect(palette.borderDim).toBe("#3f3f49")
-    expect(palette.border).toBe("#56565e")
+    // Borders come from the static dark palette, never from the background.
+    expect(palette.borderDim).toBe("#1B2438")
+    expect(palette.border).toBe("#26324B")
     // Accents come from the static dark palette.
     expect(palette.accent).toBe(paletteForMode("dark").accent)
   })
 
-  test("light background: borders sink toward black with light accents", () => {
+  test("light background: transparent canvas, static borders, overlay repaints the terminal", () => {
     const palette = paletteForTerminal("light", "#fafafa")
 
     expect(palette.bg).toBe("transparent")
     expect(palette.overlay).toBe("#fafafa")
-    expect(palette.borderDim).toBe("#d2d2d2")
-    expect(palette.border).toBe("#b9b9b9")
+    expect(palette.borderDim).toBe("#C1C6DD")
+    expect(palette.border).toBe("#A8AECB")
     expect(palette.accent).toBe(paletteForMode("light").accent)
   })
 
