@@ -124,12 +124,10 @@ export function consensusStep(
 /**
  * Extracts and validates the `quality-score` JSON block from a scorer report.
  *
- * Strict contract: the report must end with exactly one `quality-score` fenced
- * block (no `json` alias, no bare-object fallback), that block must be the last
- * thing in the report, and it must contain valid, in-range data. A report that
- * fails any of that yields undefined so the caller can treat the scorer as
- * having failed the contract — it is safer to reject an ambiguous or accidental
- * object than to take it as a control signal.
+ * The authoritative block is the last `quality-score` fenced block (no `json`
+ * alias or bare-object fallback) and must contain valid, in-range data. Text
+ * after its closing fence is tolerated because an agent's final response may
+ * append delivery narration after an otherwise valid machine-readable report.
  */
 export function parseQualityScoreReport(
   markdown: string,
@@ -181,10 +179,9 @@ export function parseQualityScoreReport(
 
 /**
  * Finds the report's authoritative quality-score block: the last
- * `quality-score` fence, which must also end the report (only whitespace may
- * follow its closing fence). Blocks earlier in the report are examples, not
- * results, and trailing content after the final block makes the report
- * malformed rather than selecting a different candidate.
+ * `quality-score` fence. Blocks earlier in the report are examples, not
+ * results. Text after the final block is ignored but logged as a contract
+ * warning so a valid score is still available to the goal loop.
  */
 function extractQualityScoreBlock(markdown: string): string | undefined {
   // Find every opening fence with the same contract as before: the tag must be
@@ -198,14 +195,15 @@ function extractQualityScoreBlock(markdown: string): string | undefined {
   // The closing fence is the LAST ``` in the remainder, not the first. A
   // non-greedy regex would close early on triple-backticks inside JSON string
   // values (e.g. a gap description that references a ```fenced``` code block),
-  // yielding invalid JSON and a silent no-score. Searching from the end and
-  // relying on the trailing-whitespace guard below is resilient to that: the
-  // real closing fence is the final ``` in the report.
+  // yielding invalid JSON and a silent no-score. The last ``` after the last
+  // opening fence is the closer; anything after it is trailing narration.
   const closingIndex = afterOpening.lastIndexOf("```")
   if (closingIndex === -1) return undefined
   const block = afterOpening.slice(0, closingIndex)
   const trailing = afterOpening.slice(closingIndex + 3)
-  if (trailing.trim() !== "") return undefined
+  if (trailing.trim() !== "") {
+    log.warn("quality score: found content after the final quality-score block; extracting the score and ignoring trailing text")
+  }
   return block.trim()
 }
 

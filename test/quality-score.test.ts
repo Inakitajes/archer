@@ -111,9 +111,9 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
     expect(parseQualityScoreReport(report)?.score).toBe(87)
   })
 
-  test("rejects a report where the final block is not at the end", () => {
+  test("parses a report where the final block is followed by text", () => {
     const report = `\`\`\`quality-score\n${JSON.stringify({ score: 80, dimensions, mustFix: [] })}\n\`\`\`\n\n(aside: the run is done)`
-    expect(parseQualityScoreReport(report)).toBeUndefined()
+    expect(parseQualityScoreReport(report)?.score).toBe(87)
   })
 
   test("never treats a bare object with braces inside strings as a score block", () => {

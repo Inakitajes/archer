@@ -26,7 +26,7 @@ import { openOpencodeSessionWindow, startOpencode } from "./opencode"
 import { HerdrReporter } from "./herdr"
 import { defaultNotificationSettings, Notifier } from "./notifications"
 import { startPermissionGate, type PermissionGate } from "./permissions"
-import { agentsForPipeline, splitModelVariant, validateStepFilters } from "./pipeline"
+import { agentsForPipeline, deliverableContractForPhase, splitModelVariant, validateStepFilters } from "./pipeline"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
@@ -50,7 +50,7 @@ import {
 import { discoverProjectContextFiles } from "./project-context"
 import { createStepRunnerImpl, stepRunnerFor, stepRunnerModel, type StepRunnerId, type StepRunnerImpl } from "./step-runners"
 import { createTerminalInput, type TerminalInput } from "./terminal-input"
-import type { AgentSpec, AgentStep, HookSet, HookSpec, Pipeline, RunOptions, Step } from "./types"
+import type { AgentSpec, AgentStep, DeliverableContract, HookSet, HookSpec, Pipeline, RunOptions, Step } from "./types"
 import { consensusStep, loadQualityRubricWeights, parseQualityScoreReport, qualityDimensionWeights, type QualityDimension, type QualityScore } from "./quality-score"
 import { addTokens, emptyTokens, tokensFromValue } from "./usage"
 import { cleanupWorkspace, createWorkspace, opencodeConfigDir, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
@@ -1185,6 +1185,30 @@ type PhaseRetryDeps = {
   restorePhaseBaseline: typeof restorePhaseBaseline
 }
 
+class DeliverableValidationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "DeliverableValidationError"
+  }
+}
+
+export function validateDeliverable(
+  contract: DeliverableContract,
+  reportText: string,
+  weights: Record<QualityDimension, number> = qualityDimensionWeights,
+): { valid: true } | { valid: false; error: string } {
+  switch (contract.kind) {
+    case "none":
+      return { valid: true }
+    case "markdown-report":
+      return reportText.trim() ? { valid: true } : { valid: false, error: "phase produced an empty report" }
+    case "quality-score-report":
+      return parseQualityScoreReport(reportText, weights)
+        ? { valid: true }
+        : { valid: false, error: "phase produced an invalid quality-score report" }
+  }
+}
+
 export async function runPhaseUntilResolved(
   client: OpencodeClient,
   workspace: Workspace,
@@ -1200,6 +1224,10 @@ export async function runPhaseUntilResolved(
   advisors?: AdvisorRuntime,
 ) {
   const sessionRef: SessionRef = {}
+  const deliverableContract = deliverableContractForPhase(phase)
+  const rubricWeights =
+    deliverableContract.kind === "quality-score-report" ? ((await loadQualityRubricWeights(targetDir)) ?? qualityDimensionWeights) : qualityDimensionWeights
+  let automaticDeliverableRetries = 0
   // Read fresh at each decision point: the user can arm/disarm [i] mid-attempt.
   const armed = () => Boolean(takeover && progress.isInteractiveTakeover?.(phase.name))
 
@@ -1209,6 +1237,23 @@ export async function runPhaseUntilResolved(
     log.info(`[${phase.name}] attempt ${attempt} with ${formatModel(prepared.model)}`)
     try {
       const text = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors)
+      const validation = validateDeliverable(deliverableContract, text, rubricWeights)
+      if (!validation.valid) {
+        await persistInvalidPhaseReport(workspace, phase, attempt, text)
+        const canRetryAutomatically =
+          deliverableContract.kind === "quality-score-report" && automaticDeliverableRetries < deliverableContract.retryOnMissingOrInvalid
+        if (canRetryAutomatically) {
+          automaticDeliverableRetries++
+          log.warn(
+            `[${phase.name}] deliverable validation failed (attempt ${attempt}/${deliverableContract.retryOnMissingOrInvalid + 1}): ${validation.error}; retrying automatically`,
+          )
+          await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, new DeliverableValidationError(validation.error)))
+          await removePhaseReport(workspace, phase)
+          continue
+        }
+        log.error(`[${phase.name}] deliverable validation failed: ${validation.error}`)
+        throw new DeliverableValidationError(validation.error)
+      }
       if (armed()) {
         // Armed means "this step is mine": even a clean finish waits for the
         // user's decision before the step commits and the pipeline moves on.
@@ -1227,6 +1272,10 @@ export async function runPhaseUntilResolved(
       return text
     } catch (error) {
       if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
+      // A report-contract failure is terminal after its bounded automatic retry;
+      // accepting it through the human failure gate would turn a missing score
+      // into a successful scored run with no machine-readable result.
+      if (error instanceof DeliverableValidationError) throw error
       if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
       progress.phaseRunning(phase.name, "step failed — waiting for your decision")
       log.warn(`[${phase.name}] attempt ${attempt} failed: ${formatSdkError(error)}`)
@@ -1494,7 +1543,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     loopGuardConfig: input.prepared.loopGuard,
     ...(input.advisors ? { advisors: input.advisors } : {}),
   })
-  const assistantText = extractAssistantText(result.parts)
+  const assistantText = extractAssistantText(result.lastAssistantParts ?? result.parts)
   // Totals for the whole attempt, not the final message: the attempt log's
   // executor figures are what the advisor split is measured against, and a
   // headline ratio computed from one message of a many-message phase would
@@ -1541,16 +1590,33 @@ async function executeClaudeCodePhaseAttempt(input: PhaseAttemptInput): Promise<
   }
 }
 
-async function persistPhaseReport(workspace: Workspace, phase: AgentStep, assistantText: string) {
+async function persistPhaseReport(
+  workspace: Workspace,
+  phase: AgentStep,
+  assistantText: string,
+  contract = deliverableContractForPhase(phase),
+  weights: Record<QualityDimension, number> = qualityDimensionWeights,
+) {
   const reportAbs = join(workspace.dir, phase.reportPath)
-  if (!(await exists(reportAbs)) && assistantText.trim() !== "") {
-    await mkdir(dirname(reportAbs), { recursive: true })
-    // Write to a temporary path then rename atomically, matching the
-    // metadata.ts pattern (tmp+rename). A crash mid-write must never leave
-    // a truncated report that phaseNeedsRun would treat as complete.
-    const tmpPath = `${reportAbs}.tmp`
-    await writeFile(tmpPath, assistantText)
-    await rename(tmpPath, reportAbs)
+  // Empty text is the human-continue signal ("accept the tree as-is"), not a
+  // report to validate. The phase loop already rejected empty markdown and
+  // invalid scores on the success path; re-checking a blank continue here
+  // would turn an explicit operator accept into a hard failure.
+  if (assistantText.trim() !== "") {
+    const validation = validateDeliverable(contract, assistantText, weights)
+    if (!validation.valid) {
+      await persistInvalidPhaseReport(workspace, phase, undefined, assistantText)
+      throw new DeliverableValidationError(validation.error)
+    }
+    if (!(await exists(reportAbs))) {
+      await mkdir(dirname(reportAbs), { recursive: true })
+      // Write to a temporary path then rename atomically, matching the
+      // metadata.ts pattern (tmp+rename). A crash mid-write must never leave
+      // a truncated report that phaseNeedsRun would treat as complete.
+      const tmpPath = `${reportAbs}.tmp`
+      await writeFile(tmpPath, assistantText)
+      await rename(tmpPath, reportAbs)
+    }
   }
 
   if (!(await exists(reportAbs))) {
@@ -1558,6 +1624,14 @@ async function persistPhaseReport(workspace: Workspace, phase: AgentStep, assist
   }
 
   return reportAbs
+}
+
+/** Keeps rejected assistant output available without allowing it to become the phase report. */
+async function persistInvalidPhaseReport(workspace: Workspace, phase: AgentStep, attempt: number | undefined, assistantText: string) {
+  const reportAbs = join(workspace.dir, phase.reportPath)
+  await mkdir(dirname(reportAbs), { recursive: true })
+  const suffix = attempt === undefined ? Date.now() : attempt
+  await writeFile(`${reportAbs}.attempt-${suffix}.raw.md`, assistantText)
 }
 
 async function commitPhase(phase: AgentStep, reportAbs: string, targetDir: string) {
@@ -1773,6 +1847,8 @@ type SessionResult = {
   info: AssistantMessage
   parts: Part[]
   assistantInfos: AssistantMessage[]
+  /** Parts emitted by the final assistant message only, excluding turn narration. */
+  lastAssistantParts: Part[]
   /** Present only when this attempt consulted an advisor; kept apart from executor usage so the split stays visible. */
   advisorUsage?: readonly AdvisorUsage[]
   advisorEvents?: readonly AdvisorEvent[]
@@ -1843,7 +1919,7 @@ export async function applyCompletionCheckpoint(
     // Propagating it would fail the attempt and roll the finished phase back.
     if (second.info.error) return keepCompletedPhase(input.phase.name, first, formatSdkError(second.info.error))
 
-    const secondText = extractAssistantText(second.parts).trim()
+    const secondText = extractAssistantText(second.lastAssistantParts ?? second.parts).trim()
     const unchanged = secondText.length === 0 || secondText.toUpperCase().startsWith(noChangesReply)
 
     return {
@@ -1852,6 +1928,7 @@ export async function applyCompletionCheckpoint(
       // is only a fallback report, so both turns are kept.
       parts: input.phase.readOnly ? (unchanged ? first.parts : second.parts) : [...first.parts, ...second.parts],
       assistantInfos: [...first.assistantInfos, ...second.assistantInfos],
+      lastAssistantParts: input.phase.readOnly ? (unchanged ? first.lastAssistantParts : second.lastAssistantParts) : second.lastAssistantParts,
     }
   } catch (error) {
     // A guard trip in the follow-up turn is the same decision a trip in the
@@ -2013,6 +2090,7 @@ export function watchSession(
             info: last.info,
             parts: turn.flatMap((message) => message.parts),
             assistantInfos: turn.map((message) => message.info),
+            lastAssistantParts: last.parts,
           },
         })
         return true
@@ -2603,16 +2681,16 @@ async function readRunQualityScore(
     // A scored pipeline that produced no consensus report is a real failure
     // mode (the consensus step crashed or was skipped); log it so a silent
     // "no-score" stop in the goal loop has a cause instead of a mystery.
-    log.warn(`quality score: consensus report not found at ${step.reportPath}; the run produced no machine-readable score`)
+    log.error(`quality score: consensus report not found at ${step.reportPath}; the run produced no machine-readable score`)
     return undefined
   }
   const score = parseQualityScoreReport(text, weights)
   if (!score) {
     // The report exists but failed the strict contract (missing fence,
-    // invalid JSON, out-of-range dimensions, or trailing content after the
-    // block). An excerpt helps diagnose a misbehaving consensus agent.
+    // invalid JSON, or out-of-range dimensions). An excerpt helps diagnose a
+    // misbehaving consensus agent.
     const excerpt = text.slice(0, 120).replace(/\n/g, " ")
-    log.warn(`quality score: consensus report at ${step.reportPath} could not be parsed (malformed or incomplete); the run produced no machine-readable score. Excerpt: ${excerpt}…`)
+    log.error(`quality score: consensus report at ${step.reportPath} could not be parsed (malformed or incomplete); the run produced no machine-readable score. Excerpt: ${excerpt}…`)
     return undefined
   }
   return { score }
@@ -2714,7 +2792,7 @@ export function isMessageAbortedError(error: unknown): error is { name: "Message
   return Boolean(error && typeof error === "object" && "name" in error && error.name === "MessageAbortedError")
 }
 
-function extractAssistantText(parts: Part[]) {
+export function extractAssistantText(parts: readonly Part[]) {
   return parts
     .filter((part): part is Part & { type: "text"; text: string } => part.type === "text")
     .filter((part) => !("synthetic" in part && part.synthetic) && !("ignored" in part && part.ignored))
