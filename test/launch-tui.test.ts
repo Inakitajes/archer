@@ -194,6 +194,114 @@ describe("launch TUI compact layout", () => {
       await closeLauncher(modal)
     }
   })
+
+  test("pageup and pagedown page by the compact pipeline window, not the wide list height", async () => {
+    // At 80×24 the compact pipeline panel shows 3 rows (compactPipelineHeight 5
+    // minus its 2-row chrome), so paging moves the selection by 3 — not the 15
+    // rows the wide layout would move. Pressing the escape sequences directly
+    // because the mock-keys helper has no PageUp/PageDown entry in its KeyCodes.
+    const launcher = await createLauncher(80, 24, 10)
+    try {
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).toContain("● pipeline-1")
+
+      launcher.mockInput.pressKey("\x1B[6~")
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).toContain("● pipeline-4")
+      expect(launcher.captureCharFrame()).not.toContain("● pipeline-1")
+
+      launcher.mockInput.pressKey("\x1B[5~")
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).toContain("● pipeline-1")
+      expect(launcher.captureCharFrame()).not.toContain("● pipeline-4")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("mouse selection tracks the pipeline panel after it moves to the top", async () => {
+    // selectFromList maps event.y through pipelineText.y, which compact mode
+    // relocates from the body row to the top of the screen. Clicking a row that
+    // only exists at its new stacked position verifies the y-adjustment survived
+    // the layout switch.
+    const launcher = await createLauncher(80, 24, 3)
+    try {
+      await launcher.renderOnce()
+      const before = launcher.captureCharFrame()
+      expect(before).toContain("● pipeline-1")
+      expect(before).not.toContain("● pipeline-2")
+
+      const lines = before.split("\n")
+      const targetY = lines.findIndex((line) => line.includes("pipeline-2"))
+      expect(targetY, "pipeline-2 row visible in compact stack").toBeGreaterThanOrEqual(0)
+      const targetX = lines[targetY]!.indexOf("pipeline-2")
+      await launcher.mockMouse.click(targetX, targetY)
+      await launcher.renderOnce()
+
+      const after = launcher.captureCharFrame()
+      expect(after).toContain("● pipeline-2")
+      expect(after).not.toContain("● pipeline-1")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+})
+
+describe("launch TUI narrow-width row budgets", () => {
+  // The launcher's supported minimum terminal width is 46 columns, so the sweep
+  // covers the full range the feature must look right in. Every row helper must
+  // keep its display width inside the panel it's rendered against — anything
+  // wider is silently chopped by the panel border, the bug this feature fixes.
+  const widths = [160, 120, 100, 90, 80, 70, 60, 50, 46]
+
+  test("pipelineRow never exceeds its panel width, with or without a badge", () => {
+    const defaultChoice = { ...launcherChoices()[0]!, isDefault: true }
+    const customChoice = { ...launcherChoices()[0]!, source: "configured" as const }
+    const bareChoice = { ...launcherChoices()[0]!, isDefault: false, source: "built-in" as const }
+    for (const width of widths) {
+      for (const choice of [defaultChoice, customChoice, bareChoice]) {
+        for (const selected of [true, false]) {
+          const row = pipelineRow(choice, selected, width)
+          const rowText = row.chunks.map((chunk) => chunk.text).join("")
+          expect(displayWidth(rowText), `pipelineRow width ${width}`).toBeLessThanOrEqual(width)
+        }
+      }
+    }
+  })
+
+  test("stepTree never exceeds its panel width across the supported range", () => {
+    const steps = [
+      { stepName: "implement", groupId: "g1", kind: "agent" as const, modelLabel: "gpt-5.6 xhigh", advisorLabel: "" },
+      { stepName: "design", groupId: "g2", kind: "agent" as const, modelLabel: "claude-opus-4-8", advisorLabel: "" },
+      { stepName: "implement", groupId: "g3", kind: "agent" as const, modelLabel: "gpt-5", advisorLabel: "claude-opus-5 advisor ×3" },
+      { stepName: "implement", groupId: "g3", kind: "agent" as const, modelLabel: "claude-4", advisorLabel: "" },
+      { stepName: "implement", groupId: "g3", kind: "agent" as const, modelLabel: "gemini-3", advisorLabel: "" },
+      { stepName: "audit-a", groupId: "g4", kind: "agent" as const, modelLabel: "gpt-5", advisorLabel: "" },
+      { stepName: "audit-b", groupId: "g4", kind: "agent" as const, modelLabel: "claude-4", advisorLabel: "" },
+      { stepName: "approve", groupId: "", kind: "human" as const, modelLabel: "", advisorLabel: "" },
+    ] satisfies Parameters<typeof stepTree>[0]
+    for (const width of widths) {
+      for (const line of stepTree(steps, width)) {
+        const lineText = line.chunks.map((chunk) => chunk.text).join("")
+        expect(displayWidth(lineText), `stepTree width ${width} line=${JSON.stringify(lineText)}`).toBeLessThanOrEqual(width)
+      }
+    }
+  })
+
+  test("hookLines never exceeds its panel width across the supported range", () => {
+    const hooks = [
+      { stage: "pre" as const, label: "lint" },
+      { stage: "post" as const, label: "notify-slack", when: "failure" as const },
+      { stage: "post" as const, label: "bun run build" },
+      { stage: "post" as const, label: "a-really-long-hook-name-that-should-be-truncated", when: "always" as const },
+    ] satisfies Parameters<typeof hookLines>[0]
+    for (const width of widths) {
+      for (const line of hookLines(hooks, width)) {
+        const lineText = line.chunks.map((chunk) => chunk.text).join("")
+        expect(displayWidth(lineText), `hookLines width ${width} line=${JSON.stringify(lineText)}`).toBeLessThanOrEqual(width)
+      }
+    }
+  })
 })
 
 describe("launch TUI prompt input", () => {
