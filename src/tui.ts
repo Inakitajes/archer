@@ -2736,15 +2736,17 @@ export class TuiProgress implements ProgressUI {
 
   /**
    * The header's title segments, each carrying how eagerly it gives up columns
-   * when the title outgrows the panel. `◆ convoy` and a goal verdict are pinned
-   * (Infinity); everything else sacrifices in the PRD's order — delta first,
-   * then the trajectory, then iter, then the version — with the goal target
-   * giving way last of all. Higher priority drops first.
+   * when the title outgrows the panel. `◆ convoy`, the running version, and a
+   * goal verdict are pinned (Infinity); everything else sacrifices in the PRD's
+   * order — delta first, then the trajectory, then iter — with the goal target
+   * giving way last of all. Higher priority drops first. The version is pinned
+   * because it is identity, not status: the header must keep branding the
+   * binary even when the panel is narrow.
    */
   private titleSegments(): { priority: number; chunks: TextChunk[] }[] {
     const segments: { priority: number; chunks: TextChunk[] }[] = [
       { priority: Infinity, chunks: [bold(fg(theme.accent)("◆ convoy"))] },
-      { priority: 3, chunks: [fg(theme.faint)(" "), fg(theme.faint)(shortVersion())] },
+      { priority: Infinity, chunks: [fg(theme.faint)(" "), fg(theme.faint)(shortVersion())] },
     ]
     const view = this.finished?.goalLoop ?? this.goalLoop
     if (view?.outcome) {
