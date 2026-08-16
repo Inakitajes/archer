@@ -277,22 +277,15 @@ export function projectScriptAllowPatterns(targetDir = process.cwd()): string[] 
 }
 
 /**
- * Assembles a bash policy from the shared lists: the denied patterns under
- * `deniedAction`, the allowlist silently allowed, and everything else "ask".
+ * Assembles a bash policy from the shared lists: denied patterns stay deny,
+ * the allowlist is silently allowed, and everything else is "ask".
  * Config additions only ever extend the lists: a project can deny more and
  * allow more, but a config allow can never resurrect a denied pattern.
  */
-function assembleBashPolicy(
-  targetDir: string,
-  additions: PermissionAdditions,
-  // "deny" lets opencode refuse the command before it ever reaches the
-  // permission gate; "ask" routes it to the gate, where the bash checkpoint
-  // can refuse it with a message (see readOnlyBashPolicy).
-  deniedAction: "deny" | "ask",
-): Record<string, "allow" | "deny" | "ask"> {
+function assembleBashPolicy(targetDir: string, additions: PermissionAdditions): Record<string, "allow" | "deny" | "ask"> {
   const policy: Record<string, "allow" | "deny" | "ask"> = {}
   const denied = new Set([...denyBashPatterns, ...additions.deny])
-  for (const pattern of denied) policy[pattern] = deniedAction
+  for (const pattern of denied) policy[pattern] = "deny"
   for (const pattern of [...baseAllowBashPatterns, ...projectScriptAllowPatterns(targetDir), ...additions.allow]) {
     if (denied.has(pattern)) continue
     policy[pattern] = "allow"
@@ -302,24 +295,7 @@ function assembleBashPolicy(
 }
 
 export function bashPolicy(targetDir = process.cwd(), additions: PermissionAdditions = noAdditions): Record<string, "allow" | "deny" | "ask"> {
-  return assembleBashPolicy(targetDir, additions, "deny")
-}
-
-/**
- * The bash policy for read-only verify phases (agents with `readOnly: true,
- * verify: true`, e.g. review-scope). The allowlist runs silently; everything
- * else — including the hard denylist — falls through to "ask" so the request
- * reaches the permission gate, where the bash checkpoint (see permissions.ts)
- * refuses it with an informative message instead of the generic error that
- * made models retry variants until the loop guard tripped.
- *
- * The denylist is never relaxed here: for these phases the gate's checkpoint
- * is consulted before auto-accept (including --yolo), so a denied command can
- * never be auto-allowed. Writable steps keep `bashPolicy`, whose deny entries
- * OpenCode rejects before the gate.
- */
-export function readOnlyBashPolicy(targetDir = process.cwd(), additions: PermissionAdditions = noAdditions): Record<string, "allow" | "deny" | "ask"> {
-  return assembleBashPolicy(targetDir, additions, "ask")
+  return assembleBashPolicy(targetDir, additions)
 }
 
 function isFile(path: string) {

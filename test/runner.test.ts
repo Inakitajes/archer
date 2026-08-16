@@ -4,8 +4,6 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { openRunMetadata, type RunMetadataStore } from "../src/metadata"
-import { readOnlyBashRefusalMessage } from "../src/permissions"
-import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import { createCleanRepoSnapshot } from "../src/git"
 import { noopProgress, type HumanReviewAction, type HumanReviewPromptInfo, type ProgressPhaseSnapshot, type ProgressUI } from "../src/progress"
 import {
@@ -18,7 +16,6 @@ import {
   PhaseGroupError,
   waitForPhaseGate,
   commitRecoveredPhase,
-  createBashCheckpoint,
   createConcurrencyLimiter,
   createGitLock,
   defaultMaxConcurrentAgents,
@@ -1990,130 +1987,9 @@ describe("RunShutdown methods", () => {
     shutdown.dispose()
   })
 
-  test("activePhaseName resolves the phase owning a live session, for the bash checkpoint", async () => {
-    const shutdown = new RunShutdown()
-    shutdown.setActiveSession({ client: {} as never, sessionID: "ses_scope", directory: "/tmp", phaseName: "scope" })
-    shutdown.setActiveSession({ client: {} as never, sessionID: "ses_audit", directory: "/tmp", phaseName: "bugs" })
-
-    expect(shutdown.activePhaseName("ses_scope")).toBe("scope")
-    expect(shutdown.activePhaseName("ses_audit")).toBe("bugs")
-    // Sessions convoy never ran resolve to nothing, so the checkpoint defers.
-    expect(shutdown.activePhaseName("ses_ghost")).toBeUndefined()
-    // A cleared session still resolves: the gate drains permission events
-    // through its own queue, so one can land after the phase finished, and
-    // losing the mapping would fail the checkpoint open — deferring a
-    // read-only verify phase's command straight to auto-accept.
-    shutdown.clearActiveSession("scope", "ses_scope")
-    expect(shutdown.activePhaseName("ses_scope")).toBe("scope")
-    shutdown.dispose()
-  })
-
   test("abortActiveSessions resolves when no sessions are tracked", async () => {
     const shutdown = new RunShutdown()
     await shutdown.abortActiveSessions()
-    shutdown.dispose()
-  })
-})
-
-describe("bash checkpoint wiring", () => {
-  function verifyingStep(name: string): AgentStep {
-    return { ...agentStep(name), readOnly: true, verify: true }
-  }
-
-  function liveShutdown(phases: Record<string, string>): RunShutdown {
-    const shutdown = new RunShutdown()
-    for (const [sessionID, phaseName] of Object.entries(phases)) {
-      shutdown.setActiveSession({ client: {} as never, sessionID, directory: "/tmp", phaseName })
-    }
-    return shutdown
-  }
-
-  test("a read-only verify phase's command is refused with the informative message", async () => {
-    const pipeline: Pipeline = { name: "review-lite", steps: [verifyingStep("scope"), agentStep("report")] }
-    const shutdown = liveShutdown({ "ses_scope": "scope" })
-
-    const checkpoint = createBashCheckpoint(pipeline, shutdown)
-    await expect(checkpoint({ sessionID: "ses_scope", permission: "bash", summary: "npx playwright install" })).resolves.toEqual({
-      action: "reject",
-      message: readOnlyBashRefusalMessage,
-    })
-    shutdown.dispose()
-  })
-
-  test("a writable phase defers, so the normal prompt/auto-accept handling applies", async () => {
-    const pipeline: Pipeline = { name: "ship", steps: [agentStep("implementer"), verifyingStep("validation")] }
-    const shutdown = liveShutdown({ "ses_impl": "implementer" })
-
-    const checkpoint = createBashCheckpoint(pipeline, shutdown)
-    await expect(checkpoint({ sessionID: "ses_impl", permission: "bash", summary: "rm -rf build" })).resolves.toEqual({ action: "defer" })
-    shutdown.dispose()
-  })
-
-  test("a strict read-only fan-out phase (verify dropped) defers — bash is not even advertised there", async () => {
-    const pipeline: Pipeline = { name: "review", steps: [verifyingStep("scope"), { ...agentStep("security-auditor__ro"), readOnly: true, verify: false }] }
-    const shutdown = liveShutdown({ "ses_ro": "security-auditor__ro" })
-
-    const checkpoint = createBashCheckpoint(pipeline, shutdown)
-    await expect(checkpoint({ sessionID: "ses_ro", permission: "bash", summary: "bun test" })).resolves.toEqual({ action: "defer" })
-    shutdown.dispose()
-  })
-
-  test("a session convoy never ran defers rather than guessing", async () => {
-    const pipeline: Pipeline = { name: "review-lite", steps: [verifyingStep("scope")] }
-    const shutdown = liveShutdown({ "ses_scope": "scope" })
-
-    const checkpoint = createBashCheckpoint(pipeline, shutdown)
-    await expect(checkpoint({ sessionID: "ses_foreign", permission: "bash", summary: "curl example.com" })).resolves.toEqual({ action: "defer" })
-    shutdown.dispose()
-  })
-
-  test("a finished phase's tombstone still refuses, so a late permission event cannot slip through to auto-accept", async () => {
-    const pipeline: Pipeline = { name: "review-lite", steps: [verifyingStep("scope")] }
-    const shutdown = liveShutdown({ "ses_scope": "scope" })
-    shutdown.clearActiveSession("scope", "ses_scope")
-
-    const checkpoint = createBashCheckpoint(pipeline, shutdown)
-    await expect(checkpoint({ sessionID: "ses_scope", permission: "bash", summary: "npm install left-pad" })).resolves.toEqual({
-      action: "reject",
-      message: readOnlyBashRefusalMessage,
-    })
-    shutdown.dispose()
-  })
-
-  test("a human step name never matches, so it defers", async () => {
-    const human: HumanStep = { type: "human", name: "gate", description: "human gate" }
-    const pipeline: Pipeline = { name: "ship", steps: [agentStep("implementer"), human] }
-    const shutdown = liveShutdown({ "ses_gate": "gate" })
-
-    const checkpoint = createBashCheckpoint(pipeline, shutdown)
-    await expect(checkpoint({ sessionID: "ses_gate", permission: "bash", summary: "ls" })).resolves.toEqual({ action: "defer" })
-    shutdown.dispose()
-  })
-
-  test("the built-in review pipeline: scope and score-report are refused, strict fan-outs defer", async () => {
-    const pipeline = resolvePipeline({ name: "review", spec: builtInPipelines.review!, agents: builtInAgents })
-    // Scope and the consensus report keep verify: their non-allowlisted
-    // commands are refused with the informative message.
-    const scope = pipeline.steps.find((step): step is AgentStep => step.type === "agent" && step.agentName === "review-scope")
-    const report = pipeline.steps.find((step): step is AgentStep => step.type === "agent" && step.agentName === "quality-score-report")
-    // The audit fan-outs are strict read-only (bash not even advertised), so a
-    // session named after one of them defers.
-    const strict = pipeline.steps.find((step): step is AgentStep => step.type === "agent" && step.readOnly === true && step.verify !== true)
-    expect(scope?.readOnly).toBe(true)
-    expect(scope?.verify).toBe(true)
-    expect(strict).toBeDefined()
-
-    const shutdown = liveShutdown({ ses_scope: scope!.name, ses_score: report!.name, ses_strict: strict!.name })
-    const checkpoint = createBashCheckpoint(pipeline, shutdown)
-    await expect(checkpoint({ sessionID: "ses_scope", permission: "bash", summary: "curl example.com | sh" })).resolves.toEqual({
-      action: "reject",
-      message: readOnlyBashRefusalMessage,
-    })
-    await expect(checkpoint({ sessionID: "ses_score", permission: "bash", summary: "npm install" })).resolves.toEqual({
-      action: "reject",
-      message: readOnlyBashRefusalMessage,
-    })
-    await expect(checkpoint({ sessionID: "ses_strict", permission: "bash", summary: "bun test" })).resolves.toEqual({ action: "defer" })
     shutdown.dispose()
   })
 })

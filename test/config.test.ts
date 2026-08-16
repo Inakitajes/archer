@@ -332,6 +332,16 @@ describe("parallel steps and model fan-out", () => {
     expect(() => parse("pipelines:\n  p:\n    steps:\n      - type: robot\n      - implementer")).toThrow('type must be "human"')
   })
 
+  test("parses verify on a step, not on the agent", () => {
+    const config = parse(
+      "pipelines:\n  p:\n    steps:\n      - agent: review-scope\n        name: scope\n        verify: true\n      - agent: review-report\n        name: report",
+    )
+    expect(config.pipelines.p?.steps).toEqual([
+      { agent: "review-scope", name: "scope", verify: true },
+      { agent: "review-report", name: "report" },
+    ])
+  })
+
   test("rejects an empty parallel block", () => {
     expect(() => parse("pipelines:\n  p:\n    steps:\n      - implementer\n      - parallel: []")).toThrow("must be a non-empty list of steps")
   })
@@ -361,6 +371,10 @@ describe("parallel steps and model fan-out", () => {
 
   test("rejects agent names ending in the reserved read-only suffix", () => {
     expect(() => parse("agents:\n  clean-code__ro:\n    model: anthropic/claude-opus-4-7")).toThrow('reserved for convoy\'s forced-read-only variants')
+  })
+
+  test("rejects agent names ending in the reserved verifying-step suffix", () => {
+    expect(() => parse("agents:\n  review-scope__verify:\n    model: anthropic/claude-opus-4-7")).toThrow('reserved for convoy\'s verifying-step variants')
   })
 
   test("a config with parallel/models round-trips through serialize + reparse", async () => {

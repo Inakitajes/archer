@@ -103,6 +103,29 @@ describe("opencode config", () => {
     }
   })
 
+  test("a synthesized verifying agent (__verify suffix) loads the base agent's prompt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-verify-variant-"))
+    try {
+      await mkdir(join(dir, ".convoy", "agents"), { recursive: true })
+      await writeFile(join(dir, ".convoy", "agents", "validator.md"), "# Validator\n\nRerun the proofs.")
+
+      const config = opencodeConfig("/tmp/convoy-run", dir, [
+        { name: "validator", description: "Validator", readOnly: true, builtIn: false },
+        { name: "validator__verify", description: "Validator", readOnly: true, verify: true, builtIn: false },
+      ])
+
+      const verifying = config.agent?.["validator__verify"]
+      expect(verifying?.prompt).toContain("# Validator")
+      expect(verifying?.tools?.bash).toBe(true)
+      expect(verifying?.tools?.write).toBe(false)
+      const bash = (verifying?.permission as { bash?: Record<string, string> } | undefined)?.bash
+      expect(bash?.["git commit*"]).toBe("deny")
+      expect(config.agent?.["validator"]?.tools?.bash).toBe(false)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("read-only agents cannot write, edit, or run shell commands", async () => {
     const dir = await mkdtemp(join(tmpdir(), "convoy-readonly-agent-"))
     try {
@@ -145,12 +168,9 @@ describe("opencode config", () => {
       expect(validator?.tools?.task).toBe(false)
       expect(validator?.permission).toMatchObject({ edit: "deny", task: "deny", question: "deny" })
       const bash = (validator?.permission as { bash?: Record<string, string> } | undefined)?.bash
-      // The read-only policy: allowlisted checks run silently, and everything
-      // else — including denylist commands — falls to "ask" so the gate's bash
-      // checkpoint can refuse it with the informative message instead of a
-      // generic error.
-      expect(bash).toMatchObject({ "bun test*": "allow", "*": "ask" })
-      expect(bash?.["git commit*"]).toBe("ask")
+      // Same policy writable agents get: allowlisted checks run silently, the
+      // hard denylist stays deny.
+      expect(bash).toMatchObject({ "bun test*": "allow", "git commit*": "deny", "*": "ask" })
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

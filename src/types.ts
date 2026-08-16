@@ -171,11 +171,10 @@ export type AgentSpec = {
   /** When true, Convoy disables write/edit/bash tools for this agent. */
   readOnly?: boolean
   /**
-   * Gives a read-only agent bash back, under the same policy writable steps get,
-   * so a validator can actually run the tests and checks its prompt asks for.
-   * Ignored unless `readOnly` is true, and dropped when a step is forced
-   * read-only for parallel/multi-model execution: concurrent agents running
-   * checks would fight over the same working tree.
+   * Registry-only: this OpenCode agent has bash under the normal `bashPolicy`
+   * (deny stays deny). Set by pipeline resolution when a step asks for
+   * `verify: true`, never by the agent catalogue or `agents.<name>` config.
+   * Ignored unless `readOnly` is true.
    */
   verify?: boolean
   /** Advising model for steps using this agent; beats defaults.advisor, loses to the step's own. */
@@ -219,7 +218,11 @@ export type AgentStep = {
   reportPath: string
   /** True when the underlying agent is configured as read-only, or forced read-only for parallel/multi-model execution. */
   readOnly?: boolean
-  /** True when this read-only step may still run bash to verify its claims. Never set without `readOnly`. */
+  /**
+   * True when this read-only step may still run bash to verify its claims.
+   * Comes from the step spec (`verify: true`), never from the agent catalogue.
+   * Never set without `readOnly`. Dropped for `parallel:` / `models:` fan-outs.
+   */
   verify?: boolean
   /** Shared by every step produced from the same top-level pipeline entry; the runner batches same-groupId steps to run concurrently. */
   groupId: string

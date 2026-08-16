@@ -25,8 +25,8 @@ import { openRunMetadata, recordProgress, type RunMetadataStore } from "./metada
 import { openOpencodeSessionWindow, startOpencode } from "./opencode"
 import { HerdrReporter } from "./herdr"
 import { defaultNotificationSettings, Notifier } from "./notifications"
-import { readOnlyBashRefusalMessage, startPermissionGate, type BashCheckpoint, type PermissionGate } from "./permissions"
-import { splitModelVariant, synthesizeReadOnlyAgents, validateStepFilters } from "./pipeline"
+import { startPermissionGate, type PermissionGate } from "./permissions"
+import { agentsForPipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
@@ -91,8 +91,6 @@ export function isIgnorableRejection(reason: unknown): boolean {
 export class RunShutdown {
   private readonly controller = new AbortController()
   private readonly activeSessions = new Map<string, ActiveSession>()
-  /** sessionID → phaseName for sessions that finished; see clearActiveSession. */
-  private readonly finishedSessions = new Map<string, string>()
   private abortingSessions: Promise<void> | undefined
   private requests = 0
   private forceTimer: ReturnType<typeof setTimeout> | undefined
@@ -147,32 +145,7 @@ export class RunShutdown {
   clearActiveSession(phaseName: string, sessionID: string) {
     if (this.activeSessions.get(phaseName)?.sessionID === sessionID) {
       this.activeSessions.delete(phaseName)
-      // Tombstone, never removed: the permission gate drains events through
-      // its own serial queue, so a permission.asked emitted just before the
-      // phase finished can be processed after this clear. Without the
-      // tombstone the bash checkpoint would fail open — defer a read-only
-      // verify phase's command straight to auto-accept, bypassing the
-      // denylist enforcement the gate now owns (see readOnlyBashPolicy).
-      // IDs are server-assigned and unique, so a tombstone can never shadow
-      // a later live session.
-      this.finishedSessions.set(sessionID, phaseName)
     }
-  }
-
-  /**
-   * The phase name owning a session, for the permission gate's bash checkpoint:
-   * it needs to know whether the session asking for a command is a read-only
-   * verify phase before deciding to refuse with the informative message.
-   * Resolves live sessions first, then the finished-session tombstones, so a
-   * late permission event still lands on its phase. Undefined only for
-   * sessions convoy never ran (foreign sessions, mapping bugs) — those defer
-   * to the normal prompt/auto-accept handling.
-   */
-  activePhaseName(sessionID: string): string | undefined {
-    for (const session of this.activeSessions.values()) {
-      if (session.sessionID === sessionID) return session.phaseName
-    }
-    return this.finishedSessions.get(sessionID)
   }
 
   async abortActiveSessions(progress?: ProgressUI) {
@@ -202,29 +175,6 @@ export class RunShutdown {
   dispose() {
     if (this.forceTimer) clearTimeout(this.forceTimer)
     this.disposed = true
-  }
-}
-
-/**
- * Builds the permission gate's bash checkpoint — the deny-informativo for
- * read-only verify phases (see readOnlyBashPolicy in bash-policy.ts). Any
- * command that reaches the gate from such a phase — i.e. one the read-only
- * allowlist did not cover — is refused with a message explaining the design,
- * so the model stops retrying variants instead of tripping the loop guard.
- *
- * The session→phase mapping comes from RunShutdown, which registers every live
- * session (and keeps tombstones for finished ones, so a permission event the
- * gate drains late still lands on its phase). Everything else — writable
- * phases, strict read-only fan-outs (whose `__ro` variants carry no bash), and
- * unknown sessions — defers to the normal prompt/auto-accept handling.
- */
-export function createBashCheckpoint(pipeline: Pipeline, shutdown: RunShutdown): BashCheckpoint {
-  return async ({ sessionID }) => {
-    const phaseName = shutdown.activePhaseName(sessionID)
-    if (!phaseName) return { action: "defer" }
-    const step = pipeline.steps.find((candidate) => candidate.type === "agent" && candidate.name === phaseName)
-    if (step?.type !== "agent" || !step.readOnly || !step.verify) return { action: "defer" }
-    return { action: "reject", message: readOnlyBashRefusalMessage }
   }
 }
 
@@ -557,8 +507,9 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     validateStepFilters(pipeline, options)
     // Parallel/multi-model steps are forced read-only and point at a synthesized
     // "<agent>__ro" variant when their base agent isn't already read-only;
-    // register those variants alongside the normal registry for this run.
-    const agents = [...options.agents, ...synthesizeReadOnlyAgents(pipeline, options.agents)]
+    // verifying steps that share an agent with a non-verifying use get
+    // "<agent>__verify". Register those variants alongside the catalogue.
+    const agents = agentsForPipeline(pipeline, options.agents)
     ensureAgentsAvailable(pipeline, agents)
     // Claude Code is an optional dependency: only a pipeline that actually
     // contains a claude-code step needs the CLI, checked before anything runs.
@@ -736,13 +687,6 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
         : {}),
     })
 
-    // The bash checkpoint is the deny-informativo for read-only verify phases
-    // (see readOnlyBashPolicy in bash-policy.ts): any command that reaches the
-    // gate from such a phase — i.e. one the read-only allowlist did not cover —
-    // is refused with a message explaining the design, so the model stops
-    // retrying variants instead of tripping the loop guard.
-    const bashCheckpoint = createBashCheckpoint(pipeline, shutdown)
-
     permissions = startPermissionGate({
       client: opencode.client,
       progress,
@@ -753,7 +697,6 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       terminalInput,
       serverUrl: opencode.url,
       ...(advisorNeeds.agents.size > 0 ? { advisorCheckpoint: advisors.checkpoint } : {}),
-      bashCheckpoint,
     })
 
     const resuming = Boolean(options.resumeRunID)
@@ -1381,8 +1324,6 @@ export async function waitForPhaseGate(
   // Pause only the session the interactive TUI owns, never the whole directory:
   // a directory-wide pause would also drop the prompts of live siblings in the
   // same parallel batch, deadlocking them waiting for replies Convoy never sends.
-  // The gate still applies structural bash-checkpoint decisions while paused,
-  // so takeover cannot make a read-only verify refusal human-approvable.
   const pausePermissions = () => {
     if (permissionsPaused || !takeover?.permissions || !sessionID) return
     permissionsPaused = true
@@ -1390,8 +1331,7 @@ export async function waitForPhaseGate(
   }
   // An interactive session owns the terminal and answers its ordinary prompts,
   // so Convoy's permission gate stays paused for that session while it waits.
-  // Structural bash-checkpoint decisions remain Convoy-owned. A failure gate
-  // starts without pausing — a dead step must never freeze sibling prompts.
+  // A failure gate starts without pausing — a dead step must never freeze sibling prompts.
   if (kind === "interactive") pausePermissions()
 
   // The readline fallback owns the terminal; the TUI path keeps the dashboard
