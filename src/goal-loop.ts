@@ -21,13 +21,32 @@
 
 import { buildRunPlan } from "./run-plan"
 import { log } from "./log"
-import { createCleanRepoSnapshot, currentHead, restoreRepoSnapshot, statusPorcelain, type RepoSnapshot } from "./git"
+import { createCleanRepoSnapshot, currentBranch, currentHead, restoreRepoSnapshot, statusPorcelain, type RepoSnapshot } from "./git"
 import { hooksForPipeline, runHooks, type GoalHookOutcome } from "./hooks"
 import { noopProgress, createProgressUI, type AutoAccept, type GoalLoopView, type ProgressUI } from "./progress"
 import { holdFinishScreen, hostedTeardownFromError, installShutdownSignals, isUserAbortError, progressPhases, run, RunShutdown, type RunResult } from "./runner"
 import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
+import { defaultNotificationSettings, Notifier } from "./notifications"
+import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
+import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import { cleanupWorkspace, type Workspace } from "./workspace"
 import type { RunOptions, RunPlan } from "./types"
+
+/**
+ * A log entry the loop defers until after the dashboard is torn down and the
+ * log is unmuted. The TUI mutes the log while it owns the terminal, so any
+ * `log.info`/`log.warn` the loop emits mid-iteration (the trajectory, the
+ * restore warnings, the per-iteration scores) would be silently discarded.
+ * The loop buffers them here and flushes after `progress.stop()`.
+ */
+type DeferredLog = { level: "info" | "warn"; message: string }
+
+function flushDeferredLogs(buffer: DeferredLog[]): void {
+  for (const { level, message } of buffer) {
+    if (level === "info") log.info(message)
+    else log.warn(message)
+  }
+}
 
 export type GoalLoopConfig = {
   goal: number
@@ -108,9 +127,10 @@ export async function runGoalLoop(
   deps: GoalLoopDeps = defaultGoalLoopDeps,
 ): Promise<GoalLoopOutcome> {
   const kept = new KeptWorkspaces()
-  // The loop owns the dashboard, not any single run: one auto-accept reference,
-  // one shared progress UI, one shutdown that covers the gaps between runs.
-  const autoAccept: AutoAccept = { mode: options.yolo ? "all" : options.smart ? "smart" : "off" }
+  // SC-5: Reuse the caller-provided dashboard's auto-accept state when it
+  // exists, so a borrowed dashboard's shift+tab toggle reaches the permission
+  // gate instead of being disconnected by a fresh reference.
+  const autoAccept: AutoAccept = options.progress?.autoAccept ?? { mode: options.yolo ? "all" : options.smart ? "smart" : "off" }
   const shutdown = new RunShutdown()
   // OS signals must reach the loop's shutdown, not only the active run's: while
   // no run is in flight — between iterations, and during the loop-owned finish
@@ -120,16 +140,66 @@ export async function runGoalLoop(
   // remove exactly their own handlers on the way out.
   const removeSignalHandlers = installShutdownSignals(shutdown)
   const phases = progressPhases(plan.pipeline, plan.hooks ?? hooksForPipeline(options.hooks, plan.pipeline.name))
-  const progress = options.progress ?? (await createProgressUI(phases, options.tui, () => shutdown.request("Ctrl+C"), autoAccept))
+  let progress = options.progress ?? (await createProgressUI(phases, options.tui, () => shutdown.request("Ctrl+C"), autoAccept))
   const owns = !options.progress
+
+  // SC-3: The loop owns one status tracker for the overall loop outcome. Each
+  // run has its own (inside the runner), but a hosted run never publishes a
+  // final status through it — the runner skips runFinished and stop for hosted
+  // runs — so the loop's completion/failure would never reach the notifier or
+  // the terminal title. Wrapping the shared progress here lets the loop's hold
+  // and stop flow through one tracker that publishes the final state.
+  const notificationSettings = {
+    ...defaultNotificationSettings,
+    ...options.notifications,
+    ...(options.notify === undefined ? {} : { enabled: options.notify }),
+  }
+  const notifier = new Notifier({ settings: notificationSettings })
+  const identity = {
+    project: projectName(options.targetDir),
+    pipeline: plan.pipeline.name,
+    ...(options.branch ? { branch: options.branch } : {}),
+  }
+  if (!identity.branch) {
+    try {
+      const branch = await currentBranch(options.targetDir)
+      if (branch) identity.branch = branch
+    } catch {
+      // The target may not be a git repo (tests, mocked deps); the identity
+      // simply lacks a branch label, which the title format tolerates.
+    }
+  }
+  const statusTracker = new RunStatusTracker({
+    phases,
+    identity,
+    sinks: {
+      ...(notifier.available ? { notify: (event) => void notifier.notify(event) } : {}),
+      ...(notificationSettings.terminalTitle ? { title: (status) => void writeTerminalTitle(formatTerminalTitle(status)) } : {}),
+    },
+  })
+  progress = trackRunStatus(progress, statusTracker)
+  statusTracker.bind(progress)
+
+  const deferredLogs: DeferredLog[] = []
+  let outcome: GoalLoopOutcome | undefined
   try {
-    const outcome = await runGoalIterations(options, plan, config, deps, kept, progress, shutdown, autoAccept)
+    outcome = await runGoalIterations(options, plan, config, deps, kept, progress, shutdown, autoAccept, deferredLogs)
     await runDeferredPostHooks(options, plan, config, deps, kept.latest, outcome)
     return outcome
   } finally {
     removeSignalHandlers()
+    // SC-6: Clear the dashboard's abort handler before disposing the shutdown,
+    // so a Ctrl+C after the loop exits doesn't fire against a dead shutdown.
+    progress.setAbortHandler?.(undefined)
     if (owns) progress.stop()
+    // SC-1: After the dashboard is torn down and the log unmuted, the
+    // trajectory, restore warnings, and per-iteration scores the README
+    // promises finally reach stderr — the TUI muted the log while it was up,
+    // so they were invisible if emitted before stop().
+    flushDeferredLogs(deferredLogs)
+    if (outcome) emitSummaryLogs(outcome)
     shutdown.dispose()
+    await notifier.stop()
     await kept.cleanup(deps.cleanupWorkspace)
   }
 }
@@ -199,6 +269,7 @@ async function runGoalIterations(
   progress: ProgressUI,
   shutdown: RunShutdown,
   autoAccept: AutoAccept,
+  deferredLogs: DeferredLog[],
 ): Promise<GoalLoopOutcome> {
   const { run: runRun, captureSnapshot, restoreSnapshot, isCleanRepo, currentHead } = deps
   const maxRuns = 1 + config.maxIterations
@@ -276,9 +347,10 @@ async function runGoalIterations(
       await hostedTeardownFromError(error)?.release?.()
       throw error
     }
-    // Nothing measured yet (the initial run failed): there is no best state to
-    // put back, so skip the restore attempt and its warning entirely.
-    if (best) await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead)
+    // SC-2: Never restore after an abort. A non-abort failure that landed
+    // while the loop's shutdown was requested (the runner's own shutdown is
+    // independent) would still attempt the destructive reset -- gate it.
+    if (best && !shutdown.aborted) await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead, deferredLogs)
     const teardown = hostedTeardownFromError(error)
     await hold("failed", error instanceof Error ? error.message : String(error), undefined, teardown?.runDir)
     await teardown?.release?.()
@@ -287,6 +359,11 @@ async function runGoalIterations(
 
   // The initial run is the first iteration of the loop.
   progress.setGoalLoop?.(viewFor())
+  // SC-2: Re-check the shutdown right before starting. A signal that landed
+  // after the loop's handlers were installed but before this first run's
+  // guard would leave the loop's shutdown aborted while the runner starts
+  // with a fresh one — the run would proceed despite the operator's intent.
+  shutdown.throwIfRequested()
   try {
     previous = await runRun({ ...hosted, plan })
   } catch (error) {
@@ -297,14 +374,14 @@ async function runGoalIterations(
   lastHead = await currentHead(options.targetDir)
   let score = previous.qualityScore?.score
   if (score === undefined) {
-    log.warn("goal loop: the run produced no machine-readable quality score; nothing to iterate on")
+    deferredLogs.push({ level: "warn", message: "goal loop: the run produced no machine-readable quality score; nothing to iterate on" })
     const outcome = summarize({ scores, reached: false, reason: "no-score", restored: false })
     await hold("completed", undefined, outcomeView(outcome))
     return outcome
   }
   scores.push(score)
-  best = { score, snapshot: await captureBestEffort(options.targetDir, captureSnapshot) }
-  logIteration(0, score, config, undefined)
+  best = { score, snapshot: await captureBestEffort(options.targetDir, captureSnapshot, deferredLogs) }
+  logIteration(0, score, config, undefined, deferredLogs)
   if (score >= config.goal) {
     const outcome = summarize({ scores, reached: true, reason: "goal", bestScore: best.score, restored: false })
     await hold("completed", undefined, outcomeView(outcome))
@@ -327,11 +404,20 @@ async function runGoalIterations(
     // The feed resets for the new run but keeps this announcement, so the
     // dashboard always says which iteration is on and what the last score was.
     const lastScore = scores[scores.length - 1]
-    if (lastScore !== undefined) {
-      progress.message?.(`goal loop: iteration ${iteration + 1}/${maxRuns} · last ${lastScore}/100`)
-    }
+    const announcement = lastScore !== undefined ? `goal loop: iteration ${iteration + 1}/${maxRuns} · last ${lastScore}/100` : undefined
+    if (announcement) progress.message?.(announcement)
     await previous.release?.()
+    // SC-2: Re-check the shutdown after the await release (an await point
+    // where a signal can land) and right before starting the next run, so an
+    // abort that arrived during the release window cannot start a run whose
+    // own shutdown is still clean.
+    if (shutdown.aborted) {
+      shutdown.throwIfRequested()
+    }
     const fixOptions = goalFixOptions(hosted, previous, scores)
+    // SC-8: Pass the announcement explicitly so resetPipeline preserves
+    // exactly that feed entry instead of guessing the last one is it.
+    if (announcement) fixOptions.retainFeedMessage = announcement
     try {
       previous = await runRun({ ...fixOptions, plan: buildRunPlan(fixOptions) })
       kept.adopt(previous)
@@ -342,16 +428,16 @@ async function runGoalIterations(
     }
     score = previous.qualityScore?.score
     if (score === undefined) {
-      log.warn(`goal loop: fix iteration ${iteration} produced no score; stopping`)
+      deferredLogs.push({ level: "warn", message: `goal loop: fix iteration ${iteration} produced no score; stopping` })
       reason = "no-score"
       break
     }
     scores.push(score)
     if (score > best.score) {
-      best = { score, snapshot: await captureBestEffort(options.targetDir, captureSnapshot) }
+      best = { score, snapshot: await captureBestEffort(options.targetDir, captureSnapshot, deferredLogs) }
     }
     const improvement = score - scores[scores.length - 2]!
-    logIteration(iteration, score, config, improvement)
+    logIteration(iteration, score, config, improvement, deferredLogs)
     progress.setGoalLoop?.(viewFor())
 
     if (score >= config.goal) {
@@ -370,9 +456,12 @@ async function runGoalIterations(
   // iteration (whose mutation was never measured) and after a plateau on a
   // lower score. A plateau or iteration cap that ends on the best score is
   // already there, so no restore is needed.
+  // SC-2: Never restore after an abort — the operator wants to stop, not roll
+  // back, and a destructive reset --hard after a Ctrl+C would destroy work
+  // they may want to keep.
   const finalScore = scores[scores.length - 1]
-  if (reason !== "goal" && best && (reason === "no-score" || finalScore === undefined || finalScore < best.score)) {
-    restored = await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead)
+  if (!shutdown.aborted && reason !== "goal" && best && (reason === "no-score" || finalScore === undefined || finalScore < best.score)) {
+    restored = await restoreBestEffort(best, options.targetDir, restoreSnapshot, isCleanRepo, lastHead, currentHead, deferredLogs)
   }
 
   const outcome = summarize({ scores, reached: reason === "goal", reason, bestScore: best?.score, restored })
@@ -481,11 +570,11 @@ function capFindings(items: string[], originalCount: number): string[] {
 }
 
 /** Captures the repo's clean state after a scored run, tolerating non-repo or unclean checks. */
-async function captureBestEffort(cwd: string, captureSnapshot: (cwd: string) => Promise<RepoSnapshot | undefined>): Promise<RepoSnapshot | undefined> {
+async function captureBestEffort(cwd: string, captureSnapshot: (cwd: string) => Promise<RepoSnapshot | undefined>, deferredLogs: DeferredLog[]): Promise<RepoSnapshot | undefined> {
   try {
     return await captureSnapshot(cwd)
   } catch (error) {
-    log.warn(`goal loop: could not capture a snapshot of the measured state: ${String(error)}`)
+    deferredLogs.push({ level: "warn", message: `goal loop: could not capture a snapshot of the measured state: ${String(error)}` })
     return undefined
   }
 }
@@ -512,9 +601,10 @@ async function restoreBestEffort(
   isCleanRepo: (cwd: string) => Promise<boolean>,
   expectedHead: string | undefined,
   currentHead: (cwd: string) => Promise<string | undefined>,
+  deferredLogs: DeferredLog[],
 ): Promise<boolean> {
   if (!best?.snapshot) {
-    log.warn(`goal loop: no snapshot of the best measured state (score ${best?.score ?? "?"}/100) was captured; the branch stays where the last iteration left it`)
+    deferredLogs.push({ level: "warn", message: `goal loop: no snapshot of the best measured state (score ${best?.score ?? "?"}/100) was captured; the branch stays where the last iteration left it` })
     return false
   }
   // Guard 1 — branch advance: if the current HEAD is not the HEAD the loop's
@@ -525,9 +615,10 @@ async function restoreBestEffort(
   if (expectedHead !== undefined) {
     const actualHead = await currentHead(cwd)
     if (actualHead !== undefined && actualHead !== expectedHead) {
-      log.warn(
-        `goal loop: the branch HEAD (${actualHead.slice(0, 12)}) advanced past the state the loop's last run left (${expectedHead.slice(0, 12)}); refusing to restore the best measured state (score ${best.score}/100) to avoid discarding concurrent commits. The branch stays where it is; the best state is reachable via git reflog.`,
-      )
+      deferredLogs.push({
+        level: "warn",
+        message: `goal loop: the branch HEAD (${actualHead.slice(0, 12)}) advanced past the state the loop's last run left (${expectedHead.slice(0, 12)}); refusing to restore the best measured state (score ${best.score}/100) to avoid discarding concurrent commits. The branch stays where it is; the best state is reachable via git reflog.`,
+      })
       return false
     }
   }
@@ -536,29 +627,37 @@ async function restoreBestEffort(
   // `git reset --hard` + `git clean -fd` would erase them. Warn and leave the
   // branch on the final iteration instead.
   if (!(await isCleanRepo(cwd))) {
-    log.warn(`goal loop: the working tree is not clean; refusing to restore the best measured state (score ${best.score}/100) to avoid destroying concurrent changes. The branch stays where the last iteration left it.`)
+    deferredLogs.push({ level: "warn", message: `goal loop: the working tree is not clean; refusing to restore the best measured state (score ${best.score}/100) to avoid destroying concurrent changes. The branch stays where the last iteration left it.` })
     return false
   }
   try {
     await restoreSnapshot(best.snapshot, cwd)
-    log.info(`goal loop: restored the branch to the best measured state (score ${best.score}/100)`)
+    deferredLogs.push({ level: "info", message: `goal loop: restored the branch to the best measured state (score ${best.score}/100)` })
     return true
   } catch (error) {
-    log.warn(`goal loop: could not restore the best measured state (score ${best.score}/100): ${String(error)}. The branch stays where the last iteration left it.`)
+    deferredLogs.push({ level: "warn", message: `goal loop: could not restore the best measured state (score ${best.score}/100): ${String(error)}. The branch stays where the last iteration left it.` })
     return false
   }
 }
 
-function logIteration(iteration: number, score: number, config: GoalLoopConfig, improvement: number | undefined) {
+function logIteration(iteration: number, score: number, config: GoalLoopConfig, improvement: number | undefined, deferredLogs: DeferredLog[]) {
   const change = improvement === undefined ? "" : ` (${improvement >= 0 ? "+" : ""}${improvement} vs previous)`
-  if (score >= config.goal) log.info(`goal loop: iteration ${iteration} scored ${score}/100 — goal ${config.goal} met${change}`)
-  else if (improvement !== undefined && improvement < config.plateau) log.warn(`goal loop: iteration ${iteration} scored ${score}/100${change} — below plateau ${config.plateau}, stopping`)
-  else log.info(`goal loop: iteration ${iteration} scored ${score}/100${change}`)
+  if (score >= config.goal) deferredLogs.push({ level: "info", message: `goal loop: iteration ${iteration} scored ${score}/100 — goal ${config.goal} met${change}` })
+  else if (improvement !== undefined && improvement < config.plateau) deferredLogs.push({ level: "warn", message: `goal loop: iteration ${iteration} scored ${score}/100${change} — below plateau ${config.plateau}, stopping` })
+  else deferredLogs.push({ level: "info", message: `goal loop: iteration ${iteration} scored ${score}/100${change}` })
 }
 
 function summarize(outcome: GoalLoopOutcome): GoalLoopOutcome {
-  // The score that matters is the state the branch is left in: the best
-  // measured score, which is also the final one when the goal was reached.
+  return outcome
+}
+
+/**
+ * SC-1: Emits the final goal-loop summary to the log. Called from the loop's
+ * `finally` after `progress.stop()` so the TUI (which mutes the log while it
+ * owns the terminal) no longer swallows the trajectory, the verdict, and the
+ * restore status the README promises.
+ */
+function emitSummaryLogs(outcome: GoalLoopOutcome): void {
   const final = outcome.bestScore ?? outcome.scores[outcome.scores.length - 1]
   const goalText = `goal ${outcome.reason === "goal" ? "met" : "not met"}`
   if (outcome.scores.length > 0) {
@@ -567,9 +666,6 @@ function summarize(outcome: GoalLoopOutcome): GoalLoopOutcome {
   if (outcome.reached && final !== undefined) {
     log.info(`goal loop: done — ${final}/100, ${goalText}`)
   } else if (final !== undefined) {
-    // Report honestly: the best score is what we aimed to leave the branch on,
-    // but a skipped or failed restore means the branch is actually on the final
-    // iteration. Say so rather than promising a state that was not reached.
     if (outcome.restored) {
       log.warn(`goal loop: best effort ${final}/100 (${goalText}); stopped: ${outcome.reason}. The branch was restored to this best measured state.`)
     } else {
@@ -579,5 +675,4 @@ function summarize(outcome: GoalLoopOutcome): GoalLoopOutcome {
   } else {
     log.warn(`goal loop: no score recorded; stopped: ${outcome.reason}`)
   }
-  return outcome
 }

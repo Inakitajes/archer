@@ -98,6 +98,13 @@ export type RunOptions = {
    * it); otherwise it derives one from `yolo`/`smart`.
    */
   autoAccept?: AutoAccept
+  /**
+   * Goal loop: the iteration announcement text the loop placed in the feed
+   * before this run started. The runner forwards it to `resetPipeline` as
+   * `retainMessage` so the dashboard preserves exactly that entry rather than
+   * guessing the last feed item is the announcement.
+   */
+  retainFeedMessage?: string
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */

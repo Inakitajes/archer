@@ -160,9 +160,10 @@ describe("runGoalLoop with an owned dashboard", () => {
     })
 
     // One dashboard for both runs, stopped exactly once — after the hold. The
-    // shared auto-accept reference was handed to it once, at creation.
+    // shared auto-accept reference was handed to it once, at creation. The
+    // abort handler is cleared on loop exit (SC-6) before the dashboard stops.
     expect(created).toBe(1)
-    expect(order).toEqual(["create", "abort-handler", "hold", "stop"])
+    expect(order).toEqual(["create", "abort-handler", "hold", "clear-abort-handler", "stop"])
     expect(capturedAutoAccept).toEqual({ mode: "off" })
     expect(dashboards[0]!.finishCalls[0]?.goalLoop?.scores).toEqual([71, 84, 92])
   })
@@ -176,9 +177,10 @@ describe("runGoalLoop with an owned dashboard", () => {
     })
 
     // No finish screen for an abort, but the dashboard the loop owns must not
-    // outlive the loop: exactly one stop, from the loop's finally.
+    // outlive the loop: exactly one stop, from the loop's finally. The abort
+    // handler is cleared on loop exit (SC-6) before the dashboard stops.
     expect(created).toBe(1)
     expect(dashboards[0]!.finishCalls).toHaveLength(0)
-    expect(order).toEqual(["create", "stop"])
+    expect(order).toEqual(["create", "clear-abort-handler", "stop"])
   })
 })

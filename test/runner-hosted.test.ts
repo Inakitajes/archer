@@ -15,14 +15,21 @@ const fakeClient = {
   permission: { reply: async () => ({}) },
 }
 
+// SC-4: When this flag is set, startOpencode throws a primitive (not an Error)
+// so the runner's catch-block wrapping can be tested against a real run().
+let throwPrimitiveFromStart = false
+
 mock.module("../src/opencode", () => ({
   // The run path only ever calls startOpencode; the rest of the surface just
   // has to exist as bindings so the modules that import it load cleanly.
-  startOpencode: async () => ({
-    client: fakeClient as never,
-    url: "http://127.0.0.1:41234",
-    close: () => {},
-  }),
+  startOpencode: async () => {
+    if (throwPrimitiveFromStart) throw "primitive boom"
+    return {
+      client: fakeClient as never,
+      url: "http://127.0.0.1:41234",
+      close: () => {},
+    }
+  },
   connectOpencode: () => fakeClient as never,
   openOpencodeSessionWindow: async () => "test-window",
   openInteractiveOpencodeWindow: async () => "test-window",
@@ -205,6 +212,42 @@ describe("run() with a hosted progress", () => {
       const metadata = JSON.parse(await readFile(join(result.dir, "metadata.json"), "utf8"))
       expect(metadata.server).toBeUndefined()
     } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  // SC-4: A primitive thrown value (string, number, …) cannot key the WeakMap
+  // the goal loop fetches the hosted teardown from. The runner wraps it in an
+  // Error before storing, so the teardown survives any thrown value.
+  test("SC-4: a primitive thrown by startOpencode is wrapped so the teardown is preserved", async () => {
+    const repo = await cleanRepo()
+    const dashboard: ProgressUI = { ...noopProgress }
+    try {
+      throwPrimitiveFromStart = true
+      let failure: unknown
+      try {
+        await run(makeOptions(repo, { progress: dashboard }))
+        throw new Error("the run should have rejected")
+      } catch (error) {
+        failure = error
+      }
+
+      // The primitive was wrapped in an Error (not the raw string).
+      expect(failure).toBeInstanceOf(Error)
+      expect((failure as Error).message).toBe("primitive boom")
+
+      // The wrapped error can key the WeakMap, so the teardown is recoverable.
+      // Without the SC-4 wrap, hostedTeardownFromError would return undefined
+      // because a string cannot key a WeakMap.
+      const teardown = hostedTeardownFromError(failure)
+      expect(teardown).toBeDefined()
+      if (!teardown) return
+      expect(teardown.runDir).not.toBe("")
+      // The release closure runs without throwing — it releases the lease
+      // and flushes metadata.
+      await teardown.release()
+    } finally {
+      throwPrimitiveFromStart = false
       await rm(repo, { recursive: true, force: true })
     }
   })

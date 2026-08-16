@@ -93,6 +93,14 @@ export class RunShutdown {
   private abortingSessions: Promise<void> | undefined
   private requests = 0
   private forceTimer: ReturnType<typeof setTimeout> | undefined
+  /**
+   * Set by {@link dispose} so a signal routed to a shutdown whose loop already
+   * exited (a borrowed dashboard's abort handler still pointing at it) is a
+   * no-op instead of a {@link process.exit}. The loop clears that handler on
+   * exit, but a signal landing in the gap between handler clear and dispose
+   * must still be inert.
+   */
+  private disposed = false
 
   get signal() {
     return this.controller.signal
@@ -103,6 +111,7 @@ export class RunShutdown {
   }
 
   request(source: string) {
+    if (this.disposed) return
     this.requests++
     if (this.requests > 1) {
       log.warn(`${source} received again; forcing exit`)
@@ -162,6 +171,7 @@ export class RunShutdown {
 
   dispose() {
     if (this.forceTimer) clearTimeout(this.forceTimer)
+    this.disposed = true
   }
 }
 
@@ -549,7 +559,7 @@ export async function run(options: RunOptions) {
       // controls and shutdown, and let this run's finally never tear it down.
       options.progress.setHostControls?.(hostControls)
       options.progress.setAbortHandler?.(() => shutdown.request("Ctrl+C"))
-      options.progress.resetPipeline?.(phases, { runID: workspace.runID, targetDir: options.targetDir, runDir: workspace.dir, pipeline })
+      options.progress.resetPipeline?.(phases, { runID: workspace.runID, targetDir: options.targetDir, runDir: workspace.dir, pipeline, ...(options.retainFeedMessage ? { retainMessage: options.retainFeedMessage } : {}) })
       progress = trackRunStatus(recordProgress(options.progress, metadata), statusTracker)
     } else {
       progress = trackRunStatus(
@@ -791,6 +801,12 @@ export async function run(options: RunOptions) {
     }
   } catch (error) {
     let failure = error
+    // A primitive thrown value (string, number, …) cannot key the WeakMap the
+    // goal loop fetches the hosted teardown from, so wrap it in an Error
+    // preserving the original as the message. The goal loop already handles
+    // both Error and primitive throws via `instanceof Error` checks and
+    // `String(error)`, so the wrapped value reads identically to the original.
+    if (typeof failure !== "object" || failure === null) failure = new Error(String(failure))
     // Deferral does not apply here: a failed run ends the loop, so there is no
     // later point to defer to, and the failure hooks must still fire. They run
     // without CONVOY_GOAL_* — the loop never reached an outcome — so a hook that

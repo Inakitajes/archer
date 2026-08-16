@@ -560,5 +560,10 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
   if (progress.resetPipeline) tracked.resetPipeline = progress.resetPipeline.bind(progress)
   if (progress.setAbortHandler) tracked.setAbortHandler = progress.setAbortHandler.bind(progress)
   if (progress.setHostControls) tracked.setHostControls = progress.setHostControls.bind(progress)
+  // The shared auto-accept reference is a property, not a method, so it is
+  // forwarded here rather than through a wrapper. The permission gate and the
+  // dashboard read it through the composed progress, so a tracked dashboard
+  // must expose the same reference the raw UI holds.
+  if (progress.autoAccept) tracked.autoAccept = progress.autoAccept
   return tracked
 }

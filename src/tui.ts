@@ -1476,7 +1476,7 @@ export class TuiProgress implements ProgressUI {
    * clears everything that belonged to the previous iteration's run. `startedAt`
    * and the accumulated totals survive deliberately.
    */
-  resetPipeline(phases: readonly ProgressPhase[], next: { runID: string; targetDir: string; runDir: string; pipeline: Pipeline }): void {
+  resetPipeline(phases: readonly ProgressPhase[], next: { runID: string; targetDir: string; runDir: string; pipeline: Pipeline; retainMessage?: string }): void {
     const usage = totalUsage(this.phases)
     const advisor = aggregateAdvisorEvents(this.phases.flatMap((phase) => phase.advisorEvents))
     this.priorUsage.cost += usage.cost
@@ -1494,11 +1494,16 @@ export class TuiProgress implements ProgressUI {
     this.serverUrl = ""
     this.transcripts.clear()
     this.reports.clear()
-    // The feed is emptied except for the loop's iteration announcement, which
-    // the goal loop places as the last entry right before calling this.
-    const lastFeed = this.feed[this.feed.length - 1]
+    // The feed is emptied except for the loop's iteration announcement. When
+    // the caller passes retainMessage explicitly, the matching entry is kept
+    // rather than guessing that the last feed entry is the announcement — a
+    // guess that breaks if anything appends between the announcement and this
+    // call.
+    const retained = next.retainMessage
+      ? this.feed.find((entry) => entry.message === next.retainMessage)
+      : this.feed[this.feed.length - 1]
     this.feed.splice(0, this.feed.length)
-    if (lastFeed) this.feed.push(lastFeed)
+    if (retained) this.feed.push(retained)
     this.feedRevision++
     for (const pending of this.permissionQueue.splice(0)) {
       pending.explainAbort?.abort()

@@ -345,7 +345,7 @@ export type ProgressUI = {
    */
   resetPipeline?(
     phases: readonly ProgressPhase[],
-    next: { runID: string; targetDir: string; runDir: string; pipeline: Pipeline },
+    next: { runID: string; targetDir: string; runDir: string; pipeline: Pipeline; retainMessage?: string },
   ): void
   /**
    * Points Ctrl+C (and the dashboard's abort key) at a new handler. `undefined`
