@@ -1991,7 +1991,7 @@ function describeDefault(key: keyof ConvoyDefaults): string {
     case "autoAcceptJudgeModel":
       return "Model the smart auto-accept judge uses (falls back to the run's model)."
     case "branchNameModel":
-      return "Model that names worktree branches (default: anthropic/claude-haiku-4-5)."
+      return "Model that names worktree branches (default: openrouter/deepseek/deepseek-v4-flash-0731)."
     case "commitMessageModel":
       return "Model that writes the squashed commit message for finish (default: anthropic/claude-haiku-4-5)."
     case "worktree":

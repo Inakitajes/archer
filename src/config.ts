@@ -262,7 +262,7 @@ defaults:
   # maxConcurrentAgents: 30 # optional: cap agents running at once within a parallel group
   # baseRef: main # optional: when unset, convoy auto-detects (origin default branch, else main/master/develop/trunk, else current branch)
   # pipeline: implement
-  # branchNameModel: anthropic/claude-haiku-4-5 # optional: model that names worktree branches
+  # branchNameModel: openrouter/deepseek/deepseek-v4-flash-0731 # optional: model that names worktree branches
   # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
   # worktree: true # optional: force a fresh branch + worktree for every run; false always runs in the current tree. Unset decides per branch: isolate on a trunk (main/master/develop/trunk or the detected base), run in place on any other branch
   # advisor: anthropic/claude-opus-5 # optional: reviewing model consulted at phase decision points

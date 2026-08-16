@@ -460,6 +460,9 @@ describe("launch TUI branch step", () => {
   })
 
   test("attributes the proposal and says when the name had to move", () => {
+    expect(branchProposalNote({ branch: "feat/x", source: "declared" }, { branch: "feat/x", dir: "/w/feat-x" })).toBe(
+      "taken from the document",
+    )
     expect(branchProposalNote({ branch: "feat/x", source: "model", model: "anthropic/claude-haiku-4-5" }, { branch: "feat/x", dir: "/w/feat-x" })).toBe(
       "proposed by anthropic/claude-haiku-4-5",
     )

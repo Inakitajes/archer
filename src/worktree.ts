@@ -1,5 +1,6 @@
-import { mkdir, stat } from "node:fs/promises"
-import { join } from "node:path"
+import { mkdir, readFile, stat } from "node:fs/promises"
+import { homedir } from "node:os"
+import { isAbsolute, join, resolve } from "node:path"
 
 import type { AgentConfig, Config, OpencodeClient } from "@opencode-ai/sdk/v2"
 
@@ -36,7 +37,7 @@ export type BranchNameInput = {
 }
 
 /** Where a proposed name came from, so the launcher can say who suggested it. */
-export type BranchNameSource = "model" | "prompt" | "fallback"
+export type BranchNameSource = "declared" | "model" | "prompt" | "fallback"
 
 export type BranchNameProposal = {
   branch: string
@@ -46,7 +47,7 @@ export type BranchNameProposal = {
 }
 
 /** Cheap, fast model used to synthesize a branch name from the prompt. */
-export const defaultBranchNameModel = "anthropic/claude-haiku-4-5"
+export const defaultBranchNameModel = "openrouter/deepseek/deepseek-v4-flash-0731"
 
 /** Registered so the namer replaces opencode's default coding agent instead of merely appending to it. */
 const namerAgentName = "convoy-branch-namer"
@@ -133,13 +134,26 @@ export function worktreeDirFor(branch: string): string {
 
 /**
  * Asks a cheap, read-only model for a short kebab-case branch name derived
- * from the prompt — it may look up referenced issues/tickets first. Any
- * failure (no auth, timeout, unparseable reply) degrades to a name derived
- * from the prompt itself, so the proposal always says something about the work.
+ * from the prompt — it may look up referenced issues/tickets first. A name
+ * the document already declared is used as-is and never sent to the model,
+ * because a paraphraser will "improve" `feat/launcher-compact-mode` into
+ * something the user then has to rewrite. Any model failure degrades to a
+ * name derived from the prompt itself, so the proposal always says something
+ * about the work.
  */
 export async function proposeBranchName(input: BranchNameInput): Promise<BranchNameProposal> {
   const trimmed = input.prompt.trim()
-  if (!trimmed && !input.guidance?.trim()) return { branch: fallbackBranchName(), source: "fallback" }
+  const steer = input.guidance?.trim()
+  if (!trimmed && !steer) return { branch: fallbackBranchName(), source: "fallback" }
+
+  const resolved = trimmed ? await resolveNamingPrompt(trimmed, input.targetDir) : ""
+
+  // Guidance outranks the document, so a declared name is only auto-accepted
+  // when the user didn't ask for something else.
+  if (!steer) {
+    const declared = extractDeclaredBranchName(resolved)
+    if (declared) return { branch: declared, source: "declared" }
+  }
 
   let error: string | undefined
   try {
@@ -147,7 +161,7 @@ export async function proposeBranchName(input: BranchNameInput): Promise<BranchN
     try {
       const reply = await askForBranchName(handle.client, {
         ...input,
-        prompt: trimmed,
+        prompt: resolved,
         model: input.model ?? defaultBranchNameModel,
       })
       const branch = readBranchName(reply)
@@ -163,7 +177,7 @@ export async function proposeBranchName(input: BranchNameInput): Promise<BranchN
   }
 
   log.warn(`worktree: couldn't generate an AI branch name (${error}); deriving one from the prompt`)
-  const heuristic = heuristicBranchName(input.guidance?.trim() || trimmed)
+  const heuristic = heuristicBranchName(steer || resolved || trimmed)
   if (heuristic) return { branch: heuristic, source: "prompt", error }
   return { branch: fallbackBranchName(), source: "fallback", error }
 }
@@ -223,7 +237,21 @@ export function namerMessage(prompt: string, guidance?: string): string {
   const parts: string[] = []
   const steer = guidance?.trim()
   if (steer) parts.push(`How the user wants it named (this outranks everything below):\n${steer}`)
-  if (prompt.trim()) parts.push(`Prompt:\n${excerpt(prompt.trim())}`)
+  const body = prompt.trim()
+  if (body) {
+    const declared = extractDeclaredBranchName(body)
+    if (declared) {
+      parts.push(`The document already names the branch. Use this exact name unless the instruction above conflicts:\n${declared}`)
+    } else {
+      const suggested = heuristicBranchName(body)
+      if (suggested) {
+        parts.push(
+          `Name suggested by the document title (keep this topic; translate to English if needed, do not invent a different subject):\n${suggested}`,
+        )
+      }
+    }
+    parts.push(`Prompt:\n${excerpt(body)}`)
+  }
   return parts.join("\n\n")
 }
 
@@ -238,8 +266,13 @@ const branchNameSystemPrompt = [
   "Rules:",
   "- When the message opens with a \"How the user wants it named\" block, that instruction wins over",
   "  everything else, including the prompt. Build the name around what it asks for.",
+  "- If the message includes a \"The document already names the branch\" block, copy that name",
+  "  exactly. Do not paraphrase it.",
   "- Always name it in ENGLISH, even when the prompt is written in another language.",
-  "- Name what the work DOES. Never transcribe a sentence, heading, or question from the prompt.",
+  "- Prefer the document's own title and Goal. Keep those words. Do not invent synonyms",
+  "  (\"reliable\" must not become \"solid\"; \"compact mode\" must not become \"narrow-screen-support\").",
+  "- A heading or Goal line is the right source for the name. A question is not — never reply",
+  "  with a question or a sentence.",
   "- Never ask the user anything. There is no follow-up turn; a question is a failed answer.",
   "- Never refuse and never explain what you couldn't find. If something the user mentions can't be",
   "  verified from the repo or the tools, name the branch from what they told you anyway — the user",
@@ -248,6 +281,8 @@ const branchNameSystemPrompt = [
   "  the work, look it up first with the tools available to you (issue-tracker tools, webfetch,",
   "  repo files) and name the branch after what the issue is actually about. If the reference",
   "  can't be resolved, use the issue ID itself as the name (e.g. dev-1339).",
+  "- Do not explore the repository unless the prompt is only an issue, ticket, URL, or file path",
+  "  that you must look up. Name from the text you were given.",
   "- You may investigate before answering, but the LAST line of your reply must be the JSON object",
   "  and nothing else.",
 ].join("\n")
@@ -404,23 +439,107 @@ const stopWords = new Set([
 ])
 
 /**
+ * A name the document already chose. Checked before the model is asked, so
+ * a paraphrasing model cannot turn `feat/launcher-compact-mode` into a synonym.
+ * Only explicit declarations count — scanning for any `type/slug` would pick
+ * up code samples.
+ */
+export function extractDeclaredBranchName(prompt: string): string {
+  for (const line of prompt.split("\n")) {
+    if (!declaredBranchLabel.test(line)) continue
+    const afterLabel = line.replace(declaredBranchLabel, "")
+    const value = stripMarkdownDecor(afterLabel).replace(/^[\s:*_\u2013\u2014-]+/, "").trim()
+    const cleaned = cleanBranchName(value)
+    if (cleaned) return cleaned
+  }
+  const checkout = /\bgit\s+checkout\s+-b\s+[`'"]?([^\s`'";\\]+)/i.exec(prompt)
+  if (checkout?.[1]) {
+    const cleaned = cleanBranchName(checkout[1])
+    if (cleaned) return cleaned
+  }
+  return ""
+}
+
+const declaredBranchLabel = /\b(?:intended\s+branch\s+name|(?:proposed|suggested|target)\s+branch(?:\s+name)?)\b/i
+
+function stripMarkdownDecor(value: string): string {
+  return value.replace(/[`'"*_[\]]+/g, " ").replace(/\s+/g, " ").trim()
+}
+
+/**
+ * When the launcher prompt is just a pointer at a plan file, read that file
+ * so naming sees the PRD instead of the path. Long pasted prompts are left
+ * alone — they may mention a path in passing.
+ */
+export async function resolveNamingPrompt(prompt: string, targetDir: string): Promise<string> {
+  const trimmed = prompt.trim()
+  if (!trimmed) return trimmed
+  if (trimmed.length > namingPointerMaxChars || trimmed.split("\n").length > namingPointerMaxLines) return trimmed
+  return (await readReferencedPromptFile(trimmed, targetDir)) ?? trimmed
+}
+
+const namingPointerMaxChars = 400
+const namingPointerMaxLines = 3
+const namingFileMaxBytes = 512_000
+
+async function readReferencedPromptFile(prompt: string, targetDir: string): Promise<string | undefined> {
+  for (const candidate of pathCandidates(prompt)) {
+    const resolved = expandUserPath(candidate, targetDir)
+    try {
+      const info = await stat(resolved)
+      if (!info.isFile() || info.size <= 0 || info.size > namingFileMaxBytes) continue
+      const text = await readFile(resolved, "utf8")
+      if (text.trim()) return text
+    } catch {
+      // not a readable file at this candidate
+    }
+  }
+  return undefined
+}
+
+function pathCandidates(prompt: string): string[] {
+  const found: string[] = []
+  for (const raw of prompt.split(/\s+/)) {
+    const token = raw.replace(/^[`'"]+|[`'":,]+$/g, "")
+    if (token && (token.includes("/") || /\.(md|txt|markdown)$/i.test(token))) found.push(token)
+  }
+  // Last path-like token wins: "implement docs/plans/foo.md".
+  return found.reverse()
+}
+
+function expandUserPath(value: string, targetDir: string): string {
+  if (value.startsWith("~/")) return resolve(homedir(), value.slice(2))
+  if (isAbsolute(value)) return value
+  return resolve(targetDir, value)
+}
+
+/**
  * Last resort before a timestamp: names the branch after the prompt's own
  * opening — its first heading or first line — so a failed model call still
  * produces something recognizable instead of `convoy-20260726-a4f2`.
+ * Only the opening counts: later `# File:` / `# 1.18.18` lines in a plan are
+ * comments, not the title.
  */
 export function heuristicBranchName(prompt: string): string {
-  const lines = prompt
+  const first = prompt
     .split("\n")
     .map((line) => line.trim())
-    .filter(Boolean)
-  const heading = lines.find((line) => line.startsWith("#"))
-  const source = (heading ?? lines[0] ?? "").replace(/^#+\s*/, "")
+    .find(Boolean) ?? ""
+  const source = stripPlanPrefix(first.replace(/^#+\s*/, ""))
   const words = kebab(source)
     .split("-")
-    .filter((word) => word && !stopWords.has(word))
+    .filter((word) => word && !stopWords.has(word) && !/^\d+$/.test(word))
     .slice(0, 4)
   if (words.length === 0) return ""
   return cleanBranchName(words.join("-"))
+}
+
+/** Drops the "Implementation Plan:" / "PRD —" wrapper so the title itself is what gets named. */
+function stripPlanPrefix(value: string): string {
+  return value.replace(
+    /^(?:implementation\s+plan|plan\s+de\s+implementaci[oó]n|plan\s+conjunto|propuesta(?:\s+de\s+implementaci[oó]n)?|prd)\s*[:\u2013\u2014-]\s*/i,
+    "",
+  )
 }
 
 /** Deterministic fallback so worktree creation never depends on a model being available. */
@@ -474,11 +593,36 @@ const excerptTail = 500
 
 /**
  * Long PRDs bury the actual ask in their closing recommendation, so the namer
- * gets both ends of the document rather than only its opening context.
+ * gets both ends of the document rather than only its opening context. Title,
+ * Goal, and any declared branch name are prepended so a mid-document
+ * "Intended Branch Name" cannot fall into the cut.
  */
 export function excerpt(value: string): string {
-  if (value.length <= excerptHead + excerptTail) return value
-  return `${value.slice(0, excerptHead)}\n…\n${value.slice(-excerptTail)}`
+  const highlights = namingHighlights(value)
+  if (value.length <= excerptHead + excerptTail) {
+    return highlights && !value.startsWith(highlights) ? `${highlights}\n\n${value}` : value
+  }
+  const clipped = `${value.slice(0, excerptHead)}\n…\n${value.slice(-excerptTail)}`
+  return highlights ? `${highlights}\n\n${clipped}` : clipped
+}
+
+function namingHighlights(value: string): string {
+  const keep: string[] = []
+  let headings = 0
+  for (const line of value.split("\n")) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    if (trimmed.startsWith("#") && headings < 2) {
+      keep.push(trimmed)
+      headings += 1
+      continue
+    }
+    if (/(?:intended|proposed|suggested|target)\s+branch|^\*{0,2}goal\*{0,2}\s*:/i.test(trimmed)) {
+      keep.push(trimmed)
+    }
+    if (keep.length >= 6) break
+  }
+  return keep.join("\n")
 }
 
 function truncate(value: string, max: number): string {

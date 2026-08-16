@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -11,10 +11,13 @@ import {
   cleanBranchName,
   ensureFreeBranchName,
   excerpt,
+  extractDeclaredBranchName,
   fallbackBranchName,
   heuristicBranchName,
   namerMessage,
+  proposeBranchName,
   readBranchName,
+  resolveNamingPrompt,
   slugifyBranch,
 } from "../src/worktree"
 
@@ -139,6 +142,20 @@ describe("heuristicBranchName", () => {
     expect(heuristicBranchName("# Propuesta de implementación\n\nLa solución debería tener tres capas")).toBe("feat/propuesta-implementacion")
   })
 
+  test("strips the Implementation Plan / PRD wrapper so the title is what gets named", () => {
+    expect(heuristicBranchName("# Implementation Plan: Compact Mode for Pipeline Launcher TUI")).toBe(
+      "feat/compact-mode-pipeline-launcher",
+    )
+    expect(heuristicBranchName("PRD — Auditorías de review fiables: Scope con verify")).toBe("feat/auditorias-review-fiables-scope")
+    expect(heuristicBranchName("Plan conjunto: fix de permisos + OpenCode 1.18.18")).toBe("feat/fix-permisos-opencode")
+  })
+
+  test("ignores later hash comments so a plan's # File: line cannot become the name", () => {
+    expect(
+      heuristicBranchName("Implementation Plan: Reliable Phase Report Delivery\n\n# Create test for last message extraction"),
+    ).toBe("feat/reliable-phase-report-delivery")
+  })
+
   test("uses the first line when there is no heading, dropping stop words", () => {
     expect(heuristicBranchName("Add a budget limit to the execution supervisor")).toBe("feat/budget-limit-execution-supervisor")
   })
@@ -181,7 +198,16 @@ describe("namer payload", () => {
   test("namerMessage puts the user's guidance above the prompt", () => {
     const message = namerMessage("build onboarding", "call it after the budget limits")
     expect(message.indexOf("budget limits")).toBeLessThan(message.indexOf("build onboarding"))
-    expect(namerMessage("build onboarding")).toBe("Prompt:\nbuild onboarding")
+    expect(message).toContain("Prompt:\nbuild onboarding")
+    expect(namerMessage("build onboarding")).toContain("Prompt:\nbuild onboarding")
+    expect(namerMessage("build onboarding")).toContain("feat/build-onboarding")
+  })
+
+  test("namerMessage pins a declared branch name so the model cannot paraphrase it", () => {
+    const message = namerMessage("# Compact Mode\n\n**Intended Branch Name:** `feat/launcher-compact-mode`")
+    expect(message).toContain("The document already names the branch")
+    expect(message).toContain("feat/launcher-compact-mode")
+    expect(message).not.toContain("Name suggested by the document title")
   })
 })
 
@@ -206,7 +232,8 @@ describe("askForBranchName", () => {
     expect(promptInput?.agent).toBe("convoy-branch-namer")
     expect(promptInput?.system).toContain("ENGLISH")
     expect(promptInput?.tools).toEqual({ read: true, list: true, glob: true, grep: true, webfetch: true, write: false, edit: false, bash: false, todoread: false, todowrite: false })
-    expect(promptInput?.parts).toEqual([{ type: "text", text: "Prompt:\nbuild onboarding" }])
+    expect(promptInput?.parts[0]?.text).toContain("Prompt:\nbuild onboarding")
+    expect(promptInput?.parts[0]?.text).toContain("feat/build-onboarding")
   })
 
   test("sends both ends of a long prompt to the naming model", async () => {
@@ -236,6 +263,90 @@ describe("askForBranchName", () => {
 
     await expect(askForBranchName(client, { prompt: "fix login", targetDir: "/repo", model: "openai/gpt-5.5" })).rejects.toThrow("provider unavailable")
     expect(deleted).toEqual({ sessionID: "namer-session", directory: "/repo" })
+  })
+})
+
+describe("extractDeclaredBranchName", () => {
+  test("reads Intended Branch Name from a plan header", () => {
+    expect(extractDeclaredBranchName("# Compact Mode\n\n**Intended Branch Name:** `feat/launcher-compact-mode`\n")).toBe(
+      "feat/launcher-compact-mode",
+    )
+    expect(extractDeclaredBranchName("Intended Branch Name: fix/reliable-score-report-extraction\n")).toBe(
+      "fix/reliable-score-report-extraction",
+    )
+  })
+
+  test("reads a git checkout -b instruction", () => {
+    expect(extractDeclaredBranchName("1. Create branch: git checkout -b fix/reliable-score-report-extraction")).toBe(
+      "fix/reliable-score-report-extraction",
+    )
+  })
+
+  test("ignores documents that never name a branch", () => {
+    expect(extractDeclaredBranchName("# Compact Mode\n\nAdd a stacked layout for narrow terminals.")).toBe("")
+  })
+})
+
+describe("resolveNamingPrompt", () => {
+  const dirs: string[] = []
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  test("reads a short prompt that is just a plan path", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-namer-path-"))
+    dirs.push(dir)
+    await writeFile(join(dir, "plan.md"), "# Compact Mode\n\n**Intended Branch Name:** `feat/launcher-compact-mode`\n")
+    const resolved = await resolveNamingPrompt("docs/plans/ignored.md implement plan.md", dir)
+    expect(resolved).toContain("feat/launcher-compact-mode")
+    expect(await resolveNamingPrompt("plan.md", dir)).toContain("Intended Branch Name")
+  })
+
+  test("leaves a long pasted PRD alone even if it mentions a path", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-namer-long-"))
+    dirs.push(dir)
+    await writeFile(join(dir, "other.md"), "SHOULD NOT BE READ")
+    const prd = `${"context ".repeat(80)}see other.md for notes`
+    expect(await resolveNamingPrompt(prd, dir)).toBe(prd)
+  })
+})
+
+describe("proposeBranchName", () => {
+  const dirs: string[] = []
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  test("uses the PRD's intended name without calling a model", async () => {
+    const proposal = await proposeBranchName({
+      prompt: "# Compact Mode\n\n**Intended Branch Name:** `feat/launcher-compact-mode`\n",
+      targetDir: "/repo",
+    })
+    expect(proposal).toEqual({ branch: "feat/launcher-compact-mode", source: "declared" })
+  })
+
+  test("reads a referenced plan file and takes its intended name", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-namer-propose-"))
+    dirs.push(dir)
+    await mkdir(join(dir, "docs/plans"), { recursive: true })
+    await writeFile(
+      join(dir, "docs/plans/2026-08-16-launcher-compact-mode.md"),
+      "# Implementation Plan: Compact Mode for Pipeline Launcher TUI\n\n**Intended Branch Name:** `feat/launcher-compact-mode`\n",
+    )
+    const proposal = await proposeBranchName({
+      prompt: "docs/plans/2026-08-16-launcher-compact-mode.md",
+      targetDir: dir,
+    })
+    expect(proposal).toEqual({ branch: "feat/launcher-compact-mode", source: "declared" })
+  })
+})
+
+describe("excerpt highlights", () => {
+  test("keeps an Intended Branch Name that sits past the head window", () => {
+    const prd = `${"a".repeat(1_200)}\n**Intended Branch Name:** \`feat/launcher-compact-mode\`\n${"b".repeat(1_200)}`
+    const sent = excerpt(prd)
+    expect(sent).toContain("feat/launcher-compact-mode")
+    expect(sent).toContain("\n…\n")
   })
 })
 

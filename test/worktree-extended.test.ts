@@ -21,7 +21,7 @@ describe("defaultBranchNameModel", () => {
   })
 
   test("is set to the expected default model", () => {
-    expect(defaultBranchNameModel).toBe("anthropic/claude-haiku-4-5")
+    expect(defaultBranchNameModel).toBe("openrouter/deepseek/deepseek-v4-flash-0731")
   })
 })
 
@@ -302,11 +302,12 @@ describe("namerMessage", () => {
     expect(guidanceIdx).toBeLessThan(promptIdx)
   })
 
-  test("without guidance, only the prompt is included", () => {
+  test("without guidance, includes the prompt and a title suggestion", () => {
     const msg = namerMessage("build onboarding")
     expect(msg).not.toContain("How the user wants it named")
     expect(msg).toContain("Prompt:")
     expect(msg).toContain("build onboarding")
+    expect(msg).toContain("feat/build-onboarding")
   })
 
   test("empty prompt with guidance still uses guidance", () => {

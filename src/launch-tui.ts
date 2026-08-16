@@ -49,8 +49,8 @@ export type LaunchRunSelection = {
 /** A branch name suggested for the run, plus where it came from so the step can say so. */
 export type LaunchBranchProposal = {
   branch: string
-  /** "model" when the namer answered, "prompt" when it was derived locally, "fallback" for the timestamp. */
-  source: "model" | "prompt" | "fallback"
+  /** "declared" when the PRD already named the branch, "model" when the namer answered, "prompt" when it was derived locally, "fallback" for the timestamp. */
+  source: "declared" | "model" | "prompt" | "fallback"
   /** Why the model call didn't produce the name; shown as a hint, never as a blocker. */
   error?: string
   /** The naming model that was asked, for attribution in the UI. */
@@ -1883,11 +1883,13 @@ function textField(value: string, cursor: number, width: number, focused: boolea
 /** Attribution line under the branch field: who proposed the name, and whether it had to move. */
 export function branchProposalNote(proposal: LaunchBranchProposal, check: LaunchBranchCheck): string {
   const origin =
-    proposal.source === "model"
-      ? `proposed by ${proposal.model || "the naming model"}`
-      : proposal.source === "prompt"
-        ? "derived from your prompt (the naming model didn't answer)"
-        : "generic name (nothing to derive it from)"
+    proposal.source === "declared"
+      ? "taken from the document"
+      : proposal.source === "model"
+        ? `proposed by ${proposal.model || "the naming model"}`
+        : proposal.source === "prompt"
+          ? "derived from your prompt (the naming model didn't answer)"
+          : "generic name (nothing to derive it from)"
   return check.suffixed ? `${origin} · renamed, the original was taken` : origin
 }
 

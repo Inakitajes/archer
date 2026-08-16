@@ -496,7 +496,7 @@ defaults:
   baseRef: main                    # optional; auto-detected when unset (origin default branch, else main/master/develop/trunk, else current branch)
   pipeline: quick                  # pipeline used when -p/--pipeline is not given
   autoAcceptJudgeModel: anthropic/claude-haiku-4-5   # model for smart auto-accept (--smart); defaults to the run's model
-  branchNameModel: anthropic/claude-haiku-4-5        # proposes worktree branch names (may look up referenced issues); you confirm the name
+  branchNameModel: openrouter/deepseek/deepseek-v4-flash-0731  # proposes worktree branch names (may look up referenced issues); you confirm the name
   commitMessageModel: anthropic/claude-haiku-4-5     # writes the conventional commit `convoy finish` squashes a run into; you edit it before it lands
   worktree: true                   # force a new branch + worktree for every run; false always runs in the current tree. Unset decides per branch (isolate on a trunk, run in place on a branch)
   advisor: anthropic/claude-opus-5   # optional; a stronger model consulted at every step's decision points
@@ -800,7 +800,7 @@ An isolated run gets a new branch checked out under `~/.convoy/worktrees/<branch
 
 The branch is always agreed with you first, in a **Branch** step between Options and Review:
 
-- `defaults.branchNameModel` (Haiku by default) reads your prompt and proposes a conventional name — `feat/runtime-guard-limits`, `fix/login-redirect` — always in English, even when the prompt is not. Prompts that only reference an issue (`#123`, `DEV-1339`, a URL) are looked up first, so the branch is named after what the issue is about.
+- An `Intended Branch Name` (or `git checkout -b …`) in the prompt is used as-is — the model is not asked to reinvent it. A short prompt that is just a path to a plan file is read first, so pasting `docs/plans/foo.md` still picks up the name inside. Otherwise `defaults.branchNameModel` (DeepSeek V4 Flash 0731 via OpenRouter by default) reads the prompt and proposes a conventional name — `feat/runtime-guard-limits`, `fix/login-redirect` — always in English, even when the prompt is not, keeping the document's own words rather than paraphrasing them. Prompts that only reference an issue (`#123`, `DEV-1339`, a URL) are looked up first, so the branch is named after what the issue is about.
 - The proposed name is shown in an editable field together with the worktree path it would take. Enter accepts it and moves on to Review; nothing is created until you confirm the run there.
 - `tab` moves to the **hint** box: describe how you want it named ("name it after the budget limits") and press Enter or `ctrl+R` to re-name it. This is also what you get when the prompt is too thin to name anything, or when the naming model is unavailable — the step still opens, with a name derived from the prompt, ready to be edited.
 - Names already taken by a branch or an existing worktree are suffixed (`-2`, `-3`) instead of failing `git worktree add` after the run has been confirmed.
