@@ -169,15 +169,18 @@ export function emptyPromptField(): PromptFieldState {
   return { prompt: "", fromDefault: false, suggestionIndex: 0, hasCycledSuggestions: false }
 }
 
+/** A clean field holding a default or suggestion: still swappable and Tab-cycleable. */
+function cleanPromptField(prompt: string): PromptFieldState {
+  return { prompt, fromDefault: true, lastDefault: prompt, suggestionIndex: 0, hasCycledSuggestions: false }
+}
+
 /**
  * What opening the prompt step does to a clean field: an empty field adopts the
  * pipeline's defaultPrompt; any existing text (typed, or preserved from another
  * pipeline) is left untouched.
  */
 export function prefillPromptField(state: PromptFieldState, defaultPrompt: string | undefined): PromptFieldState {
-  if (!state.prompt.trim() && defaultPrompt) {
-    return { prompt: defaultPrompt, fromDefault: true, lastDefault: defaultPrompt, suggestionIndex: 0, hasCycledSuggestions: false }
-  }
+  if (!state.prompt.trim() && defaultPrompt) return cleanPromptField(defaultPrompt)
   return state
 }
 
@@ -190,17 +193,12 @@ export function prefillPromptField(state: PromptFieldState, defaultPrompt: strin
 export function promptAfterPipelineSwitch(state: PromptFieldState, nextDefaultPrompt: string | undefined): PromptFieldState {
   if (state.fromDefault && state.lastDefault !== undefined) {
     if (state.prompt === "" || state.prompt === state.lastDefault) {
-      if (nextDefaultPrompt) {
-        return { prompt: nextDefaultPrompt, fromDefault: true, lastDefault: nextDefaultPrompt, suggestionIndex: 0, hasCycledSuggestions: false }
-      }
-      return { prompt: "", fromDefault: false, suggestionIndex: 0, hasCycledSuggestions: false }
+      return nextDefaultPrompt ? cleanPromptField(nextDefaultPrompt) : emptyPromptField()
     }
     // The prompt was edited after a default was applied: it is user text now.
-    return { ...state, fromDefault: false, lastDefault: undefined }
+    return markPromptEdited(state)
   }
-  if (state.prompt.trim() === "" && nextDefaultPrompt) {
-    return { prompt: nextDefaultPrompt, fromDefault: true, lastDefault: nextDefaultPrompt, suggestionIndex: 0, hasCycledSuggestions: false }
-  }
+  if (state.prompt.trim() === "" && nextDefaultPrompt) return cleanPromptField(nextDefaultPrompt)
   return state
 }
 
@@ -1250,6 +1248,7 @@ class LaunchPicker {
 
   private moveSelection(delta: number) {
     const newIndex = clamp(this.selected + delta, 0, this.choices.length - 1)
+    this.message = ""
     if (newIndex === this.selected) {
       this.render()
       return
@@ -1262,7 +1261,6 @@ class LaunchPicker {
     // the switch so moving away and back never discards work.
     this.applyPromptFieldState(promptAfterPipelineSwitch(this.promptFieldState(), newChoice.defaultPrompt))
 
-    this.message = ""
     this.render()
   }
 

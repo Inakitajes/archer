@@ -587,7 +587,7 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   }
 
   if (!prompt && !parsed.resumeRunID) {
-    // NEW: a concrete-action pipeline (review, ship, hunter, ...) may carry a
+    // A concrete-action pipeline (review, ship, hunter, ...) may carry a
     // defaultPrompt so `convoy -p review` runs without typing one. Anything
     // that counts as an explicit prompt source (positional, --prompt-file)
     // was already read above, so only a genuinely empty invocation falls back.

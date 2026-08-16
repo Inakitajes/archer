@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { beforeEach } from "bun:test"
+import { afterAll, afterEach, beforeEach } from "bun:test"
 
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -467,17 +467,35 @@ describe("parseCommand", () => {
     await expect(parseCommand(["--resume", validRunID, "new prompt"])).rejects.toThrow("can't take a new prompt")
   })
 
-  test("rejects a run without prompt", async () => {
-    await expect(parseCommand([])).rejects.toThrow("need a prompt")
-  })
-
   test("parses a run command with prompt", async () => {
     const cmd = await parseCommand(["add login"])
     expect(cmd.type).toBe("run")
   })
 })
 
+// The fallback resolves the pipeline through the merged config, so these tests
+// point CONVOY_HOME at a throwaway home: a real global config could shadow a
+// built-in pipeline or set defaults.pipeline and flip the expectations.
 describe("parseCommand default prompt fallback", () => {
+  const dirs: string[] = []
+  let savedHome: string | undefined
+
+  beforeEach(async () => {
+    savedHome = process.env.CONVOY_HOME
+    const root = await mkdtemp(join(tmpdir(), "convoy-cli-prompt-home-"))
+    dirs.push(root)
+    process.env.CONVOY_HOME = root
+  })
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.CONVOY_HOME
+    else process.env.CONVOY_HOME = savedHome
+  })
+
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
   test("uses the pipeline's defaultPrompt when no prompt is given", async () => {
     const cmd = await parseCommand(["-p", "review"])
     expect(cmd.type).toBe("run")
@@ -489,7 +507,7 @@ describe("parseCommand default prompt fallback", () => {
     }
   })
 
-  test("falls back through defaults.pipeline when -p is omitted", async () => {
+  test("rejects a run without prompt when the default pipeline has no defaultPrompt", async () => {
     // implement (the default) has no defaultPrompt, so a bare invocation still errors.
     await expect(parseCommand([])).rejects.toThrow("need a prompt")
   })
@@ -509,6 +527,7 @@ describe("parseCommand default prompt fallback", () => {
 
   test("--prompt-file beats the defaultPrompt and is marked as file", async () => {
     const dir = await mkdtemp(join(tmpdir(), "convoy-cli-prompt-"))
+    dirs.push(dir)
     const promptFile = join(dir, "prd.md")
     await writeFile(promptFile, "from file")
     const cmd = await parseCommand(["-p", "review", "--prompt-file", promptFile])
@@ -517,7 +536,6 @@ describe("parseCommand default prompt fallback", () => {
       expect(cmd.options.prompt).toBe("from file")
       expect(cmd.options.plan?.prompt.source).toBe("file")
     }
-    await rm(dir, { recursive: true, force: true })
   })
 })
 
