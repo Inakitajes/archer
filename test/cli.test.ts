@@ -525,6 +525,10 @@ describe("parseCommand default prompt fallback", () => {
     }
   })
 
+  test("an explicitly empty positional prompt does not fall back to defaultPrompt", async () => {
+    await expect(parseCommand(["-p", "review", ""])).rejects.toThrow("need a prompt")
+  })
+
   test("--prompt-file beats the defaultPrompt and is marked as file", async () => {
     const dir = await mkdtemp(join(tmpdir(), "convoy-cli-prompt-"))
     dirs.push(dir)
@@ -536,6 +540,18 @@ describe("parseCommand default prompt fallback", () => {
       expect(cmd.options.prompt).toBe("from file")
       expect(cmd.options.plan?.prompt.source).toBe("file")
     }
+  })
+
+  test("an explicitly empty prompt file does not fall back to defaultPrompt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-empty-prompt-"))
+    dirs.push(dir)
+    const promptFile = join(dir, "prd.md")
+    await writeFile(promptFile, "")
+    await expect(parseCommand(["-p", "review", "--prompt-file", promptFile])).rejects.toThrow("need a prompt")
+  })
+
+  test("an empty --resume value is rejected instead of starting a default-prompt run", async () => {
+    await expect(parseCommand(["-p", "review", "--resume="])).rejects.toThrow("invalid run id")
   })
 
   async function writeGlobalConfig(body: string): Promise<void> {

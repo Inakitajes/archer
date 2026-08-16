@@ -180,7 +180,7 @@ function cleanPromptField(prompt: string): PromptFieldState {
  * pipeline) is left untouched.
  */
 export function prefillPromptField(state: PromptFieldState, defaultPrompt: string | undefined): PromptFieldState {
-  if (!state.prompt.trim() && defaultPrompt) return cleanPromptField(defaultPrompt)
+  if (state.prompt === "" && defaultPrompt) return cleanPromptField(defaultPrompt)
   return state
 }
 
@@ -198,13 +198,19 @@ export function promptAfterPipelineSwitch(state: PromptFieldState, nextDefaultPr
     // The prompt was edited after a default was applied: it is user text now.
     return markPromptEdited(state)
   }
-  if (state.prompt.trim() === "" && nextDefaultPrompt) return cleanPromptField(nextDefaultPrompt)
+  if (state.prompt === "" && nextDefaultPrompt) return cleanPromptField(nextDefaultPrompt)
   return state
 }
 
 /** A user edit marks the field dirty: text is preserved but no longer swappable or cycleable. */
 export function markPromptEdited(state: PromptFieldState): PromptFieldState {
   return { ...state, fromDefault: false, lastDefault: undefined, suggestionIndex: 0, hasCycledSuggestions: false }
+}
+
+/** Trims the submitted value without making an untouched generated prompt look user-edited. */
+export function trimPromptField(state: PromptFieldState): PromptFieldState {
+  const prompt = state.prompt.trim()
+  return state.fromDefault && state.lastDefault === state.prompt ? { ...state, prompt, lastDefault: prompt } : { ...state, prompt }
 }
 
 /**
@@ -214,7 +220,7 @@ export function markPromptEdited(state: PromptFieldState): PromptFieldState {
  */
 export function nextPromptSuggestion(state: PromptFieldState, suggestions: readonly string[] | undefined): PromptFieldState | undefined {
   if (!suggestions || suggestions.length === 0) return undefined
-  if (!state.fromDefault && state.prompt.trim() !== "") return undefined
+  if (!state.fromDefault && state.prompt !== "") return undefined
   const index = state.hasCycledSuggestions ? (state.suggestionIndex + 1) % suggestions.length : 0
   const prompt = suggestions[index]!
   return { prompt, fromDefault: true, lastDefault: prompt, suggestionIndex: index, hasCycledSuggestions: true }
@@ -591,11 +597,9 @@ class LaunchPicker {
       const row = event.y - this.pipelineText.y
       const index = this.pipelineRows[row]
       if (index === undefined) return
-      this.selected = index
       this.mode = "pipelines"
       this.promptError = ""
-      this.message = ""
-      this.render()
+      this.selectPipeline(index)
     }
 
     const pipeline = this.panel({
@@ -772,7 +776,7 @@ class LaunchPicker {
       if (!this.prompt.trim()) {
         this.promptError = "Write a prompt before continuing."
       } else {
-        this.prompt = this.prompt.trim()
+        this.applyPromptFieldState(trimPromptField(this.promptFieldState()))
         this.cursor = this.prompt.length
         this.promptError = ""
         this.mode = "options"
@@ -1248,6 +1252,11 @@ class LaunchPicker {
 
   private moveSelection(delta: number) {
     const newIndex = clamp(this.selected + delta, 0, this.choices.length - 1)
+    this.selectPipeline(newIndex)
+  }
+
+  /** Applies one pipeline selection consistently for keyboard and mouse input. */
+  private selectPipeline(newIndex: number) {
     this.message = ""
     if (newIndex === this.selected) {
       this.render()
@@ -1536,14 +1545,20 @@ class LaunchPicker {
     // says how many, otherwise a multi-line prompt owns up to its height. The
     // row is clipped rather than wrapped, so a narrow panel degrades to an
     // ellipsis instead of spilling extra lines into the fixed-height box.
+    const suggestionCount = suggestions?.length ?? 0
+    const canCycleSuggestions = suggestionCount > 0 && (this.promptFromDefault || this.prompt === "")
     const status =
-      suggestions && suggestions.length > 0 && (this.promptFromDefault || this.prompt.trim() === "")
-        ? `tab: ${suggestions.length} suggestion${suggestions.length === 1 ? "" : "s"}`
+      canCycleSuggestions
+        ? `tab: ${suggestionCount} suggestion${suggestionCount === 1 ? "" : "s"}`
         : wrapped.length > 1
           ? `${wrapped.length} lines`
           : ""
-    const hintChunks: TextChunk[] = [fg(theme.faint)(hint)]
-    if (status) hintChunks.push(fg(theme.faint)(" · "), fg(theme.accent)(status))
+    // Suggestion discovery wins the left edge because this row is clipped in
+    // ordinary-width terminals; putting the status last made Tab invisible.
+    const hintChunks: TextChunk[] = canCycleSuggestions
+      ? [fg(theme.accent)(status), fg(theme.faint)(" · "), fg(theme.faint)(hint)]
+      : [fg(theme.faint)(hint)]
+    if (!canCycleSuggestions && status) hintChunks.push(fg(theme.faint)(" · "), fg(theme.accent)(status))
     lines.push(new StyledText(clipChunks(hintChunks, width)))
     return joinLines(lines)
   }

@@ -579,6 +579,8 @@ describe("pipeline selection", () => {
     expect(materialized.defaultPrompt).toBe("Do the thing.")
     expect(materialized.suggestedPrompts).toEqual(["A", "B"])
     expect(materialized.steps).toEqual(["implementer"])
+    materialized.suggestedPrompts![0] = "changed"
+    expect(spec.suggestedPrompts).toEqual(["A", "B"])
   })
 })
 

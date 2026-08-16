@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
+import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, trimPromptField, typedText, wrapPromptLines } from "../src/launch-tui"
 
 import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
 import { parseConvoyConfig } from "../src/config"
@@ -348,9 +348,9 @@ describe("launch TUI prompt prefill and clean/dirty tracking", () => {
     expect(prefillPromptField(emptyPromptField(), undefined)).toEqual(emptyPromptField())
   })
 
-  test("openPrompt treats a whitespace-only field as empty and prefills it", () => {
+  test("openPrompt preserves a whitespace-only user edit instead of prefilling over it", () => {
     const blank = { ...emptyPromptField(), prompt: "   " }
-    expect(prefillPromptField(blank, "Review the branch.")).toMatchObject({ prompt: "Review the branch.", fromDefault: true })
+    expect(prefillPromptField(blank, "Review the branch.")).toBe(blank)
   })
 
   test("moveSelection swaps a clean default for the new pipeline's default", () => {
@@ -372,6 +372,11 @@ describe("launch TUI prompt prefill and clean/dirty tracking", () => {
     expect(swapped.fromDefault).toBe(false)
   })
 
+  test("moveSelection preserves a whitespace-only user edit across pipeline switches", () => {
+    const dirty = { ...emptyPromptField(), prompt: "   ", fromDefault: false }
+    expect(promptAfterPipelineSwitch(dirty, "new default")).toBe(dirty)
+  })
+
   test("moveSelection treats a default that was edited afterwards as user text", () => {
     // fromDefault is still true but the text no longer matches the applied
     // default: the field was edited after prefill, so the text must survive.
@@ -384,6 +389,13 @@ describe("launch TUI prompt prefill and clean/dirty tracking", () => {
     const clean = { prompt: "default", fromDefault: true, lastDefault: "default", suggestionIndex: 0, hasCycledSuggestions: true }
     const dirty = markPromptEdited(clean)
     expect(dirty).toMatchObject({ prompt: "default", fromDefault: false, lastDefault: undefined, suggestionIndex: 0, hasCycledSuggestions: false })
+  })
+
+  test("submitting a padded default keeps its clean provenance after trimming", () => {
+    const clean = { prompt: "  default  ", fromDefault: true, lastDefault: "  default  ", suggestionIndex: 0, hasCycledSuggestions: false }
+    const trimmed = trimPromptField(clean)
+    expect(trimmed).toMatchObject({ prompt: "default", fromDefault: true, lastDefault: "default" })
+    expect(promptAfterPipelineSwitch(trimmed, "new default").prompt).toBe("new default")
   })
 })
 
@@ -414,6 +426,11 @@ describe("launch TUI Tab suggestions", () => {
 
   test("Tab does nothing when the prompt is dirty (user-typed)", () => {
     const dirty = { ...emptyPromptField(), prompt: "typed", fromDefault: false }
+    expect(nextPromptSuggestion(dirty, suggestions)).toBeUndefined()
+  })
+
+  test("Tab does not overwrite a whitespace-only user edit", () => {
+    const dirty = { ...emptyPromptField(), prompt: "   ", fromDefault: false }
     expect(nextPromptSuggestion(dirty, suggestions)).toBeUndefined()
   })
 

@@ -1040,7 +1040,7 @@ export function materializePipelineSpec(spec: PipelineSpec, effectiveDefaultMode
     ...(spec.goalMaxIterations !== undefined ? { goalMaxIterations: spec.goalMaxIterations } : {}),
     ...(spec.goalPlateau !== undefined ? { goalPlateau: spec.goalPlateau } : {}),
     ...(spec.defaultPrompt ? { defaultPrompt: spec.defaultPrompt } : {}),
-    ...(spec.suggestedPrompts?.length ? { suggestedPrompts: spec.suggestedPrompts } : {}),
+    ...(spec.suggestedPrompts?.length ? { suggestedPrompts: [...spec.suggestedPrompts] } : {}),
     steps,
   }
 }
