@@ -574,27 +574,48 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   const parsed = parseArgs(argv)
   if (parsed.help) return { type: "help", text: help() }
 
-  if (parsed.prompt && parsed.promptFile) {
+  const hasInlinePrompt = parsed.prompt !== undefined
+  const hasPromptFile = parsed.promptFile !== undefined
+  const hasResume = parsed.resumeRunID !== undefined
+
+  if (hasInlinePrompt && hasPromptFile) {
     throw new Error("use either a positional prompt or --prompt-file, not both")
   }
-  if (parsed.resumeRunID && (parsed.prompt || parsed.promptFile)) {
+  if (hasResume && (hasInlinePrompt || hasPromptFile)) {
     throw new Error("--resume continues a previous run with its original PRD; it can't take a new prompt")
   }
+  if (hasResume && !isValidRunID(parsed.resumeRunID!)) throw new Error(`invalid run id: ${parsed.resumeRunID}`)
 
   let prompt = parsed.prompt ?? ""
-  if (parsed.promptFile) {
-    prompt = await readFile(resolve(process.cwd(), parsed.promptFile), "utf8")
+  if (hasPromptFile) {
+    prompt = await readFile(resolve(process.cwd(), parsed.promptFile!), "utf8")
   }
 
-  if (!prompt && !parsed.resumeRunID) {
-    throw new Error("need a prompt (positional or --prompt-file) or --resume <id>")
+  const missingPromptMessage =
+    "need a prompt (positional or --prompt-file) or --resume <id>, or the selected pipeline must provide a defaultPrompt"
+  // An explicit-but-empty source is still explicit: report it as empty rather
+  // than silently replacing it with the selected pipeline's default.
+  if (!prompt && !hasResume && (hasInlinePrompt || hasPromptFile)) throw new Error(missingPromptMessage)
+
+  // Resolve once so the selected pipeline and its fallback prompt always come
+  // from the same merged-config snapshot.
+  const resolvedOptions = await resolveRunOptions(parsed)
+  if (!prompt && !hasResume) {
+    // A concrete-action pipeline (review, ship, hunter, ...) may carry a
+    // defaultPrompt so `convoy -p review` runs without typing one. Anything
+    // that counts as an explicit prompt source (positional, --prompt-file)
+    // was already read above, so only a genuinely empty invocation falls back.
+    if (!hasInlinePrompt && !hasPromptFile && resolvedOptions.pipeline.defaultPrompt) {
+      prompt = resolvedOptions.pipeline.defaultPrompt
+    }
+    if (!prompt) throw new Error(missingPromptMessage)
   }
 
-  const options: RunOptions = { ...(await resolveRunOptions(parsed)), prompt }
+  const options: RunOptions = { ...resolvedOptions, prompt }
   // The gateway the run froze at launch, for the review's resume-override banner.
   let resumeGateway: ModelGateway | undefined
-  if (parsed.resumeRunID) {
-    const workspace = await resumeWorkspace(parsed.resumeRunID)
+  if (hasResume) {
+    const workspace = await resumeWorkspace(parsed.resumeRunID!)
     const metadata = await readRunMetadata(resolve(workspace.dir, "metadata.json"))
     if (metadata?.pipeline) options.pipeline = metadata.pipeline
     if (parsed.gateway === undefined) options.gateway = metadata?.modelRouting?.gateway ?? "configured"
@@ -608,9 +629,10 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   // Resume filters can only be checked after metadata has restored its frozen
   // pipeline. Validate them before building a potentially empty review plan.
   validateStepFilters(options.pipeline, options)
+  const promptSource: RunPlan["prompt"]["source"] = hasResume ? "resume" : hasPromptFile ? "file" : hasInlinePrompt ? "inline" : "default"
   options.plan = buildRunPlan({
     ...options,
-    promptSource: parsed.resumeRunID ? "resume" : parsed.promptFile ? "file" : "inline",
+    promptSource,
     ...(resumeGateway ? { resumeGateway } : {}),
   })
   return { type: "run", options }

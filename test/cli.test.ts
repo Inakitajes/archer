@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import { beforeEach } from "bun:test"
+import { afterAll, afterEach, beforeEach } from "bun:test"
+
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import { goalModeFor, goalModeRejectionError, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
@@ -463,13 +467,132 @@ describe("parseCommand", () => {
     await expect(parseCommand(["--resume", validRunID, "new prompt"])).rejects.toThrow("can't take a new prompt")
   })
 
-  test("rejects a run without prompt", async () => {
-    await expect(parseCommand([])).rejects.toThrow("need a prompt")
-  })
-
   test("parses a run command with prompt", async () => {
     const cmd = await parseCommand(["add login"])
     expect(cmd.type).toBe("run")
+  })
+})
+
+// The fallback resolves the pipeline through the merged config, so these tests
+// point CONVOY_HOME at a throwaway home: a real global config could shadow a
+// built-in pipeline or set defaults.pipeline and flip the expectations.
+describe("parseCommand default prompt fallback", () => {
+  const dirs: string[] = []
+  let savedHome: string | undefined
+
+  beforeEach(async () => {
+    savedHome = process.env.CONVOY_HOME
+    const root = await mkdtemp(join(tmpdir(), "convoy-cli-prompt-home-"))
+    dirs.push(root)
+    process.env.CONVOY_HOME = root
+  })
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.CONVOY_HOME
+    else process.env.CONVOY_HOME = savedHome
+  })
+
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  test("uses the pipeline's defaultPrompt when no prompt is given", async () => {
+    const cmd = await parseCommand(["-p", "review"])
+    expect(cmd.type).toBe("run")
+    if (cmd.type === "run") {
+      expect(cmd.options.prompt).toBe(
+        "Review the current branch against its base and report prioritized findings with a verified quality score.",
+      )
+      expect(cmd.options.plan?.prompt.source).toBe("default")
+    }
+  })
+
+  test("rejects a run without prompt when the default pipeline has no defaultPrompt", async () => {
+    // implement (the default) has no defaultPrompt, so a bare invocation still errors.
+    await expect(parseCommand([])).rejects.toThrow("need a prompt")
+  })
+
+  test("still errors when the selected pipeline has no defaultPrompt", async () => {
+    await expect(parseCommand(["-p", "implement"])).rejects.toThrow("need a prompt")
+  })
+
+  test("a positional prompt beats the defaultPrompt", async () => {
+    const cmd = await parseCommand(["-p", "review", "my own prompt"])
+    expect(cmd.type).toBe("run")
+    if (cmd.type === "run") {
+      expect(cmd.options.prompt).toBe("my own prompt")
+      expect(cmd.options.plan?.prompt.source).toBe("inline")
+    }
+  })
+
+  test("an explicitly empty positional prompt does not fall back to defaultPrompt", async () => {
+    await expect(parseCommand(["-p", "review", ""])).rejects.toThrow("need a prompt")
+  })
+
+  test("--prompt-file beats the defaultPrompt and is marked as file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-prompt-"))
+    dirs.push(dir)
+    const promptFile = join(dir, "prd.md")
+    await writeFile(promptFile, "from file")
+    const cmd = await parseCommand(["-p", "review", "--prompt-file", promptFile])
+    expect(cmd.type).toBe("run")
+    if (cmd.type === "run") {
+      expect(cmd.options.prompt).toBe("from file")
+      expect(cmd.options.plan?.prompt.source).toBe("file")
+    }
+  })
+
+  test("an explicitly empty prompt file does not fall back to defaultPrompt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-empty-prompt-"))
+    dirs.push(dir)
+    const promptFile = join(dir, "prd.md")
+    await writeFile(promptFile, "")
+    await expect(parseCommand(["-p", "review", "--prompt-file", promptFile])).rejects.toThrow("need a prompt")
+  })
+
+  test("an empty --resume value is rejected instead of starting a default-prompt run", async () => {
+    await expect(parseCommand(["-p", "review", "--resume="])).rejects.toThrow("invalid run id")
+  })
+
+  async function writeGlobalConfig(body: string): Promise<void> {
+    const home = process.env.CONVOY_HOME
+    if (!home) throw new Error("CONVOY_HOME must be set by beforeEach")
+    await mkdir(join(home, ".convoy"), { recursive: true })
+    await writeFile(join(home, ".convoy", "config.yaml"), body)
+  }
+
+  test("falls back through defaults.pipeline to a configured pipeline's defaultPrompt", async () => {
+    await writeGlobalConfig(
+      [
+        "defaults:",
+        "  pipeline: triage",
+        "pipelines:",
+        "  triage:",
+        "    description: Triage incoming reports",
+        "    defaultPrompt: Triage the incoming reports and summarize.",
+        "    steps:",
+        "      - implementer",
+      ].join("\n"),
+    )
+    const cmd = await parseCommand([])
+    expect(cmd.type).toBe("run")
+    if (cmd.type === "run") {
+      expect(cmd.options.prompt).toBe("Triage the incoming reports and summarize.")
+      expect(cmd.options.plan?.prompt.source).toBe("default")
+    }
+  })
+
+  test("a configured pipeline shadowing a built-in name hides its defaultPrompt", async () => {
+    // The project's review replaces the built-in wholesale, so the built-in's
+    // defaultPrompt must not leak through the fallback.
+    await writeGlobalConfig(
+      ["pipelines:", "  review:", "    description: Project review", "    steps:", "      - patterns"].join("\n"),
+    )
+    await expect(parseCommand(["-p", "review"])).rejects.toThrow("need a prompt")
+  })
+
+  test("an unknown pipeline surfaces its error instead of the prompt error", async () => {
+    await expect(parseCommand(["-p", "nope"])).rejects.toThrow('unknown pipeline "nope"')
   })
 })
 

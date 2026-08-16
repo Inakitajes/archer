@@ -209,6 +209,10 @@ describe("built-in implement-lite pipeline", () => {
 
 describe("built-in ship pipeline", () => {
   const ship = () => resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents })
+
+  test("carries a defaultPrompt so `convoy -p ship` works without typing one", () => {
+    expect(ship().defaultPrompt).toBe("Sync this branch with its base and iterate until it clears the quality bar.")
+  })
   const shipSteps = () => ship().steps.filter((step): step is AgentStep => step.type === "agent")
 
   test("is sync then the measurement layer: no open-ended audits in between", () => {
@@ -274,6 +278,14 @@ describe("built-in ship pipeline", () => {
 
 describe("built-in review pipeline", () => {
   const scored = () => resolvePipeline({ name: "review", spec: builtInPipelines.review!, agents: builtInAgents })
+
+  test("carries a non-empty defaultPrompt and suggestedPrompts for zero-friction review runs", () => {
+    const pipeline = scored()
+    expect(pipeline.defaultPrompt).toBe(
+      "Review the current branch against its base and report prioritized findings with a verified quality score.",
+    )
+    expect(pipeline.suggestedPrompts).toEqual(["Review the open PR for this branch", "Review only the last commit's diff"])
+  })
 
   test("is report-only: every step is read-only and there is no human gate", () => {
     const pipeline = scored()
@@ -347,6 +359,14 @@ describe("built-in review pipeline", () => {
 
 describe("built-in review-lite pipeline", () => {
   const reviewLite = () => resolvePipeline({ name: "review-lite", spec: builtInPipelines["review-lite"]!, agents: builtInAgents })
+
+  test("carries the same defaultPrompt and suggestedPrompts as review", () => {
+    const pipeline = reviewLite()
+    expect(pipeline.defaultPrompt).toBe(
+      "Review the current branch against its base and report prioritized findings with a verified quality score.",
+    )
+    expect(pipeline.suggestedPrompts).toEqual(["Review the open PR for this branch", "Review only the last commit's diff"])
+  })
 
   test("is report-only: every step is read-only and there is no human gate", () => {
     const pipeline = reviewLite()
@@ -453,6 +473,11 @@ describe("built-in fixer pipeline", () => {
 })
 
 describe("built-in review-cc pipeline", () => {
+  test("carries a defaultPrompt and suggestedPrompts for zero-friction review runs", () => {
+    const pipeline = resolvePipeline({ name: "review-cc", spec: builtInPipelines["review-cc"]!, agents: builtInAgents })
+    expect(pipeline.defaultPrompt).toBe("Review the current branch against its base and report prioritized findings.")
+    expect(pipeline.suggestedPrompts).toEqual(["Review the open PR for this branch", "Review only the last commit's diff"])
+  })
   const reviewCc = () => resolvePipeline({ name: "review-cc", spec: builtInPipelines["review-cc"]!, agents: builtInAgents })
 
   test("is report-only: every step is read-only and there is no human gate", () => {
@@ -561,6 +586,33 @@ describe("built-in hunter pipelines", () => {
       expect(tracks.every((step) => step.inputDiff)).toBe(true)
       expect(tracks.every((step) => !step.inputFiles.some((file) => file.startsWith("reports/")))).toBe(true)
     }
+  })
+})
+
+describe("built-in default prompts", () => {
+  test("concrete-action pipelines carry a non-empty defaultPrompt and suggestions", () => {
+    for (const name of ["review", "review-lite", "review-cc", "hunter", "hunter-max", "ship"]) {
+      const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
+      expect(pipeline.defaultPrompt, `${name} should have a defaultPrompt`).toBeTruthy()
+    }
+    for (const name of ["review", "review-lite", "review-cc", "hunter", "hunter-max"]) {
+      const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
+      expect(pipeline.suggestedPrompts?.length, `${name} should have suggestions`).toBeGreaterThan(0)
+    }
+  })
+
+  test("pipelines where the prompt IS the description carry no defaultPrompt", () => {
+    for (const name of ["implement", "implement-lite", "fixer", "goal-fix"]) {
+      const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
+      expect(pipeline.defaultPrompt, `${name} should not have a defaultPrompt`).toBeUndefined()
+      expect(pipeline.suggestedPrompts, `${name} should not have suggestions`).toBeUndefined()
+    }
+  })
+
+  test("an empty suggestedPrompts list resolves to no suggestions", () => {
+    const pipeline = resolvePipeline({ name: "x", spec: { steps: ["implementer"], suggestedPrompts: [] }, agents: builtInAgents })
+    expect(pipeline.suggestedPrompts).toBeUndefined()
+    expect(pipeline.defaultPrompt).toBeUndefined()
   })
 })
 

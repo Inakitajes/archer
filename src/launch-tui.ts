@@ -13,7 +13,7 @@ import { stepRunnerFor } from "./step-runners"
 import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { consensusStep } from "./quality-score"
 import { runReviewLines } from "./review-tui"
-import { hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { clipChunks, hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
 
 import type { ConvoyConfig } from "./config"
@@ -118,7 +118,7 @@ type HookNode = {
   when?: "failure" | "always"
 }
 
-type PipelineChoice = {
+export type PipelineChoice = {
   name: string
   description: string
   source: "built-in" | "configured"
@@ -130,6 +130,10 @@ type PipelineChoice = {
   /** True when the pipeline ends in a quality-score-report step, enabling goal mode. */
   scored: boolean
   error?: string
+  /** Prompt text to prefill when launching this pipeline without a prompt; undefined when the prompt stays mandatory. */
+  defaultPrompt?: string
+  /** Alternative prompts Tab can cycle through while the prompt field is clean. */
+  suggestedPrompts?: string[]
 }
 
 type ToggleKey = "smart" | "yolo" | "humanReview" | "includeDirty" | "keepRunDir" | "tui" | "worktree"
@@ -145,6 +149,82 @@ type Mode = "pipelines" | "prompt" | "options" | "branch" | "review"
 
 /** The two editable fields of the branch step. */
 type BranchField = "name" | "guidance"
+
+/**
+ * The prompt field's clean/dirty state: whether its text came from a default or
+ * suggestion (`fromDefault`), which default/suggestion it is currently showing
+ * (`lastDefault`), and where the Tab suggestion cycle stands. Extracted as a
+ * plain value so the prefill/swap/cycle decisions are unit-testable without a
+ * renderer; `LaunchPicker` applies the returned states to its own fields.
+ */
+export type PromptFieldState = {
+  prompt: string
+  fromDefault: boolean
+  lastDefault?: string
+  suggestionIndex: number
+  hasCycledSuggestions: boolean
+}
+
+export function emptyPromptField(): PromptFieldState {
+  return { prompt: "", fromDefault: false, suggestionIndex: 0, hasCycledSuggestions: false }
+}
+
+/** A clean field holding a default or suggestion: still swappable and Tab-cycleable. */
+function cleanPromptField(prompt: string): PromptFieldState {
+  return { prompt, fromDefault: true, lastDefault: prompt, suggestionIndex: 0, hasCycledSuggestions: false }
+}
+
+/**
+ * What opening the prompt step does to a clean field: an empty field adopts the
+ * pipeline's defaultPrompt; any existing text (typed, or preserved from another
+ * pipeline) is left untouched.
+ */
+export function prefillPromptField(state: PromptFieldState, defaultPrompt: string | undefined): PromptFieldState {
+  if (state.prompt === "" && defaultPrompt) return cleanPromptField(defaultPrompt)
+  return state
+}
+
+/**
+ * What the field becomes after switching to a pipeline with the given default.
+ * A clean field (empty, or still holding the previous default) adopts the new
+ * default — or clears when the new pipeline has none. User-typed text is
+ * preserved across the switch.
+ */
+export function promptAfterPipelineSwitch(state: PromptFieldState, nextDefaultPrompt: string | undefined): PromptFieldState {
+  if (state.fromDefault && state.lastDefault !== undefined) {
+    if (state.prompt === "" || state.prompt === state.lastDefault) {
+      return nextDefaultPrompt ? cleanPromptField(nextDefaultPrompt) : emptyPromptField()
+    }
+    // The prompt was edited after a default was applied: it is user text now.
+    return markPromptEdited(state)
+  }
+  if (state.prompt === "" && nextDefaultPrompt) return cleanPromptField(nextDefaultPrompt)
+  return state
+}
+
+/** A user edit marks the field dirty: text is preserved but no longer swappable or cycleable. */
+export function markPromptEdited(state: PromptFieldState): PromptFieldState {
+  return { ...state, fromDefault: false, lastDefault: undefined, suggestionIndex: 0, hasCycledSuggestions: false }
+}
+
+/** Trims the submitted value without making an untouched generated prompt look user-edited. */
+export function trimPromptField(state: PromptFieldState): PromptFieldState {
+  const prompt = state.prompt.trim()
+  return state.fromDefault && state.lastDefault === state.prompt ? { ...state, prompt, lastDefault: prompt } : { ...state, prompt }
+}
+
+/**
+ * Tab while the field is clean (empty or holding a default/suggestion): the
+ * next suggestedPrompt, wrapping around — the first press shows the first
+ * suggestion, repeats advance. Returns undefined when Tab does nothing.
+ */
+export function nextPromptSuggestion(state: PromptFieldState, suggestions: readonly string[] | undefined): PromptFieldState | undefined {
+  if (!suggestions || suggestions.length === 0) return undefined
+  if (!state.fromDefault && state.prompt !== "") return undefined
+  const index = state.hasCycledSuggestions ? (state.suggestionIndex + 1) % suggestions.length : 0
+  const prompt = suggestions[index]!
+  return { prompt, fromDefault: true, lastDefault: prompt, suggestionIndex: index, hasCycledSuggestions: true }
+}
 
 type Modal =
   | { kind: "message"; title: string; message: string; footer?: string }
@@ -236,7 +316,7 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
   return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options).result
 }
 
-function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly AgentSpec[]): PipelineChoice[] {
+export function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly AgentSpec[]): PipelineChoice[] {
   const configured = config?.pipelines ?? {}
   const defaultName = config?.defaults.pipeline ?? defaultPipelineName
   const hooksConfig = config?.hooks ?? emptyHooksConfig()
@@ -269,6 +349,8 @@ function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly Agen
         // report-only scored pipeline (review, review-lite) would be mutated by
         // the goal-fixer, contradicting its "makes no changes" contract.
         scored: Boolean(consensusStep(pipeline)) && hasWritableStep(pipeline),
+        defaultPrompt: pipeline.defaultPrompt,
+        suggestedPrompts: pipeline.suggestedPrompts,
       }
     } catch (error) {
       return {
@@ -331,6 +413,14 @@ export class LaunchPicker {
   private cursor = 0
   private promptScroll = 0
   private promptError = ""
+  /** True while the prompt text came from a default or suggestion, not the user. */
+  private promptFromDefault = false
+  /** The default/suggestion currently in the field, for clean/dirty swap detection. */
+  private lastDefaultPrompt?: string
+  /** Index into the selected pipeline's suggestedPrompts the Tab cycle is showing. */
+  private suggestionIndex = 0
+  /** True once Tab has been used at all, so a repeat press advances past the first suggestion. */
+  private hasCycledSuggestions = false
   private optionIndex = 0
   private optionScroll = 0
   private message = ""
@@ -413,6 +503,7 @@ export class LaunchPicker {
       return
     }
     this.insertPromptText(text)
+    this.markPromptDirty()
     this.promptError = ""
     this.render()
   }
@@ -511,11 +602,9 @@ export class LaunchPicker {
       const row = event.y - this.pipelineText.y
       const index = this.pipelineRows[row]
       if (index === undefined) return
-      this.selected = index
       this.mode = "pipelines"
       this.promptError = ""
-      this.message = ""
-      this.render()
+      this.selectPipeline(index)
     }
 
     const pipeline = this.panel({
@@ -684,6 +773,7 @@ export class LaunchPicker {
     const enterAction = promptEnterAction(key)
     if (enterAction === "newline") {
       this.insertPromptText("\n")
+      this.markPromptDirty()
       this.promptError = ""
       this.render()
       return
@@ -692,7 +782,7 @@ export class LaunchPicker {
       if (!this.prompt.trim()) {
         this.promptError = "Write a prompt before continuing."
       } else {
-        this.prompt = this.prompt.trim()
+        this.applyPromptFieldState(trimPromptField(this.promptFieldState()))
         this.cursor = this.prompt.length
         this.promptError = ""
         this.mode = "options"
@@ -701,10 +791,15 @@ export class LaunchPicker {
       this.render()
       return
     }
+    if (key.name === "tab") {
+      this.cycleSuggestion()
+      return
+    }
     if (key.name === "backspace" || (key.ctrl && key.name === "h")) {
       if (this.cursor > 0) {
         this.prompt = this.prompt.slice(0, this.cursor - 1) + this.prompt.slice(this.cursor)
         this.cursor -= 1
+        this.markPromptDirty()
       }
       this.promptError = ""
       this.render()
@@ -713,6 +808,7 @@ export class LaunchPicker {
     if (key.ctrl && key.name === "u") {
       this.prompt = ""
       this.cursor = 0
+      this.markPromptDirty()
       this.promptError = ""
       this.render()
       return
@@ -741,14 +837,55 @@ export class LaunchPicker {
     const text = typedText(key)
     if (text) {
       this.insertPromptText(text)
+      this.markPromptDirty()
       this.promptError = ""
       this.render()
     }
   }
 
+  /**
+   * Tab while the prompt field is clean (empty or still holding a default or
+   * previous suggestion) inserts the next suggestedPrompt, wrapping around.
+   * The first press shows the first suggestion; repeats advance through the
+   * list. A user-edited prompt is left alone.
+   */
+  private cycleSuggestion() {
+    const choice = this.currentChoice()
+    const next = nextPromptSuggestion(this.promptFieldState(), choice.suggestedPrompts)
+    if (!next) return
+    this.applyPromptFieldState(next)
+    this.cursor = this.prompt.length
+    this.promptError = ""
+    this.render()
+  }
+
   private insertPromptText(text: string) {
     this.prompt = this.prompt.slice(0, this.cursor) + text + this.prompt.slice(this.cursor)
     this.cursor += text.length
+  }
+
+  /** Marks the field as user-owned: the text is preserved across switches and Tab stops cycling. */
+  private markPromptDirty() {
+    const state = markPromptEdited(this.promptFieldState())
+    this.applyPromptFieldState(state)
+  }
+
+  private promptFieldState(): PromptFieldState {
+    return {
+      prompt: this.prompt,
+      fromDefault: this.promptFromDefault,
+      lastDefault: this.lastDefaultPrompt,
+      suggestionIndex: this.suggestionIndex,
+      hasCycledSuggestions: this.hasCycledSuggestions,
+    }
+  }
+
+  private applyPromptFieldState(state: PromptFieldState) {
+    this.prompt = state.prompt
+    this.promptFromDefault = state.fromDefault
+    this.lastDefaultPrompt = state.lastDefault
+    this.suggestionIndex = state.suggestionIndex
+    this.hasCycledSuggestions = state.hasCycledSuggestions
   }
 
   private handleOptionsKey(key: KeyEvent) {
@@ -952,6 +1089,10 @@ export class LaunchPicker {
       return
     }
     this.message = ""
+    // A clean field adopts the pipeline's default prompt on first open, so a
+    // concrete-action pipeline launches without typing. An already-typed prompt
+    // (returning from options, or a previous pipeline's preserved text) is kept.
+    this.applyPromptFieldState(prefillPromptField(this.promptFieldState(), choice.defaultPrompt))
     this.mode = "prompt"
     this.cursor = this.prompt.length
     this.promptScroll = 0
@@ -1116,8 +1257,25 @@ export class LaunchPicker {
   }
 
   private moveSelection(delta: number) {
-    this.selected = clamp(this.selected + delta, 0, this.choices.length - 1)
+    const newIndex = clamp(this.selected + delta, 0, this.choices.length - 1)
+    this.selectPipeline(newIndex)
+  }
+
+  /** Applies one pipeline selection consistently for keyboard and mouse input. */
+  private selectPipeline(newIndex: number) {
     this.message = ""
+    if (newIndex === this.selected) {
+      this.render()
+      return
+    }
+    this.selected = newIndex
+    const newChoice = this.currentChoice()
+
+    // Swap the default prompt cleanly when the field is empty or still holds
+    // the previous pipeline's default; a user-typed prompt is preserved across
+    // the switch so moving away and back never discards work.
+    this.applyPromptFieldState(promptAfterPipelineSwitch(this.promptFieldState(), newChoice.defaultPrompt))
+
     this.render()
   }
 
@@ -1395,12 +1553,26 @@ export class LaunchPicker {
     }
     lines.push(plain(""))
     const hint = "shift+enter newline · enter options · ←/→ move · ctrl+U clear · esc back"
-    if (wrapped.length > 1) {
-      const suffix = ` · ${wrapped.length} lines`
-      lines.push(new StyledText([fg(theme.faint)(truncate(hint, Math.max(0, width - suffix.length))), fg(theme.accent)(suffix)]))
-    } else {
-      lines.push(t`${fg(theme.faint)(truncate(hint, width))}`)
-    }
+    const suggestions = choice.suggestedPrompts
+    // The accent slot carries one status: while Tab can cycle suggestions it
+    // says how many, otherwise a multi-line prompt owns up to its height. The
+    // row is clipped rather than wrapped, so a narrow panel degrades to an
+    // ellipsis instead of spilling extra lines into the fixed-height box.
+    const suggestionCount = suggestions?.length ?? 0
+    const canCycleSuggestions = suggestionCount > 0 && (this.promptFromDefault || this.prompt === "")
+    const status =
+      canCycleSuggestions
+        ? `tab: ${suggestionCount} suggestion${suggestionCount === 1 ? "" : "s"}`
+        : wrapped.length > 1
+          ? `${wrapped.length} lines`
+          : ""
+    // Suggestion discovery wins the left edge because this row is clipped in
+    // ordinary-width terminals; putting the status last made Tab invisible.
+    const hintChunks: TextChunk[] = canCycleSuggestions
+      ? [fg(theme.accent)(status), fg(theme.faint)(" · "), fg(theme.faint)(hint)]
+      : [fg(theme.faint)(hint)]
+    if (!canCycleSuggestions && status) hintChunks.push(fg(theme.faint)(" · "), fg(theme.accent)(status))
+    lines.push(new StyledText(clipChunks(hintChunks, width)))
     return joinLines(lines)
   }
 
