@@ -778,17 +778,17 @@ export class ConfigEditor {
     const spec = asStepObject(at.spec)
     const agentName = agentAliases[spec.agent] ?? spec.agent
     const agent = buildAgentRegistry(this.effectiveConfig()).find((candidate) => candidate.name === agentName)
-    // A verifying agent needs bash, which Claude Code's fixed tool envelope has
+    // A verifying step needs bash, which Claude Code's fixed tool envelope has
     // no way to give it — unless the step is a parallel member, where the
     // pipeline drops verify anyway. Mirrors resolveAgentStepSpec's own check.
-    const supportsReadOnlyRunner = at.meta.member !== undefined || (agent?.readOnly === true && agent?.verify !== true)
+    const supportsReadOnlyRunner = at.meta.member !== undefined || (agent?.readOnly === true && spec.verify !== true)
     const result = toggleStepRunnerSpec(spec, supportsReadOnlyRunner)
     if (!result.ok) {
       const detail =
         result.reason === "model-fanout"
           ? "Remove the models fan-out before switching this step to Claude Code."
-          : agent?.verify === true
-            ? "Claude Code can't run commands, and this agent verifies its claims by running them. Use a non-verifying read-only agent, or place the step in a parallel audit group."
+          : spec.verify === true
+            ? "Claude Code can't run commands, and this step has verify: true. Drop verify, or place the step in a parallel audit group."
             : "Claude Code currently supports read-only steps only. Use a read-only agent or place the step in a parallel audit group."
       this.message("Can't switch runner", detail)
       return

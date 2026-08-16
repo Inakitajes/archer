@@ -14,7 +14,10 @@ import {
   splitModelVariant,
   stepNames,
   synthesizeReadOnlyAgents,
+  synthesizeVerifyingAgents,
+  agentsForPipeline,
   validateStepFilters,
+  verifyAgentSuffix,
   type PipelineSpec,
 } from "../src/pipeline"
 import type { AgentStep } from "../src/types"
@@ -238,9 +241,9 @@ describe("built-in ship pipeline", () => {
       { model: "openai/gpt-5.6-sol", variant: "xhigh" },
       { model: "anthropic/claude-opus-5", variant: undefined },
     ])
-    // Fanned out across models: no bash even though the base agent is a verifier.
+    // Fanned out across models: already read-only, so no __ro and no bash.
     for (const step of scorers) {
-      expect(step.agentName).toBe("quality-scorer__ro")
+      expect(step.agentName).toBe("quality-scorer")
       expect(step.readOnly).toBe(true)
       expect(step.verify).toBeUndefined()
       // No review-scope step feeds these, so the diff has to arrive by the
@@ -278,6 +281,19 @@ describe("built-in review pipeline", () => {
     expect(agents.length).toBeGreaterThan(0)
     expect(agents.every((step) => step.readOnly)).toBe(true)
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
+  })
+
+  test("scope verifies: review-scope is a standalone read-only step with bash, so it runs the checks once", () => {
+    const pipeline = scored()
+    const scope = pipeline.steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
+
+    expect(scope).toMatchObject({
+      agentName: "review-scope",
+      readOnly: true,
+      verify: true,
+    })
+    // Not fanned out, so it keeps its own name (no __ro suffix).
+    expect(scope?.agentName.endsWith("__ro")).toBe(false)
   })
 
   test("scopes, runs the three audits fanned across two models, synthesizes a findings report, then scores", () => {
@@ -338,6 +354,11 @@ describe("built-in review-lite pipeline", () => {
     expect(agents.length).toBeGreaterThan(0)
     expect(agents.every((step) => step.readOnly)).toBe(true)
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
+  })
+
+  test("scope verifies on the cheap model too, so the checks run once per review", () => {
+    const scope = reviewLite().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
+    expect(scope).toMatchObject({ agentName: "review-scope", readOnly: true, verify: true })
   })
 
   test("runs entirely on low-cost models: GLM 5.2 scopes and reports, and the fan-out pairs GLM 5.2 with Kimi K3", () => {
@@ -440,6 +461,11 @@ describe("built-in review-cc pipeline", () => {
     expect(agents.length).toBeGreaterThan(0)
     expect(agents.every((step) => step.readOnly)).toBe(true)
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
+  })
+
+  test("scope verifies on the Terra leg too, and the claude-code audits stay bash-less", () => {
+    const scope = reviewCc().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
+    expect(scope).toMatchObject({ agentName: "review-scope", readOnly: true, verify: true })
   })
 
   test("pairs each Terra audit with a Claude Code audit and feeds every report to one Sol report step", () => {
@@ -699,19 +725,18 @@ describe("parallel groups", () => {
     expect(security?.readOnly).toBe(true)
   })
 
-  test("a verifying agent loses bash in a parallel block, through its own synthesized variant", () => {
-    const agents = builtInAgents.map((agent) => (agent.name === "security-auditor" ? { ...agent, readOnly: true, verify: true } : agent))
-    const pipeline = resolvePipeline({ name: "test", spec: { steps: [{ parallel: ["security", "patterns"] }] }, agents })
-    const [security] = pipeline.steps as AgentStep[]
+  test("a verifying step loses bash in a parallel block", () => {
+    const pipeline = resolvePipeline({
+      name: "test",
+      spec: { steps: [{ parallel: [{ agent: "review-scope", name: "scope", verify: true }, "patterns"] }] },
+      agents: builtInAgents,
+    })
+    const [scope] = pipeline.steps as AgentStep[]
 
-    expect(security?.readOnly).toBe(true)
-    expect(security?.verify).toBeUndefined()
-    // Agent configs are per name, so sharing the base name would leak bash into
-    // the parallel step: it needs a stripped variant of its own.
-    expect(security?.agentName).toBe("security-auditor__ro")
-    expect(synthesizeReadOnlyAgents(pipeline, agents)).toContainEqual(
-      expect.objectContaining({ name: "security-auditor__ro", readOnly: true, verify: false }),
-    )
+    expect(scope?.readOnly).toBe(true)
+    expect(scope?.verify).toBeUndefined()
+    // Already read-only, and verify was dropped, so no __ro / __verify for scope.
+    expect(scope?.agentName).toBe("review-scope")
   })
 
   test("a step inside a parallel block never sees its own siblings' reports, only earlier groups'", () => {
@@ -779,17 +804,16 @@ describe("model fan-out", () => {
     expect(clean1?.agentName).toBe("implementer__ro")
   })
 
-  test("a models: fan-out also strips bash from a verifying agent", () => {
-    const agents = builtInAgents.map((agent) => (agent.name === "review-validator" ? { ...agent, verify: true } : agent))
+  test("a models: fan-out also strips bash from a verifying step", () => {
     const [first] = resolvePipeline({
       name: "test",
-      spec: { steps: [{ agent: "review-validator", name: "validator", models: ["anthropic/claude-opus-4-7", "openai/gpt-5.5#xhigh"] }] },
-      agents,
+      spec: { steps: [{ agent: "review-validator", name: "validator", verify: true, models: ["anthropic/claude-opus-4-7", "openai/gpt-5.5#xhigh"] }] },
+      agents: builtInAgents,
     }).steps as AgentStep[]
 
     expect(first?.readOnly).toBe(true)
     expect(first?.verify).toBeUndefined()
-    expect(first?.agentName).toBe("review-validator__ro")
+    expect(first?.agentName).toBe("review-validator")
   })
 
   test("reports: [stepName] on a fanned-out step expands to every model variant", () => {
@@ -857,6 +881,55 @@ describe("synthesizeReadOnlyAgents", () => {
 
   test("returns nothing when no step needed a synthesized variant", () => {
     expect(synthesizeReadOnlyAgents(defaultPipeline(), builtInAgents)).toEqual([])
+  })
+})
+
+describe("step-level verify", () => {
+  test("a read-only agent only gets bash when the step asks", () => {
+    const [checking, staticScope] = agentSteps({
+      steps: [
+        { agent: "review-scope", name: "scope", verify: true },
+        { agent: "review-scope", name: "scope-static" },
+      ],
+    })
+
+    expect(checking).toMatchObject({ agentName: `review-scope${verifyAgentSuffix}`, readOnly: true, verify: true })
+    expect(staticScope).toMatchObject({ agentName: "review-scope", readOnly: true })
+    expect(staticScope?.verify).toBeUndefined()
+  })
+
+  test("verify on a writable agent is ignored", () => {
+    const [step] = agentSteps({ steps: [{ agent: "implementer", verify: true }] })
+    expect(step?.readOnly).toBeUndefined()
+    expect(step?.verify).toBeUndefined()
+    expect(step?.agentName).toBe("implementer")
+  })
+
+  test("an exclusive verifying use keeps the base agent name", () => {
+    const [scope] = agentSteps({ steps: [{ agent: "review-scope", name: "scope", verify: true }] })
+    expect(scope?.agentName).toBe("review-scope")
+    expect(scope?.verify).toBe(true)
+  })
+
+  test("agentsForPipeline sets verify on exclusive uses and synthesizes mixed ones", () => {
+    const pipeline = resolvePipeline({
+      name: "test",
+      spec: {
+        steps: [
+          { agent: "review-scope", name: "scope", verify: true },
+          { agent: "review-scope", name: "scope-static" },
+          { agent: "quality-score-report", name: "score-report", verify: true },
+        ],
+      },
+      agents: builtInAgents,
+    })
+    const agents = agentsForPipeline(pipeline, builtInAgents)
+    const byName = Object.fromEntries(agents.map((agent) => [agent.name, agent]))
+
+    expect(byName["review-scope"]?.verify).toBeUndefined()
+    expect(byName[`review-scope${verifyAgentSuffix}`]).toMatchObject({ readOnly: true, verify: true })
+    expect(byName["quality-score-report"]?.verify).toBe(true)
+    expect(synthesizeVerifyingAgents(pipeline, builtInAgents).map((agent) => agent.name)).toEqual([`review-scope${verifyAgentSuffix}`])
   })
 })
 
@@ -930,17 +1003,17 @@ describe("claude-code runner steps", () => {
   })
 
   test("rejects claude-code on a verifying step, which needs bash it cannot give", () => {
-    expect(() => agentSteps({ steps: [{ agent: "review-validator", name: "validator", runner: "claude-code" }] })).toThrow(/can't run commands/)
+    expect(() => agentSteps({ steps: [{ agent: "review-validator", name: "validator", runner: "claude-code", verify: true }] })).toThrow(/can't run commands/)
   })
 
-  test("accepts claude-code on a verifying agent forced read-only, where bash is dropped anyway", () => {
+  test("accepts claude-code on a verifying step forced read-only, where bash is dropped anyway", () => {
     const steps = agentSteps({
       steps: [
         { agent: "review-scope", name: "scope", reports: "none", diff: true },
         {
           parallel: [
             { agent: "bug-auditor", name: "bugs", reports: ["scope"] },
-            { agent: "review-validator", name: "validator-claude", runner: "claude-code", reports: ["scope"] },
+            { agent: "review-validator", name: "validator-claude", runner: "claude-code", reports: ["scope"], verify: true },
           ],
         },
       ],

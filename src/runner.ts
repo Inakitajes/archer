@@ -26,7 +26,7 @@ import { openOpencodeSessionWindow, startOpencode } from "./opencode"
 import { HerdrReporter } from "./herdr"
 import { defaultNotificationSettings, Notifier } from "./notifications"
 import { startPermissionGate, type PermissionGate } from "./permissions"
-import { splitModelVariant, synthesizeReadOnlyAgents, validateStepFilters } from "./pipeline"
+import { agentsForPipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
@@ -143,7 +143,9 @@ export class RunShutdown {
   }
 
   clearActiveSession(phaseName: string, sessionID: string) {
-    if (this.activeSessions.get(phaseName)?.sessionID === sessionID) this.activeSessions.delete(phaseName)
+    if (this.activeSessions.get(phaseName)?.sessionID === sessionID) {
+      this.activeSessions.delete(phaseName)
+    }
   }
 
   async abortActiveSessions(progress?: ProgressUI) {
@@ -505,8 +507,9 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     validateStepFilters(pipeline, options)
     // Parallel/multi-model steps are forced read-only and point at a synthesized
     // "<agent>__ro" variant when their base agent isn't already read-only;
-    // register those variants alongside the normal registry for this run.
-    const agents = [...options.agents, ...synthesizeReadOnlyAgents(pipeline, options.agents)]
+    // verifying steps that share an agent with a non-verifying use get
+    // "<agent>__verify". Register those variants alongside the catalogue.
+    const agents = agentsForPipeline(pipeline, options.agents)
     ensureAgentsAvailable(pipeline, agents)
     // Claude Code is an optional dependency: only a pipeline that actually
     // contains a claude-code step needs the CLI, checked before anything runs.
@@ -1326,10 +1329,9 @@ export async function waitForPhaseGate(
     permissionsPaused = true
     takeover.permissions.pause(sessionID)
   }
-  // An interactive session owns the terminal and answers its own prompts, so
-  // Convoy's permission gate stays paused for that session while it waits. A
-  // failure gate starts without pausing — a dead step must never freeze its
-  // live siblings' prompts.
+  // An interactive session owns the terminal and answers its ordinary prompts,
+  // so Convoy's permission gate stays paused for that session while it waits.
+  // A failure gate starts without pausing — a dead step must never freeze sibling prompts.
   if (kind === "interactive") pausePermissions()
 
   // The readline fallback owns the terminal; the TUI path keeps the dashboard

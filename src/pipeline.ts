@@ -88,6 +88,8 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: fallbackModel,
     temperature: 0.1,
     readOnly: true,
+    // Pipelines that want this step to run the repo's checks set verify: true
+    // on the step (review / review-lite / review-cc), not on this catalogue entry.
     builtIn: true,
   },
   {
@@ -135,7 +137,6 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: fallbackModel,
     temperature: 0.1,
     readOnly: true,
-    verify: true,
     builtIn: true,
   },
   {
@@ -186,7 +187,6 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: defaultOpusModel,
     temperature: 0.1,
     readOnly: true,
-    verify: true,
     builtIn: true,
   },
   // fixer: supplied findings turned into proven regression tests, minimal fixes, and an audited outcome report.
@@ -210,7 +210,6 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: fallbackModel,
     temperature: 0.1,
     readOnly: true,
-    verify: true,
     builtIn: true,
   },
   // hunter / hunter-max: six specialty audit tracks fanned across models, then one consensus report.
@@ -288,7 +287,6 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: defaultOpusModel,
     temperature: 0.1,
     readOnly: true,
-    verify: true,
     builtIn: true,
   },
   {
@@ -297,7 +295,6 @@ export const builtInAgents: readonly AgentSpec[] = [
     defaultModel: defaultOpusModel,
     temperature: 0.1,
     readOnly: true,
-    verify: true,
     builtIn: true,
   },
   // Goal loop: the directed-fix agent. Its phase brief carries the previous
@@ -346,6 +343,12 @@ export type AgentStepSpec = {
   reports?: "previous" | "all" | "none" | string[]
   /** Attach the cumulative diff against the base branch. Defaults to true except for the first agent step. */
   diff?: boolean
+  /**
+   * Give this read-only step bash under the normal `bashPolicy` (deny stays
+   * deny) so it can run tests and checks. Ignored unless the agent is
+   * read-only, and dropped for `parallel:` / `models:` fan-outs.
+   */
+  verify?: boolean
 }
 
 export type HumanStepSpec = {
@@ -385,6 +388,9 @@ export type PipelineSpec = {
 
 /** Suffix reserved for convoy's synthesized forced-read-only agent variants; project agents can't use it. */
 export const readOnlyAgentSuffix = "__ro"
+
+/** Suffix reserved for a verifying step that shares its agent with a non-verifying use in the same pipeline. */
+export const verifyAgentSuffix = "__verify"
 
 /** The pipeline run when none is selected (no -p flag and no defaults.pipeline). */
 export const defaultPipelineName = "implement"
@@ -449,7 +455,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       },
       // The consensus sees only the fresh scorer reports, never the fixer's,
       // so its measurement cannot anchor on the number it is reconciling.
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: ["score"] },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: ["score"], verify: true },
     ],
   },
   // Report-only review + the measurement layer: after the parallel audits, two
@@ -461,7 +467,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     description:
       "Report-only PR review plus a verified quality score: scope, parallel bug/clean-code/security audits across two models, a prioritized findings report, then two independent quality-scorers and a consensus step. Makes no changes.",
     steps: [
-      { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true },
+      { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true, verify: true },
       {
         parallel: [
           { agent: "clean-code-auditor", name: "clean-code", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
@@ -475,7 +481,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
           { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all", verify: true },
     ],
   },
   // review's shape with nothing on Opus. The scorer models are pinned rather
@@ -486,7 +492,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     description:
       "Like review, but every phase runs on a low-cost model: GLM 5.2 scopes, writes the report and reconciles the score, and the audit and scorer fan-outs pair GLM 5.2 with Kimi K3 instead of Opus.",
     steps: [
-      { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true },
+      { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true, verify: true },
       {
         parallel: [
           { agent: "clean-code-auditor", name: "clean-code", models: [glmModel, kimiModel], reports: ["scope"] },
@@ -500,7 +506,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
           { agent: "quality-scorer", name: "score", models: [glmXhighModel, kimiHighModel], reports: "all" },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: glmXhighModel, reports: "all" },
+      { agent: "quality-score-report", name: "score-report", model: glmXhighModel, reports: "all", verify: true },
     ],
   },
   // The close of the process: the branch is already shaped the way you want it,
@@ -531,7 +537,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
           { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all" },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all", verify: true },
     ],
   },
   // The follow-up to a report-only run: feed it the findings (as the prompt or an
@@ -548,14 +554,14 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     steps: [
       { agent: "fixer-test-author", name: "reproduction", model: fallbackModel, advisor: solXhighModel, reports: "none", diff: true },
       { agent: "fixer-implementer", name: "fixes", model: fallbackModel, advisor: solXhighModel, reports: ["reproduction"] },
-      { agent: "fixer-validator", name: "validation", model: fallbackModel, reports: ["reproduction", "fixes"] },
+      { agent: "fixer-validator", name: "validation", model: fallbackModel, reports: ["reproduction", "fixes"], verify: true },
     ],
   },
   "review-cc": {
     description:
       "Report-only PR review: Terra scope, parallel audits on Terra + Claude Code (subscription), then one prioritized findings report. Makes no changes.",
     steps: [
-      { agent: "review-scope", name: "scope", model: fallbackModel, reports: "none", diff: true },
+      { agent: "review-scope", name: "scope", model: fallbackModel, reports: "none", diff: true, verify: true },
       {
         parallel: [
           { agent: "clean-code-auditor", name: "clean-code", model: fallbackModel, reports: ["scope"] },
@@ -649,6 +655,7 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
   const names = new Set<string>()
   let legacyHumanCount = 0
   let genericHumanCount = 0
+  const mixedVerify = mixedVerifyAgents(input.spec.steps, input.agents)
 
   const claimAgentName = (name: string, position: string) => {
     if (name === humanReviewStep || name.startsWith(`${humanReviewStep}-`)) {
@@ -693,6 +700,7 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
           forcedReadOnly: true,
           priorSteps: agentSteps,
           claimName: claimAgentName,
+          mixedVerify,
         })
       })
       steps.push(...members)
@@ -727,6 +735,7 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
       forcedReadOnly: Boolean(spec.models && spec.models.length > 0),
       priorSteps: agentSteps,
       claimName: claimAgentName,
+      mixedVerify,
     })
     steps.push(...members)
     agentSteps.push(...members)
@@ -785,6 +794,12 @@ type ResolveStepContext = {
   /** Steps that finished resolving before this step's group started; never includes groupmates. */
   priorSteps: readonly AgentStep[]
   claimName: (name: string, position: string) => void
+  /**
+   * Agents that this pipeline uses both as a verifying step and as a
+   * non-verifying step. Verifying uses of those agents get a `__verify`
+   * registry name so bash does not leak into the other use.
+   */
+  mixedVerify: ReadonlySet<string>
 }
 
 /** Resolves one step spec into one or more AgentSteps: more than one only when `models:` fans it out. */
@@ -811,10 +826,9 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
 
   const models = spec.models
   const forced = ctx.forcedReadOnly || Boolean(models)
-  // A read-only agent keeps bash only when it has the working tree to itself:
-  // parallel and fanned-out steps share one, and concurrent test runs would
-  // fight over the same build caches, so they fall back to strict read-only.
-  const verify = Boolean(agent.readOnly && agent.verify && !forced)
+  // Bash comes from the step, not the agent catalogue. Forced steps
+  // (parallel:/models:) drop it so concurrent runs do not fight over one tree.
+  const verify = Boolean(spec.verify && agent.readOnly && !forced)
 
   const runnerDefinition = stepRunnerFor(spec.runner)
   // "opencode" is accepted for symmetry but resolves to the default (no runner field).
@@ -831,7 +845,7 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
   }
   if (!runnerDefinition.capabilities.verifySteps && verify) {
     throw new Error(
-      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") uses runner: ${runnerDefinition.id}, which can't run commands — agent "${agent.name}" is a verifying agent that needs bash to check its claims`,
+      `pipeline "${ctx.input.name}": step ${ctx.position} ("${baseName}") uses runner: ${runnerDefinition.id}, which can't run commands — this step has verify: true and needs bash to check its claims`,
     )
   }
 
@@ -863,11 +877,16 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
   const variants = runnerDefinition.capabilities.globalModelOverride
     ? (models ?? [spec.model ?? agent.model ?? ctx.input.defaultModel ?? agent.defaultModel ?? fallbackModel])
     : [spec.model ? normalizeStepRunnerModel(runnerDefinition.id, spec.model) : ""]
-  // Agent configs are registered per agent name, so a forced step needs its own
-  // synthesized variant whenever forcing changes anything: for a writable agent
-  // that means losing every write tool, for a verifying one just losing bash.
-  const strictReadOnly = Boolean(agent.readOnly && !agent.verify)
-  const agentName = forced && !strictReadOnly ? `${agent.name}${readOnlyAgentSuffix}` : agent.name
+  // Agent configs are registered per agent name. A verifying step that shares
+  // its agent with a non-verifying use in this pipeline needs its own variant
+  // so bash does not leak. Forced writable steps still get `__ro`.
+  const agentName = verify
+    ? ctx.mixedVerify.has(agent.name)
+      ? `${agent.name}${verifyAgentSuffix}`
+      : agent.name
+    : forced && !agent.readOnly
+      ? `${agent.name}${readOnlyAgentSuffix}`
+      : agent.name
 
   return variants.map((modelValue, variantIndex) => {
     const name = models ? `${baseName}__${slugifyModel(modelValue)}` : baseName
@@ -944,11 +963,77 @@ export function synthesizeReadOnlyAgents(pipeline: Pipeline, baseAgents: readonl
     if (!base) {
       throw new Error(`pipeline "${pipeline.name}": step "${step.name}" needs forced-read-only agent "${step.agentName}", but base agent "${baseName}" is not defined`)
     }
-    // verify: false, not just readOnly: true — a verifying agent forced into a
-    // shared working tree loses bash along with its write tools.
     synthesized.set(step.agentName, { ...base, name: step.agentName, readOnly: true, verify: false })
   }
   return [...synthesized.values()]
+}
+
+/**
+ * Builds the verifying-step agent variants a resolved pipeline references:
+ * steps whose `agentName` was suffixed `__verify` because the same agent is
+ * also used without bash in this pipeline. The copy is read-only + verify.
+ */
+export function synthesizeVerifyingAgents(pipeline: Pipeline, baseAgents: readonly AgentSpec[]): AgentSpec[] {
+  const synthesized = new Map<string, AgentSpec>()
+  for (const step of pipeline.steps) {
+    if (step.type !== "agent" || !step.agentName.endsWith(verifyAgentSuffix)) continue
+    if (synthesized.has(step.agentName)) continue
+    const baseName = step.agentName.slice(0, -verifyAgentSuffix.length)
+    const base = baseAgents.find((agent) => agent.name === baseName)
+    if (!base) {
+      throw new Error(`pipeline "${pipeline.name}": step "${step.name}" needs verifying agent "${step.agentName}", but base agent "${baseName}" is not defined`)
+    }
+    synthesized.set(step.agentName, { ...base, name: step.agentName, readOnly: true, verify: true })
+  }
+  return [...synthesized.values()]
+}
+
+/**
+ * Agent registry for one run: catalogue agents, with `verify` set on any
+ * name a verifying step uses as-is, plus the `__ro` / `__verify` variants
+ * the resolved pipeline points at.
+ */
+export function agentsForPipeline(pipeline: Pipeline, baseAgents: readonly AgentSpec[]): AgentSpec[] {
+  const verifyingNames = new Set(
+    pipeline.steps.filter((step): step is AgentStep => step.type === "agent" && Boolean(step.verify)).map((step) => step.agentName),
+  )
+  return [
+    ...baseAgents.map((agent) => (verifyingNames.has(agent.name) ? { ...agent, verify: true } : agent)),
+    ...synthesizeReadOnlyAgents(pipeline, baseAgents),
+    ...synthesizeVerifyingAgents(pipeline, baseAgents),
+  ]
+}
+
+/**
+ * Agents this pipeline uses both as a verifying step and as a non-verifying
+ * step. The verifying uses need a distinct OpenCode registry name.
+ */
+function mixedVerifyAgents(steps: readonly StepSpec[], agents: readonly AgentSpec[]): Set<string> {
+  const verifying = new Set<string>()
+  const nonVerifying = new Set<string>()
+  const walk = (list: readonly StepSpec[], forced: boolean) => {
+    for (const raw of list) {
+      if (isParallelSpec(raw)) {
+        walk(raw.parallel, true)
+        continue
+      }
+      if (asHumanStepSpec(raw)) continue
+      if (typeof raw === "string") {
+        const named = findAgent(raw, agents)
+        if (named) nonVerifying.add(named.name)
+        continue
+      }
+      if (!("agent" in raw)) continue
+      const spec = raw
+      const agent = findAgent(spec.agent, agents)
+      if (!agent) continue
+      const forcedHere = forced || Boolean(spec.models && spec.models.length > 0)
+      if (spec.verify && agent.readOnly && !forcedHere) verifying.add(agent.name)
+      else nonVerifying.add(agent.name)
+    }
+  }
+  walk(steps, false)
+  return new Set([...verifying].filter((name) => nonVerifying.has(name)))
 }
 
 /** Step names valid for --only/--skip in this pipeline: each step's full name plus, for fanned-out steps, their shared logical name. */

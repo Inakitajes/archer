@@ -6,7 +6,7 @@ import { advisorFeedbackToolName, advisorProviderOverride, advisorToolName, type
 import { bashPolicy, noAdditions } from "./bash-policy"
 import { builtInPrompts } from "./built-in-prompts"
 import { resolveLoopGuard, softAgentSteps, type LoopGuardSettings } from "./loop-guard"
-import { builtInAgents, readOnlyAgentSuffix } from "./pipeline"
+import { builtInAgents, readOnlyAgentSuffix, verifyAgentSuffix } from "./pipeline"
 import type { AgentSpec, PermissionAdditions } from "./types"
 import { globalAgentsDir } from "./workspace"
 
@@ -50,10 +50,9 @@ export function opencodeConfig(
   const steps = loopGuard.enabled ? softAgentSteps(loopGuard.maxSteps) : undefined
   const agent: Record<string, AgentConfig> = {}
   for (const spec of agents) {
-    // Synthesized forced-read-only variants (name suffixed "__ro", see
-    // synthesizeReadOnlyAgents in pipeline.ts) have no prompt file of their
-    // own; they share the base agent's prompt under its real name.
-    const promptName = spec.name.endsWith(readOnlyAgentSuffix) ? spec.name.slice(0, -readOnlyAgentSuffix.length) : spec.name
+    // Synthesized variants (name suffixed "__ro" or "__verify") have no prompt
+    // file of their own; they share the base agent's prompt under its real name.
+    const promptName = baseAgentPromptName(spec.name)
     const advised = advisorAgents.has(spec.name)
     agent[spec.name] = agentConfig(
       spec.description,
@@ -141,6 +140,12 @@ function isFile(path: string) {
   }
 }
 
+function baseAgentPromptName(name: string) {
+  if (name.endsWith(readOnlyAgentSuffix)) return name.slice(0, -readOnlyAgentSuffix.length)
+  if (name.endsWith(verifyAgentSuffix)) return name.slice(0, -verifyAgentSuffix.length)
+  return name
+}
+
 const providerIdleTimeoutMs = 10 * 60 * 1000
 
 function providerTimeouts(): Config["provider"] {
@@ -200,6 +205,8 @@ function agentConfig(
         glob: "allow",
         grep: "allow",
         edit: "deny",
+        // A verifying step gets the same bash policy writable agents get:
+        // allowlisted checks run silently, the hard denylist stays deny.
         bash: verify ? bashPolicy(targetDir, permissions) : "deny",
         task: "deny",
         question: "deny",

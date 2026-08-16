@@ -25,6 +25,8 @@ export type PermissionGate = {
   /**
    * While a session is paused, its permission requests are left for whoever owns
    * the terminal (e.g. an interactive OpenCode TUI the user opened with [o]).
+   * Structural bash-checkpoint decisions still run: pausing must not make a
+   * read-only verify session's hard refusal human-approvable.
    * Sibling sessions in the same `models:`/`parallel` batch keep being handled,
    * so a failed step's recovery can never deadlock a live sibling's prompts.
    *
@@ -95,8 +97,8 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
     if (controller.signal.aborted) return
     if (!isPermissionAsked(payload)) return
     const request = payload.properties
-    if (pausedAll || pausedSessions.has(request.sessionID)) return
     if (handled.has(request.id)) return
+    if (pausedAll || pausedSessions.has(request.sessionID)) return
     handled.add(request.id)
     queue(() =>
       handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept, options.judgeModel, controller.signal, options.advisorCheckpoint, terminalInput, options.serverUrl),
