@@ -236,7 +236,7 @@ export type Pipeline = {
 }
 
 export type RunPlan = {
-  prompt: { source: "inline" | "file" | "resume"; text: string }
+  prompt: { source: "inline" | "file" | "resume" | "retry"; text: string }
   target: {
     directory: string
     baseRef: string

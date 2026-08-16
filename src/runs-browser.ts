@@ -49,6 +49,10 @@ export class RunsBrowser {
   private scroll = 0
   private summary?: { runID: string; lines: string[]; scroll: number }
   private summaryLines?: { source: string[]; doc: MarkdownDoc; width: number; value: StyledText[] }
+  // A pending retry confirmation: keeps the selected run's id/target until the
+  // user answers y/n. Lives in the same modal as the summary (only one modal at
+  // a time), so it's set/cleared together with the overlay visibility.
+  private confirm?: { runID: string; targetDir?: string; title: string }
   // A subshell owns the terminal while the renderer is suspended; ignore keys.
   private inSubshell = false
   private readonly ticker: ReturnType<typeof setInterval>
@@ -82,7 +86,8 @@ export class RunsBrowser {
     if (this.inSubshell) return
     key.preventDefault()
     key.stopPropagation()
-    if (this.summary) this.handleSummaryKey(key)
+    if (this.confirm) this.handleConfirmKey(key)
+    else if (this.summary) this.handleSummaryKey(key)
     else this.handleListKey(key)
   }
 
@@ -281,8 +286,16 @@ export class RunsBrowser {
         break
       }
       case "r": {
+        // `r` retries: a brand-new run from step 0 with the original config,
+        // gated by a confirmation modal. `R` (shift+r) keeps the old resume
+        // behavior, which continues the run from where it stopped.
         const run = this.selectedRun()
-        this.finish({ type: "resume", runID: run.runID, targetDir: run.targetDir })
+        if (key.shift) {
+          this.finish({ type: "resume", runID: run.runID, targetDir: run.targetDir })
+        } else {
+          this.confirm = { runID: run.runID, targetDir: run.targetDir, title: run.title }
+          this.render()
+        }
         break
       }
       case "s":
@@ -335,6 +348,24 @@ export class RunsBrowser {
         break
     }
     this.render()
+  }
+
+  private handleConfirmKey(key: KeyEvent) {
+    const confirm = this.confirm
+    if (!confirm) return
+    switch (key.name) {
+      case "y":
+      case "return":
+      case "linefeed":
+        this.finish({ type: "retry", runID: confirm.runID, targetDir: confirm.targetDir })
+        break
+      case "n":
+      case "escape":
+      case "q":
+        this.confirm = undefined
+        this.render()
+        break
+    }
   }
 
   private moveSelection(delta: number) {
@@ -569,6 +600,13 @@ export class RunsBrowser {
   }
 
   private footerContent(width: number) {
+    if (this.confirm) {
+      const hints: Hint[] = [
+        { keys: "y", label: "retry", priority: 2 },
+        { keys: "n/esc", label: "cancel", priority: 1 },
+      ]
+      return hintsRow(hints, [], width, { style: "spaced", overflow: moreHintsMarker })
+    }
     if (this.summary) {
       const summary = this.summary
       const rendered = this.summaryRows(summary.lines, this.summaryWidth())
@@ -585,9 +623,10 @@ export class RunsBrowser {
     const hints: Hint[] = [
       { keys: "↑/↓", label: "select", priority: 3, tone: "dim" },
       { keys: "enter", label: "open", priority: 2 },
-      { keys: "r", label: "esume", priority: 4, style: "glued" },
-      { keys: "s", label: "ummary", priority: 5, style: "glued" },
-      { keys: "d", label: "ir", priority: 6, style: "glued" },
+      { keys: "r", label: "etry", priority: 4, style: "glued" },
+      { keys: "R", label: "resume", priority: 5 },
+      { keys: "s", label: "ummary", priority: 6, style: "glued" },
+      { keys: "d", label: "ir", priority: 7, style: "glued" },
       { keys: "q", label: "uit", priority: 1, style: "glued" },
     ]
     const right: TextChunk[] = [fg(theme.faint)(`${this.selected + 1}/${this.runs.length}`)]
@@ -600,20 +639,49 @@ export class RunsBrowser {
 
   private renderSummaryModal() {
     const summary = this.summary
-    this.overlay.visible = Boolean(summary)
-    if (!summary) return
+    const confirm = this.confirm
+    this.overlay.visible = Boolean(summary || confirm)
+    if (!summary && !confirm) return
 
     const boxWidth = this.modalWidth()
-    const visible = this.summaryHeight()
-    const rendered = this.summaryRows(summary.lines, this.summaryWidth())
-    summary.scroll = Math.max(0, Math.min(summary.scroll, rendered.length - visible))
+    if (confirm) {
+      this.renderConfirmModal(boxWidth)
+      return
+    }
 
-    const lines = rendered.slice(summary.scroll, summary.scroll + visible)
+    const visible = this.summaryHeight()
+    const rendered = this.summaryRows(summary!.lines, this.summaryWidth())
+    summary!.scroll = Math.max(0, Math.min(summary!.scroll, rendered.length - visible))
+
+    const lines = rendered.slice(summary!.scroll, summary!.scroll + visible)
     while (lines.length < visible) lines.push(plain(""))
 
-    this.modal.title = ` summary · ${summary.runID} `
+    this.modal.title = ` summary · ${summary!.runID} `
     this.modal.width = boxWidth
     this.modal.height = visible + 4
+    this.modalText.content = joinLines(lines)
+  }
+
+  // The retry confirmation reuses the summary modal: it's a small, focused
+  // prompt that spells out what "retry" does (a fresh run from step 0) so the
+  // user doesn't confuse it with resume, which continues the old run.
+  private renderConfirmModal(boxWidth: number) {
+    const confirm = this.confirm!
+    const innerWidth = Math.max(36, boxWidth - 6)
+    const lines: StyledText[] = [
+      t`${bold(fg(theme.text)("Retry this run from the start?"))}`,
+      plain(""),
+      t`${fg(theme.faint)("A new run starts at step 0 using the original")}`,
+      t`${fg(theme.faint)("prompt and pipeline config — a fresh copy, not a resume.")}`,
+      plain(""),
+      new StyledText([fg(theme.faint)("run     "), fg(theme.dim)(confirm.runID)]),
+      new StyledText([fg(theme.faint)("prompt  "), fg(theme.text)(truncate(confirm.title, innerWidth - 9))]),
+      plain(""),
+      t`${fg(theme.accent)("y")} ${fg(theme.text)("retry")}   ${fg(theme.faint)("n / esc")} ${fg(theme.dim)("cancel")}`,
+    ]
+    this.modal.title = " retry "
+    this.modal.width = boxWidth
+    this.modal.height = lines.length + 4
     this.modalText.content = joinLines(lines)
   }
 }

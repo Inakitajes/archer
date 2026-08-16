@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises"
+import { readFile, stat } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 
 import { buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, globalConfigPath, loadMergedConvoyConfig, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ConvoyDefaults } from "./config"
@@ -396,6 +396,14 @@ async function openRunsBrowser(initialRunID?: string) {
   let currentRunID = initialRunID
   for (;;) {
     const resolution = await browseRuns(currentRunID)
+    if (resolution.type === "retry") {
+      const options = await retryOptions(resolution.runID, resolution.targetDir)
+      const plan = options.plan ?? buildRunPlan({ ...options, promptSource: "retry" })
+      if (!(await confirmRunPlan(plan))) return
+      await preflightRunPlan(plan)
+      await run({ ...options, plan })
+      return
+    }
     if (resolution.type === "resume") {
       const options = await resumeOptions(resolution.runID, resolution.targetDir)
       const plan = options.plan ?? buildRunPlan({ ...options, promptSource: "resume" })
@@ -439,6 +447,40 @@ async function resumeOptions(runID: string, targetDir?: string): Promise<RunOpti
   }
   options.plan = buildRunPlan({ ...options, promptSource: "resume" })
   return options
+}
+
+// Retry is a fresh run that reuses the selected run's original prompt and
+// pipeline config: a new run dir from step 0, not a resume of the old one.
+// Like resume, the prompt and pipeline come back from the run's metadata so the
+// user doesn't have to retype or reconfigure anything.
+async function retryOptions(runID: string, targetDir?: string): Promise<RunOptions> {
+  // The recorded target may have been a worktree that's since been removed; a
+  // retry starts a fresh run, so falling back to the current directory keeps it
+  // runnable instead of failing on a missing path.
+  const resolvedTarget = (targetDir && (await dirExists(targetDir))) ? targetDir : process.cwd()
+  const parsed = parseArgs([])
+  parsed.targetDir = resolvedTarget
+  const options: RunOptions = { ...(await resolveRunOptions(parsed)), prompt: "" }
+  const workspace = await resumeWorkspace(runID)
+  const metadata = await readRunMetadata(resolve(workspace.dir, "metadata.json"))
+  if (metadata?.pipeline) options.pipeline = metadata.pipeline
+  options.gateway = metadata?.modelRouting?.gateway ?? "configured"
+  try {
+    options.prompt = await readFile(resolve(workspace.dir, "prd.md"), "utf8")
+  } catch {
+    // Legacy/incomplete workspace.
+  }
+  options.plan = buildRunPlan({ ...options, promptSource: "retry" })
+  return options
+}
+
+async function dirExists(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**

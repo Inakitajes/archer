@@ -96,10 +96,58 @@ test("o opens the current run", async () => {
   })
 })
 
-test("r resumes the current run", async () => {
+test("r opens a retry confirmation and y confirms a retry", async () => {
   const { renderer, runs, result } = await browser(2)
 
   renderer.keyInput.emit("keypress", keyEvent("r"))
+  // Arrow keys are ignored while the confirmation modal is up.
+  renderer.keyInput.emit("keypress", keyEvent("j"))
+  renderer.keyInput.emit("keypress", keyEvent("y"))
+
+  await expect(result).resolves.toEqual({
+    type: "retry",
+    runID: runs[2]!.runID,
+    targetDir: runs[2]!.targetDir,
+  })
+})
+
+test("return confirms the retry modal", async () => {
+  const { renderer, runs, result } = await browser(0)
+
+  renderer.keyInput.emit("keypress", keyEvent("r"))
+  renderer.keyInput.emit("keypress", keyEvent("return", { raw: "\r" }))
+
+  await expect(result).resolves.toEqual({
+    type: "retry",
+    runID: runs[0]!.runID,
+    targetDir: runs[0]!.targetDir,
+  })
+})
+
+test("n cancels the retry confirmation and returns to the list", async () => {
+  const { renderer, result } = await browser(1)
+
+  renderer.keyInput.emit("keypress", keyEvent("r"))
+  renderer.keyInput.emit("keypress", keyEvent("n"))
+  renderer.keyInput.emit("keypress", keyEvent("q"))
+
+  await expect(result).resolves.toEqual({ type: "exit" })
+})
+
+test("escape cancels the retry confirmation", async () => {
+  const { renderer, result } = await browser(1)
+
+  renderer.keyInput.emit("keypress", keyEvent("r"))
+  renderer.keyInput.emit("keypress", keyEvent("escape"))
+  renderer.keyInput.emit("keypress", keyEvent("q"))
+
+  await expect(result).resolves.toEqual({ type: "exit" })
+})
+
+test("R (shift+r) resumes the current run", async () => {
+  const { renderer, runs, result } = await browser(2)
+
+  renderer.keyInput.emit("keypress", keyEvent("r", { shift: true }))
 
   await expect(result).resolves.toEqual({
     type: "resume",
