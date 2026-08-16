@@ -159,6 +159,24 @@ describe("opencode config", () => {
     expect(config.agent?.implementer?.tools?.write).toBe(true)
     expect(config.agent?.implementer?.tools?.bash).toBe(true)
   })
+
+  test("denies OpenCode's doom_loop permission and sets a soft step budget", () => {
+    const config = opencodeConfig("/tmp/convoy-run")
+
+    expect(config.permission).toMatchObject({ question: "deny", doom_loop: "deny" })
+    expect(config.agent?.implementer?.permission).toMatchObject({ doom_loop: "deny" })
+    expect(config.agent?.implementer?.steps).toBe(75)
+    expect(config.agent?.["bug-auditor"]?.steps).toBe(75)
+  })
+
+  test("a disabled loop guard leaves agent.steps unset", () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", undefined, undefined, {
+      loopGuard: { enabled: false },
+    })
+
+    expect(config.agent?.implementer?.steps).toBeUndefined()
+    expect(config.permission).toMatchObject({ doom_loop: "deny" })
+  })
 })
 
 describe("advisor wiring in the opencode config", () => {

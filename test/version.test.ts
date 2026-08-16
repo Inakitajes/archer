@@ -21,6 +21,14 @@ describe("version formatting", () => {
     expect(formatVersion(released)).toMatch(/^convoy\s+([^\s(]+)/m)
   })
 
+  // scripts/build.ts injects a `-local` prerelease suffix into local builds, so
+  // `make install` shows the same shape but is never confused with the release.
+  test("a local build reads as its own prerelease, not the release", () => {
+    const local = { ...released, version: "0.1.1-local" }
+    expect(shortVersion(local)).toBe("v0.1.1-local")
+    expect(formatVersion(local)).toBe(`convoy 0.1.1-local (commit ${"a".repeat(40)}, darwin-arm64)`)
+  })
+
   test("a source checkout still reports a usable version triple", () => {
     expect(versionInfo.version.length).toBeGreaterThan(0)
     expect(versionInfo.platform).toContain("-")

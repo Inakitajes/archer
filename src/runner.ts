@@ -20,6 +20,7 @@ import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./ho
 import { getSessionEventHub, payloadProperties } from "./event-hub"
 import { askHumanAction, phaseGatePrompt, runHumanReviewGate } from "./human"
 import { log } from "./log"
+import { LoopGuard, LoopGuardError, observationFromSessionEvent, resolveLoopGuard, type LoopGuardConfig } from "./loop-guard"
 import { openRunMetadata, recordProgress, type RunMetadataStore } from "./metadata"
 import { openOpencodeSessionWindow, startOpencode } from "./opencode"
 import { HerdrReporter } from "./herdr"
@@ -640,6 +641,7 @@ export async function run(options: RunOptions) {
         opencodeConfig(workspace.dir, options.targetDir, agents, options.permissions, {
           advisorAgents: advisorNeeds.agents,
           advisorModels: advisorNeeds.models,
+          loopGuard: options.loopGuard,
         }),
         boot.signal,
       )
@@ -1123,6 +1125,8 @@ type PreparedPhaseRun = {
   attachments: FilePartInput[]
   prompt: string
   model: ModelSelection
+  /** Resolved exactly once, here, and threaded through unchanged: re-resolving would re-arm defaults over `maxPhaseCost: false`. */
+  loopGuard: LoopGuardConfig
 }
 
 async function preparePhaseRun(
@@ -1146,7 +1150,7 @@ async function preparePhaseRun(
   const prompt = buildPhasePrompt(workspace, phase)
   const model = selectedModel(phase, options.modelOverride)
 
-  return { attachments, prompt, model }
+  return { attachments, prompt, model, loopGuard: resolveLoopGuard(options.loopGuard) }
 }
 
 async function projectContextFileParts(paths: string[], targetDir: string) {
@@ -1470,6 +1474,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     shutdown: input.shutdown,
     sessionRef: input.sessionRef,
     attempt: input.attempt,
+    loopGuardConfig: input.prepared.loopGuard,
     ...(input.advisors ? { advisors: input.advisors } : {}),
   })
   const assistantText = extractAssistantText(result.parts)
@@ -1646,7 +1651,7 @@ export async function assertPendingReadOnlyResumeBaselines(metadata: RunMetadata
   }
 }
 
-async function promptPhase(
+export async function promptPhase(
   client: OpencodeClient,
   input: {
     phase: AgentStep
@@ -1660,6 +1665,8 @@ async function promptPhase(
     sessionRef?: SessionRef
     advisors?: AdvisorRuntime
     attempt: number
+    /** The resolved guard configuration; already resolved by preparePhaseRun, never re-resolved here. */
+    loopGuardConfig: LoopGuardConfig
   },
 ): Promise<SessionResult> {
   input.shutdown.throwIfRequested()
@@ -1679,6 +1686,13 @@ async function promptPhase(
   input.shutdown.setActiveSession({ client, sessionID: session.data.id, directory: input.targetDir, phaseName: input.phase.name })
   log.info(`[${input.phase.name}] session: ${session.data.id}`)
 
+  // One guard for the whole attempt, including the advisor's follow-up turn:
+  // that turn is the same session still spending money. The config is already
+  // resolved (preparePhaseRun) — resolving again would re-arm the defaults over
+  // a user's `maxPhaseCost: false`, which is why LoopGuardConfig can't be fed
+  // back into resolveLoopGuard.
+  const loopGuard = new LoopGuard(input.loopGuardConfig)
+
   // The prompt is fired asynchronously and completion is detected through the
   // event stream plus status polling. A single blocking HTTP request can't
   // survive a phase that runs for an hour (Bun kills idle sockets after 5min).
@@ -1688,6 +1702,7 @@ async function promptPhase(
     sessionID: session.data.id,
     progress: input.progress,
     signal: input.shutdown.signal,
+    loopGuard,
   })
 
   try {
@@ -1712,7 +1727,7 @@ async function promptPhase(
     // the repo before going idle — which is what makes this the right place for
     // the "is it actually done?" consultation: a session that dies during the
     // call loses nothing.
-    const reviewed = advisor ? await applyCompletionCheckpoint(client, { ...input, sessionID: session.data.id }, first, advisor) : first
+    const reviewed = advisor ? await applyCompletionCheckpoint(client, { ...input, sessionID: session.data.id, loopGuard }, first, advisor) : first
 
     const usage = combinedAssistantUsage(reviewed.assistantInfos, session.data.id)
     if (usage) {
@@ -1760,7 +1775,7 @@ const noChangesReply = "NO CHANGES"
  * would corrupt it. They are asked to either re-emit the whole report or reply
  * with the sentinel, and the sentinel case keeps the original text.
  */
-async function applyCompletionCheckpoint(
+export async function applyCompletionCheckpoint(
   client: OpencodeClient,
   input: {
     phase: AgentStep
@@ -1769,6 +1784,8 @@ async function applyCompletionCheckpoint(
     progress: ProgressUI
     shutdown: RunShutdown
     sessionID: string
+    /** The live guard from the first turn; the follow-up watcher shares it so cost and repeats accumulate. */
+    loopGuard: LoopGuard
   },
   first: SessionResult,
   advisor: AdvisorPhaseHandle,
@@ -1785,6 +1802,7 @@ async function applyCompletionCheckpoint(
     sessionID: input.sessionID,
     progress: input.progress,
     signal: input.shutdown.signal,
+    loopGuard: input.loopGuard,
     // Second turn of a session that already has one: anchored so the result is
     // this turn alone, which is what the composition below assumes.
     sinceMessageID: first.info.id,
@@ -1819,7 +1837,11 @@ async function applyCompletionCheckpoint(
       assistantInfos: [...first.assistantInfos, ...second.assistantInfos],
     }
   } catch (error) {
-    if (input.shutdown.aborted || isUserAbortError(error)) throw error
+    // A guard trip in the follow-up turn is the same decision a trip in the
+    // first turn makes: the attempt must fail through the normal decision gate.
+    // Only genuine review-turn failures (a dead provider, a wedged session) are
+    // absorbed, because the phase already produced a durable deliverable.
+    if (input.shutdown.aborted || isUserAbortError(error) || error instanceof LoopGuardError) throw error
     return keepCompletedPhase(input.phase.name, first, error instanceof Error ? error.message : String(error))
   } finally {
     await watcher.stop()
@@ -1892,6 +1914,13 @@ export function watchSession(
     progress: ProgressUI
     signal: AbortSignal
     /**
+     * Circuit breaker for this attempt. The live instance is shared across the
+     * first turn and the advisor follow-up; the guard holds the running totals
+     * (repeats, steps, and per-message cost), so a fresh watcher for the
+     * follow-up turn observes its own events but cannot reset the fuse.
+     */
+    loopGuard?: LoopGuard
+    /**
      * Anchor for a watcher that covers a follow-up turn in an already-used
      * session: everything up to and including this assistant message belongs to
      * the previous turn and is excluded from the result. Omitted, the result
@@ -1927,6 +1956,16 @@ export function watchSession(
     controller.abort(new Error("session watcher finished"))
     if (outcome.value) resolveResult(outcome.value)
     else rejectResult(outcome.error)
+  }
+
+  const tripLoopGuard = (observation: Parameters<LoopGuard["observe"]>[0]) => {
+    if (!input.loopGuard || settled) return
+    const trip = input.loopGuard.observe(observation)
+    if (!trip) return
+    input.progress.phaseActivity(input.phaseName, trip.message, "error")
+    log.warn(`[${input.phaseName}] ${trip.message}`)
+    void abortSessionQuietly(client, input.sessionID, input.directory, input.phaseName)
+    finish({ error: new LoopGuardError(trip) })
   }
 
   const onExternalAbort = () => finish({ error: new UserAbortError() })
@@ -1976,6 +2015,9 @@ export function watchSession(
         input.progress.phaseActivity(input.phaseName, signal.message, signal.kind, signal.pulse)
         return
       case "usage":
+        // Display only. The guard's cost fuse is fed per assistant message in
+        // observationFromSessionEvent, not from this summed total, so a shared
+        // guard can accumulate across the advisor's follow-up watcher.
         input.progress.phaseUsageTotal(input.phaseName, signal.usage)
         return
       case "todos":
@@ -2005,6 +2047,12 @@ export function watchSession(
   const unsubscribe = hub.onSession(input.sessionID, (payload) => {
     if (settled || controller.signal.aborted) return
     state.lastServerEvent = Date.now()
+    const properties = payloadProperties(payload)
+    if (properties) {
+      const observation = observationFromSessionEvent(payloadType(payload), properties)
+      if (observation) tripLoopGuard(observation)
+      if (settled) return
+    }
     const signal = describeSessionActivity(payload, state)
     if (signal) {
       if (signal.type !== "idle" && signal.type !== "error") sawWork = true
