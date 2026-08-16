@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
 
 import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
+import { parseConvoyConfig } from "../src/config"
 import { consensusStep } from "../src/quality-score"
 import type { KeyEvent } from "@opentui/core"
 
@@ -308,6 +309,28 @@ describe("launch TUI pipeline choices", () => {
     expect(implement?.defaultPrompt).toBeUndefined()
     expect(implement?.suggestedPrompts).toBeUndefined()
   })
+
+  test("configured pipelines carry their defaultPrompt and suggestedPrompts", () => {
+    const config = parseConvoyConfig(
+      [
+        "pipelines:",
+        "  triage:",
+        "    description: Triage incoming reports",
+        "    defaultPrompt: Triage the incoming reports.",
+        "    suggestedPrompts:",
+        "      - Triage today's reports",
+        "    steps:",
+        "      - implementer",
+      ].join("\n"),
+      ".convoy/config.yaml",
+      "/tmp/non-existent-convoy-target",
+    )
+    const choices = pipelineChoices(config, builtInAgents)
+    const triage = choices.find((choice) => choice.name === "triage")
+    expect(triage?.source).toBe("configured")
+    expect(triage?.defaultPrompt).toBe("Triage the incoming reports.")
+    expect(triage?.suggestedPrompts).toEqual(["Triage today's reports"])
+  })
 })
 
 describe("launch TUI prompt prefill and clean/dirty tracking", () => {
@@ -323,6 +346,11 @@ describe("launch TUI prompt prefill and clean/dirty tracking", () => {
 
   test("openPrompt leaves a clean empty field alone when the pipeline has no default", () => {
     expect(prefillPromptField(emptyPromptField(), undefined)).toEqual(emptyPromptField())
+  })
+
+  test("openPrompt treats a whitespace-only field as empty and prefills it", () => {
+    const blank = { ...emptyPromptField(), prompt: "   " }
+    expect(prefillPromptField(blank, "Review the branch.")).toMatchObject({ prompt: "Review the branch.", fromDefault: true })
   })
 
   test("moveSelection swaps a clean default for the new pipeline's default", () => {
@@ -342,6 +370,14 @@ describe("launch TUI prompt prefill and clean/dirty tracking", () => {
     const swapped = promptAfterPipelineSwitch(dirty, "new default")
     expect(swapped.prompt).toBe("my typed prompt")
     expect(swapped.fromDefault).toBe(false)
+  })
+
+  test("moveSelection treats a default that was edited afterwards as user text", () => {
+    // fromDefault is still true but the text no longer matches the applied
+    // default: the field was edited after prefill, so the text must survive.
+    const edited = { prompt: "default plus my note", fromDefault: true, lastDefault: "default", suggestionIndex: 0, hasCycledSuggestions: false }
+    const swapped = promptAfterPipelineSwitch(edited, "new default")
+    expect(swapped).toMatchObject({ prompt: "default plus my note", fromDefault: false, lastDefault: undefined })
   })
 
   test("typing marks the field dirty so it is no longer swapped or cycleable", () => {
@@ -379,6 +415,13 @@ describe("launch TUI Tab suggestions", () => {
   test("Tab does nothing when the prompt is dirty (user-typed)", () => {
     const dirty = { ...emptyPromptField(), prompt: "typed", fromDefault: false }
     expect(nextPromptSuggestion(dirty, suggestions)).toBeUndefined()
+  })
+
+  test("Tab replaces a held default with the first suggestion", () => {
+    const holdingDefault = { prompt: "the default", fromDefault: true, lastDefault: "the default", suggestionIndex: 0, hasCycledSuggestions: false }
+    const next = nextPromptSuggestion(holdingDefault, suggestions)!
+    expect(next.prompt).toBe("suggestion one")
+    expect(next).toMatchObject({ suggestionIndex: 0, hasCycledSuggestions: true })
   })
 
   test("an inserted suggestion stays swappable on the next pipeline switch", () => {

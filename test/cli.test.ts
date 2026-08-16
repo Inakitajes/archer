@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { afterAll, afterEach, beforeEach } from "bun:test"
 
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -536,6 +536,47 @@ describe("parseCommand default prompt fallback", () => {
       expect(cmd.options.prompt).toBe("from file")
       expect(cmd.options.plan?.prompt.source).toBe("file")
     }
+  })
+
+  async function writeGlobalConfig(body: string): Promise<void> {
+    const home = process.env.CONVOY_HOME
+    if (!home) throw new Error("CONVOY_HOME must be set by beforeEach")
+    await mkdir(join(home, ".convoy"), { recursive: true })
+    await writeFile(join(home, ".convoy", "config.yaml"), body)
+  }
+
+  test("falls back through defaults.pipeline to a configured pipeline's defaultPrompt", async () => {
+    await writeGlobalConfig(
+      [
+        "defaults:",
+        "  pipeline: triage",
+        "pipelines:",
+        "  triage:",
+        "    description: Triage incoming reports",
+        "    defaultPrompt: Triage the incoming reports and summarize.",
+        "    steps:",
+        "      - implementer",
+      ].join("\n"),
+    )
+    const cmd = await parseCommand([])
+    expect(cmd.type).toBe("run")
+    if (cmd.type === "run") {
+      expect(cmd.options.prompt).toBe("Triage the incoming reports and summarize.")
+      expect(cmd.options.plan?.prompt.source).toBe("default")
+    }
+  })
+
+  test("a configured pipeline shadowing a built-in name hides its defaultPrompt", async () => {
+    // The project's review replaces the built-in wholesale, so the built-in's
+    // defaultPrompt must not leak through the fallback.
+    await writeGlobalConfig(
+      ["pipelines:", "  review:", "    description: Project review", "    steps:", "      - patterns"].join("\n"),
+    )
+    await expect(parseCommand(["-p", "review"])).rejects.toThrow("need a prompt")
+  })
+
+  test("an unknown pipeline surfaces its error instead of the prompt error", async () => {
+    await expect(parseCommand(["-p", "nope"])).rejects.toThrow('unknown pipeline "nope"')
   })
 })
 

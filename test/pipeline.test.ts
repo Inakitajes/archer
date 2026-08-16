@@ -582,6 +582,12 @@ describe("built-in default prompts", () => {
       expect(pipeline.suggestedPrompts, `${name} should not have suggestions`).toBeUndefined()
     }
   })
+
+  test("an empty suggestedPrompts list resolves to no suggestions", () => {
+    const pipeline = resolvePipeline({ name: "x", spec: { steps: ["implementer"], suggestedPrompts: [] }, agents: builtInAgents })
+    expect(pipeline.suggestedPrompts).toBeUndefined()
+    expect(pipeline.defaultPrompt).toBeUndefined()
+  })
 })
 
 describe("pipeline resolution", () => {
