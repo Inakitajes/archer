@@ -332,6 +332,7 @@ export class LaunchPicker {
   private promptScroll = 0
   private promptError = ""
   private optionIndex = 0
+  private optionScroll = 0
   private message = ""
   private modal?: Modal
   private prepared?: LaunchReviewedRun
@@ -1330,12 +1331,20 @@ export class LaunchPicker {
     const lines: StyledText[] = []
     lines.push(new StyledText([fg(theme.faint)("pipeline "), bold(fg(theme.text)(choice.name))]))
     lines.push(plain(""))
-    lines.push(t`${fg(theme.dim)("Describe what Convoy should do. Paste freely; Shift+Enter adds a line.")}`)
+    // Wrap the instructions explicitly so the field budget below counts the
+    // rows they actually take once the panel is too narrow for one line.
+    const describeLines = wrapWords("Describe what Convoy should do. Paste freely; Shift+Enter adds a line.", width)
+    for (const line of describeLines) lines.push(t`${fg(theme.dim)(line)}`)
     lines.push(plain(""))
 
     const fieldWidth = Math.max(10, width - 2)
     const contentWidth = Math.max(1, fieldWidth)
-    const inputHeight = Math.max(5, Math.min(20, this.detailContentHeight() - 6))
+    // Rows the panel spends besides the field: the pipeline line, the blanks,
+    // the instructions, and the trailing blank + hint. The field shrinks to
+    // keep its own border inside the panel on short screens; the hint (which
+    // repeats what the footer shows) is the first row the panel clips.
+    const fixedRows = describeLines.length + 5
+    const inputHeight = Math.max(3, Math.min(20, this.detailContentHeight() - fixedRows))
     const visibleRows = Math.max(1, inputHeight - 2)
     const wrapped = wrapPromptLines(this.prompt, contentWidth)
     const { row: cursorRow, col: cursorCol } = cursorPosition(this.prompt, this.cursor, contentWidth)
@@ -1450,14 +1459,39 @@ export class LaunchPicker {
     const flagsText = flags.length ? flags.join(" ") : "no extra flags"
     lines.push(new StyledText([fg(theme.faint)(flagsPrefix), fg(theme.text)(truncate(flagsText, Math.max(1, width - flagsPrefix.length)))]))
     this.optionRows.push(undefined)
-    return joinLines(lines)
+
+    // The toggle list outgrows the panel in compact mode (and on short wide
+    // screens), so window it the way the pipeline list does: the selected
+    // toggle and its description stay in view instead of the selection
+    // walking off the bottom of the panel.
+    const visible = Math.max(1, this.detailContentHeight())
+    const selectedRow = this.optionRows.findIndex((row) => row === this.optionIndex)
+    if (selectedRow >= 0) {
+      // The flags summary belongs to the last toggle: reaching it bottoms the
+      // window out so the summary scrolls into view rather than staying clipped.
+      const selectedEnd = this.optionIndex === this.optionCount() - 1 ? lines.length - 1 : selectedRow + 1
+      if (selectedRow < this.optionScroll) this.optionScroll = selectedRow
+      if (selectedEnd >= this.optionScroll + visible) this.optionScroll = selectedEnd - visible + 1
+    }
+    this.optionScroll = clamp(this.optionScroll, 0, Math.max(0, lines.length - visible))
+    const windowed = lines.slice(this.optionScroll, this.optionScroll + visible)
+    this.optionRows = this.optionRows.slice(this.optionScroll, this.optionScroll + visible)
+    while (windowed.length < visible) {
+      windowed.push(plain(""))
+      this.optionRows.push(undefined)
+    }
+    return joinLines(windowed)
   }
 
   private branchDetail(width: number) {
     const lines: StyledText[] = []
     lines.push(new StyledText([fg(theme.faint)("pipeline "), bold(fg(theme.text)(this.currentChoice().name))]))
     lines.push(plain(""))
-    lines.push(t`${fg(theme.dim)("Name the branch and worktree for this run. Nothing is created until you confirm.")}`)
+    // Wrapped explicitly so the focus-follow window below counts the rows the
+    // introduction actually takes on narrow panels.
+    for (const line of wrapWords("Name the branch and worktree for this run. Nothing is created until you confirm.", width)) {
+      lines.push(t`${fg(theme.dim)(line)}`)
+    }
     lines.push(plain(""))
 
     const fieldWidth = Math.max(10, Math.min(width - 2, 60))
@@ -1475,6 +1509,7 @@ export class LaunchPicker {
     else lines.push(plain(""))
 
     lines.push(plain(""))
+    const guidanceRow = lines.length
     lines.push(new StyledText([fg(theme.faint)("hint "), fg(theme.dim)("optional — say how you want it named, then enter")]))
     lines.push(...textField(this.branchGuidance, this.branchGuidanceCursor, fieldWidth, this.branchField === "guidance", "e.g. name it after the budget limits"))
 
@@ -1482,7 +1517,15 @@ export class LaunchPicker {
       lines.push(plain(""))
       for (const line of wrapWords(this.branchError, width)) lines.push(t`${fg(theme.red)(line)}`)
     }
-    return joinLines(lines)
+
+    // Both fields rarely fit at once in compact mode, so the window follows
+    // the focused field: the name field shows the top of the form, and tabbing
+    // to the guidance hint pulls its label and box into view.
+    const visible = Math.max(1, this.detailContentHeight())
+    if (lines.length <= visible) return joinLines(lines)
+    const scroll =
+      this.branchField === "guidance" ? clamp(guidanceRow + 4 - visible, 0, Math.max(0, lines.length - visible)) : 0
+    return joinLines(lines.slice(scroll, scroll + visible))
   }
 
   private reviewDetail(width: number) {
@@ -1617,7 +1660,10 @@ export class LaunchPicker {
   }
 
   private reviewVisibleRows() {
-    return Math.max(3, this.detailContentHeight())
+    // Review hides the pipeline panel and owns the whole body in both
+    // layouts, so its budget is the full body height — not the detail panel's
+    // compact share, which would leave the review half-empty.
+    return this.usesCompactLayout() ? Math.max(3, this.compactBodyHeight()) : this.listHeight()
   }
 
   private listHeight() {

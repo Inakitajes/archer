@@ -51,6 +51,7 @@ async function closeLauncher(launcher: Awaited<ReturnType<typeof createLauncher>
 type LaunchPickerView = {
   mode: string
   prompt: string
+  optionIndex: number
   modalWidth(): number
   promptDetail(width: number): { chunks: Array<{ text: string }> }
   optionsDetail(width: number): { chunks: Array<{ text: string }> }
@@ -141,8 +142,31 @@ describe("launch TUI compact layout", () => {
       expect(displayWidth(promptHint)).toBeLessThanOrEqual(40)
 
       view.mode = "options"
+      // The toggle list is taller than the compact panel, so the flags
+      // summary only scrolls into view once the selection reaches the end.
+      view.optionIndex = 6
       const flags = view.optionsDetail(40).chunks.map((chunk) => chunk.text).join("").split("\n").find((line) => line.includes("will run with"))!
       expect(displayWidth(flags)).toBeLessThanOrEqual(40)
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("keeps the selected toggle inside the options window when the list overflows", async () => {
+    const launcher = await createLauncher(80, 24)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+
+      view.optionIndex = 0
+      const top = view.optionsDetail(60).chunks.map((chunk) => chunk.text).join("")
+      expect(top).toContain("▸ ━━● on  Smart auto-accept")
+      expect(top).not.toContain("will run with")
+
+      view.optionIndex = 6
+      const bottom = view.optionsDetail(60).chunks.map((chunk) => chunk.text).join("")
+      expect(bottom).toContain("▸ ●━━ off Isolate in a worktree")
+      expect(bottom).toContain("will run with")
     } finally {
       await closeLauncher(launcher)
     }
