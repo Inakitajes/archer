@@ -18,6 +18,9 @@ type PermissionRequest = {
   tool?: { messageID: string; callID: string }
 }
 
+/** Tools that look like a doom loop when paging through a large file. */
+export const doomLoopAllowTools = new Set(["read", "grep", "glob", "list"])
+
 type Reply = PermissionReply
 
 export type PermissionGate = {
@@ -143,6 +146,22 @@ async function handleRequest(
   serverUrl?: string,
 ) {
   const summary = describeRequest(request)
+
+  // OpenCode's schema only accepts ask/allow/deny for doom_loop, not a
+  // per-tool map. Ask, then decide here: sectional reads are not a loop;
+  // a write/bash loop cannot be overridden by --yolo.
+  if (request.permission === "doom_loop") {
+    const tool = pickString(request.metadata, ["tool"]) || request.patterns[0]
+    if (tool && doomLoopAllowTools.has(tool)) {
+      log.info(`[permission] allowed doom_loop on ${tool}: ${summary}`)
+      await reply(client, request.id, directory, "once")
+      return
+    }
+    log.warn(`[permission] denied doom_loop on ${tool ?? "unknown"}: ${summary}`)
+    progress.message(`denied doom loop: ${summary}`)
+    await reply(client, request.id, directory, "reject", "Convoy rejected: doom loop on a mutating tool")
+    return
+  }
 
   // Before every other branch, including --yolo: the checkpoint is structural,
   // not a safety judgement, and skipping it would turn "the first write is

@@ -15,22 +15,12 @@ const advisorTimingPrompt = "advisor-timing"
 
 /**
  * OpenCode asks `doom_loop` when the last 3 calls in one assistant message
- * are the same tool + same args. A deny cannot be overridden by --yolo, which
- * is what we want for bash/edit/write. Reading a large file in sections is
- * the same tool with near-identical args and is not a loop — allow those.
- *
- * `*` first: OpenCode's evaluator takes the last matching rule, so the
- * specific allows must come after the default deny.
- * The SDK types this as a single action; OpenCode matches the tool name
- * against a pattern map at runtime.
+ * are the same tool + same args. Its schema only accepts ask/allow/deny — a
+ * per-tool map is ConfigInvalidError and aborts the session. Ask, then the
+ * permission gate allows read/grep/glob/list (sectional file reads are not a
+ * loop) and rejects write/bash even under --yolo.
  */
-const doomLoopPermission = {
-  "*": "deny",
-  read: "allow",
-  grep: "allow",
-  glob: "allow",
-  list: "allow",
-} as unknown as PermissionActionConfig
+const doomLoopPermission: PermissionActionConfig = "ask"
 
 export type OpencodeConfigOptions = {
   /**

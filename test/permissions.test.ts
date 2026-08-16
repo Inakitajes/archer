@@ -31,12 +31,22 @@ const askedRequest = {
  * Stands up a fake opencode client: one permission.asked event on the stream,
  * a judge whose answer the test fixes, and recorders for permission.reply.
  */
-function harness(opts: { judgeAnswer?: string; askReply?: PermissionReply; permission?: string }): GateHarness {
+function harness(opts: {
+  judgeAnswer?: string
+  askReply?: PermissionReply
+  permission?: string
+  patterns?: string[]
+  metadata?: Record<string, unknown>
+}): GateHarness {
   const replies: ReplyCall[] = []
   const asked: PermissionPromptInfo[] = []
   const prompts: string[] = []
   let delivered = false
-  const request = { ...askedRequest, ...(opts.permission ? { permission: opts.permission, patterns: [opts.permission] } : {}) }
+  const request = {
+    ...askedRequest,
+    ...(opts.permission ? { permission: opts.permission, patterns: opts.patterns ?? [opts.permission] } : {}),
+    ...(opts.metadata ? { metadata: opts.metadata } : {}),
+  }
 
   const client = {
     event: {
@@ -89,9 +99,17 @@ async function drive(opts: {
   judgeAnswer?: string
   askReply?: PermissionReply
   permission?: string
+  patterns?: string[]
+  metadata?: Record<string, unknown>
   advisorCheckpoint?: AdvisorCheckpoint
 }): Promise<{ replies: ReplyCall[]; asked: PermissionPromptInfo[] }> {
-  const h = harness({ judgeAnswer: opts.judgeAnswer, askReply: opts.askReply, permission: opts.permission })
+  const h = harness({
+    judgeAnswer: opts.judgeAnswer,
+    askReply: opts.askReply,
+    permission: opts.permission,
+    patterns: opts.patterns,
+    metadata: opts.metadata,
+  })
   const gate = startPermissionGate({
     client: h.client,
     progress: h.progress,
@@ -269,6 +287,56 @@ describe("permission gate advisor checkpoint", () => {
 
     expect(seen).toHaveLength(0)
     expect(replies).toEqual([{ reply: "once" }])
+  })
+})
+
+describe("permission gate doom_loop", () => {
+  test("allows a sectional read even under --yolo", async () => {
+    const { replies, asked } = await drive({
+      mode: "all",
+      permission: "doom_loop",
+      patterns: ["read"],
+      metadata: { tool: "read" },
+    })
+
+    expect(replies).toEqual([{ reply: "once" }])
+    expect(asked).toHaveLength(0)
+  })
+
+  test("allows grep/glob/list the same way", async () => {
+    for (const tool of ["grep", "glob", "list"]) {
+      const { replies, asked } = await drive({
+        mode: "off",
+        permission: "doom_loop",
+        patterns: [tool],
+        metadata: { tool },
+      })
+      expect(replies).toEqual([{ reply: "once" }])
+      expect(asked).toHaveLength(0)
+    }
+  })
+
+  test("rejects a write/bash loop even under --yolo", async () => {
+    const { replies, asked } = await drive({
+      mode: "all",
+      permission: "doom_loop",
+      patterns: ["bash"],
+      metadata: { tool: "bash" },
+    })
+
+    expect(replies).toEqual([{ reply: "reject", message: "Convoy rejected: doom loop on a mutating tool" }])
+    expect(asked).toHaveLength(0)
+  })
+
+  test("falls back to the pattern when metadata has no tool name", async () => {
+    const { replies } = await drive({
+      mode: "all",
+      permission: "doom_loop",
+      patterns: ["edit"],
+      metadata: {},
+    })
+
+    expect(replies).toEqual([{ reply: "reject", message: "Convoy rejected: doom loop on a mutating tool" }])
   })
 })
 

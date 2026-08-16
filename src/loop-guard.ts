@@ -4,8 +4,9 @@
  * OpenCode's own `permission.doom_loop` only inspects the *current* assistant
  * message, so the loop that actually burns money — one identical tool call per
  * turn, the Kimi/GLM pattern — never trips it. When it does fire, it also
- * false-positives on reading a large file in sections, so Convoy allows that
- * permission for read/grep/glob/list and still denies it for write/bash.
+ * false-positives on reading a large file in sections. OpenCode's schema
+ * only accepts ask/allow/deny for that permission, so Convoy asks and the
+ * permission gate allows read/grep/glob/list and still rejects write/bash.
  * `agent.steps` is a prompt, not a hard stop: tools stay advertised and the
  * model can ignore it forever.
  *

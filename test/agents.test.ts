@@ -194,13 +194,12 @@ describe("opencode config", () => {
     expect(config.agent?.implementer?.tools?.bash).toBe(true)
   })
 
-  test("allows doom_loop on read tools and denies it on everything else", () => {
+  test("asks doom_loop so the permission gate can allow reads and reject writes", () => {
     const config = opencodeConfig("/tmp/convoy-run")
-    const doomLoop = { "*": "deny", read: "allow", grep: "allow", glob: "allow", list: "allow" }
 
-    expect(config.permission).toMatchObject({ question: "deny", doom_loop: doomLoop })
-    expect(config.agent?.implementer?.permission).toMatchObject({ doom_loop: doomLoop })
-    expect(config.agent?.["pattern-auditor"]?.permission).toMatchObject({ doom_loop: doomLoop })
+    expect(config.permission).toMatchObject({ question: "deny", doom_loop: "ask" })
+    expect(config.agent?.implementer?.permission).toMatchObject({ doom_loop: "ask" })
+    expect(config.agent?.["pattern-auditor"]?.permission).toMatchObject({ doom_loop: "ask" })
     expect(config.agent?.implementer?.steps).toBe(75)
     expect(config.agent?.["bug-auditor"]?.steps).toBe(75)
   })
@@ -212,7 +211,7 @@ describe("opencode config", () => {
 
     expect(config.agent?.implementer?.steps).toBeUndefined()
     expect(config.permission).toMatchObject({
-      doom_loop: { "*": "deny", read: "allow", grep: "allow", glob: "allow", list: "allow" },
+      doom_loop: "ask",
     })
   })
 })
