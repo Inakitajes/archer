@@ -300,7 +300,9 @@ describe("HN-003: persistPhaseReport now uses tmp+rename (fix)", () => {
     //   const tmpPath = `${reportAbs}.tmp`
     //   await writeFile(tmpPath, assistantText)
     //   await rename(tmpPath, reportAbs)
-    const persistSection = source.match(/async function persistPhaseReport[\s\S]{1,600}/)
+    // Contract validation and the empty-continue skip sit above the atomic
+    // write, so the window has to cover that preamble plus tmp+rename.
+    const persistSection = source.match(/async function persistPhaseReport[\s\S]{1,1800}/)
     expect(persistSection).not.toBeNull()
     expect(persistSection![0]).toContain(".tmp")
     expect(persistSection![0]).toContain("rename(tmpPath, reportAbs)")

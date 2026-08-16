@@ -91,7 +91,9 @@ export async function loadRunSummary(run: RunEntry): Promise<string> {
 
   let reports: string[] = []
   try {
-    reports = (await readdir(join(run.dir, "reports"))).filter((name) => name.endsWith(".md")).sort()
+    // Forensic copies of rejected deliverables (persistInvalidPhaseReport) end
+    // in .raw.md; they must never render as phase reports in the summary.
+    reports = (await readdir(join(run.dir, "reports"))).filter((name) => name.endsWith(".md") && !name.endsWith(".raw.md")).sort()
   } catch {
     // no reports dir
   }

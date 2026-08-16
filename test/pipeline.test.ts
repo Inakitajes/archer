@@ -9,6 +9,9 @@ import {
   defaultImplementReviewModel,
   defaultOpusModel,
   defaultPipeline,
+  defaultDeliverableContract,
+  deliverableContractForPhase,
+  qualityScoreDeliverableContract,
   resolvePipeline,
   slugifyModel,
   splitModelVariant,
@@ -20,7 +23,7 @@ import {
   verifyAgentSuffix,
   type PipelineSpec,
 } from "../src/pipeline"
-import type { AgentStep } from "../src/types"
+import type { AgentStep, DeliverableContract } from "../src/types"
 
 const resolve = (spec: PipelineSpec, defaultModel?: string) =>
   resolvePipeline({ name: "test", spec, agents: builtInAgents, defaultModel })
@@ -1170,5 +1173,72 @@ describe("advisor resolution", () => {
 
     expect(steps).toHaveLength(2)
     for (const step of steps) expect(step.advisor).toBe("anthropic/claude-opus-5")
+  })
+})
+
+describe("deliverable contracts", () => {
+  test("the quality-score contract is a v1 schema with a single automatic retry", () => {
+    expect(qualityScoreDeliverableContract).toEqual({
+      kind: "quality-score-report",
+      schemaVersion: 1,
+      retryOnMissingOrInvalid: 1,
+    })
+  })
+
+  test("defaultDeliverableContract selects the quality-score contract for the scorer agent", () => {
+    expect(defaultDeliverableContract("quality-score-report", false)).toEqual(qualityScoreDeliverableContract)
+    // read-only status does not change the scorer's contract: it is always a
+    // scored report, never a plain markdown report.
+    expect(defaultDeliverableContract("quality-score-report", true)).toEqual(qualityScoreDeliverableContract)
+  })
+
+  test("defaultDeliverableContract selects markdown-report for read-only phases and none for writable phases", () => {
+    expect(defaultDeliverableContract("review-scope", true)).toEqual({ kind: "markdown-report" })
+    expect(defaultDeliverableContract("implementer", false)).toEqual({ kind: "none" })
+    // a writable agent that happens to be read-only still gets markdown-report
+    expect(defaultDeliverableContract("implementer", true)).toEqual({ kind: "markdown-report" })
+  })
+
+  test("deliverableContractForPhase prefers an explicit contract over the inferred default", () => {
+    const explicit: DeliverableContract = { kind: "none" }
+    const phase = {
+      agentName: "quality-score-report",
+      readOnly: true,
+      deliverableContract: explicit,
+    }
+    expect(deliverableContractForPhase(phase)).toBe(explicit)
+  })
+
+  test("deliverableContractForPhase falls back to the inferred default for legacy metadata without a contract", () => {
+    // Run metadata persisted before contracts existed has no deliverableContract
+    // field; the resolver must still infer the right contract so historical runs
+    // stay readable and executable.
+    expect(deliverableContractForPhase({ agentName: "quality-score-report", readOnly: true })).toEqual(qualityScoreDeliverableContract)
+    expect(deliverableContractForPhase({ agentName: "review-scope", readOnly: true })).toEqual({ kind: "markdown-report" })
+    expect(deliverableContractForPhase({ agentName: "implementer", readOnly: false })).toEqual({ kind: "none" })
+  })
+
+  test("a resolved review pipeline gives the scorer the quality-score contract and read-only audits the markdown-report contract", () => {
+    const steps = agentSteps(builtInPipelines.review!)
+    const byName = Object.fromEntries(steps.map((step) => [step.name, step]))
+
+    // The consensus step is the scored deliverable.
+    expect(byName["score-report"]?.deliverableContract).toEqual(qualityScoreDeliverableContract)
+    expect(byName["score-report"]?.readOnly).toBe(true)
+
+    // Read-only report phases produce a markdown report, not a score.
+    expect(byName["scope"]?.deliverableContract).toEqual({ kind: "markdown-report" })
+    expect(byName["report"]?.deliverableContract).toEqual({ kind: "markdown-report" })
+
+    // A writable phase (none in review, but the default pipeline's implementer
+    // is writable) gets the none contract: Convoy does not gate its deliverable.
+    const defaultSteps = Object.fromEntries(
+      defaultPipeline()
+        .steps.filter((step): step is AgentStep => step.type === "agent")
+        .map((step) => [step.name, step]),
+    )
+    expect(defaultSteps["implementer"]?.deliverableContract).toEqual({ kind: "none" })
+    // readOnly is only set when true; a writable phase leaves it undefined.
+    expect(defaultSteps["implementer"]?.readOnly).toBeFalsy()
   })
 })

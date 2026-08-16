@@ -74,6 +74,22 @@ describe("loadRunSummary", () => {
     expect(await loadRunSummary(entry)).toBe("no summary or reports for this run")
   })
 
+  test("excludes rejected attempt forensics from the fallback report summary", async () => {
+    const dir = join(root, "has-forensics")
+    await mkdir(join(dir, "reports"), { recursive: true })
+    await writeFile(join(dir, "reports", "scope.md"), "## Scope findings")
+    await writeFile(join(dir, "reports", "scope.md.attempt-1.raw.md"), "rejected output must not render")
+
+    const entry = fakeEntry(dir)
+    const result = await loadRunSummary(entry)
+
+    // SC-4: .attempt-*.raw.md forensics are not phase reports and must not
+    // appear in the run summary.
+    expect(result).toContain("## reports/scope.md")
+    expect(result).not.toContain("attempt-1")
+    expect(result).not.toContain("rejected output")
+  })
+
   test("returns reports that exist when SUMMARY.md exists but is only empty", async () => {
     const dir = join(root, "empty-summary")
     await mkdir(join(dir, "reports"), { recursive: true })

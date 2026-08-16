@@ -1,5 +1,5 @@
 import { normalizeStepRunnerModel, stepRunnerFor } from "./step-runners"
-import type { AgentSpec, AgentStep, HumanStep, Pipeline, Step, StepRunner } from "./types"
+import type { AgentSpec, AgentStep, DeliverableContract, HumanStep, Pipeline, Step, StepRunner } from "./types"
 
 export const defaultGptModel = "openai/gpt-5.6-terra"
 export const defaultGptVariant = "xhigh"
@@ -936,11 +936,33 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
       inputFiles: ["prd.md", ...reportInputs(ctx.input.name, name, spec.reports ?? "previous", ctx.priorSteps)],
       inputDiff: spec.diff ?? ctx.priorSteps.length > 0,
       reportPath: `reports/${name}.md`,
+      deliverableContract: defaultDeliverableContract(agent.name, Boolean(forced || agent.readOnly)),
       ...(forced || agent.readOnly ? { readOnly: true } : {}),
       ...(verify ? { verify: true } : {}),
     }
     return step
   })
+}
+
+/** The contract a newly resolved quality-score-report step must satisfy. */
+export const qualityScoreDeliverableContract: DeliverableContract = {
+  kind: "quality-score-report",
+  schemaVersion: 1,
+  retryOnMissingOrInvalid: 1,
+}
+
+/** Infers the report contract from agent identity and read-only status. */
+export function defaultDeliverableContract(agentName: string, readOnly: boolean): DeliverableContract {
+  if (agentName === "quality-score-report") return qualityScoreDeliverableContract
+  return readOnly ? { kind: "markdown-report" } : { kind: "none" }
+}
+
+/**
+ * Resolves a phase's report contract, including metadata created before
+ * deliverable contracts were persisted in resolved pipelines.
+ */
+export function deliverableContractForPhase(phase: Pick<AgentStep, "agentName" | "readOnly" | "deliverableContract">): DeliverableContract {
+  return phase.deliverableContract ?? defaultDeliverableContract(phase.agentName, Boolean(phase.readOnly))
 }
 
 function findAgent(ref: string, agents: readonly AgentSpec[]): AgentSpec | undefined {

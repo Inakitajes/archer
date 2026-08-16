@@ -190,6 +190,17 @@ export type AgentSpec = {
  */
 export type StepRunner = Exclude<StepRunnerId, "opencode">
 
+/** The report shape a phase must produce before Convoy accepts it as complete. */
+export type DeliverableContract =
+  | { kind: "none" }
+  | { kind: "markdown-report" }
+  | {
+      kind: "quality-score-report"
+      schemaVersion: 1
+      /** Automatic retries after a missing or malformed machine-readable score. */
+      retryOnMissingOrInvalid: 1
+    }
+
 export type AgentStep = {
   type: "agent"
   name: string
@@ -216,6 +227,11 @@ export type AgentStep = {
   inputFiles: readonly string[]
   inputDiff: boolean
   reportPath: string
+  /**
+   * The report contract resolved for this phase. Optional so run metadata from
+   * before contracts were introduced remains readable and executable.
+   */
+  deliverableContract?: DeliverableContract
   /** True when the underlying agent is configured as read-only, or forced read-only for parallel/multi-model execution. */
   readOnly?: boolean
   /**

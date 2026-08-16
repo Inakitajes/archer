@@ -21,6 +21,7 @@ import {
   defaultMaxConcurrentAgents,
   describeMessageChunk,
   describeSessionActivity,
+  extractAssistantText,
   finalizePhaseRepository,
   isIgnorableRejection,
   isMessageAbortedError,
@@ -36,11 +37,12 @@ import {
   restorePhaseFromPreviousRun,
   selectInterruptedPhase,
   shouldSkip,
+  validateDeliverable,
   watchSession,
   withReadOnlyRepositoryBoundary,
   type ActiveSession,
 } from "../src/runner"
-import type { AgentStep, HumanStep, Pipeline, Step } from "../src/types"
+import type { AgentStep, DeliverableContract, HumanStep, Pipeline, Step } from "../src/types"
 import type { Workspace } from "../src/workspace"
 import { LoopGuard, LoopGuardError, resolveLoopGuard } from "../src/loop-guard"
 
@@ -124,6 +126,62 @@ function assistantInfo(id: string, cost: number, input: number, output: number) 
 }
 
 describe("runner helpers", () => {
+  test("extracts a report only from the last assistant message", () => {
+    const lastAssistantParts = [
+      { type: "text", text: "# Final report" },
+      { type: "text", text: "internal synthetic text", synthetic: true },
+      { type: "text", text: "ignored text", ignored: true },
+    ] as never[]
+
+    expect(extractAssistantText(lastAssistantParts)).toBe("# Final report")
+  })
+
+  test("returns an empty report when the last assistant message has no usable text", () => {
+    const lastAssistantParts = [
+      { type: "text", text: "synthetic", synthetic: true },
+      { type: "text", text: "ignored", ignored: true },
+    ] as never[]
+
+    expect(extractAssistantText(lastAssistantParts)).toBe("")
+  })
+
+  test("validateDeliverable: the none contract accepts any text, including empty", () => {
+    // A writable phase (implementer) is not gated on its report shape, so an
+    // empty continue or any text is valid.
+    const none: DeliverableContract = { kind: "none" }
+    expect(validateDeliverable(none, "")).toEqual({ valid: true })
+    expect(validateDeliverable(none, "# anything")).toEqual({ valid: true })
+  })
+
+  test("validateDeliverable: the markdown-report contract accepts non-empty text and rejects empty text", () => {
+    const markdown: DeliverableContract = { kind: "markdown-report" }
+    expect(validateDeliverable(markdown, "# report")).toEqual({ valid: true })
+    // whitespace-only is also empty: a blank report would let a read-only phase
+    // pass as if it had produced findings.
+    expect(validateDeliverable(markdown, "   \n\t ")).toEqual({ valid: false, error: "phase produced an empty report" })
+    expect(validateDeliverable(markdown, "")).toEqual({ valid: false, error: "phase produced an empty report" })
+  })
+
+  test("validateDeliverable: the quality-score-report contract accepts a valid score block", () => {
+    const score: DeliverableContract = { kind: "quality-score-report", schemaVersion: 1, retryOnMissingOrInvalid: 1 }
+    const valid = `\`\`\`quality-score\n${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainability: 90, operational: 90, scope: 90 }, mustFix: [] })}\n\`\`\``
+    expect(validateDeliverable(score, valid)).toEqual({ valid: true })
+  })
+
+  test("validateDeliverable: the quality-score-report contract rejects a missing score block", () => {
+    const score: DeliverableContract = { kind: "quality-score-report", schemaVersion: 1, retryOnMissingOrInvalid: 1 }
+    const result = validateDeliverable(score, "# no score block here")
+    expect(result.valid).toBe(false)
+    expect(result.valid === false && result.error).toBe("phase produced an invalid quality-score report")
+  })
+
+  test("validateDeliverable: the quality-score-report contract rejects malformed score JSON", () => {
+    const score: DeliverableContract = { kind: "quality-score-report", schemaVersion: 1, retryOnMissingOrInvalid: 1 }
+    const result = validateDeliverable(score, "```quality-score\nnot json\n```")
+    expect(result.valid).toBe(false)
+    expect(result.valid === false && result.error).toBe("phase produced an invalid quality-score report")
+  })
+
   test("preserves OpenCode message aborts as typed session cancellations", () => {
     const error = { name: "MessageAbortedError" as const, data: { message: "stopped" } }
     expect(isMessageAbortedError(error)).toBeTrue()
@@ -671,6 +729,212 @@ describe("run phase gate", () => {
     expect(restores).toBe(2)
     expect(prompts).toHaveLength(2)
     expect(prompts.every((p) => p.kind === "failure" && p.canRetry === true)).toBe(true)
+  })
+
+  const validQualityScoreReport = `\`\`\`quality-score
+${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainability: 90, operational: 90, scope: 90 }, mustFix: [] })}
+\`\`\``
+
+  function qualityScorePhase() {
+    return {
+      ...agentStep("score-report"),
+      agentName: "quality-score-report",
+      readOnly: true,
+      deliverableContract: { kind: "quality-score-report" as const, schemaVersion: 1 as const, retryOnMissingOrInvalid: 1 as const },
+    }
+  }
+
+  test("a missing quality score retries once without opening the human failure gate", async () => {
+    const attempts: number[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: () => {
+        throw new Error("quality-score validation must retry automatically")
+      },
+    }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      qualityScorePhase(),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          return attempt === 1 ? "# no score block" : validQualityScoreReport
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    expect(result).toBe(validQualityScoreReport)
+    expect(attempts).toEqual([1, 2])
+    expect(restores).toBe(1)
+  })
+
+  test("an invalid quality score retries once and then fails explicitly", async () => {
+    const attempts: number[] = []
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: () => {
+        throw new Error("quality-score validation must not wait for a human gate")
+      },
+    }
+
+    await expect(
+      runPhaseUntilResolved(
+        {} as never,
+        workspace,
+        qualityScorePhase(),
+        "/repo",
+        prepared,
+        { head: "baseline" },
+        progress,
+        new RunShutdown(),
+        createGitLock(),
+        { serverUrl: "http://127.0.0.1:1" },
+        {
+          runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+            attempts.push(attempt)
+            return "```quality-score\nnot json\n```"
+          },
+          restorePhaseBaseline: async () => {},
+        },
+      ),
+    ).rejects.toThrow("invalid quality-score report")
+
+    expect(attempts).toEqual([1, 2])
+  })
+
+  test("a valid quality score completes without a retry", async () => {
+    const attempts: number[] = []
+    const workspace = await retryWorkspace()
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      qualityScorePhase(),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      noopProgress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          return validQualityScoreReport
+        },
+        restorePhaseBaseline: async () => {},
+      },
+    )
+
+    expect(result).toBe(validQualityScoreReport)
+    expect(attempts).toEqual([1])
+  })
+
+  test("an empty markdown report reaches the human failure gate instead of failing terminally", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("continue")
+      },
+    }
+    const phase = { ...agentStep("scope"), readOnly: true, deliverableContract: { kind: "markdown-report" } as const }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          return ""
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    // SC-1: an empty read-only report is an ordinary attempt failure — the human
+    // gate decides ([r]/[o]/[a]) instead of a terminal throw with no recourse.
+    expect(result).toBe("")
+    expect(attempts).toEqual([1])
+    expect(restores).toBe(0)
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("failure")
+    expect(prompts[0]?.canRetry).toBe(true)
+  })
+
+  test("an armed takeover owns an invalid deliverable and presents it interactively", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      isInteractiveTakeover: () => true,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("continue")
+      },
+    }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      qualityScorePhase(),
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+          attempts.push(attempt)
+          return "# no score block"
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+    )
+
+    // SC-2: armed means the step is the user's — an invalid deliverable is shown
+    // to them interactively, not auto-retried or terminally thrown behind their back.
+    expect(result).toBe("")
+    expect(attempts).toEqual([1])
+    expect(restores).toBe(0)
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("interactive")
+    expect(prompts[0]?.canRetry).toBe(false)
   })
 
   test("abort throws UserAbortError and requests a run-wide shutdown", async () => {
@@ -1608,6 +1872,7 @@ describe("watchSession turn scoping", () => {
 
     expect(result.assistantInfos.map((info) => info.id)).toEqual(["msg_2"])
     expect(result.parts).toHaveLength(1)
+    expect(result.lastAssistantParts).toHaveLength(1)
     // The sentinel is unreachable if the first turn's report is still in front of it.
     expect((result.parts[0] as { text: string }).text).toBe("NO CHANGES")
     expect(result.info.id).toBe("msg_2")
@@ -1618,6 +1883,7 @@ describe("watchSession turn scoping", () => {
 
     expect(result.assistantInfos.map((info) => info.id)).toEqual(["msg_1", "msg_2"])
     expect(result.parts).toHaveLength(2)
+    expect(result.lastAssistantParts).toHaveLength(1)
   })
 
   test("aborts the session when the loop guard sees the same tool call over and over", async () => {
@@ -1832,6 +2098,129 @@ describe("loopGuard seam regressions", () => {
         advisor as never,
       ),
     ).rejects.toBeInstanceOf(LoopGuardError)
+  })
+})
+
+/**
+ * The completion checkpoint's second turn decides whether the report comes
+ * from the first or the second turn. lastAssistantParts must follow that
+ * decision so extractAssistantText never concatenates the first turn's report
+ * onto the second's (the narrative-contamination bug this phase fixes).
+ */
+describe("applyCompletionCheckpoint lastAssistantParts", () => {
+  const completedMessage = (id: string, text: string) => ({
+    info: {
+      id,
+      sessionID: "ses_1",
+      role: "assistant" as const,
+      time: { created: 1, completed: 2 },
+      parentID: "p",
+      modelID: "gpt-5.5",
+      providerID: "openai",
+      mode: "primary",
+      agent: "implementer",
+      path: { cwd: "/repo", root: "/repo" },
+      cost: 1,
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+    parts: [{ id: `${id}_p`, sessionID: "ses_1", messageID: id, type: "text" as const, text }],
+  })
+
+  function firstResult(text: string) {
+    const info = {
+      id: "msg_1",
+      sessionID: "ses_1",
+      role: "assistant" as const,
+      time: { created: 1, completed: 2 },
+      parentID: "p",
+      modelID: "gpt-5.5",
+      providerID: "openai",
+      mode: "primary",
+      agent: "implementer",
+      path: { cwd: "/repo", root: "/repo" },
+      cost: 1,
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    }
+    const parts = [{ id: "msg_1_p", sessionID: "ses_1", messageID: "msg_1", type: "text" as const, text }]
+    return { info, parts, assistantInfos: [info], lastAssistantParts: parts } as never
+  }
+
+  function checkpointClient(secondMessage: { info: Record<string, unknown> }) {
+    async function* stream() {
+      yield messageUpdated(secondMessage.info)
+      yield { type: "session.idle", properties: { sessionID: "ses_1" } }
+      await new Promise<void>(() => {})
+    }
+    return {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        messages: async () => ({ data: [secondMessage] }),
+        status: async () => ({ data: {} }),
+        promptAsync: async () => ({}),
+        abort: async () => ({}),
+      },
+    } as never
+  }
+
+  const advisor = {
+    consult: async () => ({ text: "review it", ok: true as const, callId: "call_1" }),
+    delivered: async () => {},
+  } as never
+
+  const baseInput = (phase: AgentStep) => ({
+    phase,
+    targetDir: "/repo",
+    model: { providerID: "openai", modelID: "gpt-5.5" },
+    progress: noopProgress,
+    shutdown: new RunShutdown(),
+    sessionID: "ses_1",
+    loopGuard: new LoopGuard(resolveLoopGuard()),
+  })
+
+  test("a read-only phase with an unchanged follow-up keeps the first turn's last parts", async () => {
+    const second = completedMessage("msg_2", "NO CHANGES")
+    const result = await applyCompletionCheckpoint(
+      checkpointClient(second),
+      baseInput({ ...agentStep("scope"), readOnly: true }),
+      firstResult("first report"),
+      advisor,
+    )
+
+    // unchanged → the read-only report stays the first turn's findings; the
+    // sentinel must not become the report.
+    expect(result.lastAssistantParts).toHaveLength(1)
+    expect((result.lastAssistantParts[0] as { text: string }).text).toBe("first report")
+  })
+
+  test("a read-only phase with a corrected report uses the second turn's last parts", async () => {
+    const second = completedMessage("msg_2", "# corrected report")
+    const result = await applyCompletionCheckpoint(
+      checkpointClient(second),
+      baseInput({ ...agentStep("scope"), readOnly: true }),
+      firstResult("first report"),
+      advisor,
+    )
+
+    // a new report replaces the first: read-only uses second.lastAssistantParts.
+    expect(result.lastAssistantParts).toHaveLength(1)
+    expect((result.lastAssistantParts[0] as { text: string }).text).toBe("# corrected report")
+  })
+
+  test("a writable phase with an unchanged follow-up keeps the first turn's last parts", async () => {
+    const second = completedMessage("msg_2", "NO CHANGES")
+    const result = await applyCompletionCheckpoint(
+      checkpointClient(second),
+      baseInput(agentStep("implementer")),
+      firstResult("first report"),
+      advisor,
+    )
+
+    // A writing phase keeps both turns' parts (fallback report), but the report
+    // extract comes from the first turn: the NO CHANGES sentinel must never
+    // become the phase report through the text-fallback channel.
+    expect(result.lastAssistantParts).toHaveLength(1)
+    expect((result.lastAssistantParts[0] as { text: string }).text).toBe("first report")
+    expect(result.parts).toHaveLength(2)
   })
 })
 
