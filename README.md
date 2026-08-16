@@ -357,9 +357,11 @@ convoy --resume 20260519-103045-x7q2
 # with status, date, cost, and prompt) plus a details panel with the per-phase
 # breakdown. A run still executing shows a green ● "running" and can be
 # attached. ↑/↓ select, [enter] re-open its dashboard (attach if it's live,
-# else reconstruct it for inspection), [r]esume (re-runs the failed/unfinished
-# phases), [s]ummary/reports overlay, subshell in the run [d]ir under
-# ~/.convoy/runs (exit to return), [q]uit.
+# else reconstruct it for inspection), [r]etry starts a brand-new run from
+# step 0 using the selected run's original prompt and pipeline config (a
+# confirmation modal asks y/n), [R]esume re-runs only the failed/unfinished
+# phases of the existing run, [s]ummary/reports overlay, subshell in the run
+# [d]ir under ~/.convoy/runs (exit to return), [q]uit.
 # Pass a run ID to open the browser with that run preselected.
 # Without a TTY (pipes/CI) it falls back to a plain listing.
 convoy runs

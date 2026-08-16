@@ -42,6 +42,9 @@ export type RunsResolution =
   // Re-enter a run's dashboard: attach to it live if its server is up, else
   // reconstruct the finish screen from metadata + reports.
   | { type: "open"; runID: string; targetDir?: string }
+  // Retry: start a brand-new run from step 0 using the selected run's original
+  // prompt and pipeline config — a fresh copy, not a resume of the old run.
+  | { type: "retry"; runID: string; targetDir?: string }
 
 export async function listRuns(root = runsRoot()): Promise<RunEntry[]> {
   let names: string[]
