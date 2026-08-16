@@ -1,7 +1,7 @@
 import { readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 
-import type { AgentConfig, Config } from "@opencode-ai/sdk/v2"
+import type { AgentConfig, Config, PermissionActionConfig } from "@opencode-ai/sdk/v2"
 import { advisorFeedbackToolName, advisorProviderOverride, advisorToolName, type ModelSelection } from "./advisor"
 import { bashPolicy, noAdditions } from "./bash-policy"
 import { builtInPrompts } from "./built-in-prompts"
@@ -12,6 +12,25 @@ import { globalAgentsDir } from "./workspace"
 
 const runtimeSafetyPrompt = "runtime-safety"
 const advisorTimingPrompt = "advisor-timing"
+
+/**
+ * OpenCode asks `doom_loop` when the last 3 calls in one assistant message
+ * are the same tool + same args. A deny cannot be overridden by --yolo, which
+ * is what we want for bash/edit/write. Reading a large file in sections is
+ * the same tool with near-identical args and is not a loop — allow those.
+ *
+ * `*` first: OpenCode's evaluator takes the last matching rule, so the
+ * specific allows must come after the default deny.
+ * The SDK types this as a single action; OpenCode matches the tool name
+ * against a pattern map at runtime.
+ */
+const doomLoopPermission = {
+  "*": "deny",
+  read: "allow",
+  grep: "allow",
+  glob: "allow",
+  list: "allow",
+} as unknown as PermissionActionConfig
 
 export type OpencodeConfigOptions = {
   /**
@@ -74,10 +93,7 @@ export function opencodeConfig(
     provider: mergeProviders(providerTimeouts(), advisorProviderOverride(options.advisorModels ?? [], options.advisorMaxTokens)),
     permission: {
       question: "deny",
-      // OpenCode's detector only sees repeats inside one assistant message, so
-      // this almost never fires for the real loop. Deny anyway: if it does
-      // fire, stop. YOLO cannot override a deny.
-      doom_loop: "deny",
+      doom_loop: doomLoopPermission,
     },
   }
 }
@@ -212,7 +228,7 @@ function agentConfig(
         question: "deny",
         webfetch: webfetch ? "allow" : "deny",
         websearch: "deny",
-        doom_loop: "deny",
+        doom_loop: doomLoopPermission,
         external_directory: {
           "*": "deny",
           [join(runDir, "**")]: "allow",
@@ -243,7 +259,7 @@ function agentConfig(
       // immediately, so no new human prompt appears.
       edit: advisor ? "ask" : "allow",
       question: "deny",
-      doom_loop: "deny",
+      doom_loop: doomLoopPermission,
       bash: bashPolicy(targetDir, permissions),
       external_directory: {
         "*": "deny",

@@ -3,8 +3,11 @@
  *
  * OpenCode's own `permission.doom_loop` only inspects the *current* assistant
  * message, so the loop that actually burns money — one identical tool call per
- * turn, the Kimi/GLM pattern — never trips it. `agent.steps` is a prompt, not a
- * hard stop: tools stay advertised and the model can ignore it forever.
+ * turn, the Kimi/GLM pattern — never trips it. When it does fire, it also
+ * false-positives on reading a large file in sections, so Convoy allows that
+ * permission for read/grep/glob/list and still denies it for write/bash.
+ * `agent.steps` is a prompt, not a hard stop: tools stay advertised and the
+ * model can ignore it forever.
  *
  * This guard watches the live event stream across turns and aborts the session
  * when a phase repeats itself, fails the same tool over and over, blows a step
