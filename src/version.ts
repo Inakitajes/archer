@@ -12,8 +12,9 @@ export type VersionInfo = {
 
 // The release build replaces these constants from package.json and Git; a local
 // `make install` build injects the same constants but with a `-local` prerelease
-// suffix on the version (see scripts/build.ts), so a local binary never reads as
-// the release that shares its number. The environment fallbacks keep
+// suffix plus the short commit as build metadata on the version (see
+// scripts/build.ts), e.g. `0.6.0-local+a475995`, so a local binary never reads
+// as the release that shares its number. The environment fallbacks keep
 // `bun run src/main.ts` useful during development.
 const injectedVersion = typeof __CONVOY_VERSION__ === "string" ? __CONVOY_VERSION__ : undefined
 const injectedCommit = typeof __CONVOY_COMMIT__ === "string" ? __CONVOY_COMMIT__ : undefined
