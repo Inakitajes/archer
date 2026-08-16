@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { LaunchPicker, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultGoalTarget, adjustGoalTarget, hookLines, launcherStepModelLabel, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
+import { LaunchPicker, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultGoalTarget, adjustGoalTarget, hookLines, launcherStepModelLabel, pipelineRow, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, typedText, wrapPromptLines } from "../src/launch-tui"
 
 import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
 import { consensusStep } from "../src/quality-score"
@@ -52,7 +52,6 @@ type LaunchPickerView = {
   mode: string
   prompt: string
   modalWidth(): number
-  pipelineRow(choice: never, selected: boolean, width: number): { chunks: Array<{ text: string }> }
   promptDetail(width: number): { chunks: Array<{ text: string }> }
   optionsDetail(width: number): { chunks: Array<{ text: string }> }
 }
@@ -133,8 +132,8 @@ describe("launch TUI compact layout", () => {
       const view = launchView(launcher.picker)
       const choice = launcherChoices()[0]!
 
-      expect(view.pipelineRow(choice as never, true, 32).chunks.map((chunk) => chunk.text).join("")).toContain("default")
-      expect(view.pipelineRow(choice as never, true, 28).chunks.map((chunk) => chunk.text).join("")).not.toContain("default")
+      expect(pipelineRow(choice, true, 32).chunks.map((chunk) => chunk.text).join("")).toContain("default")
+      expect(pipelineRow(choice, true, 28).chunks.map((chunk) => chunk.text).join("")).not.toContain("default")
 
       view.mode = "prompt"
       view.prompt = "first\nsecond"

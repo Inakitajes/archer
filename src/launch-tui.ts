@@ -1273,7 +1273,7 @@ export class LaunchPicker {
     this.pipelineRows = []
     for (let index = this.scroll; index < Math.min(this.choices.length, this.scroll + visible); index++) {
       const selected = index === this.selected
-      rows.push(this.pipelineRow(this.choices[index]!, selected, width))
+      rows.push(pipelineRow(this.choices[index]!, selected, width))
       this.pipelineRows.push(index)
     }
     while (rows.length < visible) {
@@ -1281,21 +1281,6 @@ export class LaunchPicker {
       this.pipelineRows.push(undefined)
     }
     return joinLines(rows)
-  }
-
-  // One row per pipeline: a selection dot, the name, and an optional
-  // right-aligned badge. The dot fills only for the selected row; default/custom
-  // state is carried by the badge so unselected dots stay visually uniform.
-  private pipelineRow(choice: PipelineChoice, selected: boolean, width: number) {
-    const dot = choice.valid ? fg(selected ? theme.accent : theme.dim)(selected ? "●" : "○") : fg(theme.red)("!")
-    const badgeText = width >= 30 && (choice.isDefault ? "default" : choice.source === "configured" ? "custom" : "")
-    const badge: TextChunk[] = badgeText ? [fg(choice.isDefault ? theme.green : theme.teal)(badgeText)] : []
-    // Prefix is dot (1) + space (1); reserve the badge plus a
-    // 1-cell gap so a long name truncates instead of wrapping into the badge.
-    const nameWidth = Math.max(3, width - 2 - (badgeText ? badgeText.length + 1 : 0))
-    const name = truncate(choice.name, nameWidth)
-    const label = selected ? bold(fg(theme.text)(name)) : fg(theme.text)(name)
-    return padBetween([dot, raw(" "), label], badge, width)
   }
 
   private detailContent(width: number) {
@@ -1901,6 +1886,23 @@ function wrapWords(text: string, width: number) {
   }
   if (current) lines.push(current)
   return lines.length ? lines : [""]
+}
+
+// One row per pipeline: a selection dot, the name, and an optional
+// right-aligned badge. The dot fills only for the selected row; default/custom
+// state is carried by the badge so unselected dots stay visually uniform.
+// Exported as a pure helper so the narrow-width badge threshold stays covered
+// by a direct unit test, like stepTree and hookLines beside it.
+export function pipelineRow(choice: PipelineChoice, selected: boolean, width: number): StyledText {
+  const dot = choice.valid ? fg(selected ? theme.accent : theme.dim)(selected ? "●" : "○") : fg(theme.red)("!")
+  const badgeText = width >= 30 && (choice.isDefault ? "default" : choice.source === "configured" ? "custom" : "")
+  const badge: TextChunk[] = badgeText ? [fg(choice.isDefault ? theme.green : theme.teal)(badgeText)] : []
+  // Prefix is dot (1) + space (1); reserve the badge plus a
+  // 1-cell gap so a long name truncates instead of wrapping into the badge.
+  const nameWidth = Math.max(3, width - 2 - (badgeText ? badgeText.length + 1 : 0))
+  const name = truncate(choice.name, nameWidth)
+  const label = selected ? bold(fg(theme.text)(name)) : fg(theme.text)(name)
+  return padBetween([dot, raw(" "), label], badge, width)
 }
 
 // Renders the resolved steps as a tree that shows the run shape the old flat
