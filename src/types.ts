@@ -1,6 +1,7 @@
 import type { AdvisorAuditPolicy } from "./advisor-events"
 import type { LoopGuardSettings } from "./loop-guard"
 import type { NotificationSettings } from "./notifications"
+import type { AutoAccept, ProgressUI } from "./progress"
 import type { StepRunnerId } from "./step-runners"
 import type { ModelGateway, ModelRoutingOverrides, ResolvedModel } from "./model-routing"
 
@@ -85,6 +86,26 @@ export type RunOptions = {
    * and running them ahead of each fix round is harmless.
    */
   deferPostHooks?: boolean
+  /**
+   * A shared progress UI the caller owns (the goal loop's dashboard). When set,
+   * the runner does not create or stop its own UI, does not hold the finish
+   * screen, and hands the server/lease cleanup back via `RunResult.release`
+   * instead of doing it in the finally.
+   */
+  progress?: ProgressUI
+  /**
+   * The shared auto-accept reference to use for the permission gate. When set,
+   * the gate uses exactly this object (so a dashboard shift+tab toggle reaches
+   * it); otherwise it derives one from `yolo`/`smart`.
+   */
+  autoAccept?: AutoAccept
+  /**
+   * Goal loop: the iteration announcement text the loop placed in the feed
+   * before this run started. The runner forwards it to `resetPipeline` as
+   * `retainMessage` so the dashboard preserves exactly that entry rather than
+   * guessing the last feed item is the announcement.
+   */
+  retainFeedMessage?: string
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */
@@ -236,7 +257,7 @@ export type Pipeline = {
 }
 
 export type RunPlan = {
-  prompt: { source: "inline" | "file" | "resume"; text: string }
+  prompt: { source: "inline" | "file" | "resume" | "retry"; text: string }
   target: {
     directory: string
     baseRef: string

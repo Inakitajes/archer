@@ -186,7 +186,7 @@ hooks:
             fi
 ```
 
-In the TUI, the final run's finish screen shows the score it just produced and, from the second iteration on, the trajectory so far (`71 → 84 → 92`); when the loop ends the terminal prints the full trajectory and why it stopped. (When the loop stops early — goal met or plateau before the iteration cap — the finish screen is skipped and the trajectory is logged instead, so the loop stays unattended between iterations.)
+The dashboard is one screen for the whole loop: it never remounts between iterations. The header shows the goal, the current iteration, and the trajectory (`◆ convoy · goal 90 · iter 2/4 · 71 → …`), the feed announces each new iteration (`goal loop: iteration 2/4 · last 71/100`), and the pipeline panel retitles itself to the pipeline actually running (`pipeline · goal-fix`). When the loop ends — goal met, plateau, iteration cap, no score, or a failure — the dashboard holds its finish screen **once**, with the verdict in place of the live goal readout (`✓ goal 92/100`, `plateau 86/100`, `cap 88/100`, `no score`, or `✗ run failed`) and the full trajectory (`71 → 84 → 92`); the terminal prints the trajectory and why it stopped after the dashboard closes.
 
 ## Requirements
 
@@ -357,9 +357,11 @@ convoy --resume 20260519-103045-x7q2
 # with status, date, cost, and prompt) plus a details panel with the per-phase
 # breakdown. A run still executing shows a green ● "running" and can be
 # attached. ↑/↓ select, [enter] re-open its dashboard (attach if it's live,
-# else reconstruct it for inspection), [r]esume (re-runs the failed/unfinished
-# phases), [s]ummary/reports overlay, subshell in the run [d]ir under
-# ~/.convoy/runs (exit to return), [q]uit.
+# else reconstruct it for inspection), [r]etry starts a brand-new run from
+# step 0 using the selected run's original prompt and pipeline config (a
+# confirmation modal asks y/n), [R]esume re-runs only the failed/unfinished
+# phases of the existing run, [s]ummary/reports overlay, subshell in the run
+# [d]ir under ~/.convoy/runs (exit to return), [q]uit.
 # Pass a run ID to open the browser with that run preselected.
 # Without a TTY (pipes/CI) it falls back to a plain listing.
 convoy runs

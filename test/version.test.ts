@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
+import { compareSemVer, parseSemVer } from "../src/update"
 import { formatVersion, shortVersion, versionInfo } from "../src/version"
 
 const released = { version: "0.1.1", commit: "a".repeat(40), platform: "darwin-arm64", release: true }
@@ -27,6 +28,25 @@ describe("version formatting", () => {
     const local = { ...released, version: "0.1.1-local" }
     expect(shortVersion(local)).toBe("v0.1.1-local")
     expect(formatVersion(local)).toBe(`convoy 0.1.1-local (commit ${"a".repeat(40)}, darwin-arm64)`)
+  })
+
+  // scripts/build.ts appends the short commit as SemVer build metadata so a
+  // local build names the commit it was built from: `0.1.1-local+aaaaaaa`. The
+  // build metadata is ignored for precedence, so such a build still sorts below
+  // the matching release and a numeric-only hash with a leading zero (which
+  // would be invalid as a prerelease identifier) stays valid SemVer.
+  test("a local build carries the short commit as build metadata", () => {
+    const local = { ...released, version: "0.1.1-local+aaaaaaa" }
+    expect(parseSemVer(local.version)).toBeDefined()
+    expect(shortVersion(local)).toBe("v0.1.1-local+aaaaaaa")
+    expect(formatVersion(local)).toBe(`convoy 0.1.1-local+aaaaaaa (commit ${"a".repeat(40)}, darwin-arm64)`)
+    // Build metadata is ignored: a `-local+<commit>` build is still the same
+    // prerelease as a `-local` build, and both sort below the stable release.
+    expect(compareSemVer("0.1.1", local.version)).toBeGreaterThan(0)
+    expect(compareSemVer(local.version, "0.1.1-local")).toBe(0)
+    // A numeric-only short hash with a leading zero stays valid as build
+    // metadata (it would be invalid as a prerelease identifier).
+    expect(parseSemVer("0.1.1-local+0123456")).toBeDefined()
   })
 
   test("a source checkout still reports a usable version triple", () => {

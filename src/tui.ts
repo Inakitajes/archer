@@ -32,6 +32,7 @@ import {
   formatMoney,
   formatTime,
   clipChunks,
+  chunksLength,
   displayWidth,
   hintsRow,
   indentStyled,
@@ -67,12 +68,14 @@ import type {
   FinishOutcome,
   FinishProposal,
   FinishSeam,
+  GoalLoopView,
   PermissionPromptInfo,
   PermissionReply,
   ProgressAttempt,
   ProgressDiffSummary,
   HumanReviewAction,
   HumanReviewPromptInfo,
+  ProgressHostControls,
   ProgressMessage,
   ProgressMessageChannel,
   ProgressPhase,
@@ -87,6 +90,7 @@ import type {
   RunOutcome,
   RunStatus,
 } from "./progress"
+import type { Pipeline } from "./types"
 
 const kindStyles: Record<ActivityKind, { icon: string; color: PaletteColor }> = {
   tool: { icon: "⚒", color: "cyan" },
@@ -333,10 +337,7 @@ export async function createTuiProgress(
     offlineSessions?: boolean
     observer?: boolean
     mode?: TuiDashboardMode
-    onPauseToggle?: () => void
-    onKeepAwakeToggle?: () => void
-    finish?: FinishSeam
-  },
+  } & ProgressHostControls,
 ): Promise<ProgressUI> {
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
@@ -391,7 +392,7 @@ export class TuiProgress implements ProgressUI {
   private iterateRequested = false
   private lastActivityAt = Date.now()
   private readonly startedAt = Date.now()
-  private readonly phases: PhaseState[]
+  private phases: PhaseState[]
   private readonly feed: FeedEntry[] = []
   // The live model transcript per phase (the session tab): verbatim reasoning
   // and response text, interleaved with tool/bash action markers. Streamed in
@@ -448,9 +449,29 @@ export class TuiProgress implements ProgressUI {
   // both suspend; only the outermost transition touches the renderer.
   private suspendDepth = 0
   private finished?: FinishState
+  // The goal loop's live view, painted by setGoalLoop and copied into the
+  // finish state so the verdict and trajectory survive the hold.
+  private goalLoop?: GoalLoopView
   // A subshell (lazygit / git log) owns the terminal while the renderer is
   // suspended; every key must reach it untouched.
   private inSubshell = false
+  // The goal loop swaps this per run: each iteration's shutdown while it runs,
+  // the loop's own between runs. Falls back to the constructor handler.
+  private abortHandler?: () => void
+  // Host callbacks (pause, keep-awake, finish seam), refreshed per hosted run.
+  private hostControls: ProgressHostControls = {}
+  // The goal loop's pipeline panel title carries the iteration's pipeline name.
+  private pipelineName = ""
+  // Usage accumulated across goal-loop iterations, so the header's cost/token
+  // totals keep running even though resetPipeline replaces the phases.
+  private priorUsage = {
+    cost: 0,
+    tokens: emptyTokens(),
+    advisorCost: 0,
+    advisorInput: 0,
+    advisorOutput: 0,
+    advisorAttempted: false,
+  }
   // Phase reports read lazily from the run dir; the cache entry is dropped when
   // a phase finishes so a report written mid-run is picked up on the next view.
   private readonly reports = new Map<string, string[] | "loading" | "missing">()
@@ -544,7 +565,7 @@ export class TuiProgress implements ProgressUI {
       }
       this.addEvent("convoy", "system", "ctrl+c received; shutting down")
       this.render()
-      this.onAbort?.()
+      ;(this.abortHandler ?? this.onAbort)?.()
       return
     }
     // Checked before the permission modal so the toggle also resolves an open
@@ -674,7 +695,7 @@ export class TuiProgress implements ProgressUI {
           this.render()
           return
         }
-        if (this.onPauseToggle) this.onPauseToggle()
+        if (this.hostControls.onPauseToggle) this.hostControls.onPauseToggle()
         return
     }
     // Digit keys jump straight to a content tab (1 session · 2 reports · 3 logs · 4 advisor).
@@ -689,7 +710,7 @@ export class TuiProgress implements ProgressUI {
       if (key.name === "g") {
         consume()
         void this.openGitSubshell()
-      } else if (key.name === "f" && this.finishSeam) {
+      } else if (key.name === "f" && this.hostControls.finish) {
         consume()
         void this.openFinishModal()
       } else if (key.name === "q" || key.name === "escape") {
@@ -838,7 +859,10 @@ export class TuiProgress implements ProgressUI {
     private readonly renderer: CliRenderer,
     phases: readonly ProgressPhase[],
     private readonly onAbort?: () => void,
-    private readonly autoAccept?: AutoAccept,
+    // Shared reference: the dashboard cycles `.mode` with shift+tab, and the
+    // hosted runner reads this same object for the permission gate, so one
+    // toggle reaches both surfaces.
+    readonly autoAccept?: AutoAccept,
     // When true (a re-opened finished run), [o] opens the phase's stored
     // session from disk rather than attaching to a (nonexistent) live server.
     private readonly offlineSessions = false,
@@ -847,28 +871,13 @@ export class TuiProgress implements ProgressUI {
     private readonly observer = false,
     initialTab: ContentTab = "session",
     private readonly copyReport = copyReportToClipboard,
-    private readonly onPauseToggle?: () => void,
-    private readonly onKeepAwakeToggle?: () => void,
-    private readonly finishSeam?: FinishSeam,
+    onPauseToggle?: () => void,
+    onKeepAwakeToggle?: () => void,
+    finishSeam?: FinishSeam,
   ) {
     this.contentTab = initialTab
-    this.phases = phases.map((phase) => ({
-      ...phase,
-      status: "pending",
-      sessionID: "",
-      attempt: 0,
-      model: "",
-      cost: 0,
-      tokens: emptyTokens(),
-      stepCount: 0,
-      lastStepModel: "",
-      usageReported: false,
-      usage: new PhaseUsage(),
-      now: { kind: "info", message: "" },
-      todos: [],
-      advisorEvents: [],
-      updatedAt: Date.now(),
-    }))
+    this.hostControls = { onPauseToggle, onKeepAwakeToggle, finish: finishSeam }
+    this.phases = pendingPhases(phases)
 
     const shell = new BoxRenderable(renderer, {
       id: "convoy-shell",
@@ -1447,6 +1456,75 @@ export class TuiProgress implements ProgressUI {
     this.renderer.setTerminalTitle(formatTerminalTitle(status))
   }
 
+  setGoalLoop(view: GoalLoopView): void {
+    this.goalLoop = view
+    this.scheduleRender()
+  }
+
+  setAbortHandler(handler?: () => void): void {
+    this.abortHandler = handler
+  }
+
+  setHostControls(controls: ProgressHostControls): void {
+    this.hostControls = controls
+  }
+
+  /**
+   * One goal-loop iteration is over and the next run is about to start. Folds
+   * the finished iteration's usage into `priorUsage` (so the header's cost and
+   * tokens keep running), swaps in the pending phases and the run ids, and
+   * clears everything that belonged to the previous iteration's run. `startedAt`
+   * and the accumulated totals survive deliberately.
+   */
+  resetPipeline(phases: readonly ProgressPhase[], next: { runID: string; targetDir: string; runDir: string; pipeline: Pipeline; retainMessage?: string }): void {
+    const usage = totalUsage(this.phases)
+    const advisor = aggregateAdvisorEvents(this.phases.flatMap((phase) => phase.advisorEvents))
+    this.priorUsage.cost += usage.cost
+    this.priorUsage.tokens = addTokens(this.priorUsage.tokens, usage.tokens)
+    this.priorUsage.advisorCost += advisor.cost
+    this.priorUsage.advisorInput += advisor.tokens.input + advisor.tokens.cacheRead + advisor.tokens.cacheWrite
+    this.priorUsage.advisorOutput += advisor.tokens.output + advisor.tokens.reasoning
+    this.priorUsage.advisorAttempted = this.priorUsage.advisorAttempted || advisor.attempted > 0
+
+    this.phases = pendingPhases(phases)
+    this.runID = next.runID
+    this.targetDir = next.targetDir
+    this.runDir = next.runDir
+    this.pipelineName = next.pipeline.name
+    this.serverUrl = ""
+    this.transcripts.clear()
+    this.reports.clear()
+    // The feed is emptied except for the loop's iteration announcement. When
+    // the caller passes retainMessage explicitly, the matching entry is kept
+    // rather than guessing that the last feed entry is the announcement — a
+    // guess that breaks if anything appends between the announcement and this
+    // call.
+    const retained = next.retainMessage
+      ? this.feed.find((entry) => entry.message === next.retainMessage)
+      : this.feed[this.feed.length - 1]
+    this.feed.splice(0, this.feed.length)
+    if (retained) this.feed.push(retained)
+    this.feedRevision++
+    for (const pending of this.permissionQueue.splice(0)) {
+      pending.explainAbort?.abort()
+      pending.resolve("reject")
+    }
+    for (const pending of this.humanReviewQueue.splice(0)) pending.resolve("abort")
+    this.interactiveTakeover.clear()
+    // Focus returns to the first pending phase and auto-follow re-arms.
+    this.selected = 0
+    this.selectedGroup = undefined
+    this.manualFocus = false
+    this.pipelineScroll = 0
+    this.fullscreen = undefined
+    this.commandPalette = undefined
+    this.finishModal = undefined
+    this.finished = undefined
+    this.contentFocused = false
+    this.resetContentScroll()
+    this.scheduleRender()
+  }
+
   // The focused phase, clamped to a valid index (the pipeline can be empty
   // only in degenerate cases). Shared by rendering and [o].
   private focusedPhase(): PhaseState | undefined {
@@ -1733,9 +1811,9 @@ export class TuiProgress implements ProgressUI {
       autoAccept: this.autoAccept?.mode,
       keepAwake: this.keepAwake?.status,
       controlState: this.controlState,
-      canPause: this.onPauseToggle !== undefined,
-      canKeepAwake: this.onKeepAwakeToggle !== undefined && this.keepAwake?.status !== "unavailable",
-      finishSeam: this.finishSeam !== undefined,
+      canPause: this.hostControls.onPauseToggle !== undefined,
+      canKeepAwake: this.hostControls.onKeepAwakeToggle !== undefined && this.keepAwake?.status !== "unavailable",
+      finishSeam: this.hostControls.finish !== undefined,
       interactiveArmed: this.interactiveTakeover.has(this.focusedPhase()?.name ?? ""),
       reportCopyable: fullscreen !== undefined && Array.isArray(this.reports.get(fullscreen.phase)),
       autoAcceptChunk: this.autoAccept ? autoAcceptStatusChunk(this.autoAccept.mode) : undefined,
@@ -1839,11 +1917,11 @@ export class TuiProgress implements ProgressUI {
     switch (item.id) {
       case "keep-awake":
         close()
-        this.onKeepAwakeToggle?.()
+        this.hostControls.onKeepAwakeToggle?.()
         break
       case "pause":
         close()
-        this.onPauseToggle?.()
+        this.hostControls.onPauseToggle?.()
         break
       case "permissions":
         // Stays open on purpose: cycling the policy is often done twice.
@@ -1900,7 +1978,7 @@ export class TuiProgress implements ProgressUI {
    * lands signed and attributed instead of as a stack of machine commits.
    */
   private async openFinishModal() {
-    const seam = this.finishSeam
+    const seam = this.hostControls.finish
     if (!seam || this.finishModal) return
     this.finishModal = { kind: "working", message: "reading the branch and writing a commit message…" }
     this.render()
@@ -1936,7 +2014,7 @@ export class TuiProgress implements ProgressUI {
       // The commit is already made; these only offer what comes after it, and
       // anything else closes the modal. Once settled nothing matches, so `r`
       // closes rather than asking gh for a pull request that already exists.
-      const canPr = this.finishSeam?.canOpenPullRequest() ?? false
+      const canPr = this.hostControls.finish?.canOpenPullRequest() ?? false
       if (key.name === "p" && modal.stage === "choose") void this.runFinishFollowUp(modal, "push")
       else if (key.name === "r" && canPr && modal.stage !== "settled") void this.runFinishFollowUp(modal, "pr")
       else this.finishModal = undefined
@@ -2000,7 +2078,7 @@ export class TuiProgress implements ProgressUI {
   }
 
   private async editFinishMessage(modal: Extract<FinishModal, { kind: "edit" }>) {
-    const seam = this.finishSeam
+    const seam = this.hostControls.finish
     if (!seam || this.inSubshell) return
     const current = { subject: modal.subject.trim(), body: modal.proposal.body }
     this.finishModal = { kind: "working", message: "waiting for your editor…" }
@@ -2025,7 +2103,7 @@ export class TuiProgress implements ProgressUI {
   }
 
   private async applyFinish(proposal: FinishProposal, subject: string) {
-    const seam = this.finishSeam
+    const seam = this.hostControls.finish
     if (!seam || this.inSubshell) return
     this.finishModal = { kind: "working", message: "committing — your signing key may prompt…" }
     this.render()
@@ -2057,7 +2135,7 @@ export class TuiProgress implements ProgressUI {
    * pull request — so the two are one decision rather than two prompts.
    */
   private async runFinishFollowUp(modal: Extract<FinishModal, { kind: "done" }>, action: "push" | "pr") {
-    const seam = this.finishSeam
+    const seam = this.hostControls.finish
     if (!seam || this.inSubshell) return
     const needsPush = modal.stage === "choose"
     const working = action === "push" ? `pushing ${modal.outcome.branch}…` : needsPush ? "pushing and opening a pull request…" : "opening a pull request…"
@@ -2624,6 +2702,18 @@ export class TuiProgress implements ProgressUI {
     const advisor = aggregateAdvisorEvents(this.phases.flatMap((phase) => phase.advisorEvents))
     const advisorInput = advisor.tokens.input + advisor.tokens.cacheRead + advisor.tokens.cacheWrite
     const advisorOutput = advisor.tokens.output + advisor.tokens.reasoning
+    // Goal-loop iterations replace the phases each run, so the session totals
+    // merge the accumulated prior usage (summed by resetPipeline) with the
+    // current phases'.
+    const merged = {
+      cost: usage.cost + this.priorUsage.cost,
+      input: usage.tokens.input + this.priorUsage.tokens.input,
+      output: usage.tokens.output + this.priorUsage.tokens.output,
+      advisorCost: advisor.cost + this.priorUsage.advisorCost,
+      advisorInput: advisorInput + this.priorUsage.advisorInput,
+      advisorOutput: advisorOutput + this.priorUsage.advisorOutput,
+      advisorAttempted: advisor.attempted > 0 || this.priorUsage.advisorAttempted,
+    }
     // The clock and elapsed time freeze at the moment the run ended.
     const endAt = this.finished?.at ?? now
     const totals: TextChunk[] = [
@@ -2631,37 +2721,113 @@ export class TuiProgress implements ProgressUI {
       fg(theme.faint)("  ·  "),
       fg(theme.text)(formatElapsed(endAt - this.startedAt)),
       fg(theme.faint)("  ·  "),
-      fg(theme.green)(formatMoney(usage.cost + advisor.cost)),
-      ...(advisor.attempted > 0 ? [fg(theme.faint)(` (${formatMoney(usage.cost)} exec + ${formatMoney(advisor.cost)} adv)`)] : []),
+      fg(theme.green)(formatMoney(merged.cost + merged.advisorCost)),
+      ...(merged.advisorAttempted
+        ? [fg(theme.faint)(` (${formatMoney(merged.cost)} exec + ${formatMoney(merged.advisorCost)} adv)`)]
+        : []),
       fg(theme.faint)("  ·  "),
-      fg(theme.dim)(`↑${formatCount(usage.tokens.input + advisorInput)} ↓${formatCount(usage.tokens.output + advisorOutput)} tokens`),
+      fg(theme.dim)(`↑${formatCount(merged.input + merged.advisorInput)} ↓${formatCount(merged.output + merged.advisorOutput)} tokens`),
     ]
-    const title: TextChunk[] = [bold(fg(theme.accent)("◆ convoy")), fg(theme.faint)(` ${shortVersion()}`)]
-    if (!this.finished && this.controlState !== "running") {
-      title.push(
-        fg(theme.faint)("  ·  "),
-        bold(fg(this.controlState === "paused" ? theme.yellow : theme.cyan)(
-          this.controlState === "paused" ? "paused · p resume" : `pausing · ${this.controlActivePhases} active`,
-        )),
-      )
+    const segments = this.titleSegments()
+    const budget = Math.max(12, width - Math.min(42, chunksLength(totals)) - 1)
+    const title = fitTitleSegments(segments, budget)
+    return joinLines([padBetween(title, totals, width), limitsRow(this.limits, now, width)])
+  }
+
+  /**
+   * The header's title segments, each carrying how eagerly it gives up columns
+   * when the title outgrows the panel. `◆ convoy`, the running version, and a
+   * goal verdict are pinned (Infinity); everything else sacrifices in the PRD's
+   * order — delta first, then the trajectory, then iter — with the goal target
+   * giving way last of all. Higher priority drops first. The version is pinned
+   * because it is identity, not status: the header must keep branding the
+   * binary even when the panel is narrow.
+   */
+  private titleSegments(): { priority: number; chunks: TextChunk[] }[] {
+    const segments: { priority: number; chunks: TextChunk[] }[] = [
+      { priority: Infinity, chunks: [bold(fg(theme.accent)("◆ convoy"))] },
+      { priority: Infinity, chunks: [fg(theme.faint)(" "), fg(theme.faint)(shortVersion())] },
+    ]
+    const view = this.finished?.goalLoop ?? this.goalLoop
+    if (view?.outcome) {
+      const best = view.scores.length > 0 ? Math.max(...view.scores) : undefined
+      const verdictChunks: TextChunk[] = [fg(theme.faint)("  ·  ")]
+      if (view.outcome.reason === "no-score") {
+        verdictChunks.push(bold(fg(theme.red)("no score")))
+      } else {
+        const label = view.outcome.reason === "goal" ? "goal" : view.outcome.reason === "plateau" ? "plateau" : "cap"
+        const chunks = view.outcome.reason === "goal" ? bold(fg(theme.green)(`✓ ${label} ${best ?? "?"}/100`)) : bold(fg(theme.text)(`${label} ${best ?? "?"}/100`))
+        verdictChunks.push(chunks)
+      }
+      if (view.outcome.reason !== "goal" && view.outcome.restored) {
+        verdictChunks.push(fg(theme.faint)("  ·  "), fg(theme.dim)("restored to best"))
+      }
+      segments.push({ priority: Infinity, chunks: verdictChunks })
+      if (view.scores.length > 0) segments.push(trajectorySegment(view.scores))
+      return segments
     }
-    if (!this.finished && this.keepAwake?.status === "on") {
-      title.push(fg(theme.faint)("  ·  "), bold(fg(theme.cyan)("☕ awake")))
+    if (!this.finished && view && !view.outcome) {
+      segments.push({ priority: 2, chunks: [fg(theme.faint)("  ·  "), fg(theme.text)(`goal ${view.target}`)] })
+      segments.push({ priority: 4, chunks: [fg(theme.faint)("  ·  "), fg(theme.dim)(`iter ${view.iteration}/${view.maxRuns}`)] })
+      if (view.scores.length > 0) {
+        const last = view.scores[view.scores.length - 1]!
+        const prev = view.scores[view.scores.length - 2]
+        // The loop's views name the iteration about to run, so the trajectory
+        // trails off (`71 → 84 → …`) until that iteration scores. The delta
+        // reports the last completed pair either way — a pending current
+        // iteration has no score of its own to compare against.
+        segments.push(trajectorySegment(view.scores, view.scores.length < view.iteration))
+        if (prev !== undefined) {
+          const delta = last - prev
+          segments.push({
+            priority: 6,
+            chunks: [fg(theme.faint)("  ·  "), fg(delta >= 0 ? theme.green : theme.red)(`${delta >= 0 ? "+" : ""}${delta}`)],
+          })
+        }
+      }
+    }
+    if (!this.finished) {
+      if (this.controlState !== "running") {
+        segments.push({
+          priority: 6,
+          chunks: [
+            fg(theme.faint)("  ·  "),
+            bold(fg(this.controlState === "paused" ? theme.yellow : theme.cyan)(
+              this.controlState === "paused" ? "paused · p resume" : `pausing · ${this.controlActivePhases} active`,
+            )),
+          ],
+        })
+      }
+      if (this.keepAwake?.status === "on") {
+        segments.push({ priority: 6, chunks: [fg(theme.faint)("  ·  "), bold(fg(theme.cyan)("☕ awake"))] })
+      }
     }
     if (this.finished) {
-      title.push(
-        fg(theme.faint)("  ·  "),
-        this.finished.status === "completed" ? bold(fg(theme.green)("✓ run completed")) : bold(fg(theme.red)("✗ run failed")),
-      )
+      const isGoalLoop = this.finished.goalLoop !== undefined
+      if (!isGoalLoop || this.finished.status === "failed") {
+        segments.push({
+          priority: Infinity,
+          chunks: [
+            fg(theme.faint)("  ·  "),
+            this.finished.status === "completed" ? bold(fg(theme.green)("✓ run completed")) : bold(fg(theme.red)("✗ run failed")),
+          ],
+        })
+      }
+      // A failed goal-loop run keeps the trajectory it accumulated, trailing
+      // the failed verdict the same way the completed verdicts lead theirs.
+      if (this.finished.status === "failed" && view && view.scores.length > 0) {
+        segments.push(trajectorySegment(view.scores))
+      }
     }
-    if (this.finished?.qualityScore !== undefined) {
-      title.push(fg(theme.faint)("  ·  "), bold(fg(theme.accent)(`score ${this.finished.qualityScore}/100`)))
+    if (this.finished?.qualityScore !== undefined && !this.finished.goalLoop) {
+      segments.push({ priority: 5, chunks: [fg(theme.faint)("  ·  "), bold(fg(theme.accent)(`score ${this.finished.qualityScore}/100`))] })
     }
-    const trajectory = this.finished?.goalTrajectory
-    if (trajectory && trajectory.length > 1) {
-      title.push(fg(theme.faint)("  ·  "), fg(theme.dim)(trajectory.join(" → ")))
+    const finished = this.finished
+    const trajectory = finished?.goalTrajectory
+    if (trajectory && trajectory.length > 1 && finished && !finished.goalLoop) {
+      segments.push(trajectorySegment(trajectory))
     }
-    return joinLines([padBetween(title, totals, width), limitsRow(this.limits, now, width)])
+    return segments
   }
 
   // The working directory renders above the header box, outside its border.
@@ -2819,7 +2985,8 @@ export class TuiProgress implements ProgressUI {
     // it on its own row. Repeating it down every row said nothing and starved
     // the step names of columns.
     const allReadOnly = this.phases.length > 0 && this.phases.every((phase) => phase.readOnly)
-    this.pipelineBox.title = allReadOnly ? " pipeline · read-only " : " pipeline "
+    const namePart = this.pipelineName ? ` · ${this.pipelineName}` : ""
+    this.pipelineBox.title = allReadOnly ? ` pipeline${namePart} · read-only ` : ` pipeline${namePart} `
 
     for (const group of groupPhases(this.phases)) {
       if (group.length === 1) {
@@ -3528,7 +3695,7 @@ export class TuiProgress implements ProgressUI {
       lines.push(plain(""))
 
       const actions: TextChunk[] = []
-      const canPr = this.finishSeam?.canOpenPullRequest() ?? false
+      const canPr = this.hostControls.finish?.canOpenPullRequest() ?? false
       if (modal.stage === "choose") {
         actions.push(fg(theme.accent)("p"), fg(theme.dim)(" push"))
         if (canPr) actions.push(fg(theme.dim)(" · "), fg(theme.accent)("r"), fg(theme.dim)(" push and PR"))
@@ -4197,6 +4364,56 @@ function totalUsage(phases: PhaseState[]) {
     (usage, phase) => ({ cost: usage.cost + phase.cost, tokens: addTokens(usage.tokens, phase.tokens) }),
     { cost: 0, tokens: emptyTokens() },
   )
+}
+
+/**
+ * The fresh, nothing-has-happened-yet form of a pipeline's phases: the
+ * constructor builds it for a new dashboard, and `resetPipeline` rebuilds it
+ * for each goal-loop iteration, so the two can never drift apart.
+ */
+function pendingPhases(phases: readonly ProgressPhase[]): PhaseState[] {
+  return phases.map((phase) => ({
+    ...phase,
+    status: "pending",
+    sessionID: "",
+    attempt: 0,
+    model: "",
+    cost: 0,
+    tokens: emptyTokens(),
+    stepCount: 0,
+    lastStepModel: "",
+    usageReported: false,
+    usage: new PhaseUsage(),
+    now: { kind: "info", message: "" },
+    todos: [],
+    advisorEvents: [],
+    updatedAt: Date.now(),
+  }))
+}
+
+/** The score trajectory (`71 → 84`, or `71 → …` while pending), among the first title segments to sacrifice. */
+function trajectorySegment(scores: number[], pending = false): { priority: number; chunks: TextChunk[] } {
+  return { priority: 5, chunks: [fg(theme.faint)("  ·  "), fg(theme.dim)(`${scores.join(" → ")}${pending ? " → …" : ""}`)] }
+}
+
+/**
+ * Drops the title's most droppable segments (highest `priority`) until it fits
+ * the budget. Pinned segments (Infinity) — `◆ convoy`, the verdict — never
+ * leave; everything else yields in priority order.
+ */
+function fitTitleSegments(segments: { priority: number; chunks: TextChunk[] }[], budget: number): TextChunk[] {
+  const remaining = [...segments]
+  while (chunksLength(remaining.flatMap((segment) => segment.chunks)) > budget) {
+    let worstIndex = -1
+    for (let index = 0; index < remaining.length; index++) {
+      const segment = remaining[index]!
+      if (segment.priority === Infinity) continue
+      if (worstIndex === -1 || segment.priority > remaining[worstIndex]!.priority) worstIndex = index
+    }
+    if (worstIndex === -1) break
+    remaining.splice(worstIndex, 1)
+  }
+  return remaining.flatMap((segment) => segment.chunks)
 }
 
 async function fileReadable(path: string) {

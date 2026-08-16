@@ -36,9 +36,16 @@ const commit = await gitCommit()
 if (release) await mkdir("dist", { recursive: true })
 // Local builds must never read as the release that shares their number: the
 // injected version carries a `-local` prerelease suffix so the TUI header and
-// `--version` show e.g. `v0.6.0-local`. It is still valid SemVer, so update
-// checks compare correctly (prerelease < stable).
-const injectedVersion = release ? manifest.version : `${manifest.version}-local`
+// `--version` show e.g. `v0.6.0-local+<short-commit>`. The short commit is
+// appended as SemVer build metadata (`+...`), not as a prerelease identifier:
+// a prerelease identifier that happens to be a purely-numeric hash with a
+// leading zero (e.g. `0123456`) would be invalid SemVer, whereas build metadata
+// has no such restriction and is ignored for precedence — so update checks
+// still compare correctly (prerelease < stable) and the local build is never
+// confused with the release. When Git is unavailable the suffix is dropped.
+const shortCommit = commit !== "unknown" ? commit.slice(0, 7) : undefined
+const localPrerelease = shortCommit ? `${manifest.version}-local+${shortCommit}` : `${manifest.version}-local`
+const injectedVersion = release ? manifest.version : localPrerelease
 for (const target of release ? releaseTargets : [localTarget]) {
   const result = await Bun.build({
     entrypoints: [resolve("src/main.ts")],
