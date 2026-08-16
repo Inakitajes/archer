@@ -19,6 +19,10 @@ Audit maintainability of the scoped change against this repository's actual conv
 3. Look for excessive complexity, duplication, poor naming, misplaced files, leaky abstractions, boundary violations, inconsistent dependency usage, over-engineering, under-tested seams, and avoidable churn.
 4. Prefer findings that a maintainer should ask to change before merging.
 
+## Execution evidence
+
+The scope step already ran the repository's checks once; the real results (command, exit code, output summary) are in `reports/scope.md`'s **Checks** section. Cite that evidence where it matters. Do not attempt to run commands — bash is unavailable in this phase by design, and a check you cannot run is expected, not a gap.
+
 ## Convention alignment
 
 Your first job is consistency with *this* repository, not conformance to general best practice. Judge the change the way a maintainer would: does it look like it was written by someone who already works here?

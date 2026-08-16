@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test"
+import { createTestRenderer } from "@opentui/core/testing"
 
-import { branchActionForKey, branchProposalNote, cursorPosition, defaultGoalTarget, adjustGoalTarget, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, trimPromptField, typedText, wrapPromptLines } from "../src/launch-tui"
+import { LaunchPicker, adjustGoalTarget, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultGoalTarget, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, pipelineRow, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, trimPromptField, typedText, wrapPromptLines } from "../src/launch-tui"
 
 import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
 import { parseConvoyConfig } from "../src/config"
 import { consensusStep } from "../src/quality-score"
+import { displayWidth } from "../src/tui-theme"
 import type { KeyEvent } from "@opentui/core"
 
 function key(partial: Partial<KeyEvent>): KeyEvent {
@@ -14,6 +16,294 @@ function key(partial: Partial<KeyEvent>): KeyEvent {
 function plainLines(lines: ReturnType<typeof stepTree>): string[] {
   return lines.map((line) => line.chunks.map((chunk) => chunk.text).join(""))
 }
+
+function launcherChoices(count = 1) {
+  return Array.from({ length: count }, (_, index) => ({
+    name: `pipeline-${index + 1}`,
+    description: "A test pipeline.",
+    source: "built-in" as const,
+    isDefault: index === 0,
+    steps: [],
+    hooks: [],
+    valid: true,
+    advisedSteps: 0,
+    scored: false,
+  }))
+}
+
+async function createLauncher(width: number, height = 30, choiceCount = 1) {
+  const testRenderer = await createTestRenderer({ width, height })
+  const picker = new LaunchPicker(
+    testRenderer.renderer,
+    process.cwd(),
+    launcherChoices(choiceCount),
+    "configured",
+    { isolate: false, reason: "test" },
+    {} as never,
+  )
+  return { ...testRenderer, picker }
+}
+
+async function closeLauncher(launcher: Awaited<ReturnType<typeof createLauncher>>) {
+  launcher.mockInput.pressKey("c", { ctrl: true })
+  await expect(launcher.picker.result).resolves.toBeUndefined()
+}
+
+type LaunchPickerView = {
+  mode: string
+  prompt: string
+  optionIndex: number
+  modalWidth(): number
+  promptDetail(width: number): { chunks: Array<{ text: string }> }
+  optionsDetail(width: number): { chunks: Array<{ text: string }> }
+}
+
+function launchView(picker: LaunchPicker): LaunchPickerView {
+  return picker as unknown as LaunchPickerView
+}
+
+function panelRow(frame: string, title: string) {
+  const row = frame.split("\n").findIndex((line) => line.includes(title))
+  expect(row, `missing ${title} panel`).toBeGreaterThanOrEqual(0)
+  return row
+}
+
+describe("launch TUI compact layout", () => {
+  test("switches panels at the 84-column breakpoint", async () => {
+    const compact = await createLauncher(compactLaunchMaxWidth)
+    const wide = await createLauncher(compactLaunchMaxWidth + 1)
+    try {
+      await compact.renderOnce()
+      await wide.renderOnce()
+      const compactFrame = compact.captureCharFrame()
+      const wideFrame = wide.captureCharFrame()
+      const compactPipelines = panelRow(compactFrame, "pipelines")
+      const compactDetail = panelRow(compactFrame, "run setup")
+      const widePipelines = panelRow(wideFrame, "pipelines")
+      const wideDetail = panelRow(wideFrame, "run setup")
+
+      expect(compactPipelines).toBeLessThan(compactDetail)
+      expect(compactDetail - compactPipelines - 1).toBeGreaterThanOrEqual(5)
+      expect(compactDetail - compactPipelines - 1).toBeLessThanOrEqual(9)
+      expect(displayWidth(compactFrame.split("\n")[compactPipelines]!)).toBe(compactLaunchMaxWidth)
+      expect(displayWidth(compactFrame.split("\n")[compactDetail]!)).toBe(compactLaunchMaxWidth)
+
+      expect(widePipelines).toBe(wideDetail)
+      expect(wideFrame.split("\n")[wideDetail]!.indexOf("run setup")).toBeGreaterThan(wideFrame.split("\n")[widePipelines]!.indexOf("pipelines"))
+    } finally {
+      await closeLauncher(compact)
+      await closeLauncher(wide)
+    }
+  })
+
+  test("updates the layout and preserves scrolling after a resize", async () => {
+    const launcher = await createLauncher(90, 24, 10)
+    try {
+      await launcher.renderOnce()
+      expect(panelRow(launcher.captureCharFrame(), "pipelines")).toBe(panelRow(launcher.captureCharFrame(), "run setup"))
+
+      launcher.resize(80, 24)
+      launcher.mockInput.pressKey("j")
+      await launcher.renderOnce()
+      expect(panelRow(launcher.captureCharFrame(), "pipelines")).toBeLessThan(panelRow(launcher.captureCharFrame(), "run setup"))
+
+      for (let index = 0; index < 7; index++) launcher.mockInput.pressKey("j")
+      await launcher.renderOnce()
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("pipeline-9")
+      expect(frame).not.toContain("pipeline-1")
+
+      launcher.resize(90, 24)
+      launcher.mockInput.pressKey("k")
+      await launcher.renderOnce()
+      expect(panelRow(launcher.captureCharFrame(), "pipelines")).toBe(panelRow(launcher.captureCharFrame(), "run setup"))
+
+      launcher.resize(80, 24)
+      launcher.mockInput.pressEnter()
+      await launcher.renderOnce()
+      const promptField = launcher.captureCharFrame().split("\n").find((line) => line.includes("┌"))!
+      expect(displayWidth(promptField)).toBe(80)
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("keeps detail content and narrow affordances within their row budgets", async () => {
+    const launcher = await createLauncher(80)
+    try {
+      const view = launchView(launcher.picker)
+      const choice = launcherChoices()[0]!
+
+      expect(pipelineRow(choice, true, 32).chunks.map((chunk) => chunk.text).join("")).toContain("default")
+      expect(pipelineRow(choice, true, 28).chunks.map((chunk) => chunk.text).join("")).not.toContain("default")
+
+      view.mode = "prompt"
+      view.prompt = "first\nsecond"
+      const promptHint = view.promptDetail(40).chunks.map((chunk) => chunk.text).join("").split("\n").find((line) => line.includes("shift+enter"))!
+      expect(displayWidth(promptHint)).toBeLessThanOrEqual(40)
+
+      view.mode = "options"
+      // The toggle list is taller than the compact panel, so the flags
+      // summary only scrolls into view once the selection reaches the end.
+      view.optionIndex = 6
+      const flags = view.optionsDetail(40).chunks.map((chunk) => chunk.text).join("").split("\n").find((line) => line.includes("will run with"))!
+      expect(displayWidth(flags)).toBeLessThanOrEqual(40)
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("keeps the selected toggle inside the options window when the list overflows", async () => {
+    const launcher = await createLauncher(80, 24)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+
+      view.optionIndex = 0
+      const top = view.optionsDetail(60).chunks.map((chunk) => chunk.text).join("")
+      expect(top).toContain("▸ ━━● on  Smart auto-accept")
+      expect(top).not.toContain("will run with")
+
+      view.optionIndex = 6
+      const bottom = view.optionsDetail(60).chunks.map((chunk) => chunk.text).join("")
+      expect(bottom).toContain("▸ ●━━ off Isolate in a worktree")
+      expect(bottom).toContain("will run with")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("degrades the stage trail and clamps modal widths on narrow renderers", async () => {
+    const narrow = await createLauncher(55)
+    const wide = await createLauncher(80)
+    const modal = await createLauncher(100)
+    try {
+      await narrow.renderOnce()
+      await wide.renderOnce()
+      expect(narrow.captureCharFrame()).not.toContain("→")
+      expect(wide.captureCharFrame()).toContain("→")
+
+      const view = launchView(modal.picker)
+      expect(view.modalWidth()).toBe(80)
+      modal.resize(50, 30)
+      expect(view.modalWidth()).toBe(42)
+      modal.resize(40, 30)
+      expect(view.modalWidth()).toBe(34)
+    } finally {
+      await closeLauncher(narrow)
+      await closeLauncher(wide)
+      await closeLauncher(modal)
+    }
+  })
+
+  test("pageup and pagedown page by the compact pipeline window, not the wide list height", async () => {
+    // At 80×24 the compact pipeline panel shows 3 rows (compactPipelineHeight 5
+    // minus its 2-row chrome), so paging moves the selection by 3 — not the 15
+    // rows the wide layout would move. Pressing the escape sequences directly
+    // because the mock-keys helper has no PageUp/PageDown entry in its KeyCodes.
+    const launcher = await createLauncher(80, 24, 10)
+    try {
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).toContain("● pipeline-1")
+
+      launcher.mockInput.pressKey("\x1B[6~")
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).toContain("● pipeline-4")
+      expect(launcher.captureCharFrame()).not.toContain("● pipeline-1")
+
+      launcher.mockInput.pressKey("\x1B[5~")
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).toContain("● pipeline-1")
+      expect(launcher.captureCharFrame()).not.toContain("● pipeline-4")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("mouse selection tracks the pipeline panel after it moves to the top", async () => {
+    // selectFromList maps event.y through pipelineText.y, which compact mode
+    // relocates from the body row to the top of the screen. Clicking a row that
+    // only exists at its new stacked position verifies the y-adjustment survived
+    // the layout switch.
+    const launcher = await createLauncher(80, 24, 3)
+    try {
+      await launcher.renderOnce()
+      const before = launcher.captureCharFrame()
+      expect(before).toContain("● pipeline-1")
+      expect(before).not.toContain("● pipeline-2")
+
+      const lines = before.split("\n")
+      const targetY = lines.findIndex((line) => line.includes("pipeline-2"))
+      expect(targetY, "pipeline-2 row visible in compact stack").toBeGreaterThanOrEqual(0)
+      const targetX = lines[targetY]!.indexOf("pipeline-2")
+      await launcher.mockMouse.click(targetX, targetY)
+      await launcher.renderOnce()
+
+      const after = launcher.captureCharFrame()
+      expect(after).toContain("● pipeline-2")
+      expect(after).not.toContain("● pipeline-1")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+})
+
+describe("launch TUI narrow-width row budgets", () => {
+  // The launcher's supported minimum terminal width is 46 columns, so the sweep
+  // covers the full range the feature must look right in. Every row helper must
+  // keep its display width inside the panel it's rendered against — anything
+  // wider is silently chopped by the panel border, the bug this feature fixes.
+  const widths = [160, 120, 100, 90, 80, 70, 60, 50, 46]
+
+  test("pipelineRow never exceeds its panel width, with or without a badge", () => {
+    const defaultChoice = { ...launcherChoices()[0]!, isDefault: true }
+    const customChoice = { ...launcherChoices()[0]!, source: "configured" as const }
+    const bareChoice = { ...launcherChoices()[0]!, isDefault: false, source: "built-in" as const }
+    for (const width of widths) {
+      for (const choice of [defaultChoice, customChoice, bareChoice]) {
+        for (const selected of [true, false]) {
+          const row = pipelineRow(choice, selected, width)
+          const rowText = row.chunks.map((chunk) => chunk.text).join("")
+          expect(displayWidth(rowText), `pipelineRow width ${width}`).toBeLessThanOrEqual(width)
+        }
+      }
+    }
+  })
+
+  test("stepTree never exceeds its panel width across the supported range", () => {
+    const steps = [
+      { stepName: "implement", groupId: "g1", kind: "agent" as const, modelLabel: "gpt-5.6 xhigh", advisorLabel: "" },
+      { stepName: "design", groupId: "g2", kind: "agent" as const, modelLabel: "claude-opus-4-8", advisorLabel: "" },
+      { stepName: "implement", groupId: "g3", kind: "agent" as const, modelLabel: "gpt-5", advisorLabel: "claude-opus-5 advisor ×3" },
+      { stepName: "implement", groupId: "g3", kind: "agent" as const, modelLabel: "claude-4", advisorLabel: "" },
+      { stepName: "implement", groupId: "g3", kind: "agent" as const, modelLabel: "gemini-3", advisorLabel: "" },
+      { stepName: "audit-a", groupId: "g4", kind: "agent" as const, modelLabel: "gpt-5", advisorLabel: "" },
+      { stepName: "audit-b", groupId: "g4", kind: "agent" as const, modelLabel: "claude-4", advisorLabel: "" },
+      { stepName: "approve", groupId: "", kind: "human" as const, modelLabel: "", advisorLabel: "" },
+    ] satisfies Parameters<typeof stepTree>[0]
+    for (const width of widths) {
+      for (const line of stepTree(steps, width)) {
+        const lineText = line.chunks.map((chunk) => chunk.text).join("")
+        expect(displayWidth(lineText), `stepTree width ${width} line=${JSON.stringify(lineText)}`).toBeLessThanOrEqual(width)
+      }
+    }
+  })
+
+  test("hookLines never exceeds its panel width across the supported range", () => {
+    const hooks = [
+      { stage: "pre" as const, label: "lint" },
+      { stage: "post" as const, label: "notify-slack", when: "failure" as const },
+      { stage: "post" as const, label: "bun run build" },
+      { stage: "post" as const, label: "a-really-long-hook-name-that-should-be-truncated", when: "always" as const },
+    ] satisfies Parameters<typeof hookLines>[0]
+    for (const width of widths) {
+      for (const line of hookLines(hooks, width)) {
+        const lineText = line.chunks.map((chunk) => chunk.text).join("")
+        expect(displayWidth(lineText), `hookLines width ${width} line=${JSON.stringify(lineText)}`).toBeLessThanOrEqual(width)
+      }
+    }
+  })
+})
 
 describe("launch TUI prompt input", () => {
   test("sanitizes pasted prompt text while preserving unlimited multi-line content", () => {

@@ -8,6 +8,10 @@ Default scope is the attached diff: this branch or pull request against the base
 
 Do not report pre-existing weaknesses in untouched code. The one exception is a weakness the change newly exposes, newly reaches, or newly widens; report it, say so explicitly, and tie it to the changed line responsible. Widen scope only when `prd.md` explicitly asks for a repository-wide audit.
 
+## Execution evidence
+
+The scope step already ran the repository's checks once; the real results (command, exit code, output summary) are in `reports/scope.md`'s **Checks** section. Cite that evidence where it matters. Do not attempt to run commands — bash is unavailable in this phase by design, and a check you cannot run is expected, not a gap.
+
 ## Objective
 
 Find concrete security, privacy, and operational risks introduced or exposed by the scoped change.
