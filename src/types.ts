@@ -1,6 +1,7 @@
 import type { AdvisorAuditPolicy } from "./advisor-events"
 import type { LoopGuardSettings } from "./loop-guard"
 import type { NotificationSettings } from "./notifications"
+import type { PrdHistoryPreview } from "./prd-history"
 import type { AutoAccept, ProgressUI } from "./progress"
 import type { StepRunnerId } from "./step-runners"
 import type { ModelGateway, ModelRoutingOverrides, ResolvedModel } from "./model-routing"
@@ -309,6 +310,12 @@ export type RunPlan = {
   smartJudge?: { model: ResolvedModel }
   hooks: HookSet
   attachments: string[]
+  /**
+   * Operator-facing preview of the checkout's historical PRD. Computed before
+   * confirmation (never inside `buildRunPlan`) so the launcher and CLI review
+   * can say whether scope will attach it. Absent when the caller did not load one.
+   */
+  prdHistory?: PrdHistoryPreview
   permissions: "interactive" | "smart" | "yolo"
   /**
    * Goal mode, when enabled for this run: the target score, the bounded loop

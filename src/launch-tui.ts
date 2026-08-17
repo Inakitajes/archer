@@ -1,17 +1,19 @@
 import { homedir } from "node:os"
 import { basename } from "node:path"
+import { existsSync } from "node:fs"
 
 import { BoxRenderable, StyledText, TextRenderable, bg, bold, createCliRenderer, decodePasteBytes, fg, stripAnsiSequences, t } from "@opentui/core"
 
 import { defaultAdvisorMaxCalls } from "./advisor"
 import { buildAgentRegistry, emptyHooksConfig, loadMergedConvoyConfig } from "./config"
-import { resolveWorktreeDefault } from "./git"
+import { currentBranch, resolveWorktreeDefault } from "./git"
 import { hooksForPipeline } from "./hooks"
 import { startLimitsPoller } from "./limits"
 import { builtInPipelines, defaultPipelineName, hasWritableStep, resolvePipeline } from "./pipeline"
 import { stepRunnerFor } from "./step-runners"
 import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { consensusStep } from "./quality-score"
+import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
 import { runReviewLines } from "./review-tui"
 import { clipChunks, hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
@@ -93,6 +95,13 @@ export type LaunchRunTuiOptions = {
   checkBranchName(name: string): Promise<LaunchBranchCheck>
 }
 
+/** Checkout-local history the launcher preloads so the notice can update as toggles change. */
+export type LaunchHistoryContext = {
+  enabled: boolean
+  branch?: string
+  entries: readonly PrdHistoryEntry[]
+}
+
 // One resolved step, flattened for the preview: `groupId` ties concurrent
 // steps together (the runner batches same-groupId steps), and `stepName` is
 // the pre-fan-out logical name shared by every `models:` variant. The tree in
@@ -134,6 +143,8 @@ export type PipelineChoice = {
   defaultPrompt?: string
   /** Alternative prompts Tab can cycle through while the prompt field is clean. */
   suggestedPrompts?: string[]
+  /** True when a resolved agent step will attach the branch's historical PRD. */
+  attachesPrdHistory?: boolean
 }
 
 type ToggleKey = "smart" | "yolo" | "humanReview" | "includeDirty" | "keepRunDir" | "tui" | "worktree"
@@ -313,7 +324,23 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
     config?.defaults.worktree === undefined
       ? await resolveWorktreeDefault(options.targetDir)
       : { isolate: config.defaults.worktree, reason: "set by defaults.worktree" }
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options).result
+  const history = await loadLaunchHistory(options.targetDir, config?.defaults.prdHistory ?? true)
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history).result
+}
+
+async function loadLaunchHistory(targetDir: string, enabled: boolean): Promise<LaunchHistoryContext> {
+  try {
+    const entries = (await readPrdHistoryIndex(targetDir)).filter((entry) => {
+      try {
+        return existsSync(prdHistoryFile(targetDir, entry))
+      } catch {
+        return false
+      }
+    })
+    return { enabled, entries, branch: await currentBranch(targetDir) }
+  } catch {
+    return { enabled, entries: [] }
+  }
 }
 
 export function pipelineChoices(config: ConvoyConfig | undefined, agents: readonly AgentSpec[]): PipelineChoice[] {
@@ -351,6 +378,7 @@ export function pipelineChoices(config: ConvoyConfig | undefined, agents: readon
         scored: Boolean(consensusStep(pipeline)) && hasWritableStep(pipeline),
         defaultPrompt: pipeline.defaultPrompt,
         suggestedPrompts: pipeline.suggestedPrompts,
+        attachesPrdHistory: pipeline.steps.some((step) => step.type === "agent" && step.prdHistory),
       }
     } catch (error) {
       return {
@@ -564,6 +592,7 @@ export class LaunchPicker {
     private readonly worktreeDefault: WorktreeDefault,
     // Named `callbacks` rather than `hooks`: this file already uses "hooks" for the pipeline's shell hooks.
     private readonly callbacks: Pick<LaunchRunTuiOptions, "prepareRun" | "proposeBranchName" | "checkBranchName">,
+    private readonly history: LaunchHistoryContext = { enabled: true, entries: [] },
   ) {
     this.toggleState.worktree = worktreeDefault.isolate
     const defaultIndex = choices.findIndex((choice) => choice.isDefault)
@@ -1475,6 +1504,7 @@ export class LaunchPicker {
       const agentSteps = choice.steps.filter((step) => step.kind === "agent").length
       lines.push(plain(""), t`${fg(theme.teal)(`Advisors: ${choice.advisedSteps}/${agentSteps} steps advised`)}`)
     }
+    this.pushHistoryNotice(lines, width, "picker")
     lines.push(plain(""))
     for (const line of hookLines(choice.hooks, width)) lines.push(line)
     if (this.message) {
@@ -1581,6 +1611,7 @@ export class LaunchPicker {
     const lines: StyledText[] = []
     lines.push(new StyledText([fg(theme.faint)("pipeline "), bold(fg(theme.text)(choice.name))]))
     lines.push(new StyledText([fg(theme.faint)("prompt   "), fg(theme.text)(truncate(this.prompt, Math.max(10, width - 9)))]))
+    this.pushHistoryNotice(lines, width, "options")
     lines.push(plain(""))
     lines.push(t`${fg(theme.dim)("Toggle extra run parameters, then press Enter to review.")}`)
     lines.push(new StyledText([fg(theme.faint)("gateway  "), bold(fg(theme.text)(gatewayLabel(this.gateway))), fg(theme.dim)("  (g to change)")]))
@@ -1713,6 +1744,35 @@ export class LaunchPicker {
     const lines = reviewRows.slice(this.reviewScroll, this.reviewScroll + visible)
     while (lines.length < visible) lines.push(plain(""))
     return joinLines(lines)
+  }
+
+  private historyPreview(): PrdHistoryPreview {
+    return resolvePrdHistoryPreview({
+      enabled: this.history.enabled,
+      isolateWorktree: this.toggleState.worktree,
+      attachesHistory: Boolean(this.currentChoice().attachesPrdHistory),
+      branch: this.history.branch,
+      entries: this.history.entries,
+      fileExists: () => true,
+    })
+  }
+
+  /**
+   * Picker stays quiet unless this checkout already has a PRD (browsing should
+   * not nag on every empty review). Options always shows attach-capable outcomes,
+   * including "none — will infer".
+   */
+  private pushHistoryNotice(lines: StyledText[], width: number, surface: "picker" | "options") {
+    const preview = this.historyPreview()
+    if (surface === "picker" && !preview.found) return
+    const copy = prdHistoryPreviewCopy(preview)
+    if (!copy) return
+    const tone = copy.tone === "attach" ? theme.teal : copy.tone === "warn" ? theme.yellow : theme.dim
+    lines.push(plain(""))
+    lines.push(new StyledText([fg(theme.faint)("history  "), fg(tone)(truncate(copy.headline, Math.max(8, width - 9)))]))
+    if (copy.detail) {
+      lines.push(new StyledText([raw("         "), fg(theme.dim)(truncate(copy.detail, Math.max(8, width - 9)))]))
+    }
   }
 
   private enabledFlags() {

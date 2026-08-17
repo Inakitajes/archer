@@ -221,6 +221,19 @@ describe("renderRunPlan", () => {
     expect(output).not.toMatch(/[\u001b\u0000\u0001\u0007\t]/)
     expect(output).not.toContain("\nforged-")
   })
+
+  test("renders the historical PRD preview when the plan carries one", () => {
+    const plan = samplePlan({
+      prdHistory: {
+        action: "attach",
+        branch: "feat/history",
+        found: { runID: "old", pipeline: "implement", branch: "feat/history", timestamp: Date.UTC(2026, 7, 17), file: "old.prd.md" },
+      },
+    })
+    const output = renderRunPlan(plan, true)
+    expect(output).toContain("PRD history: will attach implement PRD · 2026-08-17")
+    expect(output).toContain("original intent for feat/history")
+  })
 })
 
 describe("sanitizeReviewText", () => {

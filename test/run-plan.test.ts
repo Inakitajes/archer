@@ -53,6 +53,44 @@ test("the immutable plan filters and freezes exact routed targets", () => {
   expect(Object.isFrozen(options.hooks.pre[0])).toBe(false)
 })
 
+test("freezes a precomputed PRD history preview onto the reviewed plan", () => {
+  const preview = {
+    action: "attach" as const,
+    branch: "feat/history",
+    found: { runID: "old", pipeline: "implement", branch: "feat/history", timestamp: 1, file: "old.prd.md" },
+  }
+  const plan = buildRunPlan({
+    prompt: "review",
+    prdHistory: true,
+    files: [],
+    onlySteps: [],
+    skipSteps: [],
+    resumeRunID: "",
+    keepRunDir: true,
+    modelOverride: "",
+    advisorOverride: "",
+    advisorDisabled: false,
+    tui: false,
+    notify: false,
+    notifications: {},
+    humanReview: false,
+    baseRef: "main",
+    targetDir: "/repo",
+    worktree: false,
+    includeDirty: false,
+    yolo: false,
+    smart: false,
+    smartJudgeModel: "openai/gpt-5.6-sol",
+    pipeline: { name: "review", steps: [] },
+    agents: [],
+    permissions: { allow: [], deny: [] },
+    hooks: { pre: [], post: [], pipelines: {} },
+    prdHistoryPreview: preview,
+  })
+  expect(plan.prdHistory).toEqual(preview)
+  expect(Object.isFrozen(plan.prdHistory)).toBe(true)
+})
+
 test("routing preserves every built-in pipeline's execution structure", () => {
   for (const [name, spec] of Object.entries(builtInPipelines)) {
     const original = resolvePipeline({ name, spec, agents: builtInAgents })

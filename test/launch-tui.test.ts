@@ -53,9 +53,11 @@ type LaunchPickerView = {
   mode: string
   prompt: string
   optionIndex: number
+  toggleState: { worktree: boolean }
   modalWidth(): number
   promptDetail(width: number): { chunks: Array<{ text: string }> }
   optionsDetail(width: number): { chunks: Array<{ text: string }> }
+  pipelineDetail(width: number): { chunks: Array<{ text: string }> }
 }
 
 function launchView(picker: LaunchPicker): LaunchPickerView {
@@ -594,6 +596,7 @@ describe("launch TUI pipeline choices", () => {
       "Review the current branch against its base and report prioritized findings with a verified quality score.",
     )
     expect(review?.suggestedPrompts).toEqual(["Review the open PR for this branch", "Review only the last commit's diff"])
+    expect(review?.attachesPrdHistory).toBe(true)
   })
 
   test("leaves defaultPrompt and suggestedPrompts unset for pipelines without them", () => {
@@ -601,6 +604,7 @@ describe("launch TUI pipeline choices", () => {
     const implement = choices.find((choice) => choice.name === "implement")
     expect(implement?.defaultPrompt).toBeUndefined()
     expect(implement?.suggestedPrompts).toBeUndefined()
+    expect(implement?.attachesPrdHistory).toBe(false)
   })
 
   test("configured pipelines carry their defaultPrompt and suggestedPrompts", () => {
@@ -623,6 +627,86 @@ describe("launch TUI pipeline choices", () => {
     expect(triage?.source).toBe("configured")
     expect(triage?.defaultPrompt).toBe("Triage the incoming reports.")
     expect(triage?.suggestedPrompts).toEqual(["Triage today's reports"])
+  })
+})
+
+describe("launch TUI historical PRD notice", () => {
+  const historyEntry = {
+    runID: "20260817-103045-x7q2",
+    pipeline: "implement",
+    branch: "feat/history",
+    timestamp: Date.UTC(2026, 7, 17),
+    file: "20260817-103045-x7q2.prd.md",
+  }
+
+  function reviewChoice() {
+    return {
+      name: "review",
+      description: "Review the branch.",
+      source: "built-in" as const,
+      isDefault: true,
+      steps: [],
+      hooks: [],
+      valid: true,
+      advisedSteps: 0,
+      scored: false,
+      attachesPrdHistory: true,
+    }
+  }
+
+  async function createHistoryLauncher(isolate: boolean) {
+    const testRenderer = await createTestRenderer({ width: 100, height: 40 })
+    const picker = new LaunchPicker(
+      testRenderer.renderer,
+      process.cwd(),
+      [reviewChoice()],
+      "configured",
+      { isolate, reason: "test" },
+      {} as never,
+      { enabled: true, branch: "feat/history", entries: [historyEntry] },
+    )
+    return { ...testRenderer, picker }
+  }
+
+  function panelText(content: { chunks: Array<{ text: string }> }) {
+    return content.chunks.map((chunk) => chunk.text).join("")
+  }
+
+  test("shows that this checkout's historical PRD will be attached when running in place", async () => {
+    const launcher = await createHistoryLauncher(false)
+    try {
+      const view = launchView(launcher.picker)
+      const detail = panelText(view.pipelineDetail(80))
+      const options = panelText(view.optionsDetail(80))
+      expect(detail).toContain("will attach implement PRD · 2026-08-17")
+      expect(detail).toContain("original intent for feat/history")
+      expect(options).toContain("will attach implement PRD · 2026-08-17")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("warns that a new worktree will not see this checkout's historical PRD", async () => {
+    const launcher = await createHistoryLauncher(true)
+    try {
+      const view = launchView(launcher.picker)
+      expect(panelText(view.pipelineDetail(80))).toContain("a new worktree will not see it")
+      expect(panelText(view.optionsDetail(80))).toContain("this checkout has implement PRD · 2026-08-17")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("updates the options notice when isolate is toggled", async () => {
+    const launcher = await createHistoryLauncher(false)
+    try {
+      const view = launchView(launcher.picker)
+      expect(panelText(view.optionsDetail(80))).toContain("will attach implement PRD")
+      view.toggleState.worktree = true
+      expect(panelText(view.optionsDetail(80))).toContain("a new worktree will not see it")
+    } finally {
+      await closeLauncher(launcher)
+    }
   })
 })
 

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs"
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
 import { basename, join } from "node:path"
 
@@ -82,6 +83,123 @@ export async function readPrdHistoryIndex(targetDir: string): Promise<PrdHistory
     }
   }
   return entries
+}
+
+/** What the launcher / run-plan review should tell the operator about history. */
+export type PrdHistoryAction = "attach" | "skip-disabled" | "skip-no-scope" | "skip-new-worktree" | "skip-none"
+
+export type PrdHistoryPreview = {
+  /** Branch used for the lookup (current checkout, or detached-HEAD undefined). */
+  branch?: string
+  /** Oldest matching entry in this checkout, if any. Shown even when this run will not attach it. */
+  found?: PrdHistoryEntry
+  action: PrdHistoryAction
+}
+
+export type PrdHistoryPreviewCopy = {
+  headline: string
+  detail?: string
+  tone: "attach" | "warn" | "muted"
+}
+
+/**
+ * Pure preview of "does this checkout have a historical PRD, and will this run attach it?"
+ * Isolate-on means a *new* worktree, which does not inherit gitignored history.
+ */
+export function resolvePrdHistoryPreview(input: {
+  enabled: boolean
+  isolateWorktree: boolean
+  attachesHistory: boolean
+  branch?: string
+  excludeRunID?: string
+  entries: readonly PrdHistoryEntry[]
+  fileExists: (entry: PrdHistoryEntry) => boolean
+}): PrdHistoryPreview {
+  const found = pickPrdHistory(input.entries, {
+    branch: input.branch,
+    excludeRunID: input.excludeRunID,
+    fileExists: input.fileExists,
+  })
+  const preview: PrdHistoryPreview = {
+    ...(input.branch ? { branch: input.branch } : {}),
+    ...(found ? { found } : {}),
+    action: "skip-none",
+  }
+  if (!input.enabled) return { ...preview, action: "skip-disabled" }
+  if (!input.attachesHistory) return { ...preview, action: "skip-no-scope" }
+  if (input.isolateWorktree) return { ...preview, action: "skip-new-worktree" }
+  if (!found) return { ...preview, action: "skip-none" }
+  return { ...preview, action: "attach" }
+}
+
+/** Best-effort I/O wrapper around {@link resolvePrdHistoryPreview}; never throws. */
+export async function loadPrdHistoryPreview(input: {
+  targetDir: string
+  enabled: boolean
+  isolateWorktree: boolean
+  attachesHistory: boolean
+  branch?: string
+  excludeRunID?: string
+}): Promise<PrdHistoryPreview> {
+  let entries: PrdHistoryEntry[] = []
+  try {
+    entries = await readPrdHistoryIndex(input.targetDir)
+  } catch {
+    entries = []
+  }
+  return resolvePrdHistoryPreview({
+    enabled: input.enabled,
+    isolateWorktree: input.isolateWorktree,
+    attachesHistory: input.attachesHistory,
+    branch: input.branch,
+    excludeRunID: input.excludeRunID,
+    entries,
+    fileExists: (entry) => {
+      try {
+        return existsSync(prdHistoryFile(input.targetDir, entry))
+      } catch {
+        return false
+      }
+    },
+  })
+}
+
+export function formatPrdHistoryStamp(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 10)
+}
+
+/** Operator-facing copy. `undefined` means stay silent (no noise on implement with an empty store). */
+export function prdHistoryPreviewCopy(preview: PrdHistoryPreview): PrdHistoryPreviewCopy | undefined {
+  const found = preview.found
+  const label = found ? `${found.pipeline} PRD · ${formatPrdHistoryStamp(found.timestamp)}` : undefined
+
+  switch (preview.action) {
+    case "attach":
+      if (!found || !label) return undefined
+      return {
+        headline: `will attach ${label}`,
+        ...(found.branch ? { detail: `original intent for ${found.branch}` } : {}),
+        tone: "attach",
+      }
+    case "skip-new-worktree":
+      if (found && label) {
+        return { headline: `this checkout has ${label}`, detail: "a new worktree will not see it", tone: "warn" }
+      }
+      return { headline: "new worktree · no historical PRD will be attached", tone: "muted" }
+    case "skip-no-scope":
+      if (!found || !label) return undefined
+      return { headline: `this checkout has ${label}`, detail: "this pipeline does not attach it", tone: "muted" }
+    case "skip-disabled":
+      if (!found || !label) return undefined
+      return { headline: `${label} found`, detail: "disabled by defaults.prdHistory", tone: "warn" }
+    case "skip-none":
+      return {
+        headline: preview.branch
+          ? `no historical PRD for ${preview.branch} · scope will infer from the diff`
+          : "no historical PRD · scope will infer from the diff",
+        tone: "muted",
+      }
+  }
 }
 
 export function pickPrdHistory(

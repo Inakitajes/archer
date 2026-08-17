@@ -118,6 +118,37 @@ describe("run review TUI", () => {
     expect(lines.some((line) => line.includes("runtime  smart permissions · 2 attachments · judge openrouter/openai/gpt-5.6-terra#xhigh"))).toBe(true)
   })
 
+  test("renders a historical PRD that this run will attach", () => {
+    const plan = planWith([], {
+      prdHistory: {
+        action: "attach",
+        branch: "feat/history",
+        found: { runID: "old", pipeline: "implement", branch: "feat/history", timestamp: Date.UTC(2026, 7, 17), file: "old.prd.md" },
+      },
+    })
+
+    const lines = plain(runReviewLines(plan, 100))
+
+    expect(lines.some((line) => line.includes("history  will attach implement PRD · 2026-08-17"))).toBe(true)
+    expect(lines.some((line) => line.includes("original intent for feat/history"))).toBe(true)
+  })
+
+  test("warns when isolate will hide a checkout-local historical PRD", () => {
+    const plan = planWith([], {
+      target: { directory: "/repo", baseRef: "main", worktree: true, dirty: false, branch: "feat/new" },
+      prdHistory: {
+        action: "skip-new-worktree",
+        branch: "feat/history",
+        found: { runID: "old", pipeline: "implement", branch: "feat/history", timestamp: Date.UTC(2026, 7, 17), file: "old.prd.md" },
+      },
+    })
+
+    const lines = plain(runReviewLines(plan, 100))
+
+    expect(lines.some((line) => line.includes("this checkout has implement PRD · 2026-08-17"))).toBe(true)
+    expect(lines.some((line) => line.includes("a new worktree will not see it"))).toBe(true)
+  })
+
   test("expands the full prompt with hard wrapping and collapses it back to an excerpt", () => {
     const long = `first ${"requirement ".repeat(30)}\nsecond line`
     const plan = planWith([], { prompt: { source: "inline", text: long } })

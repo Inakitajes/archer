@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { pickPrdHistory, prdHistoryDir, readPrdHistoryIndex, writePrdHistory, type PrdHistoryEntry } from "../src/prd-history"
+import { formatPrdHistoryStamp, loadPrdHistoryPreview, pickPrdHistory, prdHistoryDir, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, writePrdHistory, type PrdHistoryEntry } from "../src/prd-history"
 
 const dirs: string[] = []
 
@@ -125,5 +125,55 @@ describe("PRD history", () => {
         { branch: "feat/history", fileExists: () => true },
       ),
     ).toMatchObject({ runID: "later" })
+  })
+
+  test("resolves whether this run will attach a checkout-local historical PRD", () => {
+    const entry: PrdHistoryEntry = { runID: "old", pipeline: "implement", branch: "feat/history", timestamp: Date.UTC(2026, 7, 17), file: "old.prd.md" }
+    const base = { branch: "feat/history", entries: [entry], fileExists: () => true }
+
+    expect(resolvePrdHistoryPreview({ ...base, enabled: true, isolateWorktree: false, attachesHistory: true })).toEqual({
+      branch: "feat/history",
+      found: entry,
+      action: "attach",
+    })
+    expect(resolvePrdHistoryPreview({ ...base, enabled: true, isolateWorktree: true, attachesHistory: true }).action).toBe("skip-new-worktree")
+    expect(resolvePrdHistoryPreview({ ...base, enabled: true, isolateWorktree: false, attachesHistory: false }).action).toBe("skip-no-scope")
+    expect(resolvePrdHistoryPreview({ ...base, enabled: false, isolateWorktree: false, attachesHistory: true }).action).toBe("skip-disabled")
+    expect(resolvePrdHistoryPreview({ ...base, enabled: true, isolateWorktree: false, attachesHistory: true, entries: [] }).action).toBe("skip-none")
+    expect(resolvePrdHistoryPreview({ ...base, enabled: true, isolateWorktree: false, attachesHistory: true, excludeRunID: "old" }).found).toBeUndefined()
+  })
+
+  test("formats operator-facing copy and stays silent when there is nothing to say", () => {
+    const entry: PrdHistoryEntry = { runID: "old", pipeline: "implement", branch: "feat/history", timestamp: Date.UTC(2026, 7, 17), file: "old.prd.md" }
+    expect(formatPrdHistoryStamp(entry.timestamp)).toBe("2026-08-17")
+
+    expect(prdHistoryPreviewCopy({ action: "attach", found: entry })).toEqual({
+      headline: "will attach implement PRD · 2026-08-17",
+      detail: "original intent for feat/history",
+      tone: "attach",
+    })
+    expect(prdHistoryPreviewCopy({ action: "skip-new-worktree", found: entry })).toMatchObject({
+      headline: "this checkout has implement PRD · 2026-08-17",
+      detail: "a new worktree will not see it",
+      tone: "warn",
+    })
+    expect(prdHistoryPreviewCopy({ action: "skip-new-worktree" })?.headline).toContain("new worktree")
+    expect(prdHistoryPreviewCopy({ action: "skip-no-scope", found: entry })?.detail).toBe("this pipeline does not attach it")
+    expect(prdHistoryPreviewCopy({ action: "skip-no-scope" })).toBeUndefined()
+    expect(prdHistoryPreviewCopy({ action: "skip-disabled", found: entry })?.detail).toBe("disabled by defaults.prdHistory")
+    expect(prdHistoryPreviewCopy({ action: "skip-disabled" })).toBeUndefined()
+    expect(prdHistoryPreviewCopy({ action: "skip-none", branch: "feat/history" })?.headline).toContain("feat/history")
+  })
+
+  test("loads a checkout preview from the on-disk index without throwing on an empty store", async () => {
+    const dir = await repo()
+    expect(await loadPrdHistoryPreview({ targetDir: dir, enabled: true, isolateWorktree: false, attachesHistory: true, branch: "main" })).toMatchObject({
+      action: "skip-none",
+      branch: "main",
+    })
+
+    await writePrdHistory({ targetDir: dir, runID: "run-1", prompt: "# First PRD\n", pipeline: "implement", branch: "main" })
+    const preview = await loadPrdHistoryPreview({ targetDir: dir, enabled: true, isolateWorktree: false, attachesHistory: true, branch: "main" })
+    expect(preview).toMatchObject({ action: "attach", found: { runID: "run-1", pipeline: "implement", branch: "main" } })
   })
 })

@@ -3,6 +3,7 @@ import { stdin, stdout } from "node:process"
 
 import { defaultAdvisorMaxCalls } from "./advisor"
 import { gatewayLabel } from "./model-routing"
+import { prdHistoryPreviewCopy } from "./prd-history"
 import { plannedStepAdvisor, plannedStepModel } from "./run-plan"
 import { stepRunnerFor } from "./step-runners"
 import type { RunPlan } from "./types"
@@ -25,6 +26,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     `Target: ${sanitizeInline(plan.target.directory)}`,
     `  Diff base: ${sanitizeInline(plan.target.baseRef)} · working tree: ${plan.target.dirty ? "include dirty" : "clean required"}`,
     `  Worktree: ${plan.target.worktree ? `yes · branch ${plan.target.branch ? sanitizeInline(plan.target.branch) : "named at start"}` : "no"}`,
+    ...prdHistoryPlanLines(plan),
     `Pipeline: ${sanitizeInline(plan.pipeline.name)} · ${plan.pipeline.steps.length} steps`,
     `Gateway: ${gatewayLabel(plan.modelRouting.gateway)}`,
     `Advisors: ${plan.pipeline.steps.filter((step) => step.type === "agent" && Boolean(plannedStepAdvisor(step))).length}/${plan.pipeline.steps.filter((step) => step.type === "agent").length} steps advised`,
@@ -102,6 +104,15 @@ export async function confirmRunPlan(plan: RunPlan): Promise<boolean> {
   } finally {
     prompt.close()
   }
+}
+
+function prdHistoryPlanLines(plan: RunPlan): string[] {
+  if (!plan.prdHistory) return []
+  const copy = prdHistoryPreviewCopy(plan.prdHistory)
+  if (!copy) return []
+  const headline = sanitizeInline(copy.headline)
+  if (copy.detail) return [`PRD history: ${headline}`, `  ${sanitizeInline(copy.detail)}`]
+  return [`PRD history: ${headline}`]
 }
 
 function sanitize(value: string) {

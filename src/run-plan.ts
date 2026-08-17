@@ -1,4 +1,5 @@
 import { resolveModel, type ModelGateway, type ModelRoutingOverrides } from "./model-routing"
+import type { PrdHistoryPreview } from "./prd-history"
 import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { stepRunnerFor } from "./step-runners"
 import type { AgentStep, Pipeline, RunOptions, RunPlan, Step } from "./types"
@@ -12,6 +13,8 @@ export type BuildRunPlanInput = RunOptions & {
   worktreeDir?: string
   /** The run's frozen gateway when resuming; recorded in the plan when an explicit --gateway replaces it. */
   resumeGateway?: ModelGateway
+  /** Precomputed checkout preview; `buildRunPlan` does not touch the filesystem. */
+  prdHistoryPreview?: PrdHistoryPreview
 }
 
 /** Purely resolves the complete execution shape; it performs no filesystem or process effects. */
@@ -58,6 +61,7 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     ...(judge ? { smartJudge: { model: judge } } : {}),
     hooks,
     attachments: [...input.files],
+    ...(input.prdHistoryPreview ? { prdHistory: input.prdHistoryPreview } : {}),
     permissions: input.yolo ? "yolo" : input.smart ? "smart" : "interactive",
     ...(goal ? { goal } : {}),
     ...(input.resumeRunID

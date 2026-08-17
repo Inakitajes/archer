@@ -2,15 +2,16 @@ import { readFile, stat } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 
 import { buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, globalConfigPath, loadMergedConvoyConfig, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ConvoyDefaults } from "./config"
-import { detectBaseRef, resolveWorktreeDefault } from "./git"
+import { detectBaseRef, currentBranch, resolveWorktreeDefault } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
 import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, hasWritableStep, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { consensusStep, defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { runGoalLoop } from "./goal-loop"
 import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
-import { buildRunPlan } from "./run-plan"
+import { buildRunPlan, type BuildRunPlanInput } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
+import { loadPrdHistoryPreview } from "./prd-history"
 import { isModelGateway, type ModelGateway } from "./model-routing"
 import { browseRuns } from "./runs"
 import { deleteKeychainSecret, keychainAvailable, storeKeychainSecret } from "./secrets"
@@ -154,7 +155,7 @@ export async function parseAndRun(argv: string[]) {
     return
   }
 
-  const plan = command.options.plan ?? buildRunPlan(command.options)
+  const plan = command.options.plan ?? (await buildReviewedPlan(command.options))
   if (command.options.planOnly) {
     process.stdout.write(renderRunPlan(plan))
     return
@@ -188,6 +189,27 @@ export async function parseAndRun(argv: string[]) {
     options = await prepareWorktreeForRun(options.targetDir, options)
   }
   await executeRun(options, plan)
+}
+
+/** Builds the operator-reviewed plan, including a checkout-local PRD history preview. */
+async function buildReviewedPlan(input: BuildRunPlanInput): Promise<RunPlan> {
+  // Lookup the launch checkout's current branch, not `input.branch` — that is the
+  // *new* worktree name when isolate is on, and would miss history sitting here.
+  let branch: string | undefined
+  try {
+    branch = await currentBranch(input.targetDir)
+  } catch {
+    branch = undefined
+  }
+  const preview = await loadPrdHistoryPreview({
+    targetDir: input.targetDir,
+    enabled: input.prdHistory,
+    isolateWorktree: Boolean(input.worktree),
+    attachesHistory: input.pipeline.steps.some((step) => step.type === "agent" && step.prdHistory),
+    branch,
+    excludeRunID: input.resumeRunID || undefined,
+  })
+  return buildRunPlan({ ...input, prdHistoryPreview: preview })
 }
 
 /** The result of deciding whether goal mode applies to a resolved run. */
@@ -363,7 +385,7 @@ async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSele
   const options = { ...(await resolveRunOptions(parsed)), prompt: selection.prompt }
   // The branch was named and confirmed in the launcher's branch step, so the
   // plan the user reviews already names the branch the run will create.
-  const plan = buildRunPlan({
+  const plan = await buildReviewedPlan({
     ...options,
     ...(selection.worktreeDir ? { worktreeDir: selection.worktreeDir } : {}),
   })
@@ -398,7 +420,7 @@ async function openRunsBrowser(initialRunID?: string) {
     const resolution = await browseRuns(currentRunID)
     if (resolution.type === "retry") {
       const options = await retryOptions(resolution.runID, resolution.targetDir)
-      const plan = options.plan ?? buildRunPlan({ ...options, promptSource: "retry" })
+      const plan = options.plan ?? (await buildReviewedPlan({ ...options, promptSource: "retry" }))
       if (!(await confirmRunPlan(plan))) return
       await preflightRunPlan(plan)
       await run({ ...options, plan })
@@ -406,7 +428,7 @@ async function openRunsBrowser(initialRunID?: string) {
     }
     if (resolution.type === "resume") {
       const options = await resumeOptions(resolution.runID, resolution.targetDir)
-      const plan = options.plan ?? buildRunPlan({ ...options, promptSource: "resume" })
+      const plan = options.plan ?? (await buildReviewedPlan({ ...options, promptSource: "resume" }))
       if (!(await confirmRunPlan(plan))) return
       await preflightRunPlan(plan)
       await run({ ...options, plan })
@@ -445,7 +467,7 @@ async function resumeOptions(runID: string, targetDir?: string): Promise<RunOpti
   } catch {
     // Legacy/incomplete workspace.
   }
-  options.plan = buildRunPlan({ ...options, promptSource: "resume" })
+  options.plan = await buildReviewedPlan({ ...options, promptSource: "resume" })
   return options
 }
 
@@ -470,7 +492,7 @@ async function retryOptions(runID: string, targetDir?: string): Promise<RunOptio
   } catch {
     // Legacy/incomplete workspace.
   }
-  options.plan = buildRunPlan({ ...options, promptSource: "retry" })
+  options.plan = await buildReviewedPlan({ ...options, promptSource: "retry" })
   return options
 }
 
@@ -630,7 +652,7 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   // pipeline. Validate them before building a potentially empty review plan.
   validateStepFilters(options.pipeline, options)
   const promptSource: RunPlan["prompt"]["source"] = hasResume ? "resume" : hasPromptFile ? "file" : hasInlinePrompt ? "inline" : "default"
-  options.plan = buildRunPlan({
+  options.plan = await buildReviewedPlan({
     ...options,
     promptSource,
     ...(resumeGateway ? { resumeGateway } : {}),

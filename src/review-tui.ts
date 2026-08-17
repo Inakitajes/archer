@@ -4,6 +4,7 @@ import { StyledText, fg } from "@opentui/core"
 
 import { defaultAdvisorMaxCalls } from "./advisor"
 import { gatewayLabel } from "./model-routing"
+import { prdHistoryPreviewCopy } from "./prd-history"
 import { plannedStepAdvisor, plannedStepModel } from "./run-plan"
 import { sanitizeReviewInline, sanitizeReviewText } from "./run-review"
 import { stepRunnerFor } from "./step-runners"
@@ -53,6 +54,7 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   } else {
     rows.push(continuation([fg(theme.dim)("runs in the current checkout")]))
   }
+  pushHistoryRows(rows, plan, value)
   rows.push(plain(""))
 
   rows.push(labelRow("gateway", [fg(theme.text)(gatewayLabel(plan.modelRouting.gateway))]))
@@ -93,6 +95,17 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   }
 
   return rows
+}
+
+function pushHistoryRows(rows: StyledText[], plan: RunPlan, value: number) {
+  if (!plan.prdHistory) return
+  const copy = prdHistoryPreviewCopy(plan.prdHistory)
+  if (!copy) return
+  const tone = copy.tone === "attach" ? theme.teal : copy.tone === "warn" ? theme.yellow : theme.dim
+  rows.push(labelRow("history", [fg(tone)(truncate(sanitizeReviewInline(copy.headline), value))]))
+  if (copy.detail) {
+    rows.push(continuation([fg(theme.dim)(truncate(sanitizeReviewInline(copy.detail), value))]))
+  }
 }
 
 function pipelineSummary(plan: RunPlan): string {
