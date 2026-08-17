@@ -75,6 +75,12 @@ describe("config loading", () => {
     expect(config.hooks).toEqual({ pre: [], post: [], pipelines: {} })
   })
 
+  test("parses the optional PRD history default and rejects non-booleans", () => {
+    expect(parse("defaults:\n  prdHistory: true").defaults.prdHistory).toBe(true)
+    expect(parse("defaults:\n  prdHistory: false").defaults.prdHistory).toBe(false)
+    expect(() => parse("defaults:\n  prdHistory: enabled")).toThrow("defaults.prdHistory must be true or false")
+  })
+
   test("parses a full project config", async () => {
     const dir = await projectDir(undefined, ["api-reviewer"])
     const config = parse(
@@ -341,6 +347,15 @@ describe("parallel steps and model fan-out", () => {
       { agent: "review-scope", name: "scope", verify: true },
       { agent: "review-report", name: "report" },
     ])
+  })
+
+  test("parses PRD history on a step and rejects non-booleans", () => {
+    expect(parse("pipelines:\n  p:\n    steps:\n      - agent: review-scope\n        prdHistory: true").pipelines.p?.steps).toEqual([
+      { agent: "review-scope", prdHistory: true },
+    ])
+    expect(() => parse("pipelines:\n  p:\n    steps:\n      - agent: review-scope\n        prdHistory: yes")).toThrow(
+      "prdHistory must be true or false",
+    )
   })
 
   test("rejects an empty parallel block", () => {

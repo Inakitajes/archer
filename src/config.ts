@@ -76,6 +76,8 @@ export type ConvoyDefaults = {
    * not "on": it decides per branch, isolating only when HEAD sits on a trunk.
    */
   worktree?: boolean
+  /** Persist and attach the git-ignored original PRD history; defaults to true. */
+  prdHistory?: boolean
   /** Advising model for every step that doesn't set its own; unset means no advisor anywhere. */
   advisor?: string
   /** Cap on advisor consultations per phase attempt, for steps that don't set their own. */
@@ -265,6 +267,7 @@ defaults:
   # branchNameModel: openrouter/deepseek/deepseek-v4-flash-0731 # optional: model that names worktree branches
   # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
   # worktree: true # optional: force a fresh branch + worktree for every run; false always runs in the current tree. Unset decides per branch: isolate on a trunk (main/master/develop/trunk or the detected base), run in place on any other branch
+  # prdHistory: true # optional: store a git-ignored copy of each run's prompt in .convoy/prd-history; false disables history writes and scope attachments
   # advisor: anthropic/claude-opus-5 # optional: reviewing model consulted at phase decision points
   # advisorMaxCalls: 1000 # optional: consultation budget per phase attempt; the default is effectively unlimited, set this to put a real cap on it
   # advisorAuditPolicy: summary # summary (hashes), redacted (lengths), or full content retention
@@ -620,6 +623,7 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
     "branchNameModel",
     "commitMessageModel",
     "worktree",
+    "prdHistory",
     "advisor",
     "advisorMaxCalls",
     "advisorAuditPolicy",
@@ -635,6 +639,7 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
   if (record.branchNameModel !== undefined) defaults.branchNameModel = v.model(record.branchNameModel, "defaults.branchNameModel")
   if (record.commitMessageModel !== undefined) defaults.commitMessageModel = v.model(record.commitMessageModel, "defaults.commitMessageModel")
   if (record.worktree !== undefined) defaults.worktree = v.boolean(record.worktree, "defaults.worktree")
+  if (record.prdHistory !== undefined) defaults.prdHistory = v.boolean(record.prdHistory, "defaults.prdHistory")
   if (record.advisor !== undefined) defaults.advisor = v.model(record.advisor, "defaults.advisor")
   if (record.advisorMaxCalls !== undefined) defaults.advisorMaxCalls = v.positiveInt(record.advisorMaxCalls, "defaults.advisorMaxCalls")
   if (record.advisorAuditPolicy !== undefined) {
@@ -754,7 +759,7 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
     return step
   }
 
-  v.knownKeys(record, path, ["agent", "name", "model", "models", "runner", "advisor", "advisorMaxCalls", "maxAttempts", "reports", "diff", "verify"])
+  v.knownKeys(record, path, ["agent", "name", "model", "models", "runner", "advisor", "advisorMaxCalls", "maxAttempts", "reports", "diff", "verify", "prdHistory"])
 
   const agent = validateStepName(v, record.agent, `${path}.agent`)
   if (context.insideParallel && agent === humanReviewStep) v.fail(path, `"${humanReviewStep}" can't run inside a parallel block`)
@@ -798,6 +803,7 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
     ...(record.reports !== undefined ? { reports: validateReports(v, record.reports, `${path}.reports`) } : {}),
     ...(record.diff !== undefined ? { diff: v.boolean(record.diff, `${path}.diff`) } : {}),
     ...(record.verify !== undefined ? { verify: v.boolean(record.verify, `${path}.verify`) } : {}),
+    ...(record.prdHistory !== undefined ? { prdHistory: v.boolean(record.prdHistory, `${path}.prdHistory`) } : {}),
   }
 }
 

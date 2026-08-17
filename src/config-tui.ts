@@ -129,6 +129,7 @@ const defaultFields: DefaultField[] = [
   { key: "branchNameModel", type: "model" },
   { key: "commitMessageModel", type: "model" },
   { key: "worktree", type: "boolean" },
+  { key: "prdHistory", type: "boolean" },
   { key: "baseRef", type: "string" },
   { key: "pipeline", type: "string" },
 ]
@@ -1996,6 +1997,8 @@ function describeDefault(key: keyof ConvoyDefaults): string {
       return "Model that writes the squashed commit message for finish (default: anthropic/claude-haiku-4-5)."
     case "worktree":
       return "Run each job on a fresh branch in its own worktree. Unset decides per branch: on for a trunk, off once you're on a branch."
+    case "prdHistory":
+      return "Store git-ignored copies of prompts in .convoy/prd-history and attach the original branch PRD to opted-in steps. Unset is on."
     case "baseRef":
       return "Branch/base used to diff between steps (auto-detected when unset)."
     case "pipeline":

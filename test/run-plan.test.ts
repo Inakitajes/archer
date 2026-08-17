@@ -9,6 +9,7 @@ import type { AgentStep, RunOptions } from "../src/types"
 test("the immutable plan filters and freezes exact routed targets", () => {
   const options: RunOptions = {
     prompt: "ship it",
+    prdHistory: true,
     files: [],
     onlySteps: ["build"],
     skipSteps: ["audit"],
@@ -101,6 +102,7 @@ test("routing preserves every built-in pipeline's execution structure", () => {
 test("the plan routes fan-out and the smart judge while leaving Claude Code untouched", () => {
   const options: RunOptions = {
     prompt: "review the change",
+    prdHistory: true,
     files: ["docs/architecture.md"],
     onlySteps: [],
     skipSteps: [],
@@ -154,6 +156,7 @@ test("the plan routes fan-out and the smart judge while leaving Claude Code unto
 test("the plan freezes the routed branch namer and marks an explicit resume gateway override", () => {
   const options: RunOptions = {
     prompt: "review the change",
+    prdHistory: true,
     files: [],
     onlySteps: [],
     skipSteps: [],

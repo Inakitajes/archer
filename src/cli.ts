@@ -279,7 +279,7 @@ async function executeRun(options: RunOptions, plan: RunPlan): Promise<void> {
  * the headless path, where it is either pinned with --branch or proposed by the
  * naming model.
  */
-async function prepareWorktreeForRun(sourceDir: string, options: RunOptions): Promise<RunOptions> {
+export async function prepareWorktreeForRun(sourceDir: string, options: RunOptions): Promise<RunOptions> {
   const { createIsolatedWorktree } = await import("./worktree")
   // A pinned name is sanitized the same way the launcher sanitizes a typed one;
   // an unusable one is a flag error, not something to silently rename around.
@@ -753,6 +753,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     onlySteps: parsed.onlySteps,
     skipSteps: parsed.skipSteps,
     resumeRunID: parsed.resumeRunID ?? "",
+    prdHistory: defaults.prdHistory ?? true,
     keepRunDir: parsed.keepRunDir ?? true,
     modelOverride: parsed.modelOverride ?? "",
     advisorOverride: parsed.advisorOverride ?? "",
@@ -1101,7 +1102,7 @@ Config files:
                            present once you eject one, and they shadow the built-in
 
 Config keys:
-  defaults:                model, baseRef, pipeline, worktree, autoAcceptJudgeModel,
+  defaults:                model, baseRef, pipeline, worktree, prdHistory, autoAcceptJudgeModel,
                            branchNameModel, commitMessageModel
   modelRouting:            gateway and explicit per-logical-model overrides
   agents:                  project agents or built-in overrides; prompts live at agents/<name>.md

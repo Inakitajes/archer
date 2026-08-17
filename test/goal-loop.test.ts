@@ -20,6 +20,7 @@ const goalFixPipeline = resolvePipeline({ name: "goal-fix", spec: builtInPipelin
 function makeOptions(overrides: Partial<RunOptions> = {}): RunOptions {
   return {
     prompt: "build it",
+    prdHistory: true,
     files: [],
     onlySteps: [],
     skipSteps: [],

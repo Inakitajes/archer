@@ -8,6 +8,12 @@ Default scope is the attached diff: this branch or pull request against the base
 
 Do not widen the review to untouched code. The one exception is code the change makes newly reachable or newly wrong; name it explicitly and tie it to the changed line that exposes it. Widen scope only when `prd.md` explicitly asks for a repository-wide review.
 
+## Historical PRD
+
+A historical PRD may be attached alongside this run's `prd.md`. This run's `prd.md` is the request for the current pipeline (often a generic review prompt); the historical PRD, when present, is the original product intent for this branch.
+
+Prefer the historical PRD for what was asked and why. Do not reconstruct a product brief from the diff when it is attached. Under **Scope**, quote its title and the decisions that matter so later auditors and quality scorers can cite the original intent without re-reading the attachment. When no historical PRD is attached, say so under **Scope** and infer intent from the diff as before.
+
 ## Objective
 
 Build the map every later reviewer will use:

@@ -7,6 +7,8 @@ import type { ModelGateway, ModelRoutingOverrides, ResolvedModel } from "./model
 
 export type RunOptions = {
   prompt: string
+  /** Whether this run persists and attaches the project's git-ignored PRD history. */
+  prdHistory: boolean
   files: string[]
   onlySteps: string[]
   skipSteps: string[]
@@ -240,6 +242,8 @@ export type AgentStep = {
    * Never set without `readOnly`. Dropped for `parallel:` / `models:` fan-outs.
    */
   verify?: boolean
+  /** Attach the original branch PRD from the project history when available. */
+  prdHistory?: boolean
   /** Shared by every step produced from the same top-level pipeline entry; the runner batches same-groupId steps to run concurrently. */
   groupId: string
   /** Pre-fan-out logical name; equals `name` unless this step was produced by a `models:` fan-out. */

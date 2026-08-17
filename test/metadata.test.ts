@@ -607,6 +607,18 @@ describe("openRunMetadata", () => {
     }
   })
 
+  test("assertSafePipelineArtifacts: accepts a frozen PRD history flag", async () => {
+    const { ws, cleanup } = await withDir("history")
+    const step = { ...validAgentStep("scope"), prdHistory: true }
+    const store = await openRunMetadata(ws, "/target", validPipeline([step]))
+    try {
+      expect(store).toBeDefined()
+    } finally {
+      await store.flush()
+      await cleanup()
+    }
+  })
+
   test("assertSafePipelineArtifacts: accepts reports/<step>.md as input", async () => {
     const { ws, cleanup } = await withDir("ok2")
     const step = validAgentStep("design")

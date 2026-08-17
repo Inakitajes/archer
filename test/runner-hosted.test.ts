@@ -1,14 +1,17 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { existsSync } from "node:fs"
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import type { ProgressUI, RunOutcome } from "../src/progress"
 import type { RunOptions } from "../src/types"
 
-import { run as realRun, hostedTeardownFromError, type RunDeps } from "../src/runner"
+import { preparePhaseRun, run as realRun, hostedTeardownFromError, type RunDeps } from "../src/runner"
 import { noopProgress } from "../src/progress"
 import { builtInAgents } from "../src/pipeline"
+import { prdHistoryDir, readPrdHistoryIndex, writePrdHistory } from "../src/prd-history"
+import { prepareWorktreeForRun } from "../src/cli"
 
 // The runner's run() spawns a real opencode server. Inject the fake through
 // run()'s deps seam rather than `mock.module("../src/opencode", …)`: that mock
@@ -73,6 +76,7 @@ const emptyPipeline = { name: "hosted-test", steps: [] }
 function makeOptions(repo: string, overrides: Partial<RunOptions> = {}): RunOptions {
   return {
     prompt: "build it",
+    prdHistory: true,
     files: [],
     onlySteps: [],
     skipSteps: [],
@@ -208,6 +212,86 @@ describe("run() with a hosted progress", () => {
       const metadata = JSON.parse(await readFile(join(result.dir, "metadata.json"), "utf8"))
       expect(metadata.server).toBeUndefined()
     } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("records fresh prompts in the target checkout and skips the duplicate on resume", async () => {
+    const repo = await cleanRepo()
+    try {
+      const first = await run(makeOptions(repo, { prompt: "original PRD" }))
+      const history = prdHistoryDir(repo)
+      const entries = await readPrdHistoryIndex(repo)
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({ runID: first.runID, pipeline: "hosted-test" })
+      expect(await readFile(join(history, `${first.runID}.prd.md`), "utf8")).toBe("original PRD")
+
+      await run(makeOptions(repo, { prompt: "disabled PRD", prdHistory: false }))
+      expect(await readPrdHistoryIndex(repo)).toHaveLength(1)
+
+      await run(makeOptions(repo, { prompt: "", resumeRunID: first.runID }))
+      expect(await readPrdHistoryIndex(repo)).toHaveLength(1)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("writes a worktree run's history in the new worktree, not the launch checkout", async () => {
+    const launchRepo = await cleanRepo()
+    let isolated: RunOptions | undefined
+    try {
+      isolated = await prepareWorktreeForRun(
+        launchRepo,
+        makeOptions(launchRepo, { prompt: "worktree PRD", worktree: true, branch: "feat/prd-history-location" }),
+      )
+      expect(isolated.targetDir).not.toBe(launchRepo)
+
+      const result = await run(isolated)
+      expect(await readPrdHistoryIndex(isolated.targetDir)).toEqual([
+        expect.objectContaining({ runID: result.runID, file: `${result.runID}.prd.md`, pipeline: "hosted-test" }),
+      ])
+      expect(existsSync(join(isolated.targetDir, ".convoy", "prd-history", `${result.runID}.prd.md`))).toBe(true)
+      expect(existsSync(join(launchRepo, ".convoy", "prd-history", "index.jsonl"))).toBe(false)
+    } finally {
+      if (isolated) await git(["worktree", "remove", "--", isolated.targetDir], launchRepo)
+      await rm(launchRepo, { recursive: true, force: true })
+    }
+  })
+
+  test("attaches only the oldest historical PRD for an opted-in scope step", async () => {
+    const repo = await cleanRepo()
+    const workspace = await mkdtemp(join(tmpdir(), "convoy-history-phase-"))
+    const phase = {
+      type: "agent" as const,
+      name: "scope",
+      stepName: "scope",
+      groupId: "g1",
+      agentName: "review-scope",
+      description: "scope",
+      model: "openai/gpt-5.6-terra",
+      inputFiles: [],
+      inputDiff: false,
+      reportPath: "reports/scope.md",
+      readOnly: true,
+      prdHistory: true,
+    }
+    try {
+      const branch = (await git(["branch", "--show-current"], repo)).trim()
+      await writePrdHistory({ targetDir: repo, runID: "original", prompt: "original PRD", pipeline: "implement", branch })
+      await writePrdHistory({ targetDir: repo, runID: "current", prompt: "review request", pipeline: "review", branch })
+
+      const prepared = await preparePhaseRun({ dir: workspace, runID: "current" }, phase, makeOptions(repo), [], [])
+      expect(prepared.attachments).toHaveLength(1)
+      expect(prepared.attachments[0]).toMatchObject({ filename: "original.prd.md" })
+      expect(prepared.attachments[0]?.url).toStartWith("file:///")
+      expect(prepared.attachments[0]?.url).toContain(".convoy/prd-history/original.prd.md")
+      expect((await preparePhaseRun({ dir: workspace, runID: "current" }, phase, makeOptions(repo, { prdHistory: false }), [], [])).attachments).toEqual([])
+
+      await rm(join(prdHistoryDir(repo), "index.jsonl"))
+      await mkdir(join(prdHistoryDir(repo), "index.jsonl"))
+      expect((await preparePhaseRun({ dir: workspace, runID: "current" }, phase, makeOptions(repo), [], [])).attachments).toEqual([])
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
       await rm(repo, { recursive: true, force: true })
     }
   })

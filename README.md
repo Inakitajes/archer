@@ -83,7 +83,7 @@ You write the plan, `implement` turns it into something functional, you shape it
 | `ship` | yes | **The close of the cycle.** A `sync` phase merges the advanced base branch in and resolves the conflicts — real and semantic — so what gets graded is the branch as it will actually merge. Then two independent quality-scorers grade it against the rubric and a consensus step reconciles and verifies. `ship` declares `goal: 85` in its own spec, so the fix/re-score loop runs **without you passing `--goal`**: it keeps closing gaps until the score clears 85, plateaus, or hits the iteration cap. See [Quality scoring](#quality-scoring) and [Goal mode](#goal-mode). Two things it expects from your config, because both are machine-local: `permissions.allow` entries for `git merge*`, `git add*` and `git checkout --ours*`/`--theirs*` (without them those commands fall through to "ask" rather than failing), and, optionally, `hooks.pipelines.ship` to fetch the base beforehand and open the PR afterwards — Convoy never runs remote git itself. Post-hooks receive `CONVOY_GOAL_REACHED`, so the PR step can require the bar was actually met. |
 | `fixer` | yes | The follow-up to a report-only run. Give it a set of findings (as the prompt or an attachment) and it proves each one with a focused regression test **before** touching production code, applies minimal fixes only for the findings that actually went red, then independently reruns those proofs and the surrounding checks to report a final per-finding verdict (`fixed`, `already-resolved`, `not-reproducible`, `not-automatable`, `blocked`, `not-fixed`). The validation phase runs the commands itself (see [verifying steps](#project-configuration-convoyconfigyaml)) rather than taking the fix phase's word for it, and never promotes an unproven finding to fixed. |
 | `goal-fix` | yes | The goal loop's fix iteration: applies exactly the gaps the previous scoring round reported, then re-scores. Not run directly — `ship`'s goal, or an explicit `--goal`, drives it. See [Goal mode](#goal-mode). |
-| `review` | **no — report only** | Scope the diff, run the bug / clean-code(+patterns) / security audits **in parallel across two models each**, synthesize one prioritized findings report, then **measure**: two independent quality-scorers grade the same diff against the rubric and a consensus step reconciles and verifies. The deliverables are `reports/report.md` and the machine-readable score in `reports/score-report.md`. Makes no changes. |
+| `review` | **no — report only** | Scope the diff (attaching the branch's original PRD when Convoy has one), run the bug / clean-code(+patterns) / security audits **in parallel across two models each**, synthesize one prioritized findings report, then **measure**: two independent quality-scorers grade the same diff against the rubric and a consensus step reconciles and verifies. The deliverables are `reports/report.md` and the machine-readable score in `reports/score-report.md`. Makes no changes. |
 | `review-lite` | **no — report only** | Same shape as `review`, but nothing runs on Opus: `openrouter/z-ai/glm-5.2` scopes the diff, writes the report and reconciles the score, and the audit and scorer fan-outs pair GLM 5.2 with `openrouter/moonshotai/kimi-k3`. The cheap way to get a full review and a number. |
 | `review-cc` | **no — report only** | `review`'s audits, but each is paired with a second run on the locally installed [`claude` CLI](https://code.claude.com) (`runner: claude-code`) instead of a second API model — cross-vendor diversity billed to a Claude subscription rather than per token. Ends at the findings report rather than a score: its point is a second opinion from a different vendor, not a measurement. Requires `claude` on `PATH`. |
 | `hunter` | **no — report only** | Repo-wide audit across six specialty tracks (correctness, memory, performance, security, reliability, supply chain), each run on GPT 5.6 Terra xhigh plus one specialty model, then reconciled into a single deduplicated, prioritized consensus report. |
@@ -499,6 +499,7 @@ defaults:
   branchNameModel: openrouter/deepseek/deepseek-v4-flash-0731  # proposes worktree branch names (may look up referenced issues); you confirm the name
   commitMessageModel: anthropic/claude-haiku-4-5     # writes the conventional commit `convoy finish` squashes a run into; you edit it before it lands
   worktree: true                   # force a new branch + worktree for every run; false always runs in the current tree. Unset decides per branch (isolate on a trunk, run in place on a branch)
+  prdHistory: true                 # store each new run's git-ignored prompt under .convoy/prd-history; false disables writes and historical attachments
   advisor: anthropic/claude-opus-5   # optional; a stronger model consulted at every step's decision points
   advisorMaxCalls: 1000              # optional; consultations allowed per phase attempt (default 1000 — effectively unlimited; set it lower to cap advisor spend)
   advisorAuditPolicy: summary        # summary (hash-only default), redacted, or full transcript/advice content
@@ -531,6 +532,7 @@ pipelines:
       - implementer
       - agent: api-reviewer
         verify: true               # optional; read-only step gets bash back so it can run tests/checks
+        prdHistory: true           # optional; attach the original PRD recorded for this branch
       - type: human
         name: api-review
       - agent: security
@@ -678,7 +680,7 @@ When a project override exists, it replaces that agent's built-in prompt complet
 
 `--file` is repeatable and accepts files or directories. Relative paths are resolved against the target repo.
 
-Convoy doesn't paste those contents into the prompt. It sends them to the SDK as `FilePartInput` with `file://` URL, just like OpenCode's `--file`. It does the same internally with `prd.md`, previous reports, and phase diffs.
+Convoy doesn't paste those contents into the prompt. It sends them to the SDK as `FilePartInput` with `file://` URL, just like OpenCode's `--file`. It does the same internally with `prd.md`, the original branch PRD for opted-in review scope steps, previous reports, and phase diffs.
 
 ## Anatomy of a Run
 
@@ -711,7 +713,7 @@ Each invocation creates `~/.convoy/runs/<run-id>/`:
 
 The run dir is kept after the run by default (browse it with `convoy runs`); pass `--no-keep-run-dir` to delete it on successful completion. If the run fails, it's always preserved for inspecting reports, diffs, and logs.
 
-The target repo only sees commits with prefix `convoy(<phase>): ...`, made on the run's branch — by default a new one in its own worktree, so your checkout is untouched until you merge. `convoy finish` replaces that stack with one signed commit of your own. Normal runs leave no CLI files in the project; `convoy init` intentionally creates `.convoy/config.yaml` when you want project-local configuration.
+The target repo only sees commits with prefix `convoy(<phase>): ...`, made on the run's branch — by default a new one in its own worktree, so your checkout is untouched until you merge. `convoy finish` replaces that stack with one signed commit of your own. Each new run also stores a git-ignored, private copy of its prompt under `.convoy/prd-history/`; set `defaults.prdHistory: false` to disable it. `convoy init` intentionally creates `.convoy/config.yaml` when you want project-local configuration.
 
 ## Development
 

@@ -306,6 +306,7 @@ describe("built-in review pipeline", () => {
       agentName: "review-scope",
       readOnly: true,
       verify: true,
+      prdHistory: true,
     })
     // Not fanned out, so it keeps its own name (no __ro suffix).
     expect(scope?.agentName.endsWith("__ro")).toBe(false)
@@ -357,6 +358,27 @@ describe("built-in review pipeline", () => {
       "reports/score__openai-gpt-5-6-sol-xhigh.md",
       "reports/score__anthropic-claude-opus-5.md",
     ])
+  })
+})
+
+describe("PRD history pipeline plumbing", () => {
+  test("marks only built-in review scope steps for historical PRD attachment", () => {
+    for (const name of ["review", "review-lite", "review-cc"] as const) {
+      const steps = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents }).steps
+      const scope = steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
+      expect(scope?.prdHistory).toBe(true)
+      expect(steps.filter((step): step is AgentStep => step.type === "agent" && step.name !== "scope").every((step) => step.prdHistory === undefined)).toBe(true)
+    }
+
+    for (const name of ["implement", "ship", "hunter"] as const) {
+      const steps = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents }).steps
+      expect(steps.every((step) => step.type !== "agent" || step.prdHistory === undefined)).toBe(true)
+    }
+  })
+
+  test("threads enabled custom step history and omits disabled history", () => {
+    expect(agentSteps({ steps: [{ agent: "review-scope", prdHistory: true }] })[0]?.prdHistory).toBe(true)
+    expect(agentSteps({ steps: [{ agent: "review-scope", prdHistory: false }] })[0]?.prdHistory).toBeUndefined()
   })
 })
 

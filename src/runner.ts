@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs"
 import { link, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
@@ -27,6 +28,7 @@ import { HerdrReporter } from "./herdr"
 import { defaultNotificationSettings, Notifier } from "./notifications"
 import { startPermissionGate, type PermissionGate } from "./permissions"
 import { agentsForPipeline, deliverableContractForPhase, splitModelVariant, validateStepFilters } from "./pipeline"
+import { pickPrdHistory, prdHistoryFile, readPrdHistoryIndex, writePrdHistory } from "./prd-history"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
@@ -460,6 +462,20 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
   const workspace = options.resumeRunID
     ? await resumeWorkspace(options.resumeRunID)
     : await createWorkspace(options.prompt)
+
+  if (options.prdHistory && !options.resumeRunID && options.prompt.trim()) {
+    try {
+      await writePrdHistory({
+        targetDir: options.targetDir,
+        runID: workspace.runID,
+        prompt: options.prompt,
+        pipeline: options.pipeline.name,
+        branch: await currentBranch(options.targetDir),
+      })
+    } catch (error) {
+      log.warn(`couldn't write PRD history: ${formatSdkError(error)}`)
+    }
+  }
 
   let runErr: unknown
   let opencode: Awaited<ReturnType<typeof startOpencode>> | undefined
@@ -1152,7 +1168,7 @@ type PreparedPhaseRun = {
   loopGuard: LoopGuardConfig
 }
 
-async function preparePhaseRun(
+export async function preparePhaseRun(
   workspace: Workspace,
   phase: AgentStep,
   options: RunOptions,
@@ -1169,11 +1185,36 @@ async function preparePhaseRun(
 
   const phaseFiles = await fileParts(inputs, workspace.dir, "skip")
   const contextFiles = await projectContextFileParts(projectContextFiles, options.targetDir)
-  const attachments = [...contextFiles, ...phaseFiles, ...extraFiles]
+  const historyFiles = options.prdHistory && phase.prdHistory ? await historicalPrdFileParts(options.targetDir, workspace.runID) : []
+  const attachments = [...contextFiles, ...phaseFiles, ...historyFiles, ...extraFiles]
   const prompt = buildPhasePrompt(workspace, phase)
   const model = selectedModel(phase, options.modelOverride)
 
   return { attachments, prompt, model, loopGuard: resolveLoopGuard(options.loopGuard) }
+}
+
+/** Best-effort dynamic attachment: history stays out of frozen pipeline metadata. */
+async function historicalPrdFileParts(targetDir: string, excludeRunID: string): Promise<FilePartInput[]> {
+  try {
+    const branch = await currentBranch(targetDir)
+    if (!branch) return []
+    const entry = pickPrdHistory(await readPrdHistoryIndex(targetDir), {
+      branch,
+      excludeRunID,
+      fileExists: (candidate) => {
+        try {
+          return existsSync(prdHistoryFile(targetDir, candidate))
+        } catch {
+          return false
+        }
+      },
+    })
+    if (!entry) return []
+    return await fileParts([prdHistoryFile(targetDir, entry)], targetDir, "skip")
+  } catch (error) {
+    log.warn(`couldn't read PRD history: ${formatSdkError(error)}`)
+    return []
+  }
 }
 
 async function projectContextFileParts(paths: string[], targetDir: string) {
@@ -2691,7 +2732,7 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
         : "This phase may edit the target repository when the phase-specific instructions call for it.",
     "",
     "## Attachments",
-    "You will receive as file attachments: project context files when present, the original PRD, previous phase reports, the cumulative diff against the base branch, and any `--file` passed by the user. Read them before acting.",
+    "You will receive as file attachments: project context files when present, the original PRD, the project's historical PRD for this branch when present, previous phase reports, the cumulative diff against the base branch, and any `--file` passed by the user. Read them before acting.",
     "",
     "## Project context",
     "Convoy automatically attaches these target-repo files when they exist: `.convoy/rules.md`, `AGENTS.md`, and `CLAUDE.md`.",

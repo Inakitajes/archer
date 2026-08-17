@@ -349,6 +349,8 @@ export type AgentStepSpec = {
    * read-only, and dropped for `parallel:` / `models:` fan-outs.
    */
   verify?: boolean
+  /** Attach the original branch PRD from the project's history when available. */
+  prdHistory?: boolean
 }
 
 export type HumanStepSpec = {
@@ -482,7 +484,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     defaultPrompt: "Review the current branch against its base and report prioritized findings with a verified quality score.",
     suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
-      { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true, verify: true },
+      { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true, verify: true, prdHistory: true },
       {
         parallel: [
           { agent: "clean-code-auditor", name: "clean-code", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
@@ -509,7 +511,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     defaultPrompt: "Review the current branch against its base and report prioritized findings with a verified quality score.",
     suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
-      { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true, verify: true },
+      { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true, verify: true, prdHistory: true },
       {
         parallel: [
           { agent: "clean-code-auditor", name: "clean-code", models: [glmModel, kimiModel], reports: ["scope"] },
@@ -581,7 +583,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     defaultPrompt: "Review the current branch against its base and report prioritized findings.",
     suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
-      { agent: "review-scope", name: "scope", model: fallbackModel, reports: "none", diff: true, verify: true },
+      { agent: "review-scope", name: "scope", model: fallbackModel, reports: "none", diff: true, verify: true, prdHistory: true },
       {
         parallel: [
           { agent: "clean-code-auditor", name: "clean-code", model: fallbackModel, reports: ["scope"] },
@@ -939,6 +941,7 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
       deliverableContract: defaultDeliverableContract(agent.name, Boolean(forced || agent.readOnly)),
       ...(forced || agent.readOnly ? { readOnly: true } : {}),
       ...(verify ? { verify: true } : {}),
+      ...(spec.prdHistory ? { prdHistory: true } : {}),
     }
     return step
   })
