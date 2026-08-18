@@ -2,6 +2,7 @@ import type { AssistantMessage, Config, OpencodeClient, Part } from "@opencode-a
 
 import { builtInPrompts } from "./built-in-prompts"
 import { log } from "./log"
+import { writeReportToolName } from "./report"
 
 /**
  * The advisor←executor pattern, emulated over OpenCode's own APIs.
@@ -201,6 +202,7 @@ export function advisorTools(): Record<string, boolean> {
     skill: false,
     [advisorToolName]: false,
     [advisorFeedbackToolName]: false,
+    [writeReportToolName]: false,
   }
 }
 

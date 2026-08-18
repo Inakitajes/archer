@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { parseQualityRubricWeights, parseQualityScoreReport, qualityDimensions, qualityDimensionWeights, qualityVerdict, weightedQualityScore, type QualityDimension, type QualityDimensionScores } from "../src/quality-score"
+import { parseQualityRubricWeights, parseQualityScoreReport, qualityDimensions, qualityDimensionWeights, qualityVerdict, renderQualityScoreReport, weightedQualityScore, type QualityDimension, type QualityDimensionScores } from "../src/quality-score"
 
 const dimensions: QualityDimensionScores = { prd: 92, tests: 70, security: 95, maintainability: 88, operational: 90, scope: 85 }
 
@@ -233,6 +233,45 @@ prd 92, tests 70, security 95, maintainability 88, operational 90, scope 85
   test("falls back to the v1 weights when none are passed", () => {
     const report = `\`\`\`quality-score\n${JSON.stringify({ dimensions, mustFix: [] })}\n\`\`\`\n`
     expect(parseQualityScoreReport(report)?.score).toBe(weightedQualityScore(dimensions))
+  })
+})
+
+describe("renderQualityScoreReport", () => {
+  test("round-trips canonical score and verdict rather than accepting them from a model", () => {
+    const report = renderQualityScoreReport("# Score\n\nEvidence", { dimensions, mustFix: [], confidence: "high" })
+    expect(parseQualityScoreReport(report)).toEqual({ score: 87, dimensions, verdict: "ready-with-caveats", mustFix: [], confidence: "high" })
+  })
+
+  test("uses caller-provided rubric weights and the minor-only floor", () => {
+    const custom: Record<QualityDimension, number> = { prd: 0.5, tests: 0.5, security: 0, maintainability: 0, operational: 0, scope: 0 }
+    const customReport = renderQualityScoreReport("score", { dimensions, mustFix: [] }, custom)
+    expect(parseQualityScoreReport(customReport, custom)?.score).toBe(81)
+
+    const low: QualityDimensionScores = { prd: 50, tests: 50, security: 50, maintainability: 50, operational: 50, scope: 50 }
+    const floored = renderQualityScoreReport("score", { dimensions: low, mustFix: ["SC-1: minor detail (minor)"] })
+    expect(parseQualityScoreReport(floored)?.score).toBe(80)
+  })
+
+  test("omits gaps when empty and preserves non-empty gaps through the round-trip", () => {
+    const withGaps = renderQualityScoreReport("# Score", {
+      dimensions,
+      mustFix: ["SC-3: missing cancellation test (major)"],
+      gaps: { tests: "Add a regression test for the cancellation path" },
+    })
+    expect(parseQualityScoreReport(withGaps)?.gaps).toEqual({ tests: "Add a regression test for the cancellation path" })
+
+    // No gaps supplied → the canonical block omits the key entirely, so a
+    // parser that copies the block verbatim cannot leak an empty gaps object.
+    const withoutGaps = renderQualityScoreReport("# Score", { dimensions, mustFix: [] })
+    expect(parseQualityScoreReport(withoutGaps)?.gaps).toBeUndefined()
+    expect(withoutGaps).not.toContain("\"gaps\"")
+  })
+
+  test("trims trailing whitespace off the narrative before appending the fence", () => {
+    const report = renderQualityScoreReport("# Score\n\n\n", { dimensions, mustFix: [] })
+    // Exactly one blank line separates the narrative from the fence, regardless
+    // of how much trailing whitespace the agent left in the markdown.
+    expect(report).toBe(`# Score\n\n\`\`\`quality-score\n${JSON.stringify({ score: 87, dimensions, verdict: "ready-with-caveats", mustFix: [] }, null, 2)}\n\`\`\`\n`)
   })
 })
 

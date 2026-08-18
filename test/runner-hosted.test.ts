@@ -145,6 +145,8 @@ describe("run() with a hosted progress", () => {
       expect(dashboard.events).not.toContain("runFinished:failed")
       // The abort handler is cleared on the way out, not left pointing at a dead run.
       expect(dashboard.events).toContain("clearAbortHandler")
+      // Every OpenCode run receives the report shim, even without an advisor.
+      expect(existsSync(join(hostedHome, ".convoy", "opencode", "tools", "write_report.ts"))).toBe(true)
 
       // The finally no longer closes the server/lease: those ride on release.
       expect(result.release).toBeFunction()

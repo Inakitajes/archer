@@ -96,6 +96,7 @@ describe("opencode config", () => {
       expect(forced?.tools?.write).toBe(false)
       expect(forced?.tools?.edit).toBe(false)
       expect(forced?.tools?.bash).toBe(false)
+      expect(forced?.tools?.write_report).toBe(true)
       // The base agent's own config is untouched: still writable.
       expect(config.agent?.["clean-code"]?.tools?.write).toBe(true)
     } finally {
@@ -118,6 +119,7 @@ describe("opencode config", () => {
       expect(verifying?.prompt).toContain("# Validator")
       expect(verifying?.tools?.bash).toBe(true)
       expect(verifying?.tools?.write).toBe(false)
+      expect(verifying?.tools?.write_report).toBe(true)
       const bash = (verifying?.permission as { bash?: Record<string, string> } | undefined)?.bash
       expect(bash?.["git commit*"]).toBe("deny")
       expect(config.agent?.["validator"]?.tools?.bash).toBe(false)
@@ -142,6 +144,7 @@ describe("opencode config", () => {
       expect(audit?.tools?.write).toBe(false)
       expect(audit?.tools?.edit).toBe(false)
       expect(audit?.tools?.bash).toBe(false)
+      expect(audit?.tools?.write_report).toBe(true)
       expect(audit?.permission).toMatchObject({ edit: "deny", bash: "deny", task: "deny", question: "deny" })
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -166,6 +169,7 @@ describe("opencode config", () => {
       expect(validator?.tools?.write).toBe(false)
       expect(validator?.tools?.edit).toBe(false)
       expect(validator?.tools?.task).toBe(false)
+      expect(validator?.tools?.write_report).toBe(true)
       expect(validator?.permission).toMatchObject({ edit: "deny", task: "deny", question: "deny" })
       const bash = (validator?.permission as { bash?: Record<string, string> } | undefined)?.bash
       // Same policy writable agents get: allowlisted checks run silently, the
@@ -183,6 +187,7 @@ describe("opencode config", () => {
 
     const bash = (config.agent?.implementer?.permission as { bash?: Record<string, string> } | undefined)?.bash
     expect(bash).toMatchObject({ "bun test*": "allow", "git commit*": "deny", "*": "ask" })
+    expect(config.agent?.implementer?.tools?.write_report).toBe(true)
   })
 
   test("verify without readOnly is ignored: a writable agent is already allowed everything", async () => {
@@ -192,6 +197,7 @@ describe("opencode config", () => {
 
     expect(config.agent?.implementer?.tools?.write).toBe(true)
     expect(config.agent?.implementer?.tools?.bash).toBe(true)
+    expect(config.agent?.implementer?.tools?.write_report).toBe(true)
   })
 
   test("asks doom_loop so the permission gate can allow reads and reject writes", () => {
@@ -226,6 +232,7 @@ describe("advisor wiring in the opencode config", () => {
     const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", agents)
 
     expect(config.agent?.implementer?.tools?.advisor).toBe(false)
+    expect(config.agent?.implementer?.tools?.write_report).toBe(true)
     expect(config.agent?.implementer?.permission).toMatchObject({ edit: "allow" })
     expect(config.agent?.implementer?.prompt).not.toContain("You have an `advisor` tool")
     expect(Object.keys(config.provider?.anthropic?.models ?? {})).toEqual([])
@@ -245,6 +252,7 @@ describe("advisor wiring in the opencode config", () => {
 
     // An unadvised agent in the same run is unaffected.
     expect(config.agent?.["bug-auditor"]?.tools?.advisor).toBe(false)
+    expect(config.agent?.["bug-auditor"]?.tools?.write_report).toBe(true)
     expect(config.agent?.["bug-auditor"]?.prompt).not.toContain("You have an `advisor` tool")
   })
 
@@ -254,6 +262,7 @@ describe("advisor wiring in the opencode config", () => {
     })
 
     expect(config.agent?.["bug-auditor"]?.tools?.advisor).toBe(true)
+    expect(config.agent?.["bug-auditor"]?.tools?.write_report).toBe(true)
     expect(config.agent?.["bug-auditor"]?.tools).toMatchObject({ write: false, edit: false, bash: false })
     expect(config.agent?.["bug-auditor"]?.permission).toMatchObject({ edit: "deny", bash: "deny" })
   })

@@ -954,10 +954,10 @@ export const qualityScoreDeliverableContract: DeliverableContract = {
   retryOnMissingOrInvalid: 1,
 }
 
-/** Infers the report contract from agent identity and read-only status. */
-export function defaultDeliverableContract(agentName: string, readOnly: boolean): DeliverableContract {
+/** Infers the report contract from agent identity. Every agent persists a report. */
+export function defaultDeliverableContract(agentName: string, _readOnly: boolean): DeliverableContract {
   if (agentName === "quality-score-report") return qualityScoreDeliverableContract
-  return readOnly ? { kind: "markdown-report" } : { kind: "none" }
+  return { kind: "markdown-report" }
 }
 
 /**

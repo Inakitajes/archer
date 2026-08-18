@@ -37,6 +37,28 @@ export type QualityScore = {
   confidence?: "high" | "medium" | "low"
 }
 
+/**
+ * Appends the canonical machine-readable score fence to a scorer's narrative.
+ * Score and verdict are derived here, never accepted from an agent's payload.
+ */
+export function renderQualityScoreReport(
+  markdown: string,
+  fields: Pick<QualityScore, "dimensions" | "mustFix" | "gaps" | "confidence">,
+  weights: Record<QualityDimension, number> = qualityDimensionWeights,
+): string {
+  const weighted = weightedQualityScore(fields.dimensions, weights)
+  const score = allFindingsMinor(fields.mustFix) ? Math.max(80, weighted) : weighted
+  const report: QualityScore = {
+    score,
+    dimensions: fields.dimensions,
+    verdict: qualityVerdict(score),
+    mustFix: fields.mustFix,
+    ...(fields.gaps && Object.keys(fields.gaps).length > 0 ? { gaps: fields.gaps } : {}),
+    ...(fields.confidence ? { confidence: fields.confidence } : {}),
+  }
+  return `${markdown.trimEnd()}\n\n\`\`\`quality-score\n${JSON.stringify(report, null, 2)}\n\`\`\`\n`
+}
+
 /** Default cap on goal-loop fix iterations after the initial run. */
 export const defaultGoalMaxIterations = 3
 /** Default goal-loop plateau: stop when a fix iteration improves by fewer points than this. */

@@ -29,6 +29,8 @@ import { defaultNotificationSettings, Notifier } from "./notifications"
 import { startPermissionGate, type PermissionGate } from "./permissions"
 import { agentsForPipeline, deliverableContractForPhase, splitModelVariant, validateStepFilters } from "./pipeline"
 import { pickPrdHistory, prdHistoryFile, readPrdHistoryIndex, writePrdHistory } from "./prd-history"
+import { installWriteReportTool, startReportBridge, type ReportBridge } from "./report-bridge"
+import { createReportRuntime, type ReportPhaseHandle, type ReportRuntime } from "./report-runtime"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
@@ -485,6 +487,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
   // parallel run never opens two readlines on stdin at once.
   const terminalInput = createTerminalInput()
   let advisorBridge: AdvisorBridge | undefined
+  let reportBridge: ReportBridge | undefined
   let advisorJournal: AdvisorEventJournal | undefined
   let metadata: RunMetadataStore | undefined
   let control: RunControl | undefined
@@ -654,14 +657,18 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     // Derived from the frozen pipeline, so a resume rebuilds the same advisor
     // machinery the run started with.
     const advisorNeeds = advisorNeedsOf(pipeline.steps)
-    // Everything the on-demand tool needs must exist before the server spawns:
-    // the SDK hands opencode Convoy's environment at spawn time, and the tool
-    // file is discovered from OPENCODE_CONFIG_DIR at startup. The runtime the
-    // bridge serves is created after, once there is a client — hence the
-    // deferred lookup.
+    // Every custom tool must exist before the server spawns: the SDK hands
+    // OpenCode Convoy's environment at spawn time and OPENCODE_CONFIG_DIR is
+    // scanned once at startup. Every OpenCode phase owns a report, so this path
+    // is deliberately independent of whether any phase has an advisor.
+    process.env.OPENCODE_CONFIG_DIR = opencodeConfigDir()
+    let reports: ReportRuntime | undefined
+    reportBridge = await startReportBridge({ reports: () => reports })
+    await installWriteReportTool({ url: reportBridge.url, token: reportBridge.token })
+    // The advisor bridge serves a runtime created only after the SDK returns a
+    // client, so it uses the same deferred lookup pattern.
     let advisors: AdvisorRuntime | undefined
     if (advisorNeeds.agents.size > 0) {
-      process.env.OPENCODE_CONFIG_DIR = opencodeConfigDir()
       // Start the bridge first so we have the URL and token to embed in the
       // tool source. The tool file must exist before the server spawns, but
       // the bridge only needs to be listening — no client yet.
@@ -683,6 +690,9 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       shutdown.signal.removeEventListener("abort", abortBoot)
     }
     progress.serverReady(opencode.url)
+    // serverReady persists asynchronously through the progress adapter. Flush
+    // before phases (or a hosted return) can expose this run for [o] attach.
+    await metadata.flush()
     log.info(`opencode SDK ready at ${opencode.url}`)
 
     advisors = createAdvisorRuntime({
@@ -702,6 +712,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
           }
         : {}),
     })
+    reports = createReportRuntime(workspace.dir)
 
     permissions = startPermissionGate({
       client: opencode.client,
@@ -758,7 +769,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
           await limitAgents(async () => {
             const restored = resuming && (await restorePhaseFromPreviousRun(workspace, runMetadata, step, progress))
             if (!restored) {
-              await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions, terminalInput }, advisors)
+              await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions, terminalInput }, advisors, reports)
             }
           })
         }),
@@ -885,6 +896,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
         // a socket nobody is going to answer. The bridge goes first — the tool
         // source carries the URL and token embedded as string literals (not
         // process.env), and they point at a bridge that no longer exists.
+        reportBridge?.close()
         advisorBridge?.close()
         // The server dies at the end of this block; clear its metadata entry now
         // so `convoy runs` stops offering to attach to a run that's shutting down.
@@ -902,6 +914,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       // carries the URL and token embedded as string literals (not process.env),
       // and they point at a bridge that no longer exists. The tool's execute will
       // fail with a fetch error, which it handles gracefully.
+      reportBridge?.close()
       advisorBridge?.close()
       // The server dies at the end of this block; clear its metadata entry now so
       // `convoy runs` stops offering to attach to a run that's shutting down.
@@ -1126,6 +1139,7 @@ async function runPhase(
   gitLock: GitLock,
   takeover?: TakeoverContext,
   advisors?: AdvisorRuntime,
+  reports?: ReportRuntime,
 ) {
   progress.phaseStarted(phase.name, phase.description)
   log.section(`${phase.name} - ${phase.description}`)
@@ -1149,8 +1163,8 @@ async function runPhase(
       // artifact that persists is always validated with the same weights the
       // loop accepted it with.
       const rubricWeights = contract.kind === "quality-score-report" ? ((await loadQualityRubricWeights(options.targetDir)) ?? qualityDimensionWeights) : qualityDimensionWeights
-      const assistantText = await runPhaseUntilResolved(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors, rubricWeights)
-      return persistPhaseReport(workspace, phase, assistantText, contract, rubricWeights)
+      const candidate = await runPhaseUntilResolved(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors, reports, rubricWeights)
+      return persistPhaseReport(workspace, phase, candidate, contract, rubricWeights)
     })
     await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline))
     progress.phaseCompleted(phase.name, "report saved and commit checked")
@@ -1268,6 +1282,7 @@ export async function runPhaseUntilResolved(
   takeover?: TakeoverContext,
   deps: PhaseRetryDeps = { runPhaseAttempt, restorePhaseBaseline },
   advisors?: AdvisorRuntime,
+  reports?: ReportRuntime,
   /** The rubric weights used for score validation; shared with persistPhaseReport so both sites agree. */
   rubricWeights?: Record<QualityDimension, number>,
 ) {
@@ -1285,10 +1300,11 @@ export async function runPhaseUntilResolved(
     progress.phaseAttempt(phase.name, { attempt, model: formatModel(prepared.model) })
     log.info(`[${phase.name}] attempt ${attempt} with ${formatModel(prepared.model)}`)
     try {
-      const text = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors)
-      const validation = validateDeliverable(deliverableContract, text, weights)
+      const text = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors, reports, deliverableContract, weights)
+      const candidate = await resolveDeliverableCandidate(workspace, phase, text, reports?.candidateFor(sessionRef.id ?? ""))
+      const validation = validateDeliverable(deliverableContract, candidate, weights)
       if (!validation.valid) {
-        await persistInvalidPhaseReport(workspace, phase, attempt, text)
+        await persistInvalidPhaseReport(workspace, phase, attempt, candidate)
         // An armed takeover owns the step even when its deliverable fails
         // validation: hand it to the user instead of auto-retrying or failing
         // terminally behind their back.
@@ -1345,7 +1361,7 @@ export async function runPhaseUntilResolved(
           runDir: workspace.dir,
         })
       }
-      return text
+      return candidate
     } catch (error) {
       if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
       // A scored-contract failure is terminal after its bounded automatic retry:
@@ -1545,8 +1561,11 @@ async function runPhaseAttempt(
   shutdown: RunShutdown,
   sessionRef?: SessionRef,
   advisors?: AdvisorRuntime,
+  reports?: ReportRuntime,
+  deliverableContract?: DeliverableContract,
+  rubricWeights?: Record<QualityDimension, number>,
 ) {
-  const input = { client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors }
+  const input = { client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors, reports, deliverableContract, rubricWeights }
   const runner = phaseAttemptRunners[stepRunnerFor(phase.runner).id]
   const result = await runner.executeAttempt(input)
 
@@ -1587,6 +1606,10 @@ type PhaseAttemptInput = {
   sessionRef?: SessionRef
   /** Absent when no step in the run has an advisor. */
   advisors?: AdvisorRuntime
+  /** Present for OpenCode runs; Claude Code keeps its assistant-text fallback. */
+  reports?: ReportRuntime
+  deliverableContract?: DeliverableContract
+  rubricWeights?: Record<QualityDimension, number>
 }
 
 type PhaseAttemptResult = {
@@ -1620,6 +1643,9 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     attempt: input.attempt,
     loopGuardConfig: input.prepared.loopGuard,
     ...(input.advisors ? { advisors: input.advisors } : {}),
+    ...(input.reports ? { reports: input.reports } : {}),
+    ...(input.deliverableContract ? { deliverableContract: input.deliverableContract } : {}),
+    ...(input.rubricWeights ? { rubricWeights: input.rubricWeights } : {}),
   })
   const assistantText = extractAssistantText(result.lastAssistantParts)
   // Totals for the whole attempt, not the final message: the attempt log's
@@ -1686,42 +1712,56 @@ async function ensureValidDeliverable(
 async function persistPhaseReport(
   workspace: Workspace,
   phase: AgentStep,
-  assistantText: string,
+  candidate: string,
   contract = deliverableContractForPhase(phase),
   weights: Record<QualityDimension, number> = qualityDimensionWeights,
 ) {
   const reportAbs = join(workspace.dir, phase.reportPath)
-  // Validate exactly what will persist. An existing report file is the artifact
-  // — a writable phase wrote it itself, or an earlier run left it — so the file
-  // is validated, not the fallback text: a stale or malformed file must never
-  // stand as the phase's deliverable just because the fallback happened to pass.
-  if (await exists(reportAbs)) {
+  // The candidate was resolved before validation in strict tool → file → chat
+  // order. When a tool report beats a later direct-file mutation, rewrite the
+  // candidate here so persistence has the same precedence as validation.
+  if (candidate.trim() !== "") {
+    await ensureValidDeliverable(workspace, phase, contract, weights, candidate)
+    const existing = await readFile(reportAbs, "utf8").catch(() => undefined)
+    if (existing !== candidate) {
+      await mkdir(dirname(reportAbs), { recursive: true })
+      // Write to a temporary path then rename atomically, matching the
+      // metadata.ts pattern (tmp+rename). A crash mid-write must never leave
+      // a truncated report that phaseNeedsRun would treat as complete.
+      const tmpPath = `${reportAbs}.tmp`
+      await writeFile(tmpPath, candidate)
+      await rename(tmpPath, reportAbs)
+    }
+  } else if (await exists(reportAbs)) {
+    // An empty candidate is normally the human-continue signal. Preserve the
+    // legacy behavior for a file an interactive user intentionally left behind.
     await ensureValidDeliverable(workspace, phase, contract, weights, await readFile(reportAbs, "utf8"))
-  } else if (assistantText.trim() !== "") {
-    // No report yet: the fallback text becomes the report, so validate it first.
-    await ensureValidDeliverable(workspace, phase, contract, weights, assistantText)
-    await mkdir(dirname(reportAbs), { recursive: true })
-    // Write to a temporary path then rename atomically, matching the
-    // metadata.ts pattern (tmp+rename). A crash mid-write must never leave
-    // a truncated report that phaseNeedsRun would treat as complete.
-    const tmpPath = `${reportAbs}.tmp`
-    await writeFile(tmpPath, assistantText)
-    await rename(tmpPath, reportAbs)
   } else {
-    // Empty text is the human-continue signal ("accept the tree as-is") and no
-    // report exists either: there is nothing to validate or persist.
+    // An empty candidate is the human-continue signal ("accept the tree as-is")
+    // and no report exists either: there is nothing to validate or persist.
     log.warn(`[${phase.name}] agent didn't write the expected report at ${reportAbs}`)
   }
 
   return reportAbs
 }
 
-/** Keeps rejected assistant output available without allowing it to become the phase report. */
-async function persistInvalidPhaseReport(workspace: Workspace, phase: AgentStep, attempt: number | undefined, assistantText: string) {
+/** Resolves the exact artifact the contract validates: tool, direct file, then chat fallback. */
+export async function resolveDeliverableCandidate(workspace: Workspace, phase: AgentStep, assistantText: string, toolCandidate?: string): Promise<string> {
+  if (toolCandidate !== undefined) return toolCandidate
+  const reportAbs = join(workspace.dir, phase.reportPath)
+  try {
+    return await readFile(reportAbs, "utf8")
+  } catch {
+    return assistantText
+  }
+}
+
+/** Keeps a rejected candidate available as forensics without allowing it to become the phase report. */
+async function persistInvalidPhaseReport(workspace: Workspace, phase: AgentStep, attempt: number | undefined, candidate: string) {
   const reportAbs = join(workspace.dir, phase.reportPath)
   await mkdir(dirname(reportAbs), { recursive: true })
   const suffix = attempt === undefined ? Date.now() : attempt
-  await writeFile(`${reportAbs}.attempt-${suffix}.raw.md`, assistantText)
+  await writeFile(`${reportAbs}.attempt-${suffix}.raw.md`, candidate)
 }
 
 async function commitPhase(phase: AgentStep, reportAbs: string, targetDir: string) {
@@ -1845,6 +1885,9 @@ export async function promptPhase(
     shutdown: RunShutdown
     sessionRef?: SessionRef
     advisors?: AdvisorRuntime
+    reports?: ReportRuntime
+    deliverableContract?: DeliverableContract
+    rubricWeights?: Record<QualityDimension, number>
     attempt: number
     /** The resolved guard configuration; already resolved by preparePhaseRun, never re-resolved here. */
     loopGuardConfig: LoopGuardConfig
@@ -1863,6 +1906,12 @@ export async function promptPhase(
   // Registered here and not earlier: the permission gate and the on-demand tool
   // both find a phase by its live session, which only exists now.
   const advisor = input.advisors?.begin(session.data.id, input.phase, input.attempt)
+  const report = input.reports?.begin(
+    session.data.id,
+    input.phase,
+    input.deliverableContract ?? deliverableContractForPhase(input.phase),
+    input.rubricWeights ?? qualityDimensionWeights,
+  )
   input.progress.phaseSession(input.phase.name, session.data.id)
   input.shutdown.setActiveSession({ client, sessionID: session.data.id, directory: input.targetDir, phaseName: input.phase.name })
   log.info(`[${input.phase.name}] session: ${session.data.id}`)
@@ -1909,14 +1958,17 @@ export async function promptPhase(
     // the "is it actually done?" consultation: a session that dies during the
     // call loses nothing.
     const reviewed = advisor ? await applyCompletionCheckpoint(client, { ...input, sessionID: session.data.id, loopGuard }, first, advisor) : first
+    const reported = report
+      ? await applyReportCheckpoint(client, { ...input, sessionID: session.data.id, loopGuard }, reviewed, report)
+      : reviewed
 
-    const usage = combinedAssistantUsage(reviewed.assistantInfos, session.data.id)
+    const usage = combinedAssistantUsage(reported.assistantInfos, session.data.id)
     if (usage) {
       input.progress.phaseUsageTotal(input.phase.name, usage)
       log.info(`[${input.phase.name}] usage: ${formatUsageForLog(usage)}`)
     }
     return {
-      ...reviewed,
+      ...reported,
       ...(advisor && advisor.usage.length > 0 ? { advisorUsage: [...advisor.usage] } : {}),
       ...(advisor && advisor.events.length > 0 ? { advisorEvents: [...advisor.events] } : {}),
     }
@@ -1926,6 +1978,7 @@ export async function promptPhase(
     }
     throw error
   } finally {
+    report?.end()
     advisor?.end()
     if (input.shutdown.aborted) await input.shutdown.abortActiveSessions(input.progress)
     input.shutdown.clearActiveSession(input.phase.name, session.data.id)
@@ -1953,10 +2006,9 @@ const noChangesReply = "NO CHANGES"
  * on purpose: nothing is re-serialized, so the phase keeps every bit of context
  * it built up.
  *
- * Read-only phases need the sentinel protocol. Their visible output *is* the
- * report — Convoy persists the assistant text verbatim — so a chatty extra turn
- * would corrupt it. They are asked to either re-emit the whole report or reply
- * with the sentinel, and the sentinel case keeps the original text.
+ * Read-only phases retain the sentinel protocol for advisor corrections. Their
+ * corrected artifact now goes through write_report, so a chatty extra turn
+ * cannot replace a report the runtime already persisted.
  */
 export async function applyCompletionCheckpoint(
   client: OpencodeClient,
@@ -2014,8 +2066,8 @@ export async function applyCompletionCheckpoint(
 
     return {
       info: second.info,
-      // A read-only phase replaces its report or keeps it; a writing phase's text
-      // is only a fallback report, so both turns are kept.
+      // A read-only phase keeps the legacy chat fallback semantics; the durable
+      // report itself is resolved separately from write_report/file/chat.
       parts: input.phase.readOnly ? (unchanged ? first.parts : second.parts) : [...first.parts, ...second.parts],
       assistantInfos: [...first.assistantInfos, ...second.assistantInfos],
       // An unchanged follow-up means the first turn still holds the report, for
@@ -2035,15 +2087,106 @@ export async function applyCompletionCheckpoint(
   }
 }
 
-/** The phase already produced a durable deliverable; a failed review turn must not discard it. */
-function keepCompletedPhase(phaseName: string, first: SessionResult, reason: string): SessionResult {
-  log.warn(`[${phaseName}] advisor review turn failed, keeping the completed phase: ${reason}`)
+/** The same-session reminder used when an OpenCode phase only described its report in chat. */
+const writeReportReminder = [
+  "You did not call write_report. Call it now with the complete report.",
+  "If you have not finished, continue working and then call it. Pasting Markdown in chat is not enough.",
+].join("\n")
+
+/**
+ * Gives OpenCode two opportunities to persist the report without discarding the
+ * live session. Claude Code has no custom-tool capability and never enters here.
+ */
+export async function applyReportCheckpoint(
+  client: OpencodeClient,
+  input: {
+    phase: AgentStep
+    workspace: Workspace
+    targetDir: string
+    model: ModelSelection
+    progress: ProgressUI
+    shutdown: RunShutdown
+    sessionID: string
+    loopGuard: LoopGuard
+    deliverableContract?: DeliverableContract
+    rubricWeights?: Record<QualityDimension, number>
+  },
+  first: SessionResult,
+  report: ReportPhaseHandle,
+): Promise<SessionResult> {
+  const contract = input.deliverableContract ?? deliverableContractForPhase(input.phase)
+  const weights = input.rubricWeights ?? qualityDimensionWeights
+  // An explicit `none` contract owns no deliverable; there is nothing to remind about.
+  if (contract.kind === "none") return first
+  if (await hasValidReportWrite(input.workspace, input.phase, contract, weights, report)) return first
+
+  let latest = first
+  for (let reminder = 0; reminder < 2; reminder++) {
+    input.shutdown.throwIfRequested()
+    input.progress.phaseActivity(input.phase.name, `reminding the agent to save its report (${reminder + 1}/2)`, "info")
+    const watcher = watchSession(client, {
+      directory: input.targetDir,
+      phaseName: input.phase.name,
+      sessionID: input.sessionID,
+      progress: input.progress,
+      signal: input.shutdown.signal,
+      loopGuard: input.loopGuard,
+      sinceMessageID: latest.info.id,
+    })
+    try {
+      await Promise.race([watcher.ready, sleep(3_000)])
+      const accepted = await client.session.promptAsync({
+        sessionID: input.sessionID,
+        directory: input.targetDir,
+        agent: input.phase.agentName,
+        model: { providerID: input.model.providerID, modelID: input.model.modelID },
+        variant: input.model.variant,
+        parts: [{ type: "text", text: writeReportReminder }],
+      }, { signal: input.shutdown.signal })
+      if (accepted.error) throw new Error(formatSdkError(accepted.error))
+      const next = await watcher.result
+      if (next.info.error) return keepCompletedPhase(input.phase.name, latest, formatSdkError(next.info.error), "report reminder turn")
+      latest = {
+        info: next.info,
+        parts: [...latest.parts, ...next.parts],
+        assistantInfos: [...latest.assistantInfos, ...next.assistantInfos],
+        lastAssistantParts: next.lastAssistantParts,
+      }
+      if (await hasValidReportWrite(input.workspace, input.phase, contract, weights, report)) return latest
+    } catch (error) {
+      if (input.shutdown.aborted || isUserAbortError(error) || error instanceof LoopGuardError) throw error
+      return keepCompletedPhase(input.phase.name, latest, error instanceof Error ? error.message : String(error), "report reminder turn")
+    } finally {
+      await watcher.stop()
+    }
+  }
+  return latest
+}
+
+async function hasValidReportWrite(
+  workspace: Workspace,
+  phase: AgentStep,
+  contract: DeliverableContract,
+  weights: Record<QualityDimension, number>,
+  report: ReportPhaseHandle,
+): Promise<boolean> {
+  if (report.candidate !== undefined) return validateDeliverable(contract, report.candidate, weights).valid
+  try {
+    return validateDeliverable(contract, await readFile(join(workspace.dir, phase.reportPath), "utf8"), weights).valid
+  } catch {
+    return false
+  }
+}
+
+/** The phase already produced a durable deliverable; a failed follow-up turn must not discard it. */
+function keepCompletedPhase(phaseName: string, first: SessionResult, reason: string, turn = "advisor review turn"): SessionResult {
+  log.warn(`[${phaseName}] ${turn} failed, keeping the completed phase: ${reason}`)
   return first
 }
 
 function completionFollowUp(phase: AgentStep, advice: string): string {
   const protocol = phase.readOnly
-    ? `If this changes your findings, reply with your COMPLETE corrected report and nothing else — it replaces what you just produced. If it changes nothing, reply with exactly \`${noChangesReply}\`.`
+    ? `If this changes your findings, call \`write_report\` again with the COMPLETE corrected report. If it changes nothing, reply with exactly \`${noChangesReply}\`.`
     : `If this identifies real work, do it now and then say what you changed. If it changes nothing, say so briefly and stop.`
 
   return [
@@ -2712,6 +2855,7 @@ function truncate(value: string, max: number) {
 }
 
 function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
+  const usesWriteReport = phase.runner !== "claude-code"
   return [
     `# Pipeline phase: ${phase.name}`,
     "",
@@ -2719,17 +2863,23 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
     "",
     "## Run context",
     `- Run dir: ${workspace.dir}`,
-    phase.readOnly
-      ? `- Report: Convoy saves your report itself as ${phase.reportPath}; you do not (and cannot) write it.`
-      : `- Write your final report to: ${join(workspace.dir, phase.reportPath)}`,
+    usesWriteReport
+      ? "- Report: call `write_report` with the complete Markdown report before finishing. Convoy fixes the path; do not use write or edit for the report. In read-only phases this is the only permitted report write."
+      : phase.readOnly
+        ? `- Report: Convoy saves your report itself as ${phase.reportPath}; you do not (and cannot) write it.`
+        : `- Write your final report to: ${join(workspace.dir, phase.reportPath)}`,
     "- Working directory: the directory where `convoy` was invoked (root of the target repo).",
     "",
     "## Access mode",
     phase.readOnly && phase.verify
-      ? "This phase verifies without editing: you have bash, so run the tests, typecheck, lint, and other checks your instructions call for, and quote the exact command and its real result as evidence — never claim a check you did not run. You have no write or edit tools, and that is expected: do not try to write any file, and do not apologize for or comment on being unable to. Do not run commands that modify the repository either — no snapshot updates (`-u`, `--update-snapshots`), no formatters that rewrite files, no dependency installs; Convoy fails this phase if the repository changes. Convoy saves your report itself by concatenating the text you emit and storing it verbatim, so your visible output for this phase must be the report and nothing else: no preamble (\"I'll verify…\", \"Let me write the report…\"), no step-by-step narration, and no closing note about writing. Keep any planning in your private reasoning; begin your visible output at the report's first line (e.g. the `#` heading)."
+      ? usesWriteReport
+        ? "This phase verifies without editing: you have bash, so run the tests, typecheck, lint, and other checks your instructions call for, and quote the exact command and its real result as evidence — never claim a check you did not run. Do not run commands that modify the repository either — no snapshot updates (`-u`, `--update-snapshots`), no formatters that rewrite files, no dependency installs; Convoy fails this phase if the repository changes. You have no write or edit tools. Use `write_report`, not write or edit, to persist the final report."
+        : "This phase verifies without editing: you have bash, so run the tests, typecheck, lint, and other checks your instructions call for, and quote the exact command and its real result as evidence — never claim a check you did not run. You have no write or edit tools, and that is expected: do not try to write any file. Do not run commands that modify the repository either — no snapshot updates (`-u`, `--update-snapshots`), no formatters that rewrite files, no dependency installs; Convoy fails this phase if the repository changes. Convoy saves your visible Markdown report as the fallback deliverable."
       : phase.readOnly
-        ? "This phase is read-only: Convoy gives you no write, edit, or bash tools, and that is expected — do not try to write any file, and do not apologize for or comment on being unable to. Convoy saves your report itself by concatenating the text you emit and storing it verbatim, so your visible output for this phase must be the report and nothing else: no preamble (\"I'll review…\", \"Let me write the report…\"), no step-by-step narration, and no closing note about writing. Keep any planning in your private reasoning; begin your visible output at the report's first line (e.g. the `#` heading)."
-        : "This phase may edit the target repository when the phase-specific instructions call for it.",
+        ? usesWriteReport
+          ? "This phase is read-only: do not modify the target repository or try to use write, edit, or bash. Call `write_report` to persist the complete final report; this tool is the only permitted write."
+          : "This phase is read-only: Convoy gives you no write, edit, or bash tools. Do not modify the target repository. Convoy saves your visible Markdown report as the fallback deliverable."
+        : "This phase may edit the target repository when the phase-specific instructions call for it. Call `write_report` to persist the final report rather than writing a report file directly.",
     "",
     "## Attachments",
     "You will receive as file attachments: project context files when present, the original PRD, the project's historical PRD for this branch when present, previous phase reports, the cumulative diff against the base branch, and any `--file` passed by the user. Read them before acting.",
@@ -2745,9 +2895,11 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
       : phase.readOnly
         ? "1. Have not modified the target repository."
         : "1. Have applied necessary changes to the repo code.",
-    phase.readOnly
-      ? "2. Make the report (markdown, max ~80 lines) your entire visible output — Convoy persists it for you. Nothing before or after it."
-      : "2. Have written the report (markdown, max ~80 lines) at the absolute path indicated above. If you can't write it, respond with the exact report content and Convoy will save it.",
+    usesWriteReport
+      ? "2. Have called `write_report` with the complete report (markdown, max ~80 lines)."
+      : phase.readOnly
+        ? "2. Make the report (markdown, max ~80 lines) your entire visible output — Convoy persists it for you. Nothing before or after it."
+        : "2. Have written the report (markdown, max ~80 lines) at the absolute path indicated above. If you can't write it, respond with the exact report content and Convoy will save it.",
     "3. Leave the tree in a compilable state.",
     "",
     // The goal brief is untrusted, agent-authored text. It is appended AFTER the

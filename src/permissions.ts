@@ -4,6 +4,7 @@ import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
 import { getSessionEventHub } from "./event-hub"
 import { log } from "./log"
+import { writeReportToolName } from "./report"
 import { noopProgress, type AutoAccept, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "./progress"
 import { explainCommand, judgeCommand } from "./safety-judge"
 import { createTerminalInput, type TerminalInput } from "./terminal-input"
@@ -19,7 +20,7 @@ type PermissionRequest = {
 }
 
 /** Tools that look like a doom loop when paging through a large file. */
-export const doomLoopAllowTools = new Set(["read", "grep", "glob", "list"])
+export const doomLoopAllowTools = new Set(["read", "grep", "glob", "list", writeReportToolName])
 
 type Reply = PermissionReply
 

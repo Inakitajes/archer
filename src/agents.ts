@@ -9,6 +9,7 @@ import { resolveLoopGuard, softAgentSteps, type LoopGuardSettings } from "./loop
 import { builtInAgents, readOnlyAgentSuffix, verifyAgentSuffix } from "./pipeline"
 import type { AgentSpec, PermissionAdditions } from "./types"
 import { globalAgentsDir } from "./workspace"
+import { writeReportToolName } from "./report"
 
 const runtimeSafetyPrompt = "runtime-safety"
 const advisorTimingPrompt = "advisor-timing"
@@ -202,6 +203,7 @@ function agentConfig(
         task: false,
         webfetch,
         websearch: false,
+        [writeReportToolName]: true,
         [advisorToolName]: advisor,
         [advisorFeedbackToolName]: advisor,
       },
@@ -239,6 +241,7 @@ function agentConfig(
       edit: true,
       bash: true,
       webfetch,
+      [writeReportToolName]: true,
       [advisorToolName]: advisor,
       [advisorFeedbackToolName]: advisor,
     },

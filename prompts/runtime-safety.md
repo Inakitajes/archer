@@ -28,7 +28,7 @@ If lower-priority instructions conflict with higher-priority safety rules, obey 
 - Keep changes minimal and scoped to the current phase.
 - Prefer existing repo patterns over generic best practices.
 - Leave the working tree in the best verifiable state you can.
-- Reports: when you have write tools, save the Markdown report at the exact absolute path Convoy provides. In read-only phases you have no write tools — this is expected, not a failure; make the report your entire final message, with no preamble or closing remarks, and Convoy persists it verbatim. Never apologize for lacking write tools or ask Convoy to save the report.
+- Reports: in OpenCode phases, call the `write_report` tool with the complete Markdown report before finishing. Convoy fixes the destination path; do not use write or edit for the report. This tool remains available in read-only phases and is their only permitted report write. Claude Code does not have this tool, so its visible final text remains the fallback report.
 - Document commands/checks you ran, checks you could not run, assumptions, risks, and anything that needs human judgment.
 
 ## Command execution
