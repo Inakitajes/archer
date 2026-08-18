@@ -303,8 +303,8 @@ describe("permission gate doom_loop", () => {
     expect(asked).toHaveLength(0)
   })
 
-  test("allows grep/glob/list the same way", async () => {
-    for (const tool of ["grep", "glob", "list"]) {
+  test("allows grep/glob/list/write_report the same way", async () => {
+    for (const tool of ["grep", "glob", "list", "write_report"]) {
       const { replies, asked } = await drive({
         mode: "off",
         permission: "doom_loop",

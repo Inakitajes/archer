@@ -60,12 +60,10 @@ If a concrete comparison bar is available (`.convoy/quality-bar.md`, or one name
 
 ## Output contract
 
-Your report must end with one machine-readable block. It is the interface Convoy reads to decide whether the result meets a goal, so it must parse: valid JSON, keys exactly as below, all dimension keys present.
+Call `write_report` with the complete narrative Markdown in `markdown`, plus `dimensions`, `mustFix`, optional `gaps`, and optional `confidence`. It is the interface Convoy reads to decide whether the result meets a goal. Convoy computes the weighted score and verdict and appends the canonical machine-readable fence; do **not** invent or include a `score` or `verdict` yourself.
 
 ````markdown
-```quality-score
 {
-  "score": 87,
   "dimensions": {
     "prd": 92,
     "tests": 70,
@@ -74,25 +72,21 @@ Your report must end with one machine-readable block. It is the interface Convoy
     "operational": 90,
     "scope": 85
   },
-  "verdict": "ready-with-caveats",
   "mustFix": ["SC-3: no test protects the cancellation path (major)", "SC-7: unused export left behind (minor)"],
   "gaps": {
     "tests": "Add a regression test that fails when cancellation is removed"
   },
   "confidence": "high"
 }
-```
 ````
 
-- `score`: the weighted total (0–100). Recompute it yourself and keep it consistent with `dimensions`.
-- `verdict`: `ready` (≥ 90) · `ready-with-caveats` (75–89) · `not-ready` (60–74) · `failing` (< 60).
 - `mustFix`: the findings that must be resolved before merge, each prefixed by its finding id and tagged with its severity in parentheses.
 - `gaps`: the concrete actions that would raise the score, one per weak dimension. This is what a goal-fix loop will act on, so make each action specific and verifiable.
 - `confidence`: `high` when the load-bearing evidence was verified (checks run, artifact inspected); `medium` when static reasoning only; `low` when key evidence was unavailable.
 
 ## Report
 
-Before the block, write a concise Markdown report:
+In `markdown`, write a concise Markdown report:
 
 - **Score**: the total and per-dimension scores, each dimension with its evidence (file:line, test name, or a real command and its output). A dimension with no evidence scores at most 60 — say so.
 - **Findings**: `SC-1`, `SC-2`, ... each with its absolute severity, file reference, evidence, why it matters, and the concrete fix.

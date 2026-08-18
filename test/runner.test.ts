@@ -33,6 +33,8 @@ import {
   progressPhases,
   promptPhase,
   applyCompletionCheckpoint,
+  applyReportCheckpoint,
+  resolveDeliverableCandidate,
   runPhaseUntilResolved,
   restorePhaseFromPreviousRun,
   selectInterruptedPhase,
@@ -45,6 +47,8 @@ import {
 import type { AgentStep, DeliverableContract, HumanStep, Pipeline, Step } from "../src/types"
 import type { Workspace } from "../src/workspace"
 import { LoopGuard, LoopGuardError, resolveLoopGuard } from "../src/loop-guard"
+import { createReportRuntime } from "../src/report-runtime"
+import { qualityDimensionWeights } from "../src/quality-score"
 
 const recoveryDirs: string[] = []
 
@@ -843,6 +847,48 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
 
     expect(result).toBe(validQualityScoreReport)
     expect(attempts).toEqual([1])
+  })
+
+  test("a write_report candidate is the deliverable when chat is empty", async () => {
+    const workspace = await retryWorkspace()
+    const phase = { ...agentStep("scope"), readOnly: true, deliverableContract: { kind: "markdown-report" } as const }
+    const reports = createReportRuntime(workspace.dir)
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      noopProgress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, _attempt, _progress, _shutdown, sessionRef) => {
+          sessionRef!.id = "ses_report"
+          const handle = reports.begin("ses_report", phase, phase.deliverableContract, qualityDimensionWeights)
+          await handle.write({ markdown: "# Tool report\n\nSaved before the chat said done." })
+          handle.end()
+          return ""
+        },
+        restorePhaseBaseline: async () => {},
+      },
+      undefined,
+      reports,
+    )
+
+    expect(result).toContain("Tool report")
+  })
+
+  test("the registered tool report wins over a direct file and chat fallback", async () => {
+    const workspace = await retryWorkspace()
+    const phase = agentStep("scope")
+    await mkdir(join(workspace.dir, "reports"))
+    await writeFile(join(workspace.dir, phase.reportPath), "direct file")
+
+    expect(await resolveDeliverableCandidate(workspace, phase, "chat fallback", "tool report")).toBe("tool report")
   })
 
   test("an empty markdown report reaches the human failure gate instead of failing terminally", async () => {
@@ -2221,6 +2267,204 @@ describe("applyCompletionCheckpoint lastAssistantParts", () => {
     expect(result.lastAssistantParts).toHaveLength(1)
     expect((result.lastAssistantParts[0] as { text: string }).text).toBe("first report")
     expect(result.parts).toHaveLength(2)
+  })
+})
+
+describe("applyReportCheckpoint", () => {
+  const reportPrepared = {
+    attachments: [],
+    prompt: "test prompt",
+    model: { providerID: "openai", modelID: "gpt-5.5" },
+    loopGuard: resolveLoopGuard(),
+  }
+
+  async function reportWorkspace(): Promise<Workspace> {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-report-checkpoint-"))
+    recoveryDirs.push(dir)
+    await mkdir(join(dir, "logs"))
+    return { dir, runID: "20260724-110022-test" }
+  }
+
+  const message = (id: string, text: string) => {
+    const info = {
+      id,
+      sessionID: "ses_1",
+      role: "assistant" as const,
+      time: { created: 1, completed: 2 },
+      parentID: "p",
+      modelID: "gpt-5.5",
+      providerID: "openai",
+      mode: "primary",
+      agent: "scope",
+      path: { cwd: "/repo", root: "/repo" },
+      cost: 0,
+      tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+    }
+    return { info, parts: [{ id: `${id}_p`, sessionID: "ses_1", messageID: id, type: "text" as const, text }] }
+  }
+
+  const firstResult = (text = "") => {
+    const first = message("msg_1", text)
+    return { ...first, assistantInfos: [first.info], lastAssistantParts: first.parts } as never
+  }
+
+  function reminderClient(first: ReturnType<typeof message>, followUps: ReturnType<typeof message>[]) {
+    const waits = followUps.map(() => deferred())
+    let prompts = 0
+    let subscriptions = 0
+    const sessionIDs: string[] = []
+    const client = {
+      event: {
+        subscribe: async () => {
+          const index = subscriptions++
+          async function* stream() {
+            await waits[index]!.promise
+            yield { type: "session.idle", properties: { sessionID: "ses_1" } }
+            await new Promise<void>(() => {})
+          }
+          return { stream: stream() }
+        },
+      },
+      session: {
+        promptAsync: async ({ sessionID }: { sessionID: string }) => {
+          sessionIDs.push(sessionID)
+          waits[prompts++]!.resolve()
+          return {}
+        },
+        messages: async () => ({ data: [first, ...followUps.slice(0, prompts)] }),
+        status: async () => ({ data: {} }),
+        abort: async () => ({}),
+      },
+    } as never
+    return { client, promptCount: () => prompts, sessionIDs }
+  }
+
+  const emptyReport = {
+    get candidate() {
+      return undefined
+    },
+    write: async () => ({ markdown: "unused" }),
+    end: () => {},
+  }
+
+  const inputFor = (workspace: Workspace, phase: AgentStep) => ({
+    phase,
+    workspace,
+    targetDir: "/repo",
+    model: { providerID: "openai", modelID: "gpt-5.5" },
+    progress: noopProgress,
+    shutdown: new RunShutdown(),
+    sessionID: "ses_1",
+    loopGuard: new LoopGuard(resolveLoopGuard()),
+  })
+
+  test("never nudges a phase whose contract explicitly owns no deliverable", async () => {
+    let prompts = 0
+    const client = {
+      session: {
+        promptAsync: async () => {
+          prompts++
+          return {}
+        },
+      },
+    } as never
+    const workspace = await reportWorkspace()
+    const phase = { ...agentStep("scope"), deliverableContract: { kind: "none" } as const }
+    const first = firstResult()
+
+    const result = await applyReportCheckpoint(client, inputFor(workspace, phase), first, emptyReport as never)
+
+    // A `none` contract stays an explicit opt-out: no report, no reminders.
+    expect(result).toBe(first)
+    expect(prompts).toBe(0)
+  })
+
+  test("does not nudge when write_report already persisted a valid report", async () => {
+    let prompts = 0
+    const first = {
+      info: { id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1, completed: 2 } },
+      parts: [],
+      assistantInfos: [],
+      lastAssistantParts: [],
+    } as never
+    const report = {
+      candidate: "# Findings\n\nNo blockers.",
+      write: async () => ({ markdown: "unused" }),
+      end: () => {},
+    }
+
+    const result = await applyReportCheckpoint(
+      { session: { promptAsync: async () => { prompts++; return {} } } } as never,
+      {
+        phase: { ...agentStep("scope"), readOnly: true, deliverableContract: { kind: "markdown-report" } },
+        workspace: { dir: "/run", runID: "test-run" },
+        targetDir: "/repo",
+        model: { providerID: "openai", modelID: "gpt-5.5" },
+        progress: noopProgress,
+        shutdown: new RunShutdown(),
+        sessionID: "ses_1",
+        loopGuard: new LoopGuard(resolveLoopGuard()),
+      },
+      first,
+      report as never,
+    )
+
+    expect(result).toBe(first)
+    expect(prompts).toBe(0)
+  })
+
+  test("sends exactly two same-session reminders before accepting valid chat fallback", async () => {
+    const workspace = await reportWorkspace()
+    const phase = { ...agentStep("scope"), readOnly: true, deliverableContract: { kind: "markdown-report" } as const }
+    const first = firstResult()
+    const reminders = reminderClient(first, [message("msg_2", "still working"), message("msg_3", "# Fallback report\n\nSaved in chat only.")])
+
+    const result = await applyReportCheckpoint(reminders.client, inputFor(workspace, phase), first, emptyReport as never)
+
+    expect(reminders.promptCount()).toBe(2)
+    expect(reminders.sessionIDs).toEqual(["ses_1", "ses_1"])
+    expect(extractAssistantText(result.lastAssistantParts)).toContain("Fallback report")
+  })
+
+  test("sends two reminders then lets empty fallback reach the normal user gate", async () => {
+    const workspace = await reportWorkspace()
+    const phase = { ...agentStep("scope"), readOnly: true, deliverableContract: { kind: "markdown-report" } as const }
+    const first = firstResult()
+    const reminders = reminderClient(first, [message("msg_2", ""), message("msg_3", "")])
+    const gates: HumanReviewPromptInfo[] = []
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        gates.push(info)
+        return Promise.resolve("continue")
+      },
+    }
+
+    const result = await runPhaseUntilResolved(
+      reminders.client,
+      workspace,
+      phase,
+      "/repo",
+      reportPrepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async () => {
+          const checkpoint = await applyReportCheckpoint(reminders.client, inputFor(workspace, phase), first, emptyReport as never)
+          return extractAssistantText(checkpoint.lastAssistantParts)
+        },
+        restorePhaseBaseline: async () => {},
+      },
+    )
+
+    expect(result).toBe("")
+    expect(reminders.promptCount()).toBe(2)
+    expect(reminders.sessionIDs).toEqual(["ses_1", "ses_1"])
+    expect(gates).toHaveLength(1)
+    expect(gates[0]).toMatchObject({ kind: "failure", error: "phase produced an empty report" })
   })
 })
 

@@ -1214,10 +1214,10 @@ describe("deliverable contracts", () => {
     expect(defaultDeliverableContract("quality-score-report", true)).toEqual(qualityScoreDeliverableContract)
   })
 
-  test("defaultDeliverableContract selects markdown-report for read-only phases and none for writable phases", () => {
+  test("defaultDeliverableContract selects markdown-report for every ordinary phase", () => {
     expect(defaultDeliverableContract("review-scope", true)).toEqual({ kind: "markdown-report" })
-    expect(defaultDeliverableContract("implementer", false)).toEqual({ kind: "none" })
-    // a writable agent that happens to be read-only still gets markdown-report
+    expect(defaultDeliverableContract("implementer", false)).toEqual({ kind: "markdown-report" })
+    // Read-only status no longer decides whether an ordinary phase owns a report.
     expect(defaultDeliverableContract("implementer", true)).toEqual({ kind: "markdown-report" })
   })
 
@@ -1237,7 +1237,7 @@ describe("deliverable contracts", () => {
     // stay readable and executable.
     expect(deliverableContractForPhase({ agentName: "quality-score-report", readOnly: true })).toEqual(qualityScoreDeliverableContract)
     expect(deliverableContractForPhase({ agentName: "review-scope", readOnly: true })).toEqual({ kind: "markdown-report" })
-    expect(deliverableContractForPhase({ agentName: "implementer", readOnly: false })).toEqual({ kind: "none" })
+    expect(deliverableContractForPhase({ agentName: "implementer", readOnly: false })).toEqual({ kind: "markdown-report" })
   })
 
   test("a resolved review pipeline gives the scorer the quality-score contract and read-only audits the markdown-report contract", () => {
@@ -1252,14 +1252,14 @@ describe("deliverable contracts", () => {
     expect(byName["scope"]?.deliverableContract).toEqual({ kind: "markdown-report" })
     expect(byName["report"]?.deliverableContract).toEqual({ kind: "markdown-report" })
 
-    // A writable phase (none in review, but the default pipeline's implementer
-    // is writable) gets the none contract: Convoy does not gate its deliverable.
+    // A writable phase gets the same markdown-report contract as a read-only
+    // phase; the tool persists every agent step's deliverable.
     const defaultSteps = Object.fromEntries(
       defaultPipeline()
         .steps.filter((step): step is AgentStep => step.type === "agent")
         .map((step) => [step.name, step]),
     )
-    expect(defaultSteps["implementer"]?.deliverableContract).toEqual({ kind: "none" })
+    expect(defaultSteps["implementer"]?.deliverableContract).toEqual({ kind: "markdown-report" })
     // readOnly is only set when true; a writable phase leaves it undefined.
     expect(defaultSteps["implementer"]?.readOnly).toBeFalsy()
   })

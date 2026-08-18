@@ -91,7 +91,8 @@ export function globalAgentsDir() {
 
 /**
  * A Convoy-owned OpenCode config directory, passed to the server as
- * OPENCODE_CONFIG_DIR so `tools/advisor.ts` is discovered.
+ * OPENCODE_CONFIG_DIR so Convoy's `tools/*.ts` shims (including write_report
+ * and advisor) are discovered.
  *
  * Convoy-owned rather than the repo's `.opencode/` (which would show up in git
  * status and in the read-only baseline checks) or the user's
