@@ -459,18 +459,22 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   "goal-fix": {
     description: "The goal loop's fix iteration: apply exactly the gaps from the previous scoring round, then re-score. Not run directly; ship's goal or --goal drives it.",
     steps: [
-      { agent: "goal-fixer", name: "fix", reports: "none", diff: true },
+      { agent: "goal-fixer", name: "fix", reports: "none", diff: true, prdHistory: true },
       {
         parallel: [
           // The re-scorers must stay blind to the previous score: the fixer's
           // report restates it, so the scorer steps receive no reports at all
-          // (they grade the artifact, not the round's history).
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "none" },
+          // (they grade the artifact, not the round's history). They still get
+          // the original PRD via prdHistory: the rubric's `prd` dimension (30%
+          // of the score) cannot be graded without it.
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "none", prdHistory: true },
         ],
       },
       // The consensus sees only the fresh scorer reports, never the fixer's,
-      // so its measurement cannot anchor on the number it is reconciling.
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: ["score"], verify: true },
+      // so its measurement cannot anchor on the number it is reconciling; the
+      // original PRD is attached so disagreements on the `prd` dimension can be
+      // judged against the actual requirements.
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: ["score"], verify: true, prdHistory: true },
     ],
   },
   // Report-only review + the measurement layer: after the parallel audits, two
@@ -495,10 +499,10 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "review-report", name: "report", model: defaultOpusModel, reports: "all" },
       {
         parallel: [
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all", prdHistory: true },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all", verify: true },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all", verify: true, prdHistory: true },
     ],
   },
   // review's shape with nothing on Opus. The scorer models are pinned rather
@@ -522,10 +526,10 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "review-report", name: "report", model: glmModel, reports: "all" },
       {
         parallel: [
-          { agent: "quality-scorer", name: "score", models: [glmXhighModel, kimiHighModel], reports: "all" },
+          { agent: "quality-scorer", name: "score", models: [glmXhighModel, kimiHighModel], reports: "all", prdHistory: true },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: glmXhighModel, reports: "all", verify: true },
+      { agent: "quality-score-report", name: "score-report", model: glmXhighModel, reports: "all", verify: true, prdHistory: true },
     ],
   },
   // The close of the process: the branch is already shaped the way you want it,
@@ -554,10 +558,10 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "sync-with-base", name: "sync", model: fallbackModel, reports: "none" },
       {
         parallel: [
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all" },
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all", prdHistory: true },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all", verify: true },
+      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all", verify: true, prdHistory: true },
     ],
   },
   // The follow-up to a report-only run: feed it the findings (as the prompt or an

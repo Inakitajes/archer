@@ -362,15 +362,47 @@ describe("built-in review pipeline", () => {
 })
 
 describe("PRD history pipeline plumbing", () => {
-  test("marks only built-in review scope steps for historical PRD attachment", () => {
-    for (const name of ["review", "review-lite", "review-cc"] as const) {
+  test("marks the built-in scored pipelines for historical PRD attachment on their scoring steps", () => {
+    // Review-style pipelines attach the PRD on the scope step AND on every
+    // scoring step (the fan-out scorers and the consensus), because the
+    // rubric's `prd` dimension (30% of the score) can only be graded against
+    // the original PRD.
+    for (const name of ["review", "review-lite"] as const) {
       const steps = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents }).steps
+      const scope = steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
+      const scorers = steps.filter((step): step is AgentStep => step.type === "agent" && step.name === "score")
+      const consensus = steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")
+      expect(scope?.prdHistory).toBe(true)
+      expect(scorers.every((step) => step.prdHistory === true)).toBe(true)
+      expect(consensus?.prdHistory).toBe(true)
+    }
+
+    // review-cc ends at the findings report — it has no scoring steps — so it
+    // attaches the PRD only on its scope step.
+    {
+      const steps = resolvePipeline({ name: "review-cc", spec: builtInPipelines["review-cc"]!, agents: builtInAgents }).steps
       const scope = steps.find((step): step is AgentStep => step.type === "agent" && step.name === "scope")
       expect(scope?.prdHistory).toBe(true)
       expect(steps.filter((step): step is AgentStep => step.type === "agent" && step.name !== "scope").every((step) => step.prdHistory === undefined)).toBe(true)
     }
 
-    for (const name of ["implement", "ship", "hunter"] as const) {
+    // ship and goal-fix have no scope step; their scorers and consensus carry
+    // the PRD so the measurement is graded against the original requirements.
+    for (const name of ["ship", "goal-fix"] as const) {
+      const steps = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents }).steps
+      expect(steps.filter((step): step is AgentStep => step.type === "agent" && step.name === "score").every((step) => step.prdHistory === true)).toBe(true)
+      expect(steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")?.prdHistory).toBe(true)
+    }
+
+    // goal-fix also attaches the PRD on the fixer, so it knows the original
+    // requirements while closing exactly the reported gaps.
+    {
+      const steps = resolvePipeline({ name: "goal-fix", spec: builtInPipelines["goal-fix"]!, agents: builtInAgents }).steps
+      expect(steps.find((step): step is AgentStep => step.type === "agent" && step.name === "fix")?.prdHistory).toBe(true)
+    }
+
+    // Non-scored pipelines attach no historical PRD anywhere.
+    for (const name of ["implement", "hunter"] as const) {
       const steps = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents }).steps
       expect(steps.every((step) => step.type !== "agent" || step.prdHistory === undefined)).toBe(true)
     }
