@@ -269,3 +269,52 @@ describe("advisor wiring in the opencode config", () => {
     })
   })
 })
+
+describe("throughput routing in the opencode config", () => {
+  test("declares provider.sort throughput on every OpenRouter model of a nitro run", () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", [
+      { name: "implementer", description: "writes", builtIn: true },
+    ], undefined, {
+      throughputModels: [
+        { providerID: "openrouter", modelID: "z-ai/glm-5.3" },
+        { providerID: "openrouter", modelID: "deepseek/deepseek-v4-flash-0731" },
+      ],
+    })
+
+    expect(config.provider?.openrouter?.models?.["z-ai/glm-5.3"]).toEqual({ options: { provider: { sort: "throughput" } } })
+    expect(config.provider?.openrouter?.models?.["deepseek/deepseek-v4-flash-0731"]).toEqual({ options: { provider: { sort: "throughput" } } })
+    // Options-only entries: no name or limit is invented over the catalog's real model.
+    expect(config.provider?.openrouter?.models?.["z-ai/glm-5.3"]?.name).toBeUndefined()
+    expect(config.provider?.openrouter?.models?.["z-ai/glm-5.3"]?.limit).toBeUndefined()
+    // The provider-level timeout settings survive the merge.
+    expect(config.provider?.openrouter?.options?.timeout).toBe(false)
+    expect(config.provider?.openrouter?.options?.chunkTimeout).toBe(10 * 60 * 1000)
+  })
+
+  test("ignores non-OpenRouter models and stays inert without throughput models", () => {
+    const withOthers = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", [
+      { name: "implementer", description: "writes", builtIn: true },
+    ], undefined, {
+      throughputModels: [{ providerID: "zai", modelID: "glm-5.3" }, { providerID: "openai", modelID: "gpt-5.6-terra" }],
+    })
+    expect(Object.keys(withOthers.provider?.openrouter?.models ?? {})).toEqual([])
+
+    const plain = opencodeConfig("/tmp/convoy-run")
+    expect(Object.keys(plain.provider?.openrouter?.models ?? {})).toEqual([])
+  })
+
+  test("merges throughput options with advisor aliases on the same provider", () => {
+    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", [
+      { name: "implementer", description: "writes", builtIn: true },
+    ], undefined, {
+      throughputModels: [{ providerID: "openrouter", modelID: "z-ai/glm-5.3" }],
+      advisorModels: [{ providerID: "openrouter", modelID: "z-ai/glm-5.3" }],
+    })
+
+    expect(config.provider?.openrouter?.models?.["z-ai/glm-5.3"]).toEqual({ options: { provider: { sort: "throughput" } } })
+    expect(config.provider?.openrouter?.models?.["convoy-advisor-z-ai/glm-5.3"]).toMatchObject({
+      id: "z-ai/glm-5.3",
+      limit: { output: 2048 },
+    })
+  })
+})

@@ -8,6 +8,7 @@ import type { ProgressUI, RunOutcome } from "../src/progress"
 import type { RunOptions } from "../src/types"
 
 import { preparePhaseRun, run as realRun, hostedTeardownFromError, type RunDeps } from "../src/runner"
+import { buildRunPlan } from "../src/run-plan"
 import { noopProgress } from "../src/progress"
 import { builtInAgents } from "../src/pipeline"
 import { prdHistoryDir, readPrdHistoryIndex, writePrdHistory } from "../src/prd-history"
@@ -213,6 +214,93 @@ describe("run() with a hosted progress", () => {
       // A normal run closes its own server entry during cleanup.
       const metadata = JSON.parse(await readFile(join(result.dir, "metadata.json"), "utf8"))
       expect(metadata.server).toBeUndefined()
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("a nitro run injects throughput routing into its own OpenCode config", async () => {
+    const repo = await cleanRepo()
+    // Capture the config the runner hands the (fake) opencode server; the phase
+    // itself then fails on the fake client's missing session API, which is fine
+    // — the injection happens at server start, before any phase runs.
+    let captured: Awaited<Parameters<RunDeps["startOpencode"]>[0]> | undefined
+    const capturingStart: RunDeps["startOpencode"] = async (config) => {
+      captured = config
+      return { client: fakeClient as never, url: "http://127.0.0.1:41235", close: () => {} }
+    }
+    try {
+      const options = makeOptions(repo, {
+        gateway: "nitro",
+        pipeline: {
+          name: "nitro-test",
+          steps: [
+            {
+              type: "agent",
+              name: "scope",
+              stepName: "scope",
+              groupId: "g1",
+              agentName: "review-scope",
+              description: "Scope",
+              model: "zai/glm-5.2#high",
+              inputFiles: ["prd.md"],
+              inputDiff: false,
+              reportPath: "reports/scope.md",
+            },
+          ],
+        },
+      })
+      try {
+        await realRun({ ...options, plan: buildRunPlan(options) }, { startOpencode: capturingStart })
+      } catch {
+        // Expected: the fake client cannot run the phase.
+      }
+
+      expect(captured?.provider?.openrouter?.models?.["z-ai/glm-5.2"]).toEqual({
+        options: { provider: { sort: "throughput" } },
+      })
+      // The provider-level timeout settings still ride along.
+      expect(captured?.provider?.openrouter?.options?.timeout).toBe(false)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("a non-nitro run leaves the OpenCode config free of throughput routing", async () => {
+    const repo = await cleanRepo()
+    let captured: Awaited<Parameters<RunDeps["startOpencode"]>[0]> | undefined
+    const capturingStart: RunDeps["startOpencode"] = async (config) => {
+      captured = config
+      return { client: fakeClient as never, url: "http://127.0.0.1:41236", close: () => {} }
+    }
+    try {
+      const options = makeOptions(repo, {
+        gateway: "openrouter",
+        pipeline: {
+          name: "openrouter-test",
+          steps: [
+            {
+              type: "agent",
+              name: "scope",
+              stepName: "scope",
+              groupId: "g1",
+              agentName: "review-scope",
+              description: "Scope",
+              model: "zai/glm-5.2#high",
+              inputFiles: ["prd.md"],
+              inputDiff: false,
+              reportPath: "reports/scope.md",
+            },
+          ],
+        },
+      })
+      try {
+        await realRun({ ...options, plan: buildRunPlan(options) }, { startOpencode: capturingStart })
+      } catch {
+        // Expected: the fake client cannot run the phase.
+      }
+
+      expect(Object.keys(captured?.provider?.openrouter?.models ?? {})).toEqual([])
     } finally {
       await rm(repo, { recursive: true, force: true })
     }

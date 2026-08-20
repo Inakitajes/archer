@@ -59,6 +59,8 @@ function directOpenAIPlan(): RunPlan {
   return result
 }
 
+// A nitro plan frozen by a pre-throughput Convoy version: its targets still
+// carry the literal `:nitro` suffix the catalog can never resolve directly.
 function nitroPlan(): RunPlan {
   const result = plan()
   const step = result.pipeline.steps[0]!
@@ -335,6 +337,30 @@ describe("OpenCode run-plan preflight", () => {
     expect(() => validatePreflightTargets(preflightTargets(reviewed), nitroCatalog())).not.toThrow()
     expect(() => validatePreflightTargets(preflightTargets(reviewed), nitroCatalog({ hasUnsuffixed: false }))).toThrow(
       "Model unavailable",
+    )
+  })
+
+  test("a fresh nitro plan preflights the plain OpenRouter target", () => {
+    const fresh = nitroPlan()
+    const step = fresh.pipeline.steps[0]!
+    if (step.type !== "agent") throw new Error("expected agent step")
+    step.model = "openrouter/z-ai/glm-5.2"
+    step.resolvedModel = {
+      configured: "zai/glm-5.2#xhigh",
+      logical: "zai/glm-5.2#xhigh",
+      gateway: "nitro",
+      providerID: "openrouter",
+      modelID: "z-ai/glm-5.2",
+      variant: "xhigh",
+      target: "openrouter/z-ai/glm-5.2#xhigh",
+    }
+
+    expect(() => validatePreflightTargets(preflightTargets(fresh), nitroCatalog())).not.toThrow()
+    expect(() => validatePreflightTargets(preflightTargets(fresh), nitroCatalog({ hasUnsuffixed: false }))).toThrow(
+      "Model unavailable",
+    )
+    expect(() => validatePreflightTargets(preflightTargets(fresh), nitroCatalog({ hasUnsuffixed: false }))).toThrow(
+      "target:  openrouter/z-ai/glm-5.2#xhigh",
     )
   })
 })

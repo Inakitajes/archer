@@ -118,16 +118,17 @@ describe("run review TUI", () => {
     expect(lines.some((line) => line.includes("runtime  smart permissions · 2 attachments · judge openrouter/openai/gpt-5.6-terra#xhigh"))).toBe(true)
   })
 
-  test("renders an OpenRouter Nitro gateway and the :nitro remap target", () => {
+  test("renders an OpenRouter Nitro gateway with the throughput note and the plain remap target", () => {
     const plan = planWith(
-      [agentStep({ name: "implementer", stepName: "implementer", groupId: "g1", resolvedModel: resolved("zai/glm-5.2#xhigh", "openrouter/z-ai/glm-5.2:nitro#xhigh", "nitro") })],
+      [agentStep({ name: "implementer", stepName: "implementer", groupId: "g1", resolvedModel: resolved("zai/glm-5.2#xhigh", "openrouter/z-ai/glm-5.2#xhigh", "nitro") })],
       { modelRouting: { gateway: "nitro" } },
     )
 
     const lines = plain(runReviewLines(plan, 100))
 
     expect(lines.some((line) => line.includes("gateway  OpenRouter Nitro"))).toBe(true)
-    expect(lines.some((line) => line.includes("zai/glm-5.2#xhigh → openrouter/z-ai/glm-5.2:nitro#xhigh"))).toBe(true)
+    expect(lines.some((line) => line.includes("routed by throughput"))).toBe(true)
+    expect(lines.some((line) => line.includes("zai/glm-5.2#xhigh → openrouter/z-ai/glm-5.2#xhigh"))).toBe(true)
   })
 
   test("renders a nitro resume override banner with the full labels", () => {

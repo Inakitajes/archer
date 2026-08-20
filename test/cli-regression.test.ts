@@ -218,7 +218,9 @@ describe("CLI semantic regression coverage", () => {
     expect(routed.length).toBeGreaterThan(0)
     for (const step of routed) {
       expect(step.resolvedModel?.providerID).toBe("openrouter")
-      expect(step.resolvedModel?.target.includes(":nitro")).toBe(true)
+      // Throughput routing is injected provider options, so the target is the
+      // plain OpenRouter id — never a `:nitro`-suffixed one.
+      expect(step.resolvedModel?.target.includes(":nitro")).toBe(false)
     }
   })
 

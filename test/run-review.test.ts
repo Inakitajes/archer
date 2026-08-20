@@ -147,7 +147,7 @@ describe("renderRunPlan", () => {
     expect(output).toContain("pending phases: As configured")
   })
 
-  test("renders an OpenRouter Nitro gateway and the :nitro target", () => {
+  test("renders an OpenRouter Nitro gateway with the throughput note and the plain target", () => {
     const plan = samplePlan()
     plan.modelRouting.gateway = "nitro"
     const step = plan.pipeline.steps[0]
@@ -157,15 +157,15 @@ describe("renderRunPlan", () => {
         logical: "zai/glm-5.2#xhigh",
         gateway: "nitro",
         providerID: "openrouter",
-        modelID: "z-ai/glm-5.2:nitro",
+        modelID: "z-ai/glm-5.2",
         variant: "xhigh",
-        target: "openrouter/z-ai/glm-5.2:nitro#xhigh",
+        target: "openrouter/z-ai/glm-5.2#xhigh",
       }
     }
     const output = renderRunPlan(plan, false)
-    expect(output).toContain("Gateway: OpenRouter Nitro")
+    expect(output).toContain("Gateway: OpenRouter Nitro · every OpenRouter model routed by throughput")
     expect(output).toContain("Logical: zai/glm-5.2#xhigh")
-    expect(output).toContain("Target:  openrouter/z-ai/glm-5.2:nitro#xhigh")
+    expect(output).toContain("Target:  openrouter/z-ai/glm-5.2#xhigh")
   })
 
   test("renders a nitro resume override copy", () => {
