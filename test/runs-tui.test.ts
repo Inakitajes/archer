@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 
 import { RunsBrowser } from "../src/runs-browser"
+import { shortVersion } from "../src/version"
 
 import type { RunEntry } from "../src/runs"
 
@@ -181,7 +182,9 @@ test("wide screens keep the run list and details side by side", async () => {
     await Bun.sleep(260)
     const lines = testRenderer.captureCharFrame().split("\n")
     // The header carries convoy+version on its border, not a meter row.
-    expect(lines.join("\n")).toContain("convoy dev")
+    // shortVersion() is "dev" in a bare checkout and "vX.Y.Z-dev" when
+    // npm_package_version is set (CI), so the assertion has to follow it.
+    expect(lines.join("\n")).toContain(`convoy ${shortVersion()}`)
     expect(lines.join("\n")).not.toContain("OpenRouter")
     expect(lines.join("\n")).not.toContain("OpenAI")
     // Side by side: both panel titles share the same horizontal band.
