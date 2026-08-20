@@ -5,6 +5,7 @@ import { join } from "node:path"
 
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test"
 
+import { modelGateways } from "../src/model-routing"
 import {
   buildAgentRegistry,
   checkPipelineResolves,
@@ -789,6 +790,21 @@ describe("model routing config", () => {
     expect(config.modelRouting?.overrides).toEqual({ "zai/glm-5.2": { openrouter: "openrouter/z-ai/glm-5.2" } })
   })
 
+  test("canonicalized override keys that collide fail instead of silently replacing", () => {
+    expect(() =>
+      parse(
+        [
+          "modelRouting:",
+          "  overrides:",
+          "    zai/glm-5.2:",
+          "      openrouter: openrouter/z-ai/glm-5.2",
+          "    zai/glm-5.2:nitro:",
+          "      vercel: vercel/zai/glm-5.2",
+        ].join("\n"),
+      ),
+    ).toThrow('modelRouting.overrides.zai/glm-5.2:nitro canonicalizes to "zai/glm-5.2", same as "zai/glm-5.2"')
+  })
+
   test("serializes a nitro gateway and override target", () => {
     const config = parse(
       "modelRouting:\n  gateway: nitro\n  overrides:\n    custom/private-model:\n      nitro: openrouter/acme/private:nitro",
@@ -801,7 +817,7 @@ describe("model routing config", () => {
   })
 
   test("the init template documents nitro in the gateway comment", () => {
-    expect(defaultConvoyConfig).toContain("configured | direct | openrouter | nitro | vercel")
+    expect(defaultConvoyConfig).toContain(modelGateways.join(" | "))
     expect(defaultConvoyConfig).toContain("nitro: openrouter/z-ai/glm-5.2:nitro")
   })
 

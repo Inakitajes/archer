@@ -12,7 +12,7 @@ import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
 import { buildRunPlan, type BuildRunPlanInput } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
 import { loadPrdHistoryPreview } from "./prd-history"
-import { isModelGateway, modelGatewayChoices, type ModelGateway } from "./model-routing"
+import { isModelGateway, modelGatewayChoices, modelGateways, type ModelGateway } from "./model-routing"
 import { browseRuns } from "./runs"
 import { deleteKeychainSecret, keychainAvailable, storeKeychainSecret } from "./secrets"
 import type { Pipeline, RunOptions, RunPlan } from "./types"
@@ -1089,7 +1089,7 @@ Flags:
                            consulted at decision points (before the first write, before declaring done,
                            and on demand) that reads the step's transcript but never runs tools
   --no-advisor             Run every step without an advisor, whatever the config sets
-  --gateway <configured|direct|openrouter|nitro|vercel> Route all OpenCode models through the selected gateway
+  --gateway <${modelGateways.join("|")}> Route all OpenCode models through the selected gateway
   --plan                   Print the complete resolved plan without creating or running anything
   --no-confirm             Show a compact plan and start without the interactive confirmation
   --tui                    Show visual phase progress (default in interactive terminals)

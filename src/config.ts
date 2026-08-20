@@ -253,7 +253,7 @@ version: 1
 
 # Route OpenCode models without rewriting pipelines. Project config overrides the global choice.
 # modelRouting:
-#   gateway: configured # configured | direct | openrouter | nitro | vercel
+#   gateway: configured # ${modelGateways.join(" | ")}
 #   overrides:
 #     zai/glm-5.2:
 #       openrouter: openrouter/z-ai/glm-5.2
@@ -554,6 +554,7 @@ function validateModelRouting(v: Validator, raw: unknown): ModelRoutingConfig {
   }
   if (record.overrides !== undefined) {
     const overrides = v.record(record.overrides, "modelRouting.overrides")
+    const seenCanonical = new Map<string, string>()
     for (const [logical, rawTargets] of Object.entries(overrides)) {
       if (!isValidModelString(logical)) v.fail(`modelRouting.overrides.${logical}`, "key must be a provider/model")
       // Keys name the canonical logical model, exactly as resolveModel recovers
@@ -566,6 +567,14 @@ function validateModelRouting(v: Validator, raw: unknown): ModelRoutingConfig {
       } catch (error) {
         v.fail(`modelRouting.overrides.${logical}`, error instanceof Error ? error.message : String(error))
       }
+      const previous = seenCanonical.get(canonical)
+      if (previous !== undefined) {
+        v.fail(
+          `modelRouting.overrides.${logical}`,
+          `canonicalizes to "${canonical}", same as "${previous}"; use one override key`,
+        )
+      }
+      seenCanonical.set(canonical, logical)
       const targets = v.record(rawTargets, `modelRouting.overrides.${logical}`)
       v.knownKeys(targets, `modelRouting.overrides.${logical}`, [...modelGateways])
       const parsed: Partial<Record<import("./model-routing").ModelGateway, string>> = {}

@@ -6,9 +6,10 @@ export type ModelGateway = (typeof modelGateways)[number]
 /** The OpenRouter routing variant Convoy requests as `:nitro` (provider.sort: "throughput"). */
 export const openRouterNitroSuffix = ":nitro"
 
-/** Removes exactly one trailing `:nitro` suffix, when present; otherwise a no-op. */
+/** Removes every trailing `:nitro` suffix; otherwise a no-op. */
 export function stripOpenRouterNitro(value: string): string {
-  return value.endsWith(openRouterNitroSuffix) ? value.slice(0, -openRouterNitroSuffix.length) : value
+  while (value.endsWith(openRouterNitroSuffix)) value = value.slice(0, -openRouterNitroSuffix.length)
+  return value
 }
 
 /** Ensures the value ends with exactly one trailing `:nitro` suffix. */
@@ -87,7 +88,7 @@ function isSafeModelPart(value: string) {
   return value.length > 0 && !/[\s/#\u0000-\u001f\u007f-\u009f]/u.test(value)
 }
 
-type RoutableGateway = "direct" | "openrouter" | "vercel" | "nitro"
+type RoutableGateway = Exclude<ModelGateway, "configured">
 
 export function resolveModel(configured: string, gateway: ModelGateway, overrides: ModelRoutingOverrides = {}): ResolvedModel {
   const configuredParts = splitModelVariant(configured)
@@ -108,14 +109,17 @@ export function resolveModel(configured: string, gateway: ModelGateway, override
     case "openrouter":
     case "vercel":
     case "nitro": {
-      const override = overrides[logical]?.[gateway]
+      const entry = overrides[logical]
+      const override = entry?.[gateway]
       if (override) {
-        physical = overrideFor(logical, gateway, override, logicalVariant)
-        variant ??= splitModelVariant(override).variant
-      } else if (gateway === "nitro" && overrides[logical]?.openrouter) {
+        const applied = overrideFor(logical, gateway, override, logicalVariant)
+        physical = applied.model
+        variant ??= applied.variant
+      } else if (gateway === "nitro" && entry?.openrouter) {
         // Fall back to the plain openrouter override, then apply `:nitro`.
-        physical = applyOpenRouterNitro(overrideFor(logical, "openrouter", overrides[logical]!.openrouter!, logicalVariant))
-        variant ??= splitModelVariant(overrides[logical]!.openrouter!).variant
+        const applied = overrideFor(logical, "openrouter", entry.openrouter, logicalVariant)
+        physical = applyOpenRouterNitro(applied.model)
+        variant ??= applied.variant
       } else {
         physical = autoWrap(gateway, configured, logical)
       }
@@ -144,12 +148,12 @@ export function resolveModel(configured: string, gateway: ModelGateway, override
  * configured logical model is still an error, and an override-only variant is
  * adopted when the configured model names none.
  */
-function overrideFor(logical: string, key: string, target: string, logicalVariant?: string): string {
+function overrideFor(logical: string, key: string, target: string, logicalVariant?: string): { model: string; variant?: string } {
   const parts = splitModelVariant(target)
   if (parts.variant && logicalVariant && parts.variant !== logicalVariant) {
     throw new Error(`modelRouting override for ${logical}.${key} must not replace variant #${logicalVariant}`)
   }
-  return parts.model
+  return parts
 }
 
 /**

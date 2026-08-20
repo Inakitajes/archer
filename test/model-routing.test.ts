@@ -148,6 +148,19 @@ describe("OpenRouter nitro gateway", () => {
     expect(logicalModel("zai/glm-5.2:nitro").model).toBe("zai/glm-5.2")
   })
 
+  test("repeated :nitro suffixes strip from logical identity and still hit overrides", () => {
+    expect(logicalModel("openrouter/z-ai/glm-5.2:nitro:nitro").model).toBe("zai/glm-5.2")
+    expect(stripOpenRouterNitro("openrouter/z-ai/glm-5.2:nitro:nitro")).toBe("openrouter/z-ai/glm-5.2")
+    expect(resolveModel("openrouter/z-ai/glm-5.2:nitro:nitro", "nitro")).toMatchObject({
+      logical: "zai/glm-5.2",
+      providerID: "openrouter",
+      modelID: "z-ai/glm-5.2:nitro",
+      target: "openrouter/z-ai/glm-5.2:nitro",
+    })
+    const overrides = { "zai/glm-5.2": { nitro: "openrouter/acme/private:nitro" } }
+    expect(resolveModel("openrouter/z-ai/glm-5.2:nitro:nitro", "nitro", overrides).target).toBe("openrouter/acme/private:nitro")
+  })
+
   test("nitro falls back to the openrouter override and applies the suffix", () => {
     const overrides = { "custom/private-model": { openrouter: "openrouter/acme/private" } }
     expect(resolveModel("custom/private-model", "nitro", overrides).target).toBe("openrouter/acme/private:nitro")

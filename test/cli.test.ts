@@ -6,6 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { goalModeFor, goalModeRejectionError, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
+import { modelGateways } from "../src/model-routing"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import type { Pipeline, RunPlan } from "../src/types"
 
@@ -290,7 +291,7 @@ describe("parseCommand", () => {
       expect(cmd.text).toContain("convoy [prompt]")
       expect(cmd.text).toContain("Commands:")
       expect(cmd.text).toContain("Flags:")
-      expect(cmd.text).toContain("--gateway <configured|direct|openrouter|nitro|vercel>")
+      expect(cmd.text).toContain(`--gateway <${modelGateways.join("|")}>`)
     }
   })
 
