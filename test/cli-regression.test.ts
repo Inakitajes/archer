@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:tes
 import { parseAndRun, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
 import { addWorktree } from "../src/git"
 import { stepNames } from "../src/pipeline"
+import type { AgentStep } from "../src/types"
 
 const dirs: string[] = []
 let savedHome: string | undefined
@@ -200,6 +201,25 @@ describe("CLI semantic regression coverage", () => {
     expect(cli.options.gateway).toBe("vercel")
     expect(cli.options.gatewayExplicit).toBe(true)
     expect(cli.options.plan?.modelRouting.gateway).toBe("vercel")
+  })
+
+  test("--gateway nitro routes the resolved plan through OpenRouter Nitro", async () => {
+    const dir = await projectWithQuickPipeline()
+
+    const nitro = await parseCommand(["--dir", dir, "--gateway", "nitro", "prompt"])
+    expect(nitro.type).toBe("run")
+    if (nitro.type !== "run") return
+    expect(nitro.options.gateway).toBe("nitro")
+    expect(nitro.options.plan?.modelRouting.gateway).toBe("nitro")
+
+    const routed = (nitro.options.plan?.pipeline.steps ?? []).filter(
+      (step): step is AgentStep => step.type === "agent" && Boolean(step.resolvedModel),
+    )
+    expect(routed.length).toBeGreaterThan(0)
+    for (const step of routed) {
+      expect(step.resolvedModel?.providerID).toBe("openrouter")
+      expect(step.resolvedModel?.target.includes(":nitro")).toBe(true)
+    }
   })
 
   test("resume restores the frozen pipeline, prompt, and routing metadata", async () => {

@@ -771,11 +771,14 @@ Convoy can change how every OpenCode model is reached without rewriting a pipeli
 ```sh
 convoy "Implement the feature" --gateway direct
 convoy "Implement the feature" --gateway openrouter
+convoy "Implement the feature" --gateway nitro
 convoy "Implement the feature" --gateway vercel
 convoy "Implement the feature" --gateway configured
 ```
 
 `configured` (the default) preserves model IDs literally. `direct` uses the model owner's provider; `openrouter` and `vercel` wrap the logical provider/model. Claude Code steps are never rerouted. A `--model` selects the logical model first, then the gateway is applied.
+
+`nitro` is OpenRouter with the `:nitro` routing suffix appended to every OpenCode model — equivalent to asking OpenRouter to sort providers by **throughput** instead of price. The wrap is identical to `openrouter` (same aliases and safety rules, same credential), so the physical IDs look like `openrouter/z-ai/glm-5.2:nitro`. Nitro often costs more than default OpenRouter routing because it does not load-balance to the cheapest provider; it is meant for long phases where speed matters more than a few cents. The `:nitro` suffix never becomes part of a model's logical identity, so overrides, vercel/direct conversion, and preflight keep working on the unsuffixed ID.
 
 Persist the choice globally in `~/.convoy/config.yaml` or per project in `.convoy/config.yaml` (CLI > project > global > configured):
 

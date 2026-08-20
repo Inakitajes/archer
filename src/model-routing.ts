@@ -1,7 +1,30 @@
 import { splitModelVariant } from "./pipeline"
 
-export const modelGateways = ["configured", "direct", "openrouter", "vercel"] as const
+export const modelGateways = ["configured", "direct", "openrouter", "nitro", "vercel"] as const
 export type ModelGateway = (typeof modelGateways)[number]
+
+/** The OpenRouter routing variant Convoy requests as `:nitro` (provider.sort: "throughput"). */
+export const openRouterNitroSuffix = ":nitro"
+
+/** Removes every trailing `:nitro` suffix; otherwise a no-op. */
+export function stripOpenRouterNitro(value: string): string {
+  while (value.endsWith(openRouterNitroSuffix)) value = value.slice(0, -openRouterNitroSuffix.length)
+  return value
+}
+
+/** Ensures the value ends with exactly one trailing `:nitro` suffix. */
+export function applyOpenRouterNitro(value: string): string {
+  return value.endsWith(openRouterNitroSuffix) ? value : `${value}${openRouterNitroSuffix}`
+}
+
+/**
+ * The accepted gateway values joined for human error messages, e.g.
+ * `"configured", "direct", "openrouter", "nitro", or "vercel"`. Derived from
+ * the union so a sixth gateway cannot drift into a stale handwritten copy.
+ */
+export function modelGatewayChoices(): string {
+  return modelGateways.map((gateway) => `"${gateway}"`).join(", ").replace(/, "([^"]+)"$/, ', or "$1"')
+}
 
 export type ModelRoutingOverrides = Record<string, Partial<Record<ModelGateway, string>>>
 
@@ -31,15 +54,17 @@ export function isModelGateway(value: unknown): value is ModelGateway {
   return typeof value === "string" && modelGateways.includes(value as ModelGateway)
 }
 
+const gatewayLabels: Record<ModelGateway, string> = {
+  configured: "As configured",
+  direct: "Direct",
+  openrouter: "OpenRouter",
+  nitro: "OpenRouter Nitro",
+  vercel: "Vercel AI Gateway",
+}
+
 /** Single display label shared by the launcher, config editor, review, and errors. */
 export function gatewayLabel(gateway: ModelGateway): string {
-  return gateway === "vercel"
-    ? "Vercel AI Gateway"
-    : gateway === "openrouter"
-      ? "OpenRouter"
-      : gateway === "direct"
-        ? "Direct"
-        : "As configured"
+  return gatewayLabels[gateway]
 }
 
 /** Recover the provider-owned model identity from a direct or gateway-wrapped OpenCode model. */
@@ -53,12 +78,17 @@ export function logicalModel(value: string): { model: string; variant?: string }
     throw new Error(`model must contain non-empty provider, model, and variant segments without whitespace or control characters, got "${value}"`)
   }
   parts[0] = directAliases[parts[0]!] ?? parts[0]!
-  return { model: parts.join("/"), ...(parsed.variant ? { variant: parsed.variant } : {}) }
+  // `:nitro` is an OpenRouter routing alias, not part of the model's identity:
+  // recover the unsuffixed logical model so override keys, vercel/direct
+  // conversion, and preflight all keep working on the plain ID.
+  return { model: stripOpenRouterNitro(parts.join("/")), ...(parsed.variant ? { variant: parsed.variant } : {}) }
 }
 
 function isSafeModelPart(value: string) {
   return value.length > 0 && !/[\s/#\u0000-\u001f\u007f-\u009f]/u.test(value)
 }
+
+type RoutableGateway = Exclude<ModelGateway, "configured">
 
 export function resolveModel(configured: string, gateway: ModelGateway, overrides: ModelRoutingOverrides = {}): ResolvedModel {
   const configuredParts = splitModelVariant(configured)
@@ -68,27 +98,32 @@ export function resolveModel(configured: string, gateway: ModelGateway, override
   let variant = logicalVariant
 
   let physical: string
-  if (gateway === "configured") {
-    physical = configuredParts.model
-  } else {
-    const override = overrides[logical]?.[gateway]
-    if (override) {
-      const overrideParts = splitModelVariant(override)
-      if (overrideParts.variant && logicalVariant && overrideParts.variant !== logicalVariant) {
-        throw new Error(`modelRouting override for ${logical}.${gateway} must not replace variant #${logicalVariant}`)
+  // Exhaustive on the ModelGateway union: no trailing `else` can silently
+  // misroute a future gateway (the vercel-else trap the PRD forbids).
+  switch (gateway) {
+    case "configured":
+      // Literal: a configured model may already carry `:nitro`; do not add or strip.
+      physical = configuredParts.model
+      break
+    case "direct":
+    case "openrouter":
+    case "vercel":
+    case "nitro": {
+      const entry = overrides[logical]
+      const override = entry?.[gateway]
+      if (override) {
+        const applied = overrideFor(logical, gateway, override, logicalVariant)
+        physical = applied.model
+        variant ??= applied.variant
+      } else if (gateway === "nitro" && entry?.openrouter) {
+        // Fall back to the plain openrouter override, then apply `:nitro`.
+        const applied = overrideFor(logical, "openrouter", entry.openrouter, logicalVariant)
+        physical = applyOpenRouterNitro(applied.model)
+        variant ??= applied.variant
+      } else {
+        physical = autoWrap(gateway, configured, logical)
       }
-      physical = overrideParts.model
-      // An override can select a provider-specific default variant when the
-      // configured logical model does not name one. A caller-selected variant
-      // still wins (and conflicting values above remain an error).
-      variant ??= overrideParts.variant
-    } else {
-      const [provider, ...model] = logical.split("/")
-      if (!provider || model.length === 0) throw unsafeConversion(configured, gateway)
-      if (!safelyRoutableProviders.has(provider)) throw unsafeConversion(configured, gateway)
-      if (gateway === "direct") physical = `${provider}/${model.join("/")}`
-      else if (gateway === "openrouter") physical = `openrouter/${openRouterAliases[provider] ?? provider}/${model.join("/")}`
-      else physical = `vercel/${provider}/${model.join("/")}`
+      break
     }
   }
 
@@ -104,6 +139,41 @@ export function resolveModel(configured: string, gateway: ModelGateway, override
     modelID,
     ...(variant ? { variant } : {}),
     target,
+  }
+}
+
+/**
+ * Applies an override target as-is (exactly like `openrouter:` / `vercel:`
+ * today): the physical model is literal, but a variant conflict with the
+ * configured logical model is still an error, and an override-only variant is
+ * adopted when the configured model names none.
+ */
+function overrideFor(logical: string, key: string, target: string, logicalVariant?: string): { model: string; variant?: string } {
+  const parts = splitModelVariant(target)
+  if (parts.variant && logicalVariant && parts.variant !== logicalVariant) {
+    throw new Error(`modelRouting override for ${logical}.${key} must not replace variant #${logicalVariant}`)
+  }
+  return parts
+}
+
+/**
+ * The no-override physical for a routable gateway. `logical` is already the
+ * unsuffixed logical model, so direct/vercel/openrouter never leak `:nitro`;
+ * only nitro re-appends the suffix.
+ */
+function autoWrap(gateway: RoutableGateway, configured: string, logical: string): string {
+  const [provider, ...model] = logical.split("/")
+  if (!provider || model.length === 0) throw unsafeConversion(configured, gateway)
+  if (!safelyRoutableProviders.has(provider)) throw unsafeConversion(configured, gateway)
+  switch (gateway) {
+    case "direct":
+      return `${provider}/${model.join("/")}`
+    case "openrouter":
+      return `openrouter/${openRouterAliases[provider] ?? provider}/${model.join("/")}`
+    case "nitro":
+      return applyOpenRouterNitro(`openrouter/${openRouterAliases[provider] ?? provider}/${model.join("/")}`)
+    case "vercel":
+      return `vercel/${provider}/${model.join("/")}`
   }
 }
 

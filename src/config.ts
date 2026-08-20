@@ -35,7 +35,7 @@ import { isStepRunnerId, normalizeStepRunnerModel, stepRunnerFor, type StepRunne
 import type { NotificationSettings } from "./notifications"
 import type { AdvisorAuditPolicy } from "./advisor-events"
 import type { AgentSpec, HookSet, HookSpec, HooksConfig, HookWhen, PermissionAdditions } from "./types"
-import { isModelGateway, logicalModel, type ModelRoutingConfig, type ModelRoutingOverrides } from "./model-routing"
+import { isModelGateway, logicalModel, modelGatewayChoices, modelGateways, type ModelRoutingConfig, type ModelRoutingOverrides } from "./model-routing"
 import { convoyHome, convoyRoot, globalConfigPath } from "./workspace"
 
 /**
@@ -253,10 +253,11 @@ version: 1
 
 # Route OpenCode models without rewriting pipelines. Project config overrides the global choice.
 # modelRouting:
-#   gateway: configured # configured | direct | openrouter | vercel
+#   gateway: configured # ${modelGateways.join(" | ")}
 #   overrides:
 #     zai/glm-5.2:
 #       openrouter: openrouter/z-ai/glm-5.2
+#       nitro: openrouter/z-ai/glm-5.2:nitro # optional; openrouter fallback + :nitro is enough
 #       vercel: vercel/zai/glm-5.2
 
 defaults:
@@ -548,11 +549,12 @@ function validateModelRouting(v: Validator, raw: unknown): ModelRoutingConfig {
   v.knownKeys(record, "modelRouting", ["gateway", "overrides"])
   const routing: ModelRoutingConfig = { overrides: {} }
   if (record.gateway !== undefined) {
-    if (!isModelGateway(record.gateway)) v.fail("modelRouting.gateway", 'must be "configured", "direct", "openrouter", or "vercel"')
+    if (!isModelGateway(record.gateway)) v.fail("modelRouting.gateway", `must be ${modelGatewayChoices()}`)
     routing.gateway = record.gateway
   }
   if (record.overrides !== undefined) {
     const overrides = v.record(record.overrides, "modelRouting.overrides")
+    const seenCanonical = new Map<string, string>()
     for (const [logical, rawTargets] of Object.entries(overrides)) {
       if (!isValidModelString(logical)) v.fail(`modelRouting.overrides.${logical}`, "key must be a provider/model")
       // Keys name the canonical logical model, exactly as resolveModel recovers
@@ -565,8 +567,16 @@ function validateModelRouting(v: Validator, raw: unknown): ModelRoutingConfig {
       } catch (error) {
         v.fail(`modelRouting.overrides.${logical}`, error instanceof Error ? error.message : String(error))
       }
+      const previous = seenCanonical.get(canonical)
+      if (previous !== undefined) {
+        v.fail(
+          `modelRouting.overrides.${logical}`,
+          `canonicalizes to "${canonical}", same as "${previous}"; use one override key`,
+        )
+      }
+      seenCanonical.set(canonical, logical)
       const targets = v.record(rawTargets, `modelRouting.overrides.${logical}`)
-      v.knownKeys(targets, `modelRouting.overrides.${logical}`, ["configured", "direct", "openrouter", "vercel"])
+      v.knownKeys(targets, `modelRouting.overrides.${logical}`, [...modelGateways])
       const parsed: Partial<Record<import("./model-routing").ModelGateway, string>> = {}
       for (const [gateway, target] of Object.entries(targets)) {
         if (!isModelGateway(gateway)) continue

@@ -147,6 +147,35 @@ describe("renderRunPlan", () => {
     expect(output).toContain("pending phases: As configured")
   })
 
+  test("renders an OpenRouter Nitro gateway and the :nitro target", () => {
+    const plan = samplePlan()
+    plan.modelRouting.gateway = "nitro"
+    const step = plan.pipeline.steps[0]
+    if (step?.type === "agent") {
+      step.resolvedModel = {
+        configured: "zai/glm-5.2#xhigh",
+        logical: "zai/glm-5.2#xhigh",
+        gateway: "nitro",
+        providerID: "openrouter",
+        modelID: "z-ai/glm-5.2:nitro",
+        variant: "xhigh",
+        target: "openrouter/z-ai/glm-5.2:nitro#xhigh",
+      }
+    }
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("Gateway: OpenRouter Nitro")
+    expect(output).toContain("Logical: zai/glm-5.2#xhigh")
+    expect(output).toContain("Target:  openrouter/z-ai/glm-5.2:nitro#xhigh")
+  })
+
+  test("renders a nitro resume override copy", () => {
+    const plan = samplePlan()
+    plan.resume = { runID: "run-previous", gatewayOverride: { original: "openrouter", pending: "nitro" } }
+    const output = renderRunPlan(plan, false)
+    expect(output).toContain("original: OpenRouter")
+    expect(output).toContain("pending phases: OpenRouter Nitro")
+  })
+
   test("renders full prompt when option is set", () => {
     const plan = samplePlan()
     plan.prompt = { source: "file", text: "Line 1\nLine 2\nLine 3" }

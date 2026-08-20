@@ -1,4 +1,4 @@
-import { gatewayLabel, type ResolvedModel } from "./model-routing"
+import { gatewayLabel, stripOpenRouterNitro, type ResolvedModel } from "./model-routing"
 import type { RunPlan } from "./types"
 
 type DiscoveredModel = { variants?: unknown }
@@ -49,8 +49,12 @@ export function validatePreflightTargets(
     }
 
     const models = isRecord(provider.models) ? provider.models : {}
-    if (!Object.hasOwn(models, target.modelID)) throw modelUnavailable(target)
-    const model = models[target.modelID] as DiscoveredModel | undefined
+    // `:nitro` is an OpenRouter routing alias, not a models.dev model: the
+    // catalog carries the unsuffixed ID. Strip for lookup only — the error and
+    // the frozen plan keep showing the full physical target.
+    const catalogID = stripOpenRouterNitro(target.modelID)
+    if (!Object.hasOwn(models, catalogID)) throw modelUnavailable(target)
+    const model = models[catalogID] as DiscoveredModel | undefined
     if (!model) throw modelUnavailable(target)
 
     if (target.variant) {
