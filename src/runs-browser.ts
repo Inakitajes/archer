@@ -2,7 +2,6 @@ import { stdout } from "node:process"
 
 import { BoxRenderable, StyledText, TextRenderable, bold, fg, t } from "@opentui/core"
 
-import { startLimitsPoller } from "./limits"
 import { parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
 import { loadRunSummary } from "./runs"
 import {
@@ -10,7 +9,6 @@ import {
   formatMoney,
   hintsRow,
   joinLines,
-  limitsRow,
   moreHintsMarker,
   padBetween,
   paletteForTerminal,
@@ -26,9 +24,11 @@ import { shortVersion } from "./version"
 import { runsRoot } from "./workspace"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
-import type { LimitsSnapshot } from "./limits"
 import type { RunEntry, RunStatusKind, RunsResolution } from "./runs"
 import type { Hint, PaletteColor } from "./tui-theme"
+
+/** Below this width the run list and details stack vertically. */
+const compactRunsMaxWidth = 84
 
 const runStatusStyles: Record<RunStatusKind, { icon: string; color: PaletteColor }> = {
   completed: { icon: "✓", color: "green" },
@@ -56,10 +56,10 @@ export class RunsBrowser {
   // A subshell owns the terminal while the renderer is suspended; ignore keys.
   private inSubshell = false
   private readonly ticker: ReturnType<typeof setInterval>
-  private readonly stopLimits: () => void
-  private limits?: LimitsSnapshot
   private readonly headerText: TextRenderable
+  private readonly bodyBox: BoxRenderable
   private readonly listText: TextRenderable
+  private readonly listBox: BoxRenderable
   private readonly detailsText: TextRenderable
   private readonly footerText: TextRenderable
   private readonly detailsBox: BoxRenderable
@@ -113,9 +113,11 @@ export class RunsBrowser {
 
     const header = this.panel({
       id: "convoy-runs-header",
-      height: 5,
+      height: 4,
       borderColor: theme.border,
       backgroundColor: theme.bg,
+      title: ` convoy ${shortVersion()} `,
+      titleAlignment: "left",
     })
 
     const body = new BoxRenderable(renderer, {
@@ -179,7 +181,9 @@ export class RunsBrowser {
     })
 
     this.headerText = header.text
+    this.bodyBox = body
     this.listText = list.text
+    this.listBox = list.box
     this.detailsText = details.text
     this.detailsBox = details.box
     this.footerText = footer.text
@@ -246,9 +250,6 @@ export class RunsBrowser {
     renderer.on("theme_mode", this.handleThemeMode)
 
     this.ticker = setInterval(() => this.render(), 250)
-    this.stopLimits = startLimitsPoller((snapshot) => {
-      this.limits = snapshot
-    })
     this.render()
   }
 
@@ -420,7 +421,6 @@ export class RunsBrowser {
 
   private finish(resolution: RunsResolution) {
     clearInterval(this.ticker)
-    this.stopLimits()
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
     this.renderer.off("theme_mode", this.handleThemeMode)
     if (!this.renderer.isDestroyed) this.renderer.destroy()
@@ -457,9 +457,19 @@ export class RunsBrowser {
     return Math.max(30, Math.min(46, this.renderer.width - 64))
   }
 
+  // Header (4) + footer (3). The body holds the stacked or side-by-side panels.
+  private bodyHeight() {
+    return Math.max(8, this.renderer.height - 7)
+  }
+
+  private compactListHeight(bodyHeight: number) {
+    return Math.max(5, Math.min(9, Math.floor(bodyHeight * 0.35)))
+  }
+
   private listHeight() {
-    // header (5) + footer (3) + list panel borders (2).
-    return Math.max(3, this.renderer.height - 10)
+    // Header (4) + footer (3) + list panel borders (2); compact stacks instead.
+    if (this.renderer.width <= compactRunsMaxWidth) return Math.max(3, this.compactListHeight(this.bodyHeight()) - 2)
+    return Math.max(3, this.renderer.height - 9)
   }
 
   private summaryHeight() {
@@ -487,13 +497,30 @@ export class RunsBrowser {
     if (this.renderer.isDestroyed) return
     const now = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
+    const compact = this.renderer.width <= compactRunsMaxWidth
     const detailsWidth = this.detailsWidth()
     const listWidth = Math.max(36, this.renderer.width - detailsWidth - 7)
+    const bodyHeight = this.bodyHeight()
 
-    this.detailsBox.width = detailsWidth
+    // Narrow terminals stack the panels: the list keeps its rows and the
+    // details pane gets whatever the body has left.
+    this.bodyBox.flexDirection = compact ? "column" : "row"
+    if (compact) {
+      const listHeight = this.compactListHeight(bodyHeight)
+      this.listBox.width = "100%"
+      this.listBox.height = listHeight
+      this.detailsBox.width = "100%"
+      this.detailsBox.height = Math.max(3, bodyHeight - listHeight)
+    } else {
+      this.listBox.width = "auto"
+      this.listBox.height = "100%"
+      this.detailsBox.width = detailsWidth
+      this.detailsBox.height = "100%"
+    }
+
     this.headerText.content = this.headerContent(innerWidth)
-    this.listText.content = this.listContent(listWidth)
-    this.detailsText.content = this.detailsContent(now, detailsWidth - 4)
+    this.listText.content = this.listContent(compact ? innerWidth : listWidth)
+    this.detailsText.content = this.detailsContent(now, (compact ? innerWidth : detailsWidth) - 4)
     this.footerText.content = this.footerContent(innerWidth)
     this.renderSummaryModal()
     this.renderer.requestRender()
@@ -504,12 +531,7 @@ export class RunsBrowser {
     const failed = this.runs.filter((run) => run.statusKind === "failed").length
     const cost = this.runs.reduce((sum, run) => sum + (run.cost ?? 0), 0)
 
-    const title: TextChunk[] = [
-      bold(fg(theme.accent)("◆ convoy")),
-      fg(theme.faint)(` ${shortVersion()}`),
-      fg(theme.faint)("  ·  "),
-      fg(theme.text)("run history"),
-    ]
+    const title: TextChunk[] = [fg(theme.text)("run history")]
     const totals: TextChunk[] = [
       fg(theme.text)(`${this.runs.length} run${this.runs.length === 1 ? "" : "s"}`),
       fg(theme.faint)("  ·  "),
@@ -521,7 +543,7 @@ export class RunsBrowser {
     ]
     const line1 = padBetween(title, totals, width)
     const line2 = t`${fg(theme.dim)(truncate(runsRoot(), width))}`
-    return joinLines([line1, line2, limitsRow(this.limits, Date.now(), width)])
+    return joinLines([line1, line2])
   }
 
   private listContent(width: number) {

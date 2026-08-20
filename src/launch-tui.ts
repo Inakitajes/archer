@@ -1424,11 +1424,13 @@ export class LaunchPicker {
     }
     this.detailBox.width = compact || reviewing ? "100%" : detailWidth
     this.detailBox.height = compact ? "auto" : "100%"
-    this.detailBox.title = reviewing ? " review " : " run setup "
-    // Mirror the dashboard focus cue: the accented border marks where Enter,
-    // Esc, and the navigation keys apply in the current setup step.
-    this.pipelineBox.borderColor = this.mode === "pipelines" ? theme.accent : theme.borderDim
-    this.detailBox.borderColor = this.mode === "pipelines" ? theme.borderDim : theme.accent
+this.detailBox.title = reviewing ? " review " : " run setup "
+     // The pipeline sidebar never borrows the accent: the steps are uniform,
+     // dimmed containers, and the selected pipeline's own row carries the
+     // focus marker. The accent marks Enter/Esc/navigation in the setup panel
+     // during the prompt/options/branch steps (never in pipelines mode).
+     this.pipelineBox.borderColor = theme.borderDim
+     this.detailBox.borderColor = this.mode === "pipelines" ? theme.borderDim : theme.accent
     this.headerText.content = this.headerContent(innerWidth)
     // Panels reserve 4 cells of chrome (rounded border + paddingX:1 each side),
     // so lay out the rows against the inner text width — matching detailWidth
@@ -1525,7 +1527,10 @@ export class LaunchPicker {
       const pct = Math.round(gpt.sessionPct)
       const barColor = pct >= 85 ? theme.red : pct >= 60 ? theme.yellow : theme.accent
       const pctChunk = fg(pct >= 60 ? barColor : theme.text)(`${pct}%`)
-      const bar: TextChunk[] = [fg(theme.dim)("OpenAI "), ...progressBar(pct / 100, 6, barColor), raw(" "), pctChunk]
+      // A compact gauge instead of the dashboard's full-width bar: the usage
+      // panel only has a sidebar's worth of columns, so the meter is a short
+      // block run and the resets/weekly tail yields before the bar shrinks.
+      const bar: TextChunk[] = [fg(theme.dim)("OpenAI "), ...progressBar(pct / 100, 4, barColor), raw(" "), pctChunk]
       const tail: TextChunk[] = []
       if (gpt.sessionResetsAt !== undefined) tail.push(fg(theme.faint)(" resets "), fg(theme.dim)(fmtCountdown(gpt.sessionResetsAt, now)))
       if (gpt.weeklyPct !== undefined) {
@@ -1535,8 +1540,8 @@ export class LaunchPicker {
       // The weekly window goes before the countdown: neither is worth pushing
       // the bar past the sidebar's edge.
       let fitted = [...bar, ...tail]
-      if (chunksLength(fitted) - 6 > width) fitted = [...bar, ...tail.slice(0, 2)]
-      if (chunksLength(fitted) - 6 > width) fitted = bar
+      if (chunksLength(fitted) > width) fitted = [...bar, ...tail.slice(0, 2)]
+      if (chunksLength(fitted) > width) fitted = bar
       lines.push(new StyledText(fitted))
     } else if (this.limits?.gptHint) {
       lines.push(new StyledText([fg(theme.dim)("OpenAI "), fg(theme.yellow)(truncate(this.limits.gptHint, width - 7))]))
