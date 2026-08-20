@@ -135,7 +135,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       group: "navigation",
       available: piloting,
       keys: "↑↓",
-      hint: state.selectedGroup ? "node" : "step",
+      // Arrows-to-move is obvious; keep it out of the footer.
       help: "select a step (or j / k)",
       priority: 2,
     },
@@ -153,7 +153,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       group: "navigation",
       available: piloting,
       keys: "enter",
-      hint: "read",
+      // Enter-to-open is obvious; keep it out of the footer.
       help: "focus the reader panel",
       priority: 4,
     },
@@ -162,7 +162,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       group: "navigation",
       available: piloting,
       keys: "←→",
-      hint: "tab",
+      // Left/right-to-switch-tabs is obvious; keep it out of the footer.
       help: "switch content tab (or h / l / tab)",
       priority: 6,
     },

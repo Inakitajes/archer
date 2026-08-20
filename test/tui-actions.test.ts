@@ -112,10 +112,21 @@ describe("dashboard action registry", () => {
   })
 
   test("the reader swaps select for scroll rather than offering both", () => {
+    expect(available({ contentFocused: true })).toContain("scroll")
+    expect(available({ contentFocused: true })).not.toContain("select")
+    expect(available()).toContain("select")
+    expect(available()).not.toContain("scroll")
     expect(footer({ contentFocused: true })).toContain("scroll")
-    expect(footer({ contentFocused: true })).not.toContain("select")
-    expect(footer()).toContain("select")
     expect(footer()).not.toContain("scroll")
+  })
+
+  test("arrows, enter, and tab-cycle stay out of the footer", () => {
+    expect(footer()).not.toContain("select")
+    expect(footer()).not.toContain("read")
+    expect(footer()).not.toContain("tab-cycle")
+    expect(available()).toContain("select")
+    expect(available()).toContain("read")
+    expect(available()).toContain("tab-cycle")
   })
 
   test("lazygit is withdrawn while reading, where [g] jumps to the top instead", () => {
@@ -124,10 +135,12 @@ describe("dashboard action registry", () => {
   })
 
   test("a group selection withdraws the single-session keys", () => {
-    const ids = footer({ selectedGroup: true })
+    const ids = available({ selectedGroup: true })
     expect(ids).not.toContain("session")
     expect(ids).not.toContain("fullscreen")
     expect(ids).toContain("select")
+    expect(footer({ selectedGroup: true })).not.toContain("session")
+    expect(footer({ selectedGroup: true })).not.toContain("fullscreen")
   })
 
   test("a permission prompt owns the row instead of sharing it with navigation", () => {
