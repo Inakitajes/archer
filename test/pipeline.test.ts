@@ -592,11 +592,11 @@ describe("built-in hunter pipelines", () => {
     const pipeline = hunter()
     expect(stepNames(pipeline)).toEqual([
       "hunter-correctness__openai-gpt-5-6-terra-xhigh",
-      "hunter-correctness__openrouter-anthropic-claude-opus-5",
+      "hunter-correctness__openrouter-z-ai-glm-5-3-high",
       "hunter-memory__openai-gpt-5-6-terra-xhigh",
-      "hunter-memory__openrouter-x-ai-grok-4-5",
+      "hunter-memory__openrouter-x-ai-grok-4-6-high",
       "hunter-performance__openai-gpt-5-6-terra-xhigh",
-      "hunter-performance__openrouter-x-ai-grok-4-5",
+      "hunter-performance__openrouter-x-ai-grok-4-6-high",
       "hunter-security__openai-gpt-5-6-terra-xhigh",
       "hunter-security__openrouter-moonshotai-kimi-k3",
       "hunter-reliability__openai-gpt-5-6-terra-xhigh",
@@ -624,9 +624,9 @@ describe("built-in hunter pipelines", () => {
       expect(models).toEqual([
         "openai/gpt-5.6-terra#xhigh",
         "openrouter/anthropic/claude-opus-5",
-        "openrouter/z-ai/glm-5.2",
+        "openrouter/z-ai/glm-5.3#high",
         "openrouter/moonshotai/kimi-k3",
-        "openrouter/x-ai/grok-4.5",
+        "openrouter/x-ai/grok-4.6#high",
       ])
     }
 
