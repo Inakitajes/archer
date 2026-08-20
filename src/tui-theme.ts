@@ -448,7 +448,7 @@ export function limitsRow(limits: LimitsSnapshot | undefined, now: number, width
     // Never an empty line: a placeholder keeps the row's cell real while the
     // first poll is in flight (and an all-empty trailing line would let the
     // text layout collapse to a single row).
-    const left: TextChunk[] = limits?.gptHint ? [fg(theme.faint)(`GPT — ${limits.gptHint}`)] : [fg(theme.faint)("…")]
+    const left: TextChunk[] = limits?.gptHint ? [fg(theme.faint)(`OpenAI — ${limits.gptHint}`)] : [fg(theme.faint)("…")]
     return padBetween(left, right, width)
   }
 
@@ -456,7 +456,7 @@ export function limitsRow(limits: LimitsSnapshot | undefined, now: number, width
   const barColor = pct >= 85 ? theme.red : pct >= 60 ? theme.yellow : theme.accent
   const pctChunk = fg(pct >= 60 ? barColor : theme.text)(`${pct}%`)
   const sep = fg(theme.faint)(" · ")
-  const bar = (cells: number): TextChunk[] => [fg(theme.dim)("GPT "), ...progressBar(pct / 100, cells, barColor), raw(" "), pctChunk]
+  const bar = (cells: number): TextChunk[] => [fg(theme.dim)("OpenAI "), ...progressBar(pct / 100, cells, barColor), raw(" "), pctChunk]
   const resets = gpt.sessionResetsAt === undefined ? [] : [sep, fg(theme.dim)(`resets ${fmtCountdown(gpt.sessionResetsAt, now)}`)]
   const weekly =
     gpt.weeklyPct === undefined
@@ -473,7 +473,7 @@ export function limitsRow(limits: LimitsSnapshot | undefined, now: number, width
     [...bar(10), ...resets],
     bar(10),
     bar(6),
-    [fg(theme.dim)("GPT "), pctChunk],
+    [fg(theme.dim)("OpenAI "), pctChunk],
   ]
   const rightLen = chunksLength(right)
   const fits = (chunks: TextChunk[]) => chunksLength(chunks) + (rightLen > 0 ? rightLen + 1 : 0) <= width

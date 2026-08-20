@@ -8,14 +8,14 @@ import { defaultAdvisorMaxCalls } from "./advisor"
 import { buildAgentRegistry, emptyHooksConfig, loadMergedConvoyConfig } from "./config"
 import { currentBranch, resolveWorktreeDefault } from "./git"
 import { hooksForPipeline } from "./hooks"
-import { startLimitsPoller } from "./limits"
+import { openRouterLowBalance, startLimitsPoller } from "./limits"
 import { builtInPipelines, defaultPipelineName, hasWritableStep, resolvePipeline } from "./pipeline"
 import { stepRunnerFor } from "./step-runners"
 import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { consensusStep } from "./quality-score"
 import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
 import { runReviewLines } from "./review-tui"
-import { clipChunks, hintsRow, joinLines, limitsRow, moreHintsMarker, padBetween, paletteForTerminal, plain, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
 
 import type { ConvoyConfig } from "./config"
@@ -497,11 +497,17 @@ export class LaunchPicker {
   // while nothing is animating.
   private lastRenderAt = 0
   private readonly stopLimits: () => void
+  /** @internal — tests inject snapshots directly instead of running the poller. */
   private limits?: LimitsSnapshot
+  /** Whether the sidebar's usage meters are on, set by every render. */
+  private usageVisible = false
   private readonly headerText: TextRenderable
   private readonly bodyBox: BoxRenderable
+  private readonly leftBox: BoxRenderable
   private readonly pipelineText: TextRenderable
   private readonly pipelineBox: BoxRenderable
+  private readonly usageText: TextRenderable
+  private readonly usageBox: BoxRenderable
   private readonly detailText: TextRenderable
   private readonly detailBox: BoxRenderable
   private readonly footerText: TextRenderable
@@ -614,7 +620,7 @@ export class LaunchPicker {
     // while the launcher is open, so it costs nothing to draw it once as chrome.
     const header = this.panel({
       id: "convoy-launch-header",
-      height: 4,
+      height: 3,
       borderColor: theme.border,
       backgroundColor: theme.bg,
       title: ` convoy ${shortVersion()} `,
@@ -647,6 +653,27 @@ export class LaunchPicker {
       onMouseDown: selectFromList,
     })
     pipeline.text.onMouseDown = selectFromList
+
+    // The pipeline list and the subscription meters share the sidebar as a
+    // column: pipelines grow to fill it and the meters sit pinned to the
+    // bottom edge, instead of costing the setup header a whole row.
+    const left = new BoxRenderable(renderer, {
+      id: "convoy-launch-left",
+      width: "100%",
+      height: "100%",
+      flexDirection: "column",
+      gap: 0,
+    })
+    const usage = this.panel({
+      id: "convoy-launch-usage",
+      width: "100%",
+      height: 4,
+      borderColor: theme.borderDim,
+      backgroundColor: theme.bg,
+      title: " usage ",
+      titleAlignment: "left",
+      visible: false,
+    })
 
     const selectOption = (event: { y: number; preventDefault(): void; stopPropagation(): void }) => {
       if (this.mode !== "options" || this.modal) return
@@ -685,8 +712,11 @@ export class LaunchPicker {
 
     this.headerText = header.text
     this.bodyBox = body
+    this.leftBox = left
     this.pipelineText = pipeline.text
     this.pipelineBox = pipeline.box
+    this.usageText = usage.text
+    this.usageBox = usage.box
     this.detailText = detail.text
     this.detailBox = detail.box
     this.footerText = footer.text
@@ -695,11 +725,14 @@ export class LaunchPicker {
       { box: shell, background: "bg" },
       { box: header.box, background: "bg", border: "border" },
       { box: pipeline.box, background: "bg", border: "borderDim" },
+      { box: usage.box, background: "bg", border: "borderDim" },
       { box: detail.box, background: "bg", border: "borderDim" },
       { box: footer.box, background: "bg", border: "borderDim" },
     )
 
-    body.add(pipeline.box)
+    left.add(pipeline.box)
+    left.add(usage.box)
+    body.add(left)
     body.add(detail.box)
     shell.add(header.box)
     shell.add(body)
@@ -1358,33 +1391,53 @@ export class LaunchPicker {
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const reviewing = this.mode === "review"
     const compact = this.usesCompactLayout()
-    // The Review step owns the whole screen: the pipeline list would only
-    // repeat what the plan already freezes, and the plan needs the width.
+    // The pipeline/usage sidebar and the Review step own the whole screen:
+    // Review freezes the plan, and the list would only repeat it.
+    this.leftBox.visible = !reviewing
     this.pipelineBox.visible = !reviewing
     const pipelineWidth = compact ? innerWidth + 4 : this.pipelineWidth()
     // In compact mode both panels occupy the shell's full inner width. Wide
     // screens retain the sidebar, but measure the detail panel from the actual
     // inner width rather than a fixed 40-column floor that could overflow.
     const detailWidth = reviewing || compact ? innerWidth : Math.max(34, innerWidth - pipelineWidth - 1)
-    const bodyHeight = this.compactBodyHeight()
-    const pipelineHeight = compact ? this.compactPipelineHeight(bodyHeight) : bodyHeight
+    // The left column runs from the header's bottom border to the footer's top,
+    // so its height is the full shell less those two (3 rows each). The usage
+    // panel pins to its bottom edge and the pipeline list fills the rest,
+    // leaving no dead stripe under the meters.
+    const bodyHeight = Math.max(8, this.renderer.height - 6)
+    const usageHeight = 4
+    const usageVisible = !compact && !reviewing && this.limits !== undefined && bodyHeight - usageHeight >= 6
+    this.usageVisible = usageVisible
+    this.usageBox.visible = usageVisible
 
     this.bodyBox.flexDirection = compact ? "column" : "row"
-    this.pipelineBox.width = compact ? "100%" : pipelineWidth
-    this.pipelineBox.height = compact ? pipelineHeight : "100%"
+    if (compact) {
+      this.leftBox.width = "100%"
+      this.leftBox.height = this.compactPipelineHeight(this.compactBodyHeight())
+      this.pipelineBox.width = "100%"
+      this.pipelineBox.height = "100%"
+    } else {
+      this.leftBox.width = pipelineWidth
+      this.leftBox.height = bodyHeight
+      this.pipelineBox.width = "100%"
+      this.pipelineBox.height = usageVisible ? bodyHeight - usageHeight : bodyHeight
+    }
     this.detailBox.width = compact || reviewing ? "100%" : detailWidth
     this.detailBox.height = compact ? "auto" : "100%"
-    this.detailBox.title = reviewing ? " review " : " run setup "
-    // Mirror the dashboard focus cue: the accented border marks where Enter,
-    // Esc, and the navigation keys apply in the current setup step.
-    this.pipelineBox.borderColor = this.mode === "pipelines" ? theme.accent : theme.borderDim
-    this.detailBox.borderColor = this.mode === "pipelines" ? theme.borderDim : theme.accent
+this.detailBox.title = reviewing ? " review " : " run setup "
+     // The pipeline sidebar never borrows the accent: the steps are uniform,
+     // dimmed containers, and the selected pipeline's own row carries the
+     // focus marker. The accent marks Enter/Esc/navigation in the setup panel
+     // during the prompt/options/branch steps (never in pipelines mode).
+     this.pipelineBox.borderColor = theme.borderDim
+     this.detailBox.borderColor = this.mode === "pipelines" ? theme.borderDim : theme.accent
     this.headerText.content = this.headerContent(innerWidth)
     // Panels reserve 4 cells of chrome (rounded border + paddingX:1 each side),
     // so lay out the rows against the inner text width — matching detailWidth
     // below. Passing the full box width made every right-aligned badge overflow
     // and wrap onto its own line.
     this.pipelineText.content = this.pipelineContent(pipelineWidth - 4)
+    if (usageVisible) this.usageText.content = joinLines(this.usageContent(pipelineWidth - 4))
     this.detailText.content = this.detailContent(compact || reviewing ? innerWidth : detailWidth - 4)
     this.footerText.content = this.footerContent(innerWidth)
     this.renderModal()
@@ -1448,7 +1501,54 @@ export class LaunchPicker {
       }
     }
     const line1 = padBetween(title, stage, width)
-    return joinLines([line1, limitsRow(this.limits, Date.now(), width)])
+    return joinLines([line1])
+  }
+
+  /**
+   * The sidebar's subscription meters: the OpenRouter wallet on the first
+   * line, the OpenAI window below it. Reuses the dashboard's color language
+   * but drops detail before ever clipping a value mid-token.
+   */
+  private usageContent(width: number): StyledText[] {
+    const lines: StyledText[] = []
+    const now = Date.now()
+
+    const openrouter = this.limits?.openrouter
+    if (openrouter) {
+      const value = openrouter.kind === "remaining" ? `${formatMoney(openrouter.amount)} left` : `${formatMoney(openrouter.amount)}/mo`
+      const color = openrouter.kind === "remaining" && openrouter.amount < openRouterLowBalance ? theme.yellow : theme.text
+      lines.push(new StyledText([fg(theme.dim)("OpenRouter "), fg(color)(value)]))
+    } else {
+      lines.push(new StyledText([fg(theme.dim)("OpenRouter "), fg(theme.faint)("not configured")]))
+    }
+
+    const gpt = this.limits?.gpt
+    if (gpt) {
+      const pct = Math.round(gpt.sessionPct)
+      const barColor = pct >= 85 ? theme.red : pct >= 60 ? theme.yellow : theme.accent
+      const pctChunk = fg(pct >= 60 ? barColor : theme.text)(`${pct}%`)
+      // A compact gauge instead of the dashboard's full-width bar: the usage
+      // panel only has a sidebar's worth of columns, so the meter is a short
+      // block run and the resets/weekly tail yields before the bar shrinks.
+      const bar: TextChunk[] = [fg(theme.dim)("OpenAI "), ...progressBar(pct / 100, 4, barColor), raw(" "), pctChunk]
+      const tail: TextChunk[] = []
+      if (gpt.sessionResetsAt !== undefined) tail.push(fg(theme.faint)(" resets "), fg(theme.dim)(fmtCountdown(gpt.sessionResetsAt, now)))
+      if (gpt.weeklyPct !== undefined) {
+        const wk = Math.round(gpt.weeklyPct)
+        tail.push(fg(theme.faint)(" wk "), fg(wk >= 85 ? theme.red : wk >= 60 ? theme.yellow : theme.dim)(`${wk}%`))
+      }
+      // The weekly window goes before the countdown: neither is worth pushing
+      // the bar past the sidebar's edge.
+      let fitted = [...bar, ...tail]
+      if (chunksLength(fitted) > width) fitted = [...bar, ...tail.slice(0, 2)]
+      if (chunksLength(fitted) > width) fitted = bar
+      lines.push(new StyledText(fitted))
+    } else if (this.limits?.gptHint) {
+      lines.push(new StyledText([fg(theme.dim)("OpenAI "), fg(theme.yellow)(truncate(this.limits.gptHint, width - 7))]))
+    } else {
+      lines.push(new StyledText([fg(theme.dim)("OpenAI "), fg(theme.faint)("not configured")]))
+    }
+    return lines
   }
 
   private pipelineContent(width: number) {
@@ -1877,12 +1977,18 @@ export class LaunchPicker {
   }
 
   private compactBodyHeight() {
-    // Header (4), footer (3), and the detail panel's top/bottom borders (2).
-    return Math.max(8, this.renderer.height - 9)
+    // Header (3), footer (3), and the detail panel's top/bottom borders (2).
+    return Math.max(8, this.renderer.height - 8)
   }
 
   private pipelineVisibleRows() {
-    return this.usesCompactLayout() ? Math.max(1, this.compactPipelineHeight(this.compactBodyHeight()) - 2) : this.listHeight()
+    if (this.usesCompactLayout()) return Math.max(1, this.compactPipelineHeight(this.compactBodyHeight()) - 2)
+    // Wide: the sidebar shares its column with the usage meters when they're
+    // on, so the list's visible rows shrink to match the box laid out in
+    // render() — keeping pagination and click targets in sync with the panel.
+    const bodyHeight = Math.max(8, this.renderer.height - 6)
+    const rows = bodyHeight - (this.usageVisible ? 4 : 0) - 2
+    return Math.max(3, rows)
   }
 
   private detailContentHeight() {
@@ -1899,8 +2005,8 @@ export class LaunchPicker {
   }
 
   private listHeight() {
-    // Header (4) + footer (3) + list panel borders (2).
-    return Math.max(3, this.renderer.height - 9)
+    // Header (3) + footer (3) + list panel borders (2).
+    return Math.max(3, this.renderer.height - 8)
   }
 }
 

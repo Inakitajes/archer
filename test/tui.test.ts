@@ -104,19 +104,24 @@ describe("run dashboard defaults", () => {
     expect([live, historical]).not.toContain("logs")
   })
 
-  test("brands the header with the running version and keeps it inside a narrow panel", async () => {
+  test("brands the footer's border with the running version and shrinks to the wordmark when narrow", async () => {
+    const fullTitle = `◆ convoy ${shortVersion()}`
     const wide = await createDashboard(120, 40)
-    const narrow = await createDashboard(60, 40)
+    // Just under the width the full border title needs, so the footer falls
+    // back to the bare wordmark regardless of the build's version string.
+    const narrow = await createDashboard(displayWidth(fullTitle) + 4, 40)
     try {
       await wide.renderOnce()
-      expect(wide.captureCharFrame()).toContain(`◆ convoy ${shortVersion()}`)
+      const wideLine = lineContaining(wide.captureCharFrame(), fullTitle).trim()
+      // The title rides the footer panel's top border (rounded corners), not
+      // a content row.
+      expect(wideLine.startsWith("╭")).toBe(true)
+      expect(wideLine).toContain("─")
 
-      // The complete title and the panel's closing border remain visible at the
-      // narrow width instead of the title being clipped by the totals column.
       await narrow.renderOnce()
-      const line = lineContaining(narrow.captureCharFrame(), `◆ convoy ${shortVersion()}`)
-      expect(displayWidth(line)).toBeLessThanOrEqual(60)
-      expect(line.match(/│/g)?.length).toBe(2)
+      const narrowFrame = narrow.captureCharFrame()
+      expect(narrowFrame).toContain("◆ convoy")
+      expect(narrowFrame).not.toContain(shortVersion())
     } finally {
       wide.dashboard.stop()
       narrow.dashboard.stop()
@@ -1040,7 +1045,7 @@ describe("header limits row", () => {
   test("wide row shows the bar, reset countdown, weekly percent, and credits", () => {
     const row = text(full, 100)
 
-    expect(row).toContain("GPT ")
+    expect(row).toContain("OpenAI ")
     expect(row).toContain("█")
     expect(row).toContain("42%")
     expect(row).toContain("resets 2h 10m")
@@ -1071,7 +1076,7 @@ describe("header limits row", () => {
   test("auth problems surface a dim hint instead of a meter", () => {
     const row = text({ gptHint: "codex login", fetchedAt: now }, 80)
 
-    expect(row).toContain("GPT — codex login")
+    expect(row).toContain("OpenAI — codex login")
     expect(row).not.toContain("█")
   })
 
@@ -1235,7 +1240,9 @@ describe("goal loop header", () => {
         const frame = captureCharFrame()
         expect(frame, testCase.outcome.reason).toContain(testCase.verdict)
         expect(frame, testCase.outcome.reason).toContain(testCase.trajectory)
-        expect(frame, testCase.outcome.reason).not.toContain("run completed")
+        // The status row still names the run's end state; the verdict is the
+        // goal row's job, not a replacement for it.
+        expect(frame, testCase.outcome.reason).toContain("✓ run completed")
       } finally {
         dashboard.stop()
       }
@@ -1332,6 +1339,162 @@ describe("goal loop header", () => {
       await renderOnce()
       // The clock kept running from the loop's start rather than the new run's.
       expect(captureCharFrame()).not.toContain("·  0:00")
+    } finally {
+      dashboard.stop()
+    }
+  })
+})
+
+describe("dashboard header status row", () => {
+  test("a plain pipeline stays one row: status on the left, totals on the right", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.phaseStarted("implement")
+      await renderOnce()
+      const frame = captureCharFrame()
+      const beforePipeline = frame.slice(0, frame.indexOf("╭─ pipeline")).trim().split("\n")
+      // dir line + header top border + the single status row + bottom border.
+      expect(beforePipeline).toHaveLength(4)
+      const statusRow = beforePipeline[2]!
+      expect(statusRow).toContain("running")
+      expect(statusRow).toContain("tokens")
+      // No goal segments, no stray meter placeholders on the only row.
+      expect(statusRow).not.toContain("goal ")
+      expect(statusRow).not.toContain("…")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a slowing pipeline names the pausing state without a stray separator", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.runControlState("pausing", 1)
+      dashboard.phaseStarted("implement")
+      await renderOnce()
+      const row = lineContaining(captureCharFrame(), "pausing · 1 active")
+      expect(row.trimStart().startsWith("│ pausing")).toBe(true)
+    } finally {
+      dashboard.stop()
+    }
+  })
+})
+
+describe("header limit chips", () => {
+  type Dashboard = Awaited<ReturnType<typeof createDashboard>>["dashboard"]
+  const setLimits = (dashboard: Dashboard, snapshot: LimitsSnapshot) => {
+    ;(dashboard as unknown as { limits: LimitsSnapshot }).limits = snapshot
+  }
+  const now = Date.now()
+  // The dashboard coalesces repaints per frame, so ask for frames until the
+  // injected snapshot — or the absence of any chip — is what's on screen.
+  const renderWithLimits = (
+    dashboard: Dashboard,
+    renderOnce: () => Promise<void>,
+    captureCharFrame: () => string,
+    snapshot: LimitsSnapshot,
+    expectChip: boolean,
+  ) => {
+    dashboard.phaseStarted("implement")
+    setLimits(dashboard, snapshot)
+    return waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("⚠") === expectChip)
+  }
+
+  test("no second row while every meter is healthy", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      const frame = await renderWithLimits(dashboard, renderOnce, captureCharFrame, { gpt: { sessionPct: 42, weeklyPct: 18 }, openrouter: { kind: "remaining", amount: 26.78 }, fetchedAt: now }, false)
+      expect(frame).not.toContain("⚠")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a hot GPT session earns a chip with its reset countdown", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      const frame = await renderWithLimits(dashboard, renderOnce, captureCharFrame, { gpt: { sessionPct: 92, sessionResetsAt: now + 2 * 1440 * 60_000 + 14 * 60 * 60_000 }, fetchedAt: now }, true)
+      expect(frame).toContain("⚠ OpenAI 92%")
+      // The countdown is hour-precision within the coarse fmtCountdown window.
+      expect(frame).toMatch(/resets 2d 1[34]h/)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("the weekly window warns on its own", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.phaseStarted("implement")
+      setLimits(dashboard, { gpt: { sessionPct: 42, weeklyPct: 91 }, fetchedAt: now })
+      const frame = await waitForRenderedFrame(renderOnce, captureCharFrame, (f) => f.includes("wk 91%"))
+      expect(frame).toContain("⚠ OpenAI wk 91%")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("an auth problem surfaces instead of a silent meter", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.phaseStarted("implement")
+      setLimits(dashboard, { gptHint: "codex login", fetchedAt: now })
+      const frame = await waitForRenderedFrame(renderOnce, captureCharFrame, (f) => f.includes("codex login"))
+      expect(frame).toContain("⚠ OpenAI — codex login")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("an OpenRouter balance below the threshold earns a chip", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.phaseStarted("implement")
+      setLimits(dashboard, { openrouter: { kind: "remaining", amount: 7.4 }, fetchedAt: now })
+      const frame = await waitForRenderedFrame(renderOnce, captureCharFrame, (f) => f.includes("left"))
+      expect(frame).toContain("⚠ OpenRouter $7.40 left")
+    } finally {
+      dashboard.stop()
+    }
+  })
+})
+
+describe("usage modal", () => {
+  test("[u] opens the meters, any key closes it", async () => {
+    const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      await renderOnce()
+      mockInput.pressKey("u")
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("usage")
+      expect(frame).toContain("not configured")
+      expect(frame).toContain("updated")
+
+      mockInput.pressKey("escape")
+      await renderOnce()
+      expect(captureCharFrame()).not.toContain("esc close")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("configured meters render their detail", async () => {
+    const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(160, 40)
+    const now = Date.now()
+      ;(dashboard as unknown as { limits: LimitsSnapshot }).limits = {
+      gpt: { sessionPct: 42, sessionResetsAt: now + 130 * 60_000, weeklyPct: 18 },
+      openrouter: { kind: "remaining", amount: 12.34 },
+      fetchedAt: now,
+    }
+    try {
+      mockInput.pressKey("u")
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("42%")
+      expect(frame).toContain("wk 18%")
+      expect(frame).toContain("OpenRouter $12.34 left")
+      expect(frame).toContain("updated")
     } finally {
       dashboard.stop()
     }

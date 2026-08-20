@@ -26,6 +26,9 @@ export type OpenRouterLimits =
   | { kind: "remaining"; amount: number } // $ left (exact balance or key limit_remaining)
   | { kind: "monthly"; amount: number } // fallback: $ spent this month on a limitless key
 
+/** Below this remaining balance the run header surfaces a low-credit chip. */
+export const openRouterLowBalance = 10
+
 export type LimitsSnapshot = {
   gpt?: GptLimits
   /** Auth problem worth showing instead of the meter, e.g. "codex login". */
@@ -225,10 +228,30 @@ let lastSnapshot: LimitsSnapshot | undefined
 const freshEnoughMs = 30_000
 
 /**
- * Background poll of both providers. `ok` replaces the segment, `auth` clears
- * it (surfacing a hint for GPT), `transient` keeps the last good data so a
- * blip doesn't blank the header. The returned stop() also gates in-flight
- * ticks so nothing resurrects state after the TUI is torn down.
+ * Swap the provider fetches in tests. Restored by installing the live
+ * implementation again (nothing ever does this in production).
+ */
+export let fetchLimitsSnapshot: () => Promise<Pick<LimitsSnapshot, "gpt" | "gptHint" | "openrouter">>
+
+export function setLimitsFetcherForTests(fetcher: typeof fetchLimitsSnapshot | undefined) {
+  fetchLimitsSnapshot = fetcher ?? liveFetchLimitsSnapshot
+}
+
+const liveFetchLimitsSnapshot = async (): Promise<Pick<LimitsSnapshot, "gpt" | "gptHint" | "openrouter">> => {
+  const [gpt, openrouter] = await Promise.all([fetchGptUsage(), fetchOpenRouter()])
+  return {
+    gpt: gpt.ok ? gpt.value : undefined,
+    gptHint: gpt.ok ? undefined : gpt.kind === "auth" ? (gpt.hint ?? "codex login") : undefined,
+    openrouter: openrouter.ok ? openrouter.value : undefined,
+  }
+}
+fetchLimitsSnapshot = liveFetchLimitsSnapshot
+
+/**
+ * Background poll of both providers. A successful segment replaces the last
+ * one; anything else (auth problems, transient blips) keeps it so a hiccup
+ * doesn't blank the header. The returned stop() also gates in-flight ticks so
+ * nothing resurrects state after the TUI is torn down.
  */
 export function startLimitsPoller(onUpdate: (snapshot: LimitsSnapshot) => void, intervalMs = limitsPollMs): () => void {
   let stopped = false
@@ -237,13 +260,13 @@ export function startLimitsPoller(onUpdate: (snapshot: LimitsSnapshot) => void, 
 
   const tick = async () => {
     try {
-      const [gpt, openrouter] = await Promise.all([fetchGptUsage(), fetchOpenRouter()])
+      const snapshot = await fetchLimitsSnapshot()
       if (stopped) return
       last = {
         fetchedAt: Date.now(),
-        gpt: gpt.ok ? gpt.value : gpt.kind === "transient" ? last.gpt : undefined,
-        gptHint: gpt.ok ? undefined : gpt.kind === "auth" ? (gpt.hint ?? "codex login") : last.gptHint,
-        openrouter: openrouter.ok ? openrouter.value : openrouter.kind === "transient" ? last.openrouter : undefined,
+        gpt: snapshot.gpt ?? last.gpt,
+        gptHint: snapshot.gptHint ?? last.gptHint,
+        openrouter: snapshot.openrouter ?? last.openrouter,
       }
       lastSnapshot = last
       onUpdate(last)

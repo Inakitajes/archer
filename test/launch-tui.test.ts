@@ -7,6 +7,7 @@ import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } fro
 import { parseConvoyConfig } from "../src/config"
 import { consensusStep } from "../src/quality-score"
 import { displayWidth } from "../src/tui-theme"
+import type { LimitsSnapshot } from "../src/limits"
 import type { KeyEvent } from "@opentui/core"
 
 function key(partial: Partial<KeyEvent>): KeyEvent {
@@ -885,5 +886,77 @@ describe("launch TUI goal mode", () => {
     expect(eligible("review")).toBe(false)
     expect(eligible("review-lite")).toBe(false)
     expect(eligible("implement")).toBe(false)
+  })
+})
+
+describe("launch TUI sidebar usage meters", () => {
+  type Launcher = Awaited<ReturnType<typeof createLauncher>>
+  const injectLimits = (picker: Launcher["picker"], limits: LimitsSnapshot) => {
+    ;(picker as unknown as { limits: LimitsSnapshot }).limits = limits
+  }
+
+  // The launcher repaints on its 250ms ticker, and the background limits poll
+  // (stubbed empty in test/env.ts) can race with its own empty snapshot, so
+  // re-apply the field and wait a tick before judging each frame.
+  async function renderWithLimits(launcher: Launcher, limits: LimitsSnapshot, predicate: (frame: string) => boolean) {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      injectLimits(launcher.picker, limits)
+      await Bun.sleep(280)
+      const frame = launcher.captureCharFrame()
+      if (predicate(frame)) return frame
+    }
+    throw new Error(`timed out waiting for usage render:\n${launcher.captureCharFrame()}`)
+  }
+
+  test("a tall wide screen pins the meters under the pipeline list", async () => {
+    const launcher = await createLauncher(120, 30)
+    try {
+      const frame = await renderWithLimits(
+        launcher,
+        { gpt: { sessionPct: 42, sessionResetsAt: Date.now() + 130 * 60_000, weeklyPct: 18 }, openrouter: { kind: "remaining", amount: 12.34 }, fetchedAt: Date.now() },
+        (f) => f.includes("OpenRouter $12.34 left"),
+      )
+      const pipelines = frame.indexOf(" pipelines ")
+      const usage = frame.indexOf(" usage ", pipelines)
+      expect(usage).toBeGreaterThanOrEqual(pipelines)
+      // OpenRouter is the wallet row, so it sits above the OpenAI bar.
+      expect(frame.indexOf("OpenRouter ")).toBeLessThan(frame.indexOf("OpenAI "))
+      expect(frame).toContain("OpenAI")
+      expect(frame).toContain("42%")
+      // The panel is pegged to the footer: its top border, two meter rows, and
+      // bottom border, then the footer's top border immediately after.
+      const lines = frame.split("\n")
+      const usageLine = lines.findIndex((line) => line.includes(" usage "))
+      // The footer's top border is the first rounded corner after the panel.
+      const footerLine = lines.findIndex((line, index) => index > usageLine && line.trimStart().startsWith("╭"))
+      // usage top, two meter rows, bottom border, then the footer immediately.
+      expect(footerLine - usageLine).toBe(4)
+    } finally {
+      closeLauncher(launcher)
+    }
+  })
+
+  test("a low balance warns the amber the way the dashboard does", async () => {
+    const launcher = await createLauncher(120, 30)
+    try {
+      const frame = await renderWithLimits(
+        launcher,
+        { openrouter: { kind: "remaining", amount: 7.4 }, fetchedAt: Date.now() },
+        (f) => f.includes("OpenRouter $7.40 left"),
+      )
+      expect(frame).toContain("OpenRouter $7.40 left")
+    } finally {
+      closeLauncher(launcher)
+    }
+  })
+
+  test("compact panels keep the meters off the sidebar to save vertical space", async () => {
+    const launcher = await createLauncher(compactLaunchMaxWidth, 30)
+    try {
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).not.toContain(" usage ")
+    } finally {
+      closeLauncher(launcher)
+    }
   })
 })

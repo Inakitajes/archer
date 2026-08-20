@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 
 import { RunsBrowser } from "../src/runs-browser"
+import { shortVersion } from "../src/version"
 
 import type { RunEntry } from "../src/runs"
 
@@ -172,4 +173,42 @@ test("Ctrl-C exits immediately", async () => {
   renderer.keyInput.emit("keypress", keyEvent("c", { ctrl: true, raw: "\u0003" }))
 
   await expect(result).resolves.toEqual({ type: "exit" })
+})
+
+test("wide screens keep the run list and details side by side", async () => {
+  const testRenderer = await createTestRenderer({ width: 120, height: 40 })
+  const instance = new RunsBrowser(testRenderer.renderer, sampleRuns(), 0)
+  try {
+    await Bun.sleep(260)
+    const lines = testRenderer.captureCharFrame().split("\n")
+    // The header carries convoy+version on its border, not a meter row.
+    // shortVersion() is "dev" in a bare checkout and "vX.Y.Z-dev" when
+    // npm_package_version is set (CI), so the assertion has to follow it.
+    expect(lines.join("\n")).toContain(`convoy ${shortVersion()}`)
+    expect(lines.join("\n")).not.toContain("OpenRouter")
+    expect(lines.join("\n")).not.toContain("OpenAI")
+    // Side by side: both panel titles share the same horizontal band.
+    const runsTitle = lines.findIndex((line) => line.trimStart().startsWith("╭─ runs"))
+    expect(runsTitle).toBeGreaterThanOrEqual(0)
+    // The stock title starts the line; the details border follows on the same row.
+    expect(lines[runsTitle]).toContain("╭─ deta")
+  } finally {
+    testRenderer.mockInput.pressKey("c", { ctrl: true })
+  }
+})
+
+test("compact screens stack the run list above the details panel", async () => {
+  const testRenderer = await createTestRenderer({ width: 84, height: 30 })
+  const instance = new RunsBrowser(testRenderer.renderer, sampleRuns(), 0)
+  try {
+    await Bun.sleep(260)
+    const lines = testRenderer.captureCharFrame().split("\n")
+    const runsTitle = lines.findIndex((line) => line.trimStart().startsWith("╭─ runs"))
+    const detailsTitle = lines.findIndex((line) => line.trimStart().startsWith("╭─ deta"))
+    // Stacked: the details panel's title sits below the runs panel's.
+    expect(runsTitle).toBeGreaterThanOrEqual(0)
+    expect(detailsTitle).toBeGreaterThan(runsTitle)
+  } finally {
+    testRenderer.mockInput.pressKey("c", { ctrl: true })
+  }
 })

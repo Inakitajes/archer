@@ -44,6 +44,7 @@ export type ActionID =
   | "permissions"
   | "keep-awake"
   | "interactive"
+  | "usage"
   | "commands"
   | "help"
   | "abort"
@@ -282,6 +283,17 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       label: "Interactive takeover",
       detail: state.interactiveArmed ? "armed for selected step" : "selected running step",
       help: "take over the selected running step",
+      priority: 9,
+    },
+    {
+      id: "usage",
+      group: "run",
+      available: navigable,
+      keys: "u",
+      hint: "usage",
+      label: "Usage and credits",
+      detail: "subscription and wallet meters",
+      help: "show subscription and credit usage",
       priority: 9,
     },
     {

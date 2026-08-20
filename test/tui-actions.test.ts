@@ -53,7 +53,7 @@ describe("dashboard action registry", () => {
   })
 
   test("a live run offers the run controls", () => {
-    expect(commands()).toEqual(["keep-awake", "pause", "permissions", "interactive", "session", "fullscreen", "tab-session", "tab-reports", "tab-logs", "tab-advisor", "help"])
+    expect(commands()).toEqual(["keep-awake", "pause", "permissions", "interactive", "usage", "session", "fullscreen", "tab-session", "tab-reports", "tab-logs", "tab-advisor", "help"])
   })
 
   test("an attached observer cannot pause, keep awake, or take over", () => {
