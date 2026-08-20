@@ -499,6 +499,8 @@ export class LaunchPicker {
   private readonly stopLimits: () => void
   /** @internal — tests inject snapshots directly instead of running the poller. */
   private limits?: LimitsSnapshot
+  /** Whether the sidebar's usage meters are on, set by every render. */
+  private usageVisible = false
   private readonly headerText: TextRenderable
   private readonly bodyBox: BoxRenderable
   private readonly leftBox: BoxRenderable
@@ -1398,25 +1400,27 @@ export class LaunchPicker {
     // screens retain the sidebar, but measure the detail panel from the actual
     // inner width rather than a fixed 40-column floor that could overflow.
     const detailWidth = reviewing || compact ? innerWidth : Math.max(34, innerWidth - pipelineWidth - 1)
-    const pipelineHeight = compact ? this.compactPipelineHeight(this.compactBodyHeight()) : this.listHeight()
-    // The meters deserve the sidebar's bottom when they fit without crowding
-    // the pipeline list; on short, compact, or review screens every row goes
-    // to the plan or the list and the usage panel stays hidden.
+    // The left column runs from the header's bottom border to the footer's top,
+    // so its height is the full shell less those two (3 rows each). The usage
+    // panel pins to its bottom edge and the pipeline list fills the rest,
+    // leaving no dead stripe under the meters.
+    const bodyHeight = Math.max(8, this.renderer.height - 6)
     const usageHeight = 4
-    const usageVisible = !compact && !reviewing && this.limits !== undefined && pipelineHeight - usageHeight >= 6
+    const usageVisible = !compact && !reviewing && this.limits !== undefined && bodyHeight - usageHeight >= 6
+    this.usageVisible = usageVisible
     this.usageBox.visible = usageVisible
 
     this.bodyBox.flexDirection = compact ? "column" : "row"
     if (compact) {
       this.leftBox.width = "100%"
-      this.leftBox.height = pipelineHeight
+      this.leftBox.height = this.compactPipelineHeight(this.compactBodyHeight())
       this.pipelineBox.width = "100%"
       this.pipelineBox.height = "100%"
     } else {
       this.leftBox.width = pipelineWidth
-      this.leftBox.height = "100%"
+      this.leftBox.height = bodyHeight
       this.pipelineBox.width = "100%"
-      this.pipelineBox.height = usageVisible ? pipelineHeight - usageHeight : "100%"
+      this.pipelineBox.height = usageVisible ? bodyHeight - usageHeight : bodyHeight
     }
     this.detailBox.width = compact || reviewing ? "100%" : detailWidth
     this.detailBox.height = compact ? "auto" : "100%"
@@ -1499,19 +1503,29 @@ export class LaunchPicker {
   }
 
   /**
-   * The sidebar's subscription meters: GPT window on the first line, the
-   * OpenRouter balance on the second. Reuses the dashboard's color language
+   * The sidebar's subscription meters: the OpenRouter wallet on the first
+   * line, the OpenAI window below it. Reuses the dashboard's color language
    * but drops detail before ever clipping a value mid-token.
    */
   private usageContent(width: number): StyledText[] {
     const lines: StyledText[] = []
     const now = Date.now()
+
+    const openrouter = this.limits?.openrouter
+    if (openrouter) {
+      const value = openrouter.kind === "remaining" ? `${formatMoney(openrouter.amount)} left` : `${formatMoney(openrouter.amount)}/mo`
+      const color = openrouter.kind === "remaining" && openrouter.amount < openRouterLowBalance ? theme.yellow : theme.text
+      lines.push(new StyledText([fg(theme.dim)("OpenRouter "), fg(color)(value)]))
+    } else {
+      lines.push(new StyledText([fg(theme.dim)("OpenRouter "), fg(theme.faint)("not configured")]))
+    }
+
     const gpt = this.limits?.gpt
     if (gpt) {
       const pct = Math.round(gpt.sessionPct)
       const barColor = pct >= 85 ? theme.red : pct >= 60 ? theme.yellow : theme.accent
       const pctChunk = fg(pct >= 60 ? barColor : theme.text)(`${pct}%`)
-      const bar: TextChunk[] = [fg(theme.dim)(`GPT `), ...progressBar(pct / 100, 6, barColor), raw(" "), pctChunk]
+      const bar: TextChunk[] = [fg(theme.dim)("OpenAI "), ...progressBar(pct / 100, 6, barColor), raw(" "), pctChunk]
       const tail: TextChunk[] = []
       if (gpt.sessionResetsAt !== undefined) tail.push(fg(theme.faint)(" resets "), fg(theme.dim)(fmtCountdown(gpt.sessionResetsAt, now)))
       if (gpt.weeklyPct !== undefined) {
@@ -1525,18 +1539,9 @@ export class LaunchPicker {
       if (chunksLength(fitted) - 6 > width) fitted = bar
       lines.push(new StyledText(fitted))
     } else if (this.limits?.gptHint) {
-      lines.push(new StyledText([fg(theme.dim)("GPT "), fg(theme.yellow)(truncate(this.limits.gptHint, width - 4))]))
+      lines.push(new StyledText([fg(theme.dim)("OpenAI "), fg(theme.yellow)(truncate(this.limits.gptHint, width - 7))]))
     } else {
-      lines.push(new StyledText([fg(theme.dim)("GPT "), fg(theme.faint)("not configured")]))
-    }
-
-    const openrouter = this.limits?.openrouter
-    if (openrouter) {
-      const value = openrouter.kind === "remaining" ? `${formatMoney(openrouter.amount)} left` : `${formatMoney(openrouter.amount)}/mo`
-      const color = openrouter.kind === "remaining" && openrouter.amount < openRouterLowBalance ? theme.yellow : theme.text
-      lines.push(new StyledText([fg(theme.dim)("OpenRouter "), fg(color)(value)]))
-    } else {
-      lines.push(new StyledText([fg(theme.dim)("OpenRouter "), fg(theme.faint)("not configured")]))
+      lines.push(new StyledText([fg(theme.dim)("OpenAI "), fg(theme.faint)("not configured")]))
     }
     return lines
   }
@@ -1972,7 +1977,13 @@ export class LaunchPicker {
   }
 
   private pipelineVisibleRows() {
-    return this.usesCompactLayout() ? Math.max(1, this.compactPipelineHeight(this.compactBodyHeight()) - 2) : this.listHeight()
+    if (this.usesCompactLayout()) return Math.max(1, this.compactPipelineHeight(this.compactBodyHeight()) - 2)
+    // Wide: the sidebar shares its column with the usage meters when they're
+    // on, so the list's visible rows shrink to match the box laid out in
+    // render() — keeping pagination and click targets in sync with the panel.
+    const bodyHeight = Math.max(8, this.renderer.height - 6)
+    const rows = bodyHeight - (this.usageVisible ? 4 : 0) - 2
+    return Math.max(3, rows)
   }
 
   private detailContentHeight() {

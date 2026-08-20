@@ -2851,13 +2851,13 @@ export class TuiProgress implements ProgressUI {
       const session = Math.round(gpt.sessionPct)
       const weekly = gpt.weeklyPct === undefined ? undefined : Math.round(gpt.weeklyPct)
       const resets = gpt.sessionResetsAt === undefined ? undefined : fmtCountdown(gpt.sessionResetsAt, now)
-      const chunks: TextChunk[] = [fg(theme.yellow)("⚠ GPT")]
+      const chunks: TextChunk[] = [fg(theme.yellow)("⚠ OpenAI")]
       if (session >= 85) chunks.push(fg(theme.yellow)(` ${session}%`), ...(resets ? [fg(theme.faint)(` resets ${resets}`)] : []))
       else if (weekly !== undefined && weekly >= 85) chunks.push(fg(theme.yellow)(` wk ${weekly}%`))
       if (session >= 85 && weekly !== undefined && weekly >= 85) chunks.push(fg(theme.yellow)(` · wk ${weekly}%`))
       if (chunks.length > 1) chips.push({ priority: 0, chunks })
     } else if (this.limits?.gptHint) {
-      chips.push({ priority: 0, chunks: [fg(theme.yellow)(`⚠ GPT — ${this.limits.gptHint}`)] })
+      chips.push({ priority: 0, chunks: [fg(theme.yellow)(`⚠ OpenAI — ${this.limits.gptHint}`)] })
     }
     const openrouter = this.limits?.openrouter
     if (openrouter?.kind === "remaining" && openrouter.amount < openRouterLowBalance) {
@@ -3749,12 +3749,22 @@ export class TuiProgress implements ProgressUI {
     const lines: StyledText[] = []
     const now = Date.now()
 
+    const openrouter = this.limits?.openrouter
+    const orLabel = "OpenRouter "
+    if (openrouter) {
+      const value = openrouter.kind === "remaining" ? `${formatMoney(openrouter.amount)} left` : `${formatMoney(openrouter.amount)} spent this month`
+      const color = openrouter.kind === "remaining" && openrouter.amount < openRouterLowBalance ? theme.yellow : theme.text
+      lines.push(new StyledText([fg(theme.dim)(orLabel), fg(color)(value)]))
+    } else {
+      lines.push(new StyledText([fg(theme.dim)(orLabel), fg(theme.faint)(truncate("not configured — `convoy auth openrouter` stores the balance key", width - orLabel.length))]))
+    }
+
     const gpt = this.limits?.gpt
-    const gptLabel = "GPT        "
+    const openaiLabel = "OpenAI     "
     if (gpt) {
       const pct = Math.round(gpt.sessionPct)
       const barColor = pct >= 85 ? theme.red : pct >= 60 ? theme.yellow : theme.accent
-      const label = fg(theme.dim)(gptLabel)
+      const label = fg(theme.dim)(openaiLabel)
       const bar = [...progressBar(pct / 100, 10, barColor), raw(" "), fg(pct >= 60 ? barColor : theme.text)(`${pct}%`)]
       const tail: TextChunk[] = []
       if (gpt.sessionResetsAt !== undefined) tail.push(fg(theme.faint)(" · resets "), fg(theme.dim)(fmtCountdown(gpt.sessionResetsAt, now)))
@@ -3771,19 +3781,9 @@ export class TuiProgress implements ProgressUI {
       if (chunksLength(fitted) > budget) fitted = bar
       lines.push(new StyledText([label, ...fitted]))
     } else if (this.limits?.gptHint) {
-      lines.push(new StyledText([fg(theme.dim)(gptLabel), fg(theme.yellow)(truncate(this.limits.gptHint, width - gptLabel.length))]))
+      lines.push(new StyledText([fg(theme.dim)(openaiLabel), fg(theme.yellow)(truncate(this.limits.gptHint, width - openaiLabel.length))]))
     } else {
-      lines.push(new StyledText([fg(theme.dim)(gptLabel), fg(theme.faint)(truncate("not configured — `codex login` meters the ChatGPT windows", width - gptLabel.length))]))
-    }
-
-    const openrouter = this.limits?.openrouter
-    const orLabel = "OpenRouter "
-    if (openrouter) {
-      const value = openrouter.kind === "remaining" ? `${formatMoney(openrouter.amount)} left` : `${formatMoney(openrouter.amount)} spent this month`
-      const color = openrouter.kind === "remaining" && openrouter.amount < openRouterLowBalance ? theme.yellow : theme.text
-      lines.push(new StyledText([fg(theme.dim)(orLabel), fg(color)(value)]))
-    } else {
-      lines.push(new StyledText([fg(theme.dim)(orLabel), fg(theme.faint)(truncate("not configured — `convoy auth openrouter` stores the balance key", width - orLabel.length))]))
+      lines.push(new StyledText([fg(theme.dim)(openaiLabel), fg(theme.faint)(truncate("not configured — `codex login` meters the OpenAI windows", width - openaiLabel.length))]))
     }
 
     lines.push(plain(""))

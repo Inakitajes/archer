@@ -1045,7 +1045,7 @@ describe("header limits row", () => {
   test("wide row shows the bar, reset countdown, weekly percent, and credits", () => {
     const row = text(full, 100)
 
-    expect(row).toContain("GPT ")
+    expect(row).toContain("OpenAI ")
     expect(row).toContain("█")
     expect(row).toContain("42%")
     expect(row).toContain("resets 2h 10m")
@@ -1076,7 +1076,7 @@ describe("header limits row", () => {
   test("auth problems surface a dim hint instead of a meter", () => {
     const row = text({ gptHint: "codex login", fetchedAt: now }, 80)
 
-    expect(row).toContain("GPT — codex login")
+    expect(row).toContain("OpenAI — codex login")
     expect(row).not.toContain("█")
   })
 
@@ -1414,7 +1414,7 @@ describe("header limit chips", () => {
     const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
     try {
       const frame = await renderWithLimits(dashboard, renderOnce, captureCharFrame, { gpt: { sessionPct: 92, sessionResetsAt: now + 2 * 1440 * 60_000 + 14 * 60 * 60_000 }, fetchedAt: now }, true)
-      expect(frame).toContain("⚠ GPT 92%")
+      expect(frame).toContain("⚠ OpenAI 92%")
       // The countdown is hour-precision within the coarse fmtCountdown window.
       expect(frame).toMatch(/resets 2d 1[34]h/)
     } finally {
@@ -1428,7 +1428,7 @@ describe("header limit chips", () => {
       dashboard.phaseStarted("implement")
       setLimits(dashboard, { gpt: { sessionPct: 42, weeklyPct: 91 }, fetchedAt: now })
       const frame = await waitForRenderedFrame(renderOnce, captureCharFrame, (f) => f.includes("wk 91%"))
-      expect(frame).toContain("⚠ GPT wk 91%")
+      expect(frame).toContain("⚠ OpenAI wk 91%")
     } finally {
       dashboard.stop()
     }
@@ -1440,7 +1440,7 @@ describe("header limit chips", () => {
       dashboard.phaseStarted("implement")
       setLimits(dashboard, { gptHint: "codex login", fetchedAt: now })
       const frame = await waitForRenderedFrame(renderOnce, captureCharFrame, (f) => f.includes("codex login"))
-      expect(frame).toContain("⚠ GPT — codex login")
+      expect(frame).toContain("⚠ OpenAI — codex login")
     } finally {
       dashboard.stop()
     }

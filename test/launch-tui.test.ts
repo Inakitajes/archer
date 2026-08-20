@@ -919,8 +919,18 @@ describe("launch TUI sidebar usage meters", () => {
       const pipelines = frame.indexOf(" pipelines ")
       const usage = frame.indexOf(" usage ", pipelines)
       expect(usage).toBeGreaterThanOrEqual(pipelines)
-      expect(frame).toContain("GPT")
+      // OpenRouter is the wallet row, so it sits above the OpenAI bar.
+      expect(frame.indexOf("OpenRouter ")).toBeLessThan(frame.indexOf("OpenAI "))
+      expect(frame).toContain("OpenAI")
       expect(frame).toContain("42%")
+      // The panel is pegged to the footer: its top border, two meter rows, and
+      // bottom border, then the footer's top border immediately after.
+      const lines = frame.split("\n")
+      const usageLine = lines.findIndex((line) => line.includes(" usage "))
+      // The footer's top border is the first rounded corner after the panel.
+      const footerLine = lines.findIndex((line, index) => index > usageLine && line.trimStart().startsWith("╭"))
+      // usage top, two meter rows, bottom border, then the footer immediately.
+      expect(footerLine - usageLine).toBe(4)
     } finally {
       closeLauncher(launcher)
     }
