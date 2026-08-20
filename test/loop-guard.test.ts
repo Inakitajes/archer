@@ -7,7 +7,7 @@ import {
   LoopGuardError,
   observationFromSessionEvent,
   resolveLoopGuard,
-  softAgentSteps,
+  softNudgeSteps,
   type LoopGuardObservation,
 } from "../src/loop-guard"
 
@@ -41,10 +41,11 @@ describe("resolveLoopGuard", () => {
     resolveLoopGuard(resolveLoopGuard({ maxPhaseCost: false }))
   })
 
-  test("soft agent steps land a few turns before the hard abort", () => {
-    expect(softAgentSteps(80)).toBe(75)
-    expect(softAgentSteps(5)).toBe(1)
-    expect(softAgentSteps(1)).toBe(1)
+  test("soft nudge threshold is halfway to the hard budget gate", () => {
+    expect(defaultLoopGuard.maxSteps).toBe(200)
+    expect(softNudgeSteps(200)).toBe(100)
+    expect(softNudgeSteps(5)).toBe(2)
+    expect(softNudgeSteps(1)).toBe(0)
   })
 })
 
@@ -180,7 +181,7 @@ describe("LoopGuard ceilings", () => {
   test("trips on the configured step count", () => {
     const guard = new LoopGuard(tight)
     expect(guard.observe({ kind: "step" })).toBeUndefined()
-    expect(guard.observe({ kind: "step" })).toBeUndefined()
+    expect(guard.observe({ kind: "step" })).toMatchObject({ reason: "soft-nudge", count: 2 })
     expect(guard.observe({ kind: "step" })).toBeUndefined()
     expect(guard.observe({ kind: "step" })).toBeUndefined()
     expect(guard.observe({ kind: "step" })).toMatchObject({ reason: "max-steps", count: 5 })

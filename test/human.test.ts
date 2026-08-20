@@ -193,6 +193,11 @@ describe("phaseGatePrompt", () => {
     const prompt = phaseGatePrompt({ stepName: "implementer", kind: "interactive", allowed: ["continue", "iterate", "abort"] })
     expect(prompt).toBe('Interactive session on step "implementer": [c]ontinue pipeline, [o]pen OpenCode, [a]bort > ')
   })
+
+  test("a budget gate offers reset and abort without a transparent continue action", () => {
+    const prompt = phaseGatePrompt({ stepName: "implementer", kind: "budget-gate", allowed: ["reset", "abort"] })
+    expect(prompt).toBe('Step "implementer" reached its step budget. Resetting starts another budget while keeping accumulated cost.\n[r]eset and continue, [a]bort > ')
+  })
 })
 
 /**

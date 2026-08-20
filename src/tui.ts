@@ -1381,7 +1381,17 @@ export class TuiProgress implements ProgressUI {
         this.selectPhaseByName(info.stepName)
         this.manualFocus = false
       }
-      this.addEvent(info.stepName, "permission", info.kind === "failure" ? "step failed — waiting for your decision" : info.kind === "interactive" ? "interactive session — waiting for your decision" : "waiting for human review action")
+      this.addEvent(
+        info.stepName,
+        "permission",
+        info.kind === "failure"
+          ? "step failed — waiting for your decision"
+          : info.kind === "budget-gate"
+            ? "step budget reached — waiting for your decision"
+            : info.kind === "interactive"
+              ? "interactive session — waiting for your decision"
+              : "waiting for human review action",
+      )
       this.render()
     })
   }
@@ -1809,7 +1819,16 @@ export class TuiProgress implements ProgressUI {
       fullscreen: fullscreen !== undefined,
       contentTab: fullscreen?.tab ?? this.contentTab,
       permissionPending: this.permissionQueue.length > 0,
-      humanReviewGate: this.humanReviewQueue[0]?.info.kind === "interactive" ? "interactive" : this.humanReviewQueue[0]?.info.kind === "failure" ? "failure" : this.humanReviewQueue.length > 0 ? "review" : undefined,
+      humanReviewGate:
+        this.humanReviewQueue[0]?.info.kind === "interactive"
+          ? "interactive"
+          : this.humanReviewQueue[0]?.info.kind === "failure"
+            ? "failure"
+            : this.humanReviewQueue[0]?.info.kind === "budget-gate"
+              ? "budget-gate"
+              : this.humanReviewQueue.length > 0
+                ? "review"
+                : undefined,
       reviewCanRetry: this.humanReviewQueue[0]?.info.canRetry ?? false,
       autoAccept: this.autoAccept?.mode,
       keepAwake: this.keepAwake?.status,
@@ -2393,8 +2412,15 @@ export class TuiProgress implements ProgressUI {
       this.render()
       return
     }
-    if (this.humanReviewQueue[0]?.info.kind === "failure") {
-      this.addEvent("convoy", "system", "use [o] in the step failed gate before taking over a session")
+    const takeoverGate = this.humanReviewQueue[0]?.info.kind
+    if (takeoverGate === "failure" || takeoverGate === "budget-gate") {
+      this.addEvent(
+        "convoy",
+        "system",
+        takeoverGate === "failure"
+          ? "use [o] in the step failed gate before taking over a session"
+          : "answer the step budget gate with [r] or [a] before taking over a session",
+      )
       this.render()
       return
     }
@@ -2432,11 +2458,19 @@ export class TuiProgress implements ProgressUI {
   }
 
   private openSessionWindowForPhase(name: string) {
-    if (this.humanReviewQueue[0]?.info.kind === "failure") {
-      // Opening a session through the normal navigation path would leave the
-      // failure gate offering [r], whose clean restore could erase those edits.
-      // The gate's own [o] flips it to interactive only after the open succeeds.
-      this.addEvent("convoy", "system", "use [o] in the step failed gate before opening a session")
+    const openGate = this.humanReviewQueue[0]?.info.kind
+    if (openGate === "failure" || openGate === "budget-gate") {
+      // An active gate owns its choices. A failure gate's [o] flips it to
+      // interactive only after the open succeeds — a plain open would leave
+      // [r]'s clean restore able to erase those edits. A budget gate has no
+      // [o] at all: only [r] or [a] may resolve it.
+      this.addEvent(
+        "convoy",
+        "system",
+        openGate === "failure"
+          ? "use [o] in the step failed gate before opening a session"
+          : "answer the step budget gate with [r] or [a] before opening a session",
+      )
       this.render()
       return
     }
@@ -3257,19 +3291,24 @@ export class TuiProgress implements ProgressUI {
     const gate = this.humanReviewQueue[0]
     if (gate?.info.stepName === phase.name) {
       const isFailure = gate.info.kind === "failure"
+      const isBudgetGate = gate.info.kind === "budget-gate"
       out.push(plain(""))
-      out.push(new StyledText([fg(theme.yellow)(isFailure ? "step failed" : gate.info.kind === "interactive" ? "interactive session" : "human review"), fg(theme.faint)(" · choose from the dashboard shortcuts")]))
+      out.push(new StyledText([fg(theme.yellow)(isFailure ? "step failed" : isBudgetGate ? "step budget reached" : gate.info.kind === "interactive" ? "interactive session" : "human review"), fg(theme.faint)(" · choose from the dashboard shortcuts")]))
       if (isFailure && gate.info.error) out.push(new StyledText([fg(theme.red)(truncate(gate.info.error, Math.max(20, width)))]))
       out.push(
         new StyledText(
-          isFailure && gate.info.canRetry
+          isBudgetGate
+            ? [fg(theme.accent)("r"), fg(theme.dim)(" reset and continue   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")]
+            : isFailure && gate.info.canRetry
             ? [fg(theme.accent)("r"), fg(theme.dim)(" retry clean   "), fg(theme.accent)("o"), fg(theme.dim)(" open OpenCode   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")]
             : isFailure
               ? [fg(theme.accent)("o"), fg(theme.dim)(" open OpenCode   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")]
               : [fg(theme.accent)("c"), fg(theme.dim)(" continue pipeline   "), fg(theme.accent)("o"), fg(theme.dim)(" open OpenCode   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")],
         ),
       )
-      out.push(new StyledText([fg(theme.faint)("iterations "), fg(theme.dim)(String(gate.info.iterations))]))
+      // A budget gate has no iterate action, so its counter is always zero —
+      // showing it would be dead text. Other gates can actually iterate.
+      if (!isBudgetGate) out.push(new StyledText([fg(theme.faint)("iterations "), fg(theme.dim)(String(gate.info.iterations))]))
     } else if (phase.status === "running" && this.interactiveTakeover.has(phase.name)) {
       out.push(plain(""))
       out.push(new StyledText([fg(theme.cyan)("interactive armed"), fg(theme.faint)(" · esc in OpenCode holds the step here; a clean finish waits for you — "), fg(theme.accent)("i"), fg(theme.faint)(" disarms")]))
@@ -3688,7 +3727,7 @@ export class TuiProgress implements ProgressUI {
       const right: TextChunk[] = []
       if (this.humanReviewQueue.length > 1) right.push(fg(theme.yellow)(`${this.humanReviewQueue.length - 1} more waiting`), fg(theme.faint)(" · "))
       if (gate.info.iterations > 0) right.push(fg(theme.faint)(`${gate.info.iterations} iteration${gate.info.iterations === 1 ? "" : "s"}`))
-      const prefix = [fg(theme.yellow)(gate.info.kind === "failure" ? "step failed · " : gate.info.kind === "interactive" ? "interactive session · " : "human review · ")]
+      const prefix = [fg(theme.yellow)(gate.info.kind === "failure" ? "step failed · " : gate.info.kind === "budget-gate" ? "step budget reached · " : gate.info.kind === "interactive" ? "interactive session · " : "human review · ")]
       return hintsRow(hints, [right], width, { style: "spaced", overflow: moreHintsMarker, prefix })
     }
 
@@ -4078,24 +4117,24 @@ function wheelDelta(event: WheelEvent): number {
   return scroll.direction === "up" ? -magnitude : magnitude
 }
 
-function humanReviewActionForKey(key: KeyEvent, kind: "interactive" | "failure" | undefined, canRetry: boolean): HumanReviewAction | undefined {
+function humanReviewActionForKey(key: KeyEvent, kind: "interactive" | "failure" | "budget-gate" | undefined, canRetry: boolean): HumanReviewAction | undefined {
   switch (key.name) {
     case "c":
       // [c] continue is never offered on a failure gate: reaching forward
       // (continue) from a broken step must require taking control via [o] first.
-      return kind === "failure" ? undefined : "continue"
+      return kind === "failure" || kind === "budget-gate" ? undefined : "continue"
     case "o":
-      return "iterate"
+      return kind === "budget-gate" ? undefined : "iterate"
     case "a":
       return "abort"
     case "r":
-      return kind === "failure" && canRetry ? "retry" : undefined
+      return kind === "budget-gate" ? "reset" : kind === "failure" && canRetry ? "retry" : undefined
   }
   return undefined
 }
 
-function humanReviewActionLabel(action: HumanReviewAction, kind: "interactive" | "failure" | undefined) {
-  const gate = kind === "failure" ? "step failed" : kind === "interactive" ? "interactive session" : "human review"
+function humanReviewActionLabel(action: HumanReviewAction, kind: "interactive" | "failure" | "budget-gate" | undefined) {
+  const gate = kind === "failure" ? "step failed" : kind === "budget-gate" ? "step budget reached" : kind === "interactive" ? "interactive session" : "human review"
   switch (action) {
     case "continue":
       return `${gate}: continue`
@@ -4105,6 +4144,8 @@ function humanReviewActionLabel(action: HumanReviewAction, kind: "interactive" |
       return `${gate}: abort`
     case "retry":
       return `${gate}: retry clean`
+    case "reset":
+      return `${gate}: reset and continue`
   }
 }
 

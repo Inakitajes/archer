@@ -42,6 +42,7 @@ import {
   validateDeliverable,
   watchSession,
   withReadOnlyRepositoryBoundary,
+  softBudgetNudgeText,
   type ActiveSession,
 } from "../src/runner"
 import type { AgentStep, DeliverableContract, HumanStep, Pipeline, Step } from "../src/types"
@@ -641,6 +642,126 @@ describe("run phase gate", () => {
     expect(prompts).toHaveLength(1)
     expect(prompts[0]?.kind).toBe("failure")
     expect(prompts[0]?.canRetry).toBe(true)
+  })
+
+  test("a max-steps trip opens a reset-or-abort budget gate and reuses its guard after reset", async () => {
+    const attempts: LoopGuard[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return Promise.resolve("reset")
+      },
+    }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      agentStep("implementer"),
+      "/repo",
+      prepared,
+      undefined,
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (...args) => {
+          const guard = args[13]!
+          attempts.push(guard)
+          if (attempts.length === 1) {
+            guard.observe({ kind: "cost", messageID: "msg_1", cost: 10 })
+            for (let step = 0; step < 199; step++) guard.observe({ kind: "step" })
+            const trip = guard.observe({ kind: "step" })!
+            throw new LoopGuardError(trip)
+          }
+          expect(guard.getSteps()).toBe(0)
+          expect(guard.getTotalCost()).toBe(10)
+          return "# completed after reset"
+        },
+        restorePhaseBaseline: async () => {},
+      },
+    )
+
+    expect(result).toBe("# completed after reset")
+    expect(attempts).toHaveLength(2)
+    expect(attempts[1]).toBe(attempts[0])
+    expect(prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "budget-gate", error: expect.stringContaining("cap 200"), canRetry: false }])
+  })
+
+  test("answering abort at a budget gate throws UserAbortError and requests a run-wide shutdown", async () => {
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        expect(info.kind).toBe("budget-gate")
+        return Promise.resolve("abort")
+      },
+    }
+    const shutdown = new RunShutdown()
+    const trip = {
+      reason: "max-steps" as const,
+      message: "phase reached 200 model steps without finishing (cap 200). The phase was aborted to stop a runaway session.",
+      count: 200,
+    }
+
+    try {
+      await expect(
+        runPhaseUntilResolved(
+          {} as never,
+          workspace,
+          agentStep("implementer"),
+          "/repo",
+          prepared,
+          undefined,
+          progress,
+          shutdown,
+          createGitLock(),
+          { serverUrl: "http://127.0.0.1:1" },
+          {
+            runPhaseAttempt: async () => {
+              throw new LoopGuardError(trip)
+            },
+            restorePhaseBaseline: async () => {},
+          },
+        ),
+      ).rejects.toThrow(UserAbortError)
+      expect(shutdown.aborted).toBe(true)
+    } finally {
+      shutdown.dispose()
+    }
+  })
+
+  test("a max-steps trip fails instead of continuing when no dashboard or TTY can answer the budget gate", async () => {
+    const workspace = await retryWorkspace()
+    const trip = {
+      reason: "max-steps" as const,
+      message: "phase reached 200 model steps without finishing (cap 200). The phase was aborted to stop a runaway session.",
+      count: 200,
+    }
+
+    await expect(
+      runPhaseUntilResolved(
+        {} as never,
+        workspace,
+        agentStep("implementer"),
+        "/repo",
+        prepared,
+        undefined,
+        noopProgress,
+        new RunShutdown(),
+        createGitLock(),
+        undefined,
+        {
+          runPhaseAttempt: async () => {
+            throw new LoopGuardError(trip)
+          },
+          restorePhaseBaseline: async () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ name: "LoopGuardError", trip })
   })
 
   test("retry restores the baseline and runs the attempt again", async () => {
@@ -1651,6 +1772,40 @@ describe("waitForPhaseGate", () => {
     expect(calls.prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "failure", error: "network down", canRetry: true }])
   })
 
+  test("a budget gate returns reset and offers neither retry nor an interactive session", async () => {
+    const { calls, progress } = gateProgress(["reset"])
+    const { events, permissions } = trackedPermissions()
+
+    const outcome = await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1", permissions }, progress, {
+      kind: "budget-gate",
+      error: "step cap reached",
+      canRetry: false,
+    })
+
+    expect(outcome).toBe("reset")
+    expect(events).toEqual([])
+    expect(calls.prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "budget-gate", error: "step cap reached", canRetry: false }])
+  })
+
+  test("a budget gate ignores an unsupported open-session reply", async () => {
+    const { calls, progress } = gateProgress(["iterate", "reset"])
+    let opened = 0
+
+    const outcome = await waitForPhaseGate("implementer", "/repo", "ses_1", { serverUrl: "http://127.0.0.1:1" }, progress, {
+      kind: "budget-gate",
+      canRetry: false,
+    }, {
+      openWindow: async () => {
+        opened++
+        return "terminal"
+      },
+    })
+
+    expect(outcome).toBe("reset")
+    expect(opened).toBe(0)
+    expect(calls.prompts).toHaveLength(2)
+  })
+
   test("retry on a failure gate returns the retry outcome without restoring", async () => {
     const { calls, progress } = gateProgress(["retry"])
     const { events, permissions } = trackedPermissions()
@@ -2080,6 +2235,126 @@ describe("loopGuard seam regressions", () => {
     })
 
     expect(result.info.id).toBe("msg_1")
+  })
+
+  test("queues the soft nudge through v2 for a session created and prompted through v1", async () => {
+    const started = deferred()
+    const queued: unknown[] = []
+    const activities: string[] = []
+    let v1Prompts = 0
+    async function* stream() {
+      await started.promise
+      for (let step = 0; step < 100; step++) {
+        yield { type: "session.next.step.started", properties: { sessionID: "ses_1" } }
+      }
+      yield { type: "session.idle", properties: { sessionID: "ses_1" } }
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        create: async () => ({ data: { id: "ses_1" } }),
+        promptAsync: async () => {
+          v1Prompts++
+          started.resolve()
+          return {}
+        },
+        messages: async () => ({ data: [completedMessage("msg_1", 0, "# report")] }),
+        status: async () => ({ data: {} }),
+        abort: async () => ({}),
+      },
+      v2: {
+        session: {
+          prompt: async (input: unknown) => {
+            queued.push(input)
+            return {}
+          },
+        },
+      },
+    } as never
+
+    const result = await promptPhase(client, {
+      phase: agentStep("implementer"),
+      workspace: { dir: "/run", runID: "test-run" } as Workspace,
+      targetDir: "/repo",
+      prompt: "do the thing",
+      model: { providerID: "openai", modelID: "gpt-5.5" },
+      attachments: [],
+      progress: { ...noopProgress, phaseActivity: (_name, detail) => void activities.push(detail) },
+      shutdown: new RunShutdown(),
+      attempt: 1,
+      loopGuardConfig: resolveLoopGuard({ maxSteps: 200 }),
+    })
+
+    await Promise.resolve()
+    expect(result.info.id).toBe("msg_1")
+    expect(v1Prompts).toBe(1)
+    expect(queued).toEqual([{ sessionID: "ses_1", prompt: { text: softBudgetNudgeText }, delivery: "queue" }])
+    expect(activities.some((detail) => detail.includes("soft budget"))).toBe(false)
+  })
+
+  test("a failed soft-nudge delivery never aborts the session or fails the phase", async () => {
+    const started = deferred()
+    const activities: string[] = []
+    let aborts = 0
+    async function* stream() {
+      await started.promise
+      for (let step = 0; step < 100; step++) {
+        yield { type: "session.next.step.started", properties: { sessionID: "ses_1" } }
+      }
+      yield { type: "session.idle", properties: { sessionID: "ses_1" } }
+      await new Promise<void>(() => {})
+    }
+    // SessionBusyError-shaped rejection: the v2 queue route can refuse a
+    // mid-turn delivery. The nudge is best-effort, so the turn must survive.
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        create: async () => ({ data: { id: "ses_1" } }),
+        promptAsync: async () => {
+          started.resolve()
+          return {}
+        },
+        messages: async () => ({ data: [completedMessage("msg_1", 0, "# report")] }),
+        status: async () => ({ data: {} }),
+        abort: async () => {
+          aborts++
+          return {}
+        },
+      },
+      v2: {
+        session: {
+          prompt: async () => {
+            throw new Error("Session is busy")
+          },
+        },
+      },
+    } as never
+
+    const result = await promptPhase(client, {
+      phase: agentStep("implementer"),
+      workspace: { dir: "/run", runID: "test-run" } as Workspace,
+      targetDir: "/repo",
+      prompt: "do the thing",
+      model: { providerID: "openai", modelID: "gpt-5.5" },
+      attachments: [],
+      progress: {
+        ...noopProgress,
+        phaseActivity: (_name, detail, level) => {
+          activities.push(`${level}:${detail}`)
+        },
+      },
+      shutdown: new RunShutdown(),
+      attempt: 1,
+      loopGuardConfig: resolveLoopGuard({ maxSteps: 200 }),
+    })
+
+    // Give the rejected nudge's catch handler a chance to (wrongly) act.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(result.info.id).toBe("msg_1")
+    expect(aborts).toBe(0)
+    expect(activities.some((detail) => detail.startsWith("error:"))).toBe(false)
   })
 
   test("SC-2: a follow-up watcher's spend accumulates into the shared cost cap", async () => {

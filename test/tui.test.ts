@@ -406,6 +406,24 @@ describe("footer hints and the command palette", () => {
     }
   })
 
+  test("a budget gate exposes reset and abort, and r resets without opening a session", async () => {
+    const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(200, 40)
+    try {
+      const action = dashboard.askHumanReview({ stepName: "implement", iterations: 0, kind: "budget-gate", canRetry: false })
+      await renderOnce()
+
+      const frame = captureCharFrame()
+      expect(frame).toContain("step budget reached")
+      expect(frame).toContain("reset and continue")
+      expect(frame).not.toContain("open OpenCode")
+
+      mockInput.pressKey("r")
+      expect(await action).toBe("reset")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
   // Regression: the palette gated every action behind `!finished`, so the
   // finish screen offered a single entry while five actions sat on the keyboard.
   test("the finish screen's palette lists its own actions", async () => {

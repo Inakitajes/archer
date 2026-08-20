@@ -152,13 +152,13 @@ export type PermissionPromptInfo = {
   explain?(signal?: AbortSignal): Promise<string>
 }
 
-export type HumanReviewAction = "continue" | "iterate" | "abort" | "retry"
+export type HumanReviewAction = "continue" | "iterate" | "abort" | "retry" | "reset"
 
 export type HumanReviewPromptInfo = {
   stepName: string
   iterations: number
-  /** Gate mode. "interactive" is the mid-step takeover gate (armed with [i]); "failure" is a failed step waiting for a decision; absent for pipeline human steps. */
-  kind?: "interactive" | "failure"
+  /** Gate mode. "interactive" is the mid-step takeover gate (armed with [i]); "failure" is a failed step waiting for a decision; "budget-gate" resets or aborts a phase that exhausted its step budget; absent for pipeline human steps. */
+  kind?: "interactive" | "failure" | "budget-gate"
   /** The SDK error a failed step surfaced, shown in the dashboard instead of a generic label. */
   error?: string
   /** Whether [r] (retry clean) is offered: true only for a failure gate with a baseline snapshot. */

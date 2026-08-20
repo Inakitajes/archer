@@ -128,12 +128,13 @@ export type HumanActionPrompt = {
   terminalInput?: TerminalInput
 }
 
-/** One key per ReviewAction, shared by askHumanAction's prompt and dispatch. */
+/** One key per ReviewAction, shared by askHumanAction's prompt and dispatch. Retry and reset share "r"; a gate never allows both at once. */
 const humanActionKeys: Record<HumanReviewAction, string> = {
   continue: "c",
   iterate: "o",
   abort: "a",
   retry: "r",
+  reset: "r",
 }
 
 /** The words each key completes in the [k]ey prompt style ("[o]pen OpenCode"); every label starts with its key. */
@@ -142,6 +143,7 @@ const humanActionLabels: Record<HumanReviewAction, string> = {
   iterate: "open OpenCode",
   abort: "abort",
   retry: "retry clean",
+  reset: "reset and continue",
 }
 
 /** Extra words an action answers to, beyond its key and action name. */
@@ -165,8 +167,11 @@ export function humanActionMenu(allowed: ReadonlyArray<HumanReviewAction>): stri
  * as the human-step prompt above. A failure puts the error on its own line so
  * the menu stays next to the cursor; the terminal wraps long errors for us.
  */
-export function phaseGatePrompt(info: { stepName: string; kind: "interactive" | "failure"; error?: string; allowed: ReadonlyArray<HumanReviewAction> }): string {
+export function phaseGatePrompt(info: { stepName: string; kind: "interactive" | "failure" | "budget-gate"; error?: string; allowed: ReadonlyArray<HumanReviewAction> }): string {
   const menu = humanActionMenu(info.allowed)
+  if (info.kind === "budget-gate") {
+    return `Step "${info.stepName}" reached its step budget. Resetting starts another budget while keeping accumulated cost.\n${menu} > `
+  }
   if (info.kind === "failure") {
     const reason = info.error ? `: ${info.error.replace(/\s+/g, " ").trim()}` : ""
     return `Step "${info.stepName}" failed${reason}\n${menu} > `

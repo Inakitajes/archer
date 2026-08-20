@@ -191,6 +191,15 @@ describe("dashboard action registry", () => {
     expect(available({ humanReviewGate: "interactive", reviewCanRetry: true })).not.toContain("review-retry")
   })
 
+  test("a budget gate offers only reset and abort", () => {
+    const ids = available({ humanReviewGate: "budget-gate" })
+    expect(ids).toContain("review-reset")
+    expect(ids).toContain("review-abort")
+    expect(ids).not.toContain("review-continue")
+    expect(ids).not.toContain("review-open")
+    expect(ids).not.toContain("review-retry")
+  })
+
   test("[MF-2] the focused reader keeps session available to the palette but not its footer", () => {
     expect(commands({ contentFocused: true })).toContain("session")
     expect(footer({ contentFocused: true })).not.toContain("session")

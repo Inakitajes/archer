@@ -682,7 +682,6 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
         opencodeConfig(workspace.dir, options.targetDir, agents, options.permissions, {
           advisorAgents: advisorNeeds.agents,
           advisorModels: advisorNeeds.models,
-          loopGuard: options.loopGuard,
         }),
         boot.signal,
       )
@@ -1292,15 +1291,36 @@ export async function runPhaseUntilResolved(
     rubricWeights ??
     (deliverableContract.kind === "quality-score-report" ? ((await loadQualityRubricWeights(targetDir)) ?? qualityDimensionWeights) : qualityDimensionWeights)
   let automaticDeliverableRetries = 0
+  // A budget-gate reset starts a new prompt but keeps the renewable guard's
+  // other fuses (especially accumulated cost) intact. Ordinary retries still
+  // receive a fresh guard because they begin a clean phase attempt.
+  let budgetGuard: LoopGuard | undefined
   // Read fresh at each decision point: the user can arm/disarm [i] mid-attempt.
   const armed = () => Boolean(takeover && progress.isInteractiveTakeover?.(phase.name))
 
   for (let attempt = 1; ; attempt++) {
     shutdown.throwIfRequested()
+    const loopGuard = budgetGuard ?? new LoopGuard(prepared.loopGuard)
+    budgetGuard = undefined
     progress.phaseAttempt(phase.name, { attempt, model: formatModel(prepared.model) })
     log.info(`[${phase.name}] attempt ${attempt} with ${formatModel(prepared.model)}`)
     try {
-      const text = await deps.runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors, reports, deliverableContract, weights)
+      const text = await deps.runPhaseAttempt(
+        client,
+        workspace,
+        phase,
+        targetDir,
+        prepared,
+        attempt,
+        progress,
+        shutdown,
+        sessionRef,
+        advisors,
+        reports,
+        deliverableContract,
+        weights,
+        loopGuard,
+      )
       const candidate = await resolveDeliverableCandidate(workspace, phase, text, reports?.candidateFor(sessionRef.id ?? ""))
       const validation = validateDeliverable(deliverableContract, candidate, weights)
       if (!validation.valid) {
@@ -1364,6 +1384,31 @@ export async function runPhaseUntilResolved(
       return candidate
     } catch (error) {
       if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
+      if (error instanceof LoopGuardError && error.trip.reason === "max-steps") {
+        // The budget gate replaces the failure gate for this trip, so journal
+        // the attempt here — the generic path below is never reached for it.
+        if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
+        const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
+          kind: "budget-gate",
+          error: formatSdkError(error),
+          canRetry: false,
+          signal: shutdown.signal,
+          onAbort: () => {
+            if (!shutdown.aborted) shutdown.request("budget gate abort")
+          },
+          runner: phase.runner,
+          runDir: workspace.dir,
+        })
+        // A noninteractive budget gate cannot choose reset, so preserve the
+        // original hard-limit failure instead of allowing a silent continuation.
+        // Any unexpected outcome fails too: falling through to the failure gate
+        // below would re-offer [o]+[c], continuing a budget-exhausted phase
+        // without the reset the budget contract requires.
+        if (outcome !== "reset") throw error
+        loopGuard.resetSteps()
+        budgetGuard = loopGuard
+        continue
+      }
       // A scored-contract failure is terminal after its bounded automatic retry:
       // accepting a missing score through the human failure gate would turn a
       // missing score into a successful scored run with no machine-readable
@@ -1407,7 +1452,7 @@ type PhaseGateDeps = {
 }
 
 type PhaseGateOptions = {
-  kind: "interactive" | "failure"
+  kind: PhaseGateKind
   error?: string
   canRetry: boolean
   /** Cancels an open decision gate promptly during a run-wide shutdown. */
@@ -1424,10 +1469,13 @@ const defaultPhaseGateDeps: Required<PhaseGateDeps> = {
   openClaudeWindow: openClaudeSessionWindow,
 }
 
-export type PhaseGateOutcome = "continue" | "retry" | "unavailable"
+type PhaseGateKind = "interactive" | "failure" | "budget-gate"
 
-/** The [c]/[o]/[a] keys a human gate answers with, per mode. */
-function gateAllowedActions(kind: "interactive" | "failure", canRetry: boolean): readonly HumanReviewAction[] {
+export type PhaseGateOutcome = "continue" | "retry" | "reset" | "unavailable"
+
+/** The actions a human gate answers with, per mode. */
+function gateAllowedActions(kind: PhaseGateKind, canRetry: boolean): readonly HumanReviewAction[] {
+  if (kind === "budget-gate") return ["reset", "abort"]
   if (kind === "interactive") return ["continue", "iterate", "abort"]
   return canRetry ? ["retry", "iterate", "abort"] : ["iterate", "abort"]
 }
@@ -1460,8 +1508,11 @@ export async function waitForPhaseGate(
   const usingTui = Boolean(askInTui)
   if (!usingTui && !(stdin.isTTY && stdout.isTTY)) return "unavailable"
 
-  let kind: "interactive" | "failure" = options.kind
-  progress.phaseRunning(phaseName, kind === "interactive" ? "interactive session — waiting for your decision" : "step failed — waiting for your decision")
+  let kind: PhaseGateKind = options.kind
+  progress.phaseRunning(
+    phaseName,
+    kind === "interactive" ? "interactive session — waiting for your decision" : kind === "budget-gate" ? "step budget reached — waiting for your decision" : "step failed — waiting for your decision",
+  )
   let iterations = 0
   let permissionsPaused = false
   // Pause only the session the interactive TUI owns, never the whole directory:
@@ -1493,12 +1544,17 @@ export async function waitForPhaseGate(
         options.signal,
       )
 
+      // ProgressUI implementations normally enforce the action set themselves;
+      // keep the budget gate authoritative so a malformed dashboard reply
+      // cannot reopen or continue a phase that exhausted its step budget.
+      if (kind === "budget-gate" && action !== "reset" && action !== "abort") continue
       if (action === "continue") return "continue"
       if (action === "abort") {
         options.onAbort?.()
         throw new UserAbortError("aborted from phase gate")
       }
       if (action === "retry") return "retry"
+      if (action === "reset") return "reset"
 
       iterations++
       if (!sessionID) {
@@ -1564,8 +1620,9 @@ async function runPhaseAttempt(
   reports?: ReportRuntime,
   deliverableContract?: DeliverableContract,
   rubricWeights?: Record<QualityDimension, number>,
+  loopGuard?: LoopGuard,
 ) {
-  const input = { client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors, reports, deliverableContract, rubricWeights }
+  const input = { client, workspace, phase, targetDir, prepared, attempt, progress, shutdown, sessionRef, advisors, reports, deliverableContract, rubricWeights, loopGuard }
   const runner = phaseAttemptRunners[stepRunnerFor(phase.runner).id]
   const result = await runner.executeAttempt(input)
 
@@ -1610,6 +1667,8 @@ type PhaseAttemptInput = {
   reports?: ReportRuntime
   deliverableContract?: DeliverableContract
   rubricWeights?: Record<QualityDimension, number>
+  /** Reused only after a budget-gate reset; ordinary attempts receive a fresh guard. */
+  loopGuard?: LoopGuard
 }
 
 type PhaseAttemptResult = {
@@ -1642,6 +1701,7 @@ async function executeOpenCodePhaseAttempt(input: PhaseAttemptInput): Promise<Ph
     sessionRef: input.sessionRef,
     attempt: input.attempt,
     loopGuardConfig: input.prepared.loopGuard,
+    ...(input.loopGuard ? { loopGuard: input.loopGuard } : {}),
     ...(input.advisors ? { advisors: input.advisors } : {}),
     ...(input.reports ? { reports: input.reports } : {}),
     ...(input.deliverableContract ? { deliverableContract: input.deliverableContract } : {}),
@@ -1891,6 +1951,8 @@ export async function promptPhase(
     attempt: number
     /** The resolved guard configuration; already resolved by preparePhaseRun, never re-resolved here. */
     loopGuardConfig: LoopGuardConfig
+    /** A budget-gate reset reuses this guard so cost remains capped across prompts. */
+    loopGuard?: LoopGuard
   },
 ): Promise<SessionResult> {
   input.shutdown.throwIfRequested()
@@ -1921,7 +1983,7 @@ export async function promptPhase(
   // resolved (preparePhaseRun) — resolving again would re-arm the defaults over
   // a user's `maxPhaseCost: false`, which is why LoopGuardConfig can't be fed
   // back into resolveLoopGuard.
-  const loopGuard = new LoopGuard(input.loopGuardConfig)
+  const loopGuard = input.loopGuard ?? new LoopGuard(input.loopGuardConfig)
 
   // The prompt is fired asynchronously and completion is detected through the
   // event stream plus status polling. A single blocking HTTP request can't
@@ -2206,6 +2268,28 @@ export type SessionWatcher = {
   stop(): Promise<void>
 }
 
+/** A one-time, best-effort, model-only queued reminder; it never opens a Convoy UI surface. */
+export const softBudgetNudgeText = [
+  "You have used half of this phase's step budget.",
+  "Review your progress now, avoid repeating work, and complete or persist the deliverable with the remaining budget.",
+].join(" ")
+
+async function queueSoftBudgetNudge(client: OpencodeClient, sessionID: string, phaseName: string) {
+  try {
+    // The v2 route queues this user message behind the in-flight turn.
+    // It is intentionally separate from v1 promptAsync(), which created the
+    // phase session and cannot request non-interrupting delivery. Best-effort:
+    // OpenCode may accept the queue on a busy v1 session without injecting the
+    // instruction into later turns. The hard budget gate is the real stop.
+    const queued = await client.v2.session.prompt({ sessionID, prompt: { text: softBudgetNudgeText }, delivery: "queue" })
+    if (queued.error) log.warn(`[${phaseName}] couldn't queue the soft step-budget nudge: ${formatSdkError(queued.error)}`)
+  } catch (error) {
+    // A failed nudge must not change the active turn or bypass the hard budget
+    // gate. In particular, no abort-and-reprompt fallback is used here.
+    log.warn(`[${phaseName}] couldn't queue the soft step-budget nudge: ${formatSdkError(error)}`)
+  }
+}
+
 type ActivityState = {
   reasoningChars: number
   textChars: number
@@ -2292,6 +2376,13 @@ export function watchSession(
     if (!input.loopGuard || settled) return
     const trip = input.loopGuard.observe(observation)
     if (!trip) return
+    if (trip.reason === "soft-nudge") {
+      // Queued delivery is model-only: don't add activity to the dashboard or
+      // interrupt the current turn. The guard emits this exactly once per
+      // budget cycle, and resetSteps deliberately makes it eligible again.
+      void queueSoftBudgetNudge(client, input.sessionID, input.phaseName)
+      return
+    }
     input.progress.phaseActivity(input.phaseName, trip.message, "error")
     log.warn(`[${input.phaseName}] ${trip.message}`)
     void abortSessionQuietly(client, input.sessionID, input.directory, input.phaseName)

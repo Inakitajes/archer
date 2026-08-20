@@ -65,6 +65,7 @@ export type ActionID =
   | "review-open"
   | "review-abort"
   | "review-retry"
+  | "review-reset"
 
 export type Action = {
   id: ActionID
@@ -97,7 +98,7 @@ export type DashboardActionState = {
   fullscreen: boolean
   contentTab: ContentTab
   permissionPending: boolean
-  humanReviewGate?: "interactive" | "failure" | "review"
+  humanReviewGate?: "interactive" | "failure" | "budget-gate" | "review"
   /** Whether a failure gate can offer [r]: true only when a baseline snapshot exists. */
   reviewCanRetry: boolean
   autoAccept?: AutoAcceptMode
@@ -475,7 +476,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       group: "review",
       // [c] is never offered on a failure gate: taking control ([o]) then
       // continuing at the flipped interactive gate is the only safe way forward.
-      available: !state.permissionPending && state.humanReviewGate !== undefined && state.humanReviewGate !== "failure",
+      available: !state.permissionPending && state.humanReviewGate !== undefined && state.humanReviewGate !== "failure" && state.humanReviewGate !== "budget-gate",
       keys: "c",
       hint: "continue",
       style: "spaced",
@@ -485,7 +486,7 @@ export function dashboardActions(state: DashboardActionState): Action[] {
     {
       id: "review-open",
       group: "review",
-      available: !state.permissionPending && state.humanReviewGate !== undefined,
+      available: !state.permissionPending && state.humanReviewGate !== undefined && state.humanReviewGate !== "budget-gate",
       keys: "o",
       hint: "open OpenCode",
       style: "spaced",
@@ -510,6 +511,16 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       hint: "retry clean",
       style: "spaced",
       help: "retry the step from a clean baseline",
+      priority: 1,
+    },
+    {
+      id: "review-reset",
+      group: "review",
+      available: !state.permissionPending && state.humanReviewGate === "budget-gate",
+      keys: "r",
+      hint: "reset and continue",
+      style: "spaced",
+      help: "reset the phase step budget and re-prompt it",
       priority: 1,
     },
   ]
