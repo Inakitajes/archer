@@ -7,8 +7,8 @@
  * false-positives on reading a large file in sections. OpenCode's schema
  * only accepts ask/allow/deny for that permission, so Convoy asks and the
  * permission gate allows read/grep/glob/list and still rejects write/bash.
- * `agent.steps` is a prompt, not a hard stop: tools stay advertised and the
- * model can ignore it forever.
+ * Convoy intentionally does not set OpenCode's `agent.steps`: its hardcoded
+ * limit can stop tool use before an agent has durably completed its phase.
  *
  * This guard watches the live event stream across turns and aborts the session
  * when a phase repeats itself, fails the same tool over and over, blows a step
@@ -28,7 +28,7 @@ export type LoopGuardConfig = {
   identicalCalls: number
   /** Consecutive failures of the same tool, even when the arguments drift. */
   sameToolFailures: number
-  /** Model round-trips in one phase attempt. Hard abort; OpenCode is asked to stop a few steps earlier. */
+  /** Model round-trips between budget-gate resets. */
   maxSteps: number
   /**
    * USD spent by the executor in one phase attempt. `undefined` means no cost
@@ -57,7 +57,7 @@ export const defaultLoopGuard: LoopGuardConfig = {
   enabled: true,
   identicalCalls: 4,
   sameToolFailures: 6,
-  maxSteps: 80,
+  maxSteps: 200,
   maxPhaseCost: 20,
 }
 
@@ -78,17 +78,12 @@ function resolveCostCap(value: number | false | undefined): number | undefined {
   return defaultLoopGuard.maxPhaseCost
 }
 
-/**
- * Soft OpenCode `agent.steps` value: inject the "stop and summarize" prompt a
- * few turns before the hard abort, so a model that obeys it can still write a
- * report. Tools stay advertised on current OpenCode — this is a request, not a
- * disable — which is why the hard abort still exists.
- */
-export function softAgentSteps(maxSteps: number): number {
-  return Math.max(1, maxSteps - 5)
+/** The model-only soft-nudge threshold before the hard budget gate. */
+export function softNudgeSteps(maxSteps: number): number {
+  return Math.floor(maxSteps / 2)
 }
 
-export type LoopGuardReason = "identical-calls" | "same-tool-failures" | "max-steps" | "max-cost"
+export type LoopGuardReason = "identical-calls" | "same-tool-failures" | "soft-nudge" | "max-steps" | "max-cost"
 
 export type LoopGuardTrip = {
   reason: LoopGuardReason
@@ -131,6 +126,19 @@ export class LoopGuard {
   private readonly callIDToTool = new Map<string, string>()
 
   constructor(private readonly config: LoopGuardConfig) {}
+
+  /** Reset only the renewable step budget; all other fuses retain their history. */
+  resetSteps(): void {
+    this.steps = 0
+  }
+
+  getSteps(): number {
+    return this.steps
+  }
+
+  getTotalCost(): number {
+    return this.totalCost
+  }
 
   observe(observation: LoopGuardObservation): LoopGuardTrip | undefined {
     if (!this.config.enabled) return undefined
@@ -204,6 +212,14 @@ export class LoopGuard {
 
   private observeStep(): LoopGuardTrip | undefined {
     this.steps++
+    const softSteps = softNudgeSteps(this.config.maxSteps)
+    if (this.steps === softSteps) {
+      return trip(
+        "soft-nudge",
+        `phase reached ${this.steps} model steps (soft budget ${softSteps}; hard cap ${this.config.maxSteps}).`,
+        this.steps,
+      )
+    }
     if (this.steps < this.config.maxSteps) return undefined
     return trip(
       "max-steps",

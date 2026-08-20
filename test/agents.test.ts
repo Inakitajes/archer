@@ -200,25 +200,14 @@ describe("opencode config", () => {
     expect(config.agent?.implementer?.tools?.write_report).toBe(true)
   })
 
-  test("asks doom_loop so the permission gate can allow reads and reject writes", () => {
+  test("asks doom_loop and never injects OpenCode's maximum-steps prompt", () => {
     const config = opencodeConfig("/tmp/convoy-run")
 
     expect(config.permission).toMatchObject({ question: "deny", doom_loop: "ask" })
     expect(config.agent?.implementer?.permission).toMatchObject({ doom_loop: "ask" })
     expect(config.agent?.["pattern-auditor"]?.permission).toMatchObject({ doom_loop: "ask" })
-    expect(config.agent?.implementer?.steps).toBe(75)
-    expect(config.agent?.["bug-auditor"]?.steps).toBe(75)
-  })
-
-  test("a disabled loop guard leaves agent.steps unset", () => {
-    const config = opencodeConfig("/tmp/convoy-run", "/tmp/non-existent-convoy-target", undefined, undefined, {
-      loopGuard: { enabled: false },
-    })
-
     expect(config.agent?.implementer?.steps).toBeUndefined()
-    expect(config.permission).toMatchObject({
-      doom_loop: "ask",
-    })
+    expect(config.agent?.["bug-auditor"]?.steps).toBeUndefined()
   })
 })
 

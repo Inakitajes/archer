@@ -282,7 +282,7 @@ defaults:
 #   enabled: true
 #   identicalCalls: 4      # same tool + same args in a row
 #   sameToolFailures: 6    # same tool failing in a row (args may drift)
-#   maxSteps: 80           # hard abort; OpenCode is asked to stop 5 steps earlier
+#   maxSteps: 200          # hard budget gate; a model-only queued nudge arrives at half this value
 #   maxPhaseCost: 20       # USD; false to disable the cost fuse
 
 # Agents are matched by name with Markdown prompts next to this config:

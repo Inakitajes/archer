@@ -5,7 +5,6 @@ import type { AgentConfig, Config, PermissionActionConfig } from "@opencode-ai/s
 import { advisorFeedbackToolName, advisorProviderOverride, advisorToolName, type ModelSelection } from "./advisor"
 import { bashPolicy, noAdditions } from "./bash-policy"
 import { builtInPrompts } from "./built-in-prompts"
-import { resolveLoopGuard, softAgentSteps, type LoopGuardSettings } from "./loop-guard"
 import { builtInAgents, readOnlyAgentSuffix, verifyAgentSuffix } from "./pipeline"
 import type { AgentSpec, PermissionAdditions } from "./types"
 import { globalAgentsDir } from "./workspace"
@@ -39,11 +38,6 @@ export type OpencodeConfigOptions = {
   advisorModels?: readonly ModelSelection[]
   /** Output cap for those aliases. */
   advisorMaxTokens?: number
-  /**
-   * Circuit-breaker settings for this run. Drives the soft OpenCode `steps`
-   * budget; the hard abort lives in the session watcher.
-   */
-  loopGuard?: LoopGuardSettings
 }
 
 export function opencodeConfig(
@@ -54,10 +48,6 @@ export function opencodeConfig(
   options: OpencodeConfigOptions = {},
 ): Config {
   const advisorAgents = options.advisorAgents ?? new Set<string>()
-  const loopGuard = resolveLoopGuard(options.loopGuard)
-  // Soft prompt only: current OpenCode still advertises tools after this. The
-  // watcher is what actually stops a model that ignores it.
-  const steps = loopGuard.enabled ? softAgentSteps(loopGuard.maxSteps) : undefined
   const agent: Record<string, AgentConfig> = {}
   for (const spec of agents) {
     // Synthesized variants (name suffixed "__ro" or "__verify") have no prompt
@@ -75,7 +65,6 @@ export function opencodeConfig(
       false,
       permissions,
       advised,
-      steps,
     )
   }
 
@@ -184,14 +173,12 @@ function agentConfig(
   webfetch: boolean,
   permissions: PermissionAdditions,
   advisor = false,
-  steps?: number,
 ): AgentConfig {
   if (readOnly) {
     return {
       description,
       mode: "primary",
       ...(temperature === undefined ? {} : { temperature }),
-      ...(steps === undefined ? {} : { steps }),
       tools: {
         read: true,
         list: true,
@@ -234,7 +221,6 @@ function agentConfig(
     description,
     mode: "primary",
     ...(temperature === undefined ? {} : { temperature }),
-    ...(steps === undefined ? {} : { steps }),
     tools: {
       read: true,
       write: true,

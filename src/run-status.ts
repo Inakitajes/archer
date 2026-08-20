@@ -32,6 +32,7 @@ const text = {
   waitingReview: "waiting for manual review",
   waitingTakeover: "waiting for interactive takeover",
   waitingFailure: "step failed — waiting for your decision",
+  waitingBudget: "step budget reached — waiting for your decision",
 } as const
 
 const activityIcon: Record<RunActivity, string> = {
@@ -177,6 +178,7 @@ function describePermission(): string {
 
 function describeHumanReview(info: HumanReviewPromptInfo): string {
   if (info.kind === "failure") return text.waitingFailure
+  if (info.kind === "budget-gate") return text.waitingBudget
   return info.kind === "interactive" ? text.waitingTakeover : text.waitingReview
 }
 
@@ -449,7 +451,7 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
     humanWaits.delete(name)
   }
   const phaseGateKind = (detail: string | undefined): HumanReviewPromptInfo["kind"] | undefined =>
-    detail === text.waitingFailure ? "failure" : detail === "interactive session — waiting for your decision" ? "interactive" : undefined
+    detail === text.waitingFailure ? "failure" : detail === text.waitingBudget ? "budget-gate" : detail === "interactive session — waiting for your decision" ? "interactive" : undefined
 
   const tracked: ProgressUI = {
     start: (runID, targetDir, runDir) => progress.start(runID, targetDir, runDir),
@@ -460,7 +462,7 @@ export function trackRunStatus(progress: ProgressUI, tracker: RunStatusTracker):
     },
     phaseRunning(name, detail) {
       const kind = phaseGateKind(detail)
-      if (kind) beginHumanWait(name, kind, kind === "failure" ? text.waitingFailure : text.waitingTakeover)
+      if (kind) beginHumanWait(name, kind, kind === "failure" ? text.waitingFailure : kind === "budget-gate" ? text.waitingBudget : text.waitingTakeover)
       progress.phaseRunning(name, detail)
     },
     phaseAttempt(name, info) {
