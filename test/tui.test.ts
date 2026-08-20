@@ -1185,6 +1185,13 @@ describe("goal loop header", () => {
       // The current iteration hasn't scored yet: the trajectory trails off.
       expect(frame).toContain("71 → …")
       expect(frame).not.toContain("run completed")
+      // The clock keeps its bottom-left spot in goal mode too; the loop's
+      // readout follows it on the same row.
+      const goalRow = lineContaining(frame, "goal 90")
+      expect(goalRow).toMatch(/\d+:\d{2} {2}· {2}goal 90/)
+      // The totals row carries cost and tokens, never the clock.
+      const statusRow = lineContaining(frame, "tokens")
+      expect(statusRow).not.toMatch(/\d+:\d{2}/)
     } finally {
       dashboard.stop()
     }
@@ -1351,13 +1358,13 @@ describe("goal loop header", () => {
       dashboard.phaseStarted("implement")
       await Bun.sleep(1100)
       await renderOnce()
-      // The header clock has advanced past zero.
-      expect(captureCharFrame()).not.toContain("·  0:00")
+      // The header clock (under the status word) has advanced past zero.
+      expect(captureCharFrame()).not.toContain("0:00")
 
       dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "goal-fix", steps: [] } })
       await renderOnce()
       // The clock kept running from the loop's start rather than the new run's.
-      expect(captureCharFrame()).not.toContain("·  0:00")
+      expect(captureCharFrame()).not.toContain("0:00")
     } finally {
       dashboard.stop()
     }
@@ -1365,20 +1372,24 @@ describe("goal loop header", () => {
 })
 
 describe("dashboard header status row", () => {
-  test("a plain pipeline stays one row: status on the left, totals on the right", async () => {
+  test("a plain pipeline spreads two rows: ◆ running + totals, clock below", async () => {
     const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
     try {
       dashboard.phaseStarted("implement")
       await renderOnce()
       const frame = captureCharFrame()
       const beforePipeline = frame.slice(0, frame.indexOf("╭─ pipeline")).trim().split("\n")
-      // dir line + header top border + the single status row + bottom border.
-      expect(beforePipeline).toHaveLength(4)
+      // dir line + header top border + status row + clock row + bottom border.
+      expect(beforePipeline).toHaveLength(5)
       const statusRow = beforePipeline[2]!
-      expect(statusRow).toContain("running")
+      expect(statusRow).toContain("◆ running")
       expect(statusRow).toContain("tokens")
-      // No goal segments, no stray meter placeholders on the only row.
-      expect(statusRow).not.toContain("goal ")
+      // The clock moved under the status word; the totals keep cost + tokens.
+      const clockRow = beforePipeline[3]!
+      expect(clockRow).toMatch(/│ \d+:\d{2}/)
+      expect(clockRow).not.toContain("tokens")
+      // No goal segments, no stray meter placeholders on either row.
+      expect(beforePipeline.join("\n")).not.toContain("goal ")
       expect(statusRow).not.toContain("…")
     } finally {
       dashboard.stop()
