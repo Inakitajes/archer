@@ -10,6 +10,7 @@ import {
   checkPipelineResolves,
   ConfigError,
   defaultConfigTemplate,
+  defaultConvoyConfig,
   ejectAgentPrompt,
   isValidModelString,
   loadConvoyConfig,
@@ -755,6 +756,53 @@ describe("model routing config", () => {
 
     // resolveModel looks up the canonical logical identity "zai/glm-5.2".
     expect(config.modelRouting?.overrides).toEqual({ "zai/glm-5.2": { vercel: "vercel/zai/glm-5.2" } })
+  })
+
+  test("parses the nitro gateway and a nitro override target", () => {
+    const config = parse(
+      [
+        "modelRouting:",
+        "  gateway: nitro",
+        "  overrides:",
+        "    zai/glm-5.2:",
+        "      openrouter: openrouter/z-ai/glm-5.2",
+        "      nitro: openrouter/z-ai/glm-5.2:nitro",
+      ].join("\n"),
+    )
+
+    expect(config.modelRouting?.gateway).toBe("nitro")
+    expect(config.modelRouting?.overrides["zai/glm-5.2"]).toEqual({
+      openrouter: "openrouter/z-ai/glm-5.2",
+      nitro: "openrouter/z-ai/glm-5.2:nitro",
+    })
+    expect(() => parse("modelRouting:\n  gateway: automatic")).toThrow("modelRouting.gateway")
+  })
+
+  test("an unknown override target key is dropped from the parsed routing", () => {
+    const config = parse("modelRouting:\n  overrides:\n    zai/glm-5.2:\n      bogus: whatever")
+    expect(config.modelRouting?.overrides["zai/glm-5.2"]).toEqual({})
+  })
+
+  test("override keys with a nitro suffix canonicalize to the logical model", () => {
+    const config = parse("modelRouting:\n  overrides:\n    openrouter/z-ai/glm-5.2:nitro:\n      openrouter: openrouter/z-ai/glm-5.2")
+
+    expect(config.modelRouting?.overrides).toEqual({ "zai/glm-5.2": { openrouter: "openrouter/z-ai/glm-5.2" } })
+  })
+
+  test("serializes a nitro gateway and override target", () => {
+    const config = parse(
+      "modelRouting:\n  gateway: nitro\n  overrides:\n    custom/private-model:\n      nitro: openrouter/acme/private:nitro",
+    )
+
+    const yaml = serializeConvoyConfig(config)
+    expect(yaml).toContain("gateway: nitro")
+    expect(yaml).toContain("nitro: openrouter/acme/private:nitro")
+    expect(parse(yaml).modelRouting).toEqual(config.modelRouting)
+  })
+
+  test("the init template documents nitro in the gateway comment", () => {
+    expect(defaultConvoyConfig).toContain("configured | direct | openrouter | nitro | vercel")
+    expect(defaultConvoyConfig).toContain("nitro: openrouter/z-ai/glm-5.2:nitro")
   })
 
   test("global and project overrides merge after canonicalization", () => {

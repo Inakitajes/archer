@@ -104,7 +104,7 @@ test("routing preserves every built-in pipeline's execution structure", () => {
     })
     const originalAgents = original.steps.filter((step): step is AgentStep => step.type === "agent")
 
-    for (const gateway of ["configured", "direct", "openrouter", "vercel"] as const) {
+    for (const gateway of ["configured", "direct", "openrouter", "nitro", "vercel"] as const) {
       const routed = routePipeline(original, gateway, {})
       const routedAgents = routed.steps.filter((step): step is AgentStep => step.type === "agent")
 
@@ -120,15 +120,18 @@ test("routing preserves every built-in pipeline's execution structure", () => {
         }
         const configured = `${originalStep.model}${originalStep.variant ? `#${originalStep.variant}` : ""}`
         const recovered = logicalModel(configured)
-        const logical = `${recovered.model}${recovered.variant ? `#${recovered.variant}` : ""}`
+        const physicalModel = recovered.model.replace(/^zai\//, "z-ai/").replace(/^xai\//, "x-ai/")
+        const variant = recovered.variant ? `#${recovered.variant}` : ""
         const expectedTarget =
           gateway === "configured"
             ? configured
             : gateway === "direct"
-              ? logical
+              ? `${recovered.model}${variant}`
               : gateway === "openrouter"
-                ? `openrouter/${logical.replace(/^zai\//, "z-ai/").replace(/^xai\//, "x-ai/")}`
-                : `vercel/${logical}`
+                ? `openrouter/${physicalModel}${variant}`
+                : gateway === "nitro"
+                  ? `openrouter/${physicalModel}:nitro${variant}`
+                  : `vercel/${recovered.model}${variant}`
 
         expect(step.resolvedModel?.gateway).toBe(gateway)
         expect(step.resolvedModel?.target).toBe(expectedTarget)
@@ -247,6 +250,92 @@ test("the plan freezes the routed branch namer and marks an explicit resume gate
   expect(unchanged.target).not.toHaveProperty("branch")
 })
 
+test("resuming an openrouter run with --gateway nitro marks a nitro pending override", () => {
+  const options: RunOptions = {
+    prompt: "review the change",
+    prdHistory: true,
+    files: [],
+    onlySteps: [],
+    skipSteps: [],
+    resumeRunID: "20260720-135802-5bbh",
+    keepRunDir: true,
+    modelOverride: "",
+    advisorOverride: "",
+    advisorDisabled: false,
+    gateway: "nitro",
+    modelRoutingOverrides: {},
+    tui: false,
+    notify: false,
+    notifications: {},
+    humanReview: false,
+    baseRef: "main",
+    targetDir: "/repo",
+    worktree: false,
+    includeDirty: false,
+    yolo: false,
+    smart: false,
+    smartJudgeModel: "openai/gpt-5.6-sol",
+    pipeline: { name: "review", steps: [] },
+    agents: [],
+    permissions: { allow: [], deny: [] },
+    hooks: { pre: [], post: [], pipelines: {} },
+  }
+
+  const plan = buildRunPlan({ ...options, promptSource: "resume", resumeGateway: "openrouter" })
+  expect(plan.resume).toEqual({ runID: "20260720-135802-5bbh", gatewayOverride: { original: "openrouter", pending: "nitro" } })
+})
+
+test("nitro routes the smart judge and the goal-fix pipeline through the same gateway", () => {
+  const options: RunOptions = {
+    prompt: "score and fix",
+    prdHistory: true,
+    files: [],
+    onlySteps: [],
+    skipSteps: [],
+    resumeRunID: "",
+    keepRunDir: true,
+    modelOverride: "",
+    advisorOverride: "",
+    advisorDisabled: false,
+    gateway: "nitro",
+    modelRoutingOverrides: {},
+    tui: false,
+    notify: false,
+    notifications: {},
+    humanReview: false,
+    baseRef: "main",
+    targetDir: "/repo",
+    worktree: false,
+    includeDirty: false,
+    yolo: false,
+    smart: true,
+    smartJudgeModel: "anthropic/claude-haiku-4.5",
+    goal: 90,
+    goalMaxIterations: 2,
+    goalPlateau: 3,
+    goalFixPipeline: {
+      name: "goal-fix",
+      steps: [
+        { type: "agent", name: "fixer", stepName: "fixer", groupId: "g1", agentName: "goal-fixer", description: "Fix", model: "openai/gpt-5.6-sol", inputFiles: ["prd.md"], inputDiff: true, reportPath: "reports/fixer.md" },
+      ],
+    },
+    pipeline: {
+      name: "ship",
+      steps: [
+        { type: "agent", name: "implementer", stepName: "implementer", groupId: "g1", agentName: "implementer", description: "Implement", model: "openai/gpt-5.6-sol", inputFiles: ["prd.md"], inputDiff: false, reportPath: "reports/implementer.md" },
+      ],
+    },
+    agents: [],
+    permissions: { allow: [], deny: [] },
+    hooks: { pre: [], post: [], pipelines: {} },
+  }
+
+  const plan = buildRunPlan(options)
+  expect(plan.smartJudge?.model).toMatchObject({ gateway: "nitro", target: "openrouter/anthropic/claude-haiku-4.5:nitro" })
+  const fixer = plan.goal?.fixPipeline.steps[0]
+  expect(fixer?.type === "agent" && fixer.resolvedModel?.target).toBe("openrouter/openai/gpt-5.6-sol:nitro")
+})
+
 describe("advisor routing", () => {
   const step = (extra: Partial<AgentStep> = {}): AgentStep => ({
     type: "agent",
@@ -274,6 +363,18 @@ describe("advisor routing", () => {
       providerID: "openrouter",
     })
     expect(routed.advisor).toBe("openrouter/anthropic/claude-opus-5")
+    expect(routed.advisorVariant).toBe("high")
+  })
+
+  test("routes the advisor through nitro with the :nitro suffix", () => {
+    const routed = route(step({ advisor: "anthropic/claude-opus-5", advisorVariant: "high" }), "nitro")
+
+    expect(routed.resolvedAdvisor).toMatchObject({
+      logical: "anthropic/claude-opus-5#high",
+      target: "openrouter/anthropic/claude-opus-5:nitro#high",
+      providerID: "openrouter",
+    })
+    expect(routed.advisor).toBe("openrouter/anthropic/claude-opus-5:nitro")
     expect(routed.advisorVariant).toBe("high")
   })
 

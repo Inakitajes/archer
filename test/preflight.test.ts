@@ -59,6 +59,38 @@ function directOpenAIPlan(): RunPlan {
   return result
 }
 
+function nitroPlan(): RunPlan {
+  const result = plan()
+  const step = result.pipeline.steps[0]!
+  if (step.type !== "agent") throw new Error("expected agent step")
+  step.model = "openrouter/z-ai/glm-5.2:nitro"
+  step.variant = "xhigh"
+  step.resolvedModel = {
+    configured: "zai/glm-5.2#xhigh",
+    logical: "zai/glm-5.2#xhigh",
+    gateway: "nitro",
+    providerID: "openrouter",
+    modelID: "z-ai/glm-5.2:nitro",
+    variant: "xhigh",
+    target: "openrouter/z-ai/glm-5.2:nitro#xhigh",
+  }
+  result.modelRouting.gateway = "nitro"
+  return result
+}
+
+function nitroCatalog(input: { hasUnsuffixed?: boolean; onlySuffixed?: boolean; variants?: string[]; connected?: boolean } = {}) {
+  const models: Record<string, { variants: Record<string, unknown> }> = {}
+  if (input.hasUnsuffixed !== false) models["z-ai/glm-5.2"] = { variants: Object.fromEntries((input.variants ?? ["xhigh"]).map((variant) => [variant, {}])) }
+  if (input.onlySuffixed) {
+    delete models["z-ai/glm-5.2"]
+    models["z-ai/glm-5.2:nitro"] = { variants: Object.fromEntries((input.variants ?? ["xhigh"]).map((variant) => [variant, {}])) }
+  }
+  return {
+    all: [{ id: "openrouter", models }],
+    connected: input.connected === false ? [] : ["openrouter"],
+  }
+}
+
 function catalog(input: { providerID?: string; connected?: boolean; modelID?: string; variants?: string[] } = {}) {
   const providerID = input.providerID ?? "vercel"
   const modelID = input.modelID ?? "openai/gpt-5.6-sol"
@@ -240,6 +272,70 @@ describe("OpenCode run-plan preflight", () => {
     expect(() => validatePreflightTargets(targets, withoutTarget)).toThrow("Model unavailable through Vercel AI Gateway")
     expect(() => validatePreflightTargets(targets, withoutTarget)).toThrow("logical: openai/gpt-5.6-sol")
     expect(() => validatePreflightTargets(targets, withoutTarget)).toThrow("target:  vercel/openai/gpt-5.6-sol")
+  })
+
+  test("nitro preflight looks up the unsuffixed catalog model", () => {
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), nitroCatalog())).not.toThrow()
+  })
+
+  test("nitro preflight fails when the unsuffixed catalog model is missing", () => {
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), nitroCatalog({ hasUnsuffixed: false }))).toThrow(
+      "Model unavailable through OpenRouter Nitro",
+    )
+  })
+
+  test("nitro preflight never looks up the suffixed catalog key", () => {
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), nitroCatalog({ onlySuffixed: true }))).toThrow(
+      "Model unavailable",
+    )
+  })
+
+  test("nitro failure reports the full suffixed physical target", () => {
+    const withoutTarget = nitroCatalog({ hasUnsuffixed: false })
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), withoutTarget)).toThrow(
+      "Model unavailable through OpenRouter Nitro",
+    )
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), withoutTarget)).toThrow("logical: zai/glm-5.2#xhigh")
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), withoutTarget)).toThrow("target:  openrouter/z-ai/glm-5.2:nitro#xhigh")
+  })
+
+  test("nitro variant checks run against the unsuffixed catalog entry", () => {
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), nitroCatalog({ variants: ["high"] }))).toThrow(
+      "Model unavailable",
+    )
+  })
+
+  test("missing openrouter credentials use the generic login hint, not the Vercel key", () => {
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), nitroCatalog({ connected: false }))).toThrow(
+      "Missing provider credentials: openrouter",
+    )
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), nitroCatalog({ connected: false }))).toThrow(
+      "opencode providers login",
+    )
+    expect(() => validatePreflightTargets(preflightTargets(nitroPlan()), nitroCatalog({ connected: false }))).not.toThrow(
+      "AI_GATEWAY_API_KEY",
+    )
+  })
+
+  test("a configured target with a :nitro modelID still preflights the unsuffixed catalog ID", () => {
+    const reviewed = nitroPlan()
+    const step = reviewed.pipeline.steps[0]!
+    if (step.type !== "agent") throw new Error("expected agent step")
+    step.resolvedModel = {
+      configured: "openrouter/z-ai/glm-5.2:nitro#xhigh",
+      logical: "zai/glm-5.2#xhigh",
+      gateway: "configured",
+      providerID: "openrouter",
+      modelID: "z-ai/glm-5.2:nitro",
+      variant: "xhigh",
+      target: "openrouter/z-ai/glm-5.2:nitro#xhigh",
+    }
+    reviewed.modelRouting.gateway = "configured"
+
+    expect(() => validatePreflightTargets(preflightTargets(reviewed), nitroCatalog())).not.toThrow()
+    expect(() => validatePreflightTargets(preflightTargets(reviewed), nitroCatalog({ hasUnsuffixed: false }))).toThrow(
+      "Model unavailable",
+    )
   })
 })
 
