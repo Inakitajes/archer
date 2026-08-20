@@ -11,10 +11,12 @@ const fallbackModel = `${defaultGptModel}#${defaultGptVariant}`
 const glmModel = "openrouter/z-ai/glm-5.2"
 /** GLM 5.2 with its reasoning turned up: what the audit phases of `implement` run on. */
 const glmXhighModel = `${glmModel}#xhigh`
+/** GLM 5.3 with reasoning raised: the correctness leg of `hunter` and the GLM leg of `hunter-max`. */
+const glm53HighModel = "openrouter/z-ai/glm-5.3#high"
 /** Opus reached through OpenRouter, so the hunter fan-outs share one provider across every track. */
 const opusViaOpenRouter = "openrouter/anthropic/claude-opus-5"
 /** Remaining specialty models the hunter pipelines fan their audit tracks across. */
-const grokModel = "openrouter/x-ai/grok-4.5"
+const grokModel = "openrouter/x-ai/grok-4.6#high"
 const kimiModel = "openrouter/moonshotai/kimi-k3"
 /** Kimi K3 with reasoning raised one notch: the design and adversarial passes earn it, the cheap fan-outs don't. */
 const kimiHighModel = `${kimiModel}#high`
@@ -609,7 +611,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     steps: [
       {
         parallel: [
-          { agent: "hunter-correctness", models: [fallbackModel, opusViaOpenRouter], reports: "none", diff: true },
+          { agent: "hunter-correctness", models: [fallbackModel, glm53HighModel], reports: "none", diff: true },
           { agent: "hunter-memory", models: [fallbackModel, grokModel], reports: "none", diff: true },
           { agent: "hunter-performance", models: [fallbackModel, grokModel], reports: "none", diff: true },
           { agent: "hunter-security", models: [fallbackModel, kimiModel], reports: "none", diff: true },
@@ -636,7 +638,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
 function hunterMaxTracks(): AgentStepSpec[] {
   return hunterTracks.map((track) => ({
     agent: `hunter-${track}`,
-    models: [fallbackModel, opusViaOpenRouter, glmModel, kimiModel, grokModel],
+    models: [fallbackModel, opusViaOpenRouter, glm53HighModel, kimiModel, grokModel],
     reports: "none",
     diff: true,
   }))
