@@ -14,6 +14,25 @@ function key(partial: Partial<KeyEvent>): KeyEvent {
   return partial as KeyEvent
 }
 
+/** A complete keypress event for direct keyInput emission (mock stdin never
+ * parses a lone ESC byte into an event). */
+function keyEvent(name: string): KeyEvent {
+  return {
+    name,
+    ctrl: false,
+    meta: false,
+    shift: false,
+    option: false,
+    sequence: name,
+    number: false,
+    raw: name,
+    eventType: "keypress",
+    source: "raw",
+    preventDefault: () => {},
+    stopPropagation: () => {},
+  } as unknown as KeyEvent
+}
+
 function plainLines(lines: ReturnType<typeof stepTree>): string[] {
   return lines.map((line) => line.chunks.map((chunk) => chunk.text).join(""))
 }
@@ -54,6 +73,8 @@ type LaunchPickerView = {
   mode: string
   prompt: string
   optionIndex: number
+  gateway: string
+  modal: { kind: string; index: number } | undefined
   toggleState: { worktree: boolean }
   modalWidth(): number
   promptDetail(width: number): { chunks: Array<{ text: string }> }
@@ -148,7 +169,7 @@ describe("launch TUI compact layout", () => {
       view.mode = "options"
       // The toggle list is taller than the compact panel, so the flags
       // summary only scrolls into view once the selection reaches the end.
-      view.optionIndex = 6
+      view.optionIndex = 7
       const flags = view.optionsDetail(40).chunks.map((chunk) => chunk.text).join("").split("\n").find((line) => line.includes("will run with"))!
       expect(displayWidth(flags)).toBeLessThanOrEqual(40)
     } finally {
@@ -162,12 +183,12 @@ describe("launch TUI compact layout", () => {
       const view = launchView(launcher.picker)
       view.mode = "options"
 
-      view.optionIndex = 0
+      view.optionIndex = 1
       const top = view.optionsDetail(60).chunks.map((chunk) => chunk.text).join("")
       expect(top).toContain("▸ ━━● on  Smart auto-accept")
       expect(top).not.toContain("will run with")
 
-      view.optionIndex = 6
+      view.optionIndex = 7
       const bottom = view.optionsDetail(60).chunks.map((chunk) => chunk.text).join("")
       expect(bottom).toContain("▸ ●━━ off Isolate in a worktree")
       expect(bottom).toContain("will run with")
@@ -824,6 +845,182 @@ describe("launch TUI Tab suggestions", () => {
     expect(inserted.fromDefault).toBe(true)
     const swapped = promptAfterPipelineSwitch(inserted, "new default")
     expect(swapped.prompt).toBe("new default")
+  })
+})
+
+describe("launch TUI gateway selector", () => {
+  function optionsLines(view: LaunchPickerView, width = 80) {
+    return view.optionsDetail(width).chunks.map((chunk) => chunk.text).join("").split("\n")
+  }
+
+  test("leads the options list with its own row, description, and breathing room", async () => {
+    const launcher = await createLauncher(100)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      view.optionIndex = 0
+      const lines = optionsLines(view)
+      const instruction = lines.findIndex((line) => line.includes("Choose a gateway"))
+      const gatewayRow = lines.findIndex((line) => line.includes("gateway  As configured ▾"))
+      expect(instruction).toBeGreaterThanOrEqual(0)
+      expect(gatewayRow).toBeGreaterThan(instruction)
+      expect(lines[gatewayRow]).toContain("▸ gateway")
+      expect(lines[gatewayRow]).toContain("--gateway")
+      // The selector is separated from the instruction above and the toggles
+      // below, instead of being glued to either.
+      expect(lines[instruction + 1]).toBe("")
+      expect(lines[gatewayRow + 1]).toContain("Route every model through one provider")
+      expect(lines[gatewayRow + 2]).toBe("")
+      expect(lines[gatewayRow + 3]).toContain("Smart auto-accept")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("an unselected gateway row keeps its value and flag but loses the marker", async () => {
+    const launcher = await createLauncher(100)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      view.optionIndex = 1
+      const lines = optionsLines(view)
+      const gatewayRow = lines.findIndex((line) => line.includes("gateway  As configured ▾"))
+      expect(gatewayRow).toBeGreaterThanOrEqual(0)
+      expect(lines[gatewayRow]).not.toContain("▸ gateway")
+      expect(lines[gatewayRow]).toContain("--gateway")
+      expect(lines.find((line) => line.includes("Smart auto-accept"))).toContain("▸ ━━● on")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("g opens the dropdown listing every gateway with hints and the current one marked", async () => {
+    const launcher = await createLauncher(100)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await launcher.renderOnce()
+      launcher.mockInput.pressKey("g")
+      await launcher.renderOnce()
+      expect(view.modal?.kind).toBe("gateway")
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("model gateway")
+      expect(frame).toContain("▸ ◆ As configured")
+      expect(frame).toContain("◇ Direct")
+      expect(frame).toContain("◇ OpenRouter")
+      expect(frame).toContain("◇ OpenRouter Nitro")
+      expect(frame).toContain("◇ Vercel AI Gateway")
+      expect(frame).toContain("preserve pipeline model IDs literally")
+      expect(frame).toContain("↑/↓ select · enter apply · esc cancel")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("enter applies the highlighted gateway to the run setup row", async () => {
+    const launcher = await createLauncher(100)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await launcher.renderOnce()
+      launcher.mockInput.pressKey("g")
+      launcher.mockInput.pressArrow("down")
+      launcher.mockInput.pressArrow("down")
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).toContain("▸ ◇ OpenRouter")
+      launcher.mockInput.pressEnter()
+      await launcher.renderOnce()
+      expect(view.modal).toBeUndefined()
+      expect(view.gateway).toBe("openrouter")
+      expect(launcher.captureCharFrame()).toContain("gateway  OpenRouter ▾")
+      expect(launcher.captureCharFrame()).not.toContain("model gateway")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("escape cancels the dropdown without touching the gateway", async () => {
+    const launcher = await createLauncher(100)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await launcher.renderOnce()
+      launcher.mockInput.pressKey("g")
+      launcher.mockInput.pressArrow("down")
+      // A lone ESC byte never becomes a keypress event in the mock stdin, so
+      // emit the event the way runs-tui tests do.
+      launcher.renderer.keyInput.emit("keypress", keyEvent("escape"))
+      await launcher.renderOnce()
+      expect(view.modal).toBeUndefined()
+      expect(view.gateway).toBe("configured")
+      expect(launcher.captureCharFrame()).not.toContain("model gateway")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("left/right cycle the gateway from its own row only", async () => {
+    const launcher = await createLauncher(100)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      view.optionIndex = 1
+      await launcher.renderOnce()
+      launcher.mockInput.pressArrow("right")
+      await launcher.renderOnce()
+      // Arrows on a toggle row adjust nothing gateway-related.
+      expect(view.gateway).toBe("configured")
+
+      view.optionIndex = 0
+      await launcher.renderOnce()
+      launcher.mockInput.pressArrow("right")
+      await launcher.renderOnce()
+      expect(view.gateway).toBe("direct")
+      launcher.mockInput.pressArrow("left")
+      await launcher.renderOnce()
+      expect(view.gateway).toBe("configured")
+      // Clamped at the ends rather than wrapping.
+      launcher.mockInput.pressArrow("left")
+      await launcher.renderOnce()
+      expect(view.gateway).toBe("configured")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("space on the gateway row opens the dropdown instead of toggling", async () => {
+    const launcher = await createLauncher(100)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      view.optionIndex = 0
+      await launcher.renderOnce()
+      launcher.mockInput.pressKey(" ")
+      await launcher.renderOnce()
+      expect(view.modal?.kind).toBe("gateway")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("clicking the gateway row opens the dropdown", async () => {
+    const launcher = await createLauncher(100)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      // Assigning mode directly doesn't request a render; a clamped "k" moves
+      // nothing but repaints, so the options panel lands in the frame.
+      launcher.mockInput.pressKey("k")
+      await launcher.renderOnce()
+      const lines = launcher.captureCharFrame().split("\n")
+      const gatewayRow = lines.findIndex((line) => line.includes("gateway  As configured ▾"))
+      expect(gatewayRow, "gateway row visible in options panel").toBeGreaterThanOrEqual(0)
+      await launcher.mockMouse.click(lines[gatewayRow]!.indexOf("gateway"), gatewayRow)
+      await launcher.renderOnce()
+      expect(view.modal?.kind).toBe("gateway")
+    } finally {
+      await closeLauncher(launcher)
+    }
   })
 })
 

@@ -67,6 +67,21 @@ export function gatewayLabel(gateway: ModelGateway): string {
   return gatewayLabels[gateway]
 }
 
+// One-line reason shown beside each gateway wherever a picker lists them, so
+// the launcher dropdown and the config editor can never drift apart.
+const gatewayHints: Record<ModelGateway, string> = {
+  configured: "preserve pipeline model IDs literally",
+  direct: "use the model owner's provider",
+  openrouter: "route every model through OpenRouter",
+  nitro: "use OpenRouter's highest-throughput providers",
+  vercel: "route through Vercel's AI gateway",
+}
+
+/** The hint for one gateway in a picker list, next to its label. */
+export function gatewayHint(gateway: ModelGateway): string {
+  return gatewayHints[gateway]
+}
+
 /** Recover the provider-owned model identity from a direct or gateway-wrapped OpenCode model. */
 export function logicalModel(value: string): { model: string; variant?: string } {
   const parsed = splitModelVariant(value)
