@@ -425,6 +425,7 @@ export class TuiProgress implements ProgressUI {
   private readonly todosText: TextRenderable
   private readonly feedBox: BoxRenderable
   private readonly feedText: TextRenderable
+  private readonly footerBox: BoxRenderable
   private readonly footerText: TextRenderable
   // Rebuilt on every pipeline render: panel row index → selectable tree target,
   // so group headers and concrete phases both resolve exactly as rendered.
@@ -672,7 +673,7 @@ export class TuiProgress implements ProgressUI {
         return
       case "o":
         consume()
-        this.openActiveSessionWindow("key")
+        this.openActiveSessionWindow()
         return
       case "v":
         if (!this.selectedGroup) {
@@ -955,14 +956,9 @@ export class TuiProgress implements ProgressUI {
       gap: 0,
     })
 
-    // The detail panel shows the focused phase; a click on it opens that
-    // phase's opencode session externally (same as [o]).
-    const openFocusedSession = (event: { preventDefault(): void; stopPropagation(): void }) => {
-      event.preventDefault()
-      event.stopPropagation()
-      this.openActiveSessionWindow("click")
-    }
-
+    // The detail panel shows the focused phase. Clicks here used to open that
+    // phase's opencode session, which fired on accidental clicks while reading;
+    // the session opens via [o] or the command palette instead.
     const step = this.panel({
       id: "convoy-step",
       width: "100%",
@@ -971,9 +967,7 @@ export class TuiProgress implements ProgressUI {
       backgroundColor: theme.bg,
       title: " step ",
       titleAlignment: "left",
-      onMouseDown: openFocusedSession,
     })
-    step.text.onMouseDown = openFocusedSession
 
     // Todos live in their own panel below the detail meta, showing the focused
     // phase's list whenever it has one.
@@ -986,9 +980,7 @@ export class TuiProgress implements ProgressUI {
       title: " todos ",
       titleAlignment: "left",
       visible: false,
-      onMouseDown: openFocusedSession,
     })
-    todos.text.onMouseDown = openFocusedSession
 
     // A click on the tab strip (content rows 0-1: labels or rail) selects
     // that tab; clicks anywhere else in the panel fall through untouched.
@@ -1025,20 +1017,15 @@ export class TuiProgress implements ProgressUI {
     feed.text.onMouseDown = switchTabFromFeed
     feed.text.onMouseScroll = wheelFromFeed
 
-    const openFromFooter = (event: { preventDefault(): void; stopPropagation(): void }) => {
-      event.preventDefault()
-      event.stopPropagation()
-      this.openActiveSessionWindow("click")
-    }
-
+    // The footer brands the run in its border title (◆ convoy + version,
+    // right-aligned like the other panels' titles) and holds the key hints.
     const footer = this.panel({
       id: "convoy-footer",
       height: 3,
       borderColor: theme.borderDim,
       backgroundColor: theme.bg,
-      onMouseDown: openFromFooter,
+      titleAlignment: "right",
     })
-    footer.text.onMouseDown = openFromFooter
 
     this.dirText = dirLine
     this.headerText = header.text
@@ -1052,6 +1039,7 @@ export class TuiProgress implements ProgressUI {
     this.todosText = todos.text
     this.feedBox = feed.box
     this.feedText = feed.text
+    this.footerBox = footer.box
     this.footerText = footer.text
 
     this.paletteTargets.push(
@@ -1933,7 +1921,7 @@ export class TuiProgress implements ProgressUI {
         return
       case "session":
         close()
-        this.openActiveSessionWindow("key")
+        this.openActiveSessionWindow()
         return
       case "fullscreen":
         close()
@@ -2351,7 +2339,7 @@ export class TuiProgress implements ProgressUI {
 
   // Opens the focused phase's opencode session in an external window; falls
   // back to any running phase if focus somehow lands on one without a session.
-  private openActiveSessionWindow(source: "click" | "key") {
+  private openActiveSessionWindow() {
     if (this.selectedGroup) {
       this.addEvent("convoy", "system", "select a model row to open its OpenCode session")
       this.render()
@@ -2363,7 +2351,7 @@ export class TuiProgress implements ProgressUI {
       this.render()
       return
     }
-    this.openSessionWindowForPhase(active.name, source)
+    this.openSessionWindowForPhase(active.name)
   }
 
   // Arms (or disarms) interactive takeover for the focused phase: while armed,
@@ -2412,10 +2400,10 @@ export class TuiProgress implements ProgressUI {
     }
     this.interactiveTakeover.add(phase.name)
     this.addEvent(phase.name, "system", "interactive mode armed — a clean finish holds the step here for you; esc in OpenCode holds it too")
-    this.openSessionWindowForPhase(phase.name, "key")
+    this.openSessionWindowForPhase(phase.name)
   }
 
-  private openSessionWindowForPhase(name: string, source: "click" | "key") {
+  private openSessionWindowForPhase(name: string) {
     if (this.humanReviewQueue[0]?.info.kind === "failure") {
       // Opening a session through the normal navigation path would leave the
       // failure gate offering [r], whose clean restore could erase those edits.
@@ -2454,7 +2442,7 @@ export class TuiProgress implements ProgressUI {
     }
 
     if (!runner.capabilities.liveAttach) this.iterateRequested = true
-    this.addEvent("convoy", "system", `${source === "key" ? "[o]" : "click"}: opening ${name} ${runner.sessionName} session ${shortID(phase.sessionID)}`)
+    this.addEvent("convoy", "system", `[o]: opening ${name} ${runner.sessionName} session ${shortID(phase.sessionID)}`)
     open
       .then((backend) => {
         this.addEvent("convoy", "system", `${name} session opened in ${backend}`)
@@ -2688,6 +2676,7 @@ export class TuiProgress implements ProgressUI {
           : this.phaseFeedLines(focus, rightWidth, contentRows)
     this.feedText.content = joinLines([...this.contentTabBar(rightWidth), ...body])
 
+    this.footerBox.title = this.footerTitle()
     this.footerText.content = this.footerContent(now, innerWidth)
     this.renderFullscreenView()
     this.renderModal()
@@ -2736,18 +2725,15 @@ export class TuiProgress implements ProgressUI {
 
   /**
    * The header's title segments, each carrying how eagerly it gives up columns
-   * when the title outgrows the panel. `◆ convoy`, the running version, and a
-   * goal verdict are pinned (Infinity); everything else sacrifices in the PRD's
-   * order — delta first, then the trajectory, then iter — with the goal target
-   * giving way last of all. Higher priority drops first. The version is pinned
-   * because it is identity, not status: the header must keep branding the
-   * binary even when the panel is narrow.
+   * when the title outgrows the panel. A goal verdict is pinned (Infinity);
+   * everything else sacrifices in the PRD's order — delta first, then the
+   * trajectory, then iter — with the goal target giving way last of all.
+   * Higher priority drops first. Branding (`◆ convoy` + version) is identity,
+   * not status, so it lives in the footer panel's border title instead of
+   * spending header columns on it.
    */
   private titleSegments(): { priority: number; chunks: TextChunk[] }[] {
-    const segments: { priority: number; chunks: TextChunk[] }[] = [
-      { priority: Infinity, chunks: [bold(fg(theme.accent)("◆ convoy"))] },
-      { priority: Infinity, chunks: [fg(theme.faint)(" "), fg(theme.faint)(shortVersion())] },
-    ]
+    const segments: { priority: number; chunks: TextChunk[] }[] = []
     const view = this.finished?.goalLoop ?? this.goalLoop
     if (view?.outcome) {
       const best = view.scores.length > 0 ? Math.max(...view.scores) : undefined
@@ -3593,6 +3579,18 @@ export class TuiProgress implements ProgressUI {
   }
 
   /**
+   * Branding rides the footer's border (right-aligned, like the other panels'
+   * titles) so the header row keeps its columns for live run status. When the
+   * full title would outgrow the border it falls back to the bare wordmark —
+   * the version is a nicety, not worth clipping mid-string.
+   */
+  private footerTitle() {
+    const full = ` ◆ convoy ${shortVersion()} `
+    // Border corners and a little slack on each side of the title.
+    return displayWidth(full) + 6 <= this.renderer.width ? full : " ◆ convoy "
+  }
+
+  /**
    * The footer is one unwrapped line in a fixed-height box, so hints that don't
    * fit used to be chopped off against the border with nothing to say they
    * existed. Now the row sheds them by priority and the pinned [ctrl+p] hint
@@ -3629,11 +3627,7 @@ export class TuiProgress implements ProgressUI {
     // Pinned: whatever else goes, the way to find the rest stays. The wording
     // switches to "all shortcuts" the moment a hint is actually dropped.
     const overflow: OverflowHint = { keys: "ctrl+p", label: "commands", moreLabel: "all shortcuts", priority: 0 }
-    const prefix = state.contentFocused
-      ? [fg(theme.dim)("read · ")]
-      : state.selectedGroup
-        ? [fg(theme.dim)("select a child for session · ")]
-        : []
+    const prefix = state.contentFocused ? [fg(theme.dim)("read · ")] : []
     return hintsRow(hints, this.footerStatusCandidates(now), width, { overflow, prefix })
   }
 

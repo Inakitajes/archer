@@ -104,19 +104,24 @@ describe("run dashboard defaults", () => {
     expect([live, historical]).not.toContain("logs")
   })
 
-  test("brands the header with the running version and keeps it inside a narrow panel", async () => {
+  test("brands the footer's border with the running version and shrinks to the wordmark when narrow", async () => {
+    const fullTitle = `◆ convoy ${shortVersion()}`
     const wide = await createDashboard(120, 40)
-    const narrow = await createDashboard(60, 40)
+    // Just under the width the full border title needs, so the footer falls
+    // back to the bare wordmark regardless of the build's version string.
+    const narrow = await createDashboard(displayWidth(fullTitle) + 4, 40)
     try {
       await wide.renderOnce()
-      expect(wide.captureCharFrame()).toContain(`◆ convoy ${shortVersion()}`)
+      const wideLine = lineContaining(wide.captureCharFrame(), fullTitle).trim()
+      // The title rides the footer panel's top border (rounded corners), not
+      // a content row.
+      expect(wideLine.startsWith("╭")).toBe(true)
+      expect(wideLine).toContain("─")
 
-      // The complete title and the panel's closing border remain visible at the
-      // narrow width instead of the title being clipped by the totals column.
       await narrow.renderOnce()
-      const line = lineContaining(narrow.captureCharFrame(), `◆ convoy ${shortVersion()}`)
-      expect(displayWidth(line)).toBeLessThanOrEqual(60)
-      expect(line.match(/│/g)?.length).toBe(2)
+      const narrowFrame = narrow.captureCharFrame()
+      expect(narrowFrame).toContain("◆ convoy")
+      expect(narrowFrame).not.toContain(shortVersion())
     } finally {
       wide.dashboard.stop()
       narrow.dashboard.stop()
