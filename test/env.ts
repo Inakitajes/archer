@@ -2,9 +2,16 @@ import { mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+import { setLimitsFetcherForTests } from "../src/limits"
+
 // Isolate every test run from the developer's real ~/.convoy so tests never
 // read or write the user's actual config, runs, or agent prompts. CONVOY_HOME
 // points at the directory that holds `.convoy` (the same convention as a repo
 // root), so the global config resolves to <tmp>/.convoy/config.yaml.
 process.env.CONVOY_HOME ??= join(tmpdir(), `convoy-test-home-${process.pid}`)
 mkdirSync(process.env.CONVOY_HOME, { recursive: true })
+
+// Same for the developer's own subscriptions: dashboards under test must not
+// pick up the real ChatGPT/OpenRouter meters. Tests that need a snapshot
+// assign it to `dashboard.limits` directly.
+setLimitsFetcherForTests(async () => ({}))

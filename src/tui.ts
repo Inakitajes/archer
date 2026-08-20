@@ -17,7 +17,7 @@ import { defaultAdvisorMaxCalls } from "./advisor"
 import { openClaudeSessionWindow } from "./claude-code"
 import { aggregateAdvisorEvents, type AdvisorEvent } from "./advisor-events"
 import { copyReportToClipboard, writeClipboardOSC52, type ClipboardResult } from "./clipboard"
-import { startLimitsPoller } from "./limits"
+import { openRouterLowBalance, startLimitsPoller } from "./limits"
 import { log } from "./log"
 import { markdownInlineChunks, markdownLines, parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
 import { openIterateOpencodeWindow, openOpencodeSessionWindow, openStoredSessionWindow, type SessionWindowBackend } from "./opencode"
@@ -31,13 +31,13 @@ import {
   formatElapsed,
   formatMoney,
   formatTime,
+  fmtCountdown,
   clipChunks,
   chunksLength,
   displayWidth,
   hintsRow,
   indentStyled,
   joinLines,
-  limitsRow,
   moreHintsMarker,
   padBetween,
   paletteForTerminal,
@@ -409,8 +409,10 @@ export class TuiProgress implements ProgressUI {
   // Subscription meters (GPT windows, OpenRouter credits) polled in the
   // background; the ticker just repaints whatever the last poll left.
   private readonly stopLimits: () => void
+  /** @internal — tests inject snapshots directly instead of running the poller. */
   private limits?: LimitsSnapshot
   private readonly dirText: TextRenderable
+  private readonly headerBox: BoxRenderable
   private readonly headerText: TextRenderable
   private readonly bodyBox: BoxRenderable
   private readonly pipelineBox: BoxRenderable
@@ -493,6 +495,7 @@ export class TuiProgress implements ProgressUI {
   private controlActivePhases = 0
   private keepAwake?: KeepAwakeState
   private commandPalette?: CommandPalette
+  private usageModal = false
   private finishModal?: FinishModal
   // ScrollBarRenderable emits change events for programmatic state updates as
   // well as mouse drags. Ignore the former so a layout recalculation cannot
@@ -604,6 +607,13 @@ export class TuiProgress implements ProgressUI {
       this.handleFinishKey(key)
       return
     }
+    // Read-only info modal: anything closes it; [u] toggles, esc also exits
+    // content focus so the modal doesn't leave a hidden focus state behind.
+    if (this.usageModal) {
+      this.usageModal = false
+      this.render()
+      return
+    }
     if (this.commandPalette) {
       this.handleCommandPaletteKey(key)
       return
@@ -674,6 +684,10 @@ export class TuiProgress implements ProgressUI {
       case "o":
         consume()
         this.openActiveSessionWindow()
+        return
+      case "u":
+        consume()
+        this.openUsageModal()
         return
       case "v":
         if (!this.selectedGroup) {
@@ -891,8 +905,8 @@ export class TuiProgress implements ProgressUI {
     })
 
     // The working directory sits above the header as a bare line, outside the
-    // bordered box, so the header holds just the run totals row and the
-    // subscription-meter row beneath it.
+    // bordered box. The header itself is one status row; a second row appears
+    // for goal-loop progress or hot subscription meters (see headerContent).
     const dirLine = new TextRenderable(renderer, {
       id: "convoy-dir",
       content: "",
@@ -903,7 +917,7 @@ export class TuiProgress implements ProgressUI {
 
     const header = this.panel({
       id: "convoy-header",
-      height: 4,
+      height: 3,
       borderColor: theme.border,
       backgroundColor: theme.bg,
     })
@@ -1028,6 +1042,7 @@ export class TuiProgress implements ProgressUI {
     })
 
     this.dirText = dirLine
+    this.headerBox = header.box
     this.headerText = header.text
     this.bodyBox = body
     this.pipelineBox = pipeline.box
@@ -1896,6 +1911,15 @@ export class TuiProgress implements ProgressUI {
     this.render()
   }
 
+  // [u]: the subscription meters behind a modal, so the header only surfaces
+  // them when one is hot. Content focus can't carry into a modal — the first
+  // key closes it — so it is dropped on open.
+  private openUsageModal() {
+    this.usageModal = true
+    this.contentFocused = false
+    this.render()
+  }
+
   private runCommand(item: CommandItem) {
     const close = () => {
       this.commandPalette = undefined
@@ -1918,6 +1942,10 @@ export class TuiProgress implements ProgressUI {
       case "interactive":
         close()
         this.toggleInteractiveTakeover()
+        return
+      case "usage":
+        close()
+        this.openUsageModal()
         return
       case "session":
         close()
@@ -2601,13 +2629,15 @@ export class TuiProgress implements ProgressUI {
     }
     const now = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
+    const headerLines = this.headerContent(now, innerWidth)
+    this.headerBox.height = headerLines.length + 2
     const compact = this.usesCompactLayout()
     const pipelineWidth = compact ? innerWidth + 4 : this.pipelineWidth()
     const rightWidth = compact ? innerWidth : Math.max(40, this.renderer.width - pipelineWidth - 9)
-    // Body rows left after the dir line (1), header (4), and footer (3); the
-    // detail and todos panels grow with their content but never starve the
-    // content panel below them.
-    const bodyHeight = Math.max(8, this.renderer.height - 8)
+    // Body rows left after the dir line (1), the header (its rows plus the two
+    // borders), and the footer (3); the detail and todos panels grow with
+    // their content but never starve the content panel below them.
+    const bodyHeight = Math.max(8, this.renderer.height - headerLines.length - 7)
     const pipelineHeight = compact ? this.compactPipelineHeight(bodyHeight) : bodyHeight
     const rightBodyHeight = compact ? Math.max(8, bodyHeight - pipelineHeight - 1) : bodyHeight
 
@@ -2661,7 +2691,7 @@ export class TuiProgress implements ProgressUI {
     this.contentPageRows = contentRows
 
     this.dirText.content = this.dirContent(innerWidth)
-    this.headerText.content = this.headerContent(now, innerWidth)
+    this.headerText.content = joinLines(headerLines)
     this.pipelineText.content = this.pipelineContent(now, pipelineHeight - 2, pipelineWidth)
 
     // Body first: the active content tab computes the scroll indicator the rail shows.
@@ -2683,10 +2713,15 @@ export class TuiProgress implements ProgressUI {
     this.renderer.requestRender()
   }
 
-  // Header owns the session-wide totals (clock, elapsed time, cost, tokens)
-  // with the subscription meters on the row beneath. Phase status lives in
-  // the pipeline panel.
-  private headerContent(now: number, width: number) {
+  /**
+   * The header is one status row: run state on the left, session-wide totals
+   * (elapsed, cost, tokens) on the right. A second row appears only when the
+   * run is a goal loop (target, iteration, score trajectory) or a meter is
+   * hot enough to be worth an interruption (see limitChips); the panel grows
+   * to fit it. Phase status lives in the pipeline panel and the full meters
+   * behind [u].
+   */
+  private headerContent(now: number, width: number): StyledText[] {
     const usage = totalUsage(this.phases)
     const advisor = aggregateAdvisorEvents(this.phases.flatMap((phase) => phase.advisorEvents))
     const advisorInput = advisor.tokens.input + advisor.tokens.cacheRead + advisor.tokens.cacheWrite
@@ -2703,11 +2738,9 @@ export class TuiProgress implements ProgressUI {
       advisorOutput: advisorOutput + this.priorUsage.advisorOutput,
       advisorAttempted: advisor.attempted > 0 || this.priorUsage.advisorAttempted,
     }
-    // The clock and elapsed time freeze at the moment the run ended.
+    // Elapsed time freezes at the moment the run ended.
     const endAt = this.finished?.at ?? now
     const totals: TextChunk[] = [
-      fg(theme.dim)(formatTime(endAt)),
-      fg(theme.faint)("  ·  "),
       fg(theme.text)(formatElapsed(endAt - this.startedAt)),
       fg(theme.faint)("  ·  "),
       fg(theme.green)(formatMoney(merged.cost + merged.advisorCost)),
@@ -2717,44 +2750,69 @@ export class TuiProgress implements ProgressUI {
       fg(theme.faint)("  ·  "),
       fg(theme.dim)(`↑${formatCount(merged.input + merged.advisorInput)} ↓${formatCount(merged.output + merged.advisorOutput)} tokens`),
     ]
-    const segments = this.titleSegments()
-    const budget = Math.max(12, width - Math.min(42, chunksLength(totals)) - 1)
-    const title = fitTitleSegments(segments, budget)
-    return joinLines([padBetween(title, totals, width), limitsRow(this.limits, now, width)])
+
+    const status: TextChunk[] = this.finished
+      ? this.finished.status === "completed"
+        ? [bold(fg(theme.green)("✓ run completed"))]
+        : [bold(fg(theme.red)("✗ run failed"))]
+      : this.controlState === "paused"
+        ? [bold(fg(theme.yellow)("paused")), fg(theme.faint)(" · p resume")]
+        : this.controlState === "pausing"
+          ? [bold(fg(theme.cyan)("pausing")), fg(theme.faint)(` · ${this.controlActivePhases} active`)]
+          : [fg(theme.dim)("running")]
+    if (this.keepAwake?.status === "on" && !this.finished) status.push(fg(theme.faint)("  ·  "), fg(theme.cyan)("☕ awake"))
+    const row1 = padBetween(status, totals, width)
+
+    const rows = [row1]
+    const goal = this.goalRowSegments()
+    const chips = this.limitChips(now)
+    if (goal.length > 0 || chips.length > 0) {
+      const sep = fg(theme.faint)("  ·  ")
+      const left: TextChunk[] = []
+      for (const segment of goal) {
+        if (left.length > 0) left.push(sep)
+        left.push(...segment.chunks)
+      }
+      const right: TextChunk[] = []
+      for (const segment of chips) {
+        if (right.length > 0) right.push(sep)
+        right.push(...segment.chunks)
+      }
+      rows.push(padBetween(left, right, width))
+    }
+    return rows
   }
 
   /**
-   * The header's title segments, each carrying how eagerly it gives up columns
-   * when the title outgrows the panel. A goal verdict is pinned (Infinity);
-   * everything else sacrifices in the PRD's order — delta first, then the
-   * trajectory, then iter — with the goal target giving way last of all.
-   * Higher priority drops first. Branding (`◆ convoy` + version) is identity,
-   * not status, so it lives in the footer panel's border title instead of
-   * spending header columns on it.
+   * The header's second-row goal segments, each carrying how eagerly it gives
+   * up columns when the row outgrows the panel. The verdict is pinned
+   * (Infinity); everything else sacrifices in the PRD's order — delta first,
+   * then the trajectory, then iter — with the goal target giving way last of
+   * all. Higher priority drops first. Empty for pipelines without a goal
+   * loop, so the header stays a single row.
    */
-  private titleSegments(): { priority: number; chunks: TextChunk[] }[] {
+  private goalRowSegments(): { priority: number; chunks: TextChunk[] }[] {
     const segments: { priority: number; chunks: TextChunk[] }[] = []
     const view = this.finished?.goalLoop ?? this.goalLoop
     if (view?.outcome) {
       const best = view.scores.length > 0 ? Math.max(...view.scores) : undefined
-      const verdictChunks: TextChunk[] = [fg(theme.faint)("  ·  ")]
       if (view.outcome.reason === "no-score") {
-        verdictChunks.push(bold(fg(theme.red)("no score")))
+        segments.push({ priority: Infinity, chunks: [bold(fg(theme.red)("no score"))] })
       } else {
         const label = view.outcome.reason === "goal" ? "goal" : view.outcome.reason === "plateau" ? "plateau" : "cap"
-        const chunks = view.outcome.reason === "goal" ? bold(fg(theme.green)(`✓ ${label} ${best ?? "?"}/100`)) : bold(fg(theme.text)(`${label} ${best ?? "?"}/100`))
-        verdictChunks.push(chunks)
+        const chunks =
+          view.outcome.reason === "goal" ? bold(fg(theme.green)(`✓ ${label} ${best ?? "?"}/100`)) : bold(fg(theme.text)(`${label} ${best ?? "?"}/100`))
+        segments.push({ priority: Infinity, chunks: [chunks] })
       }
       if (view.outcome.reason !== "goal" && view.outcome.restored) {
-        verdictChunks.push(fg(theme.faint)("  ·  "), fg(theme.dim)("restored to best"))
+        segments.push({ priority: Infinity, chunks: [fg(theme.dim)("restored to best")] })
       }
-      segments.push({ priority: Infinity, chunks: verdictChunks })
       if (view.scores.length > 0) segments.push(trajectorySegment(view.scores))
       return segments
     }
     if (!this.finished && view && !view.outcome) {
-      segments.push({ priority: 2, chunks: [fg(theme.faint)("  ·  "), fg(theme.text)(`goal ${view.target}`)] })
-      segments.push({ priority: 4, chunks: [fg(theme.faint)("  ·  "), fg(theme.dim)(`iter ${view.iteration}/${view.maxRuns}`)] })
+      segments.push({ priority: 2, chunks: [fg(theme.text)(`goal ${view.target}`)] })
+      segments.push({ priority: 4, chunks: [fg(theme.dim)(`iter ${view.iteration}/${view.maxRuns}`)] })
       if (view.scores.length > 0) {
         const last = view.scores[view.scores.length - 1]!
         const prev = view.scores[view.scores.length - 2]
@@ -2767,48 +2825,58 @@ export class TuiProgress implements ProgressUI {
           const delta = last - prev
           segments.push({
             priority: 6,
-            chunks: [fg(theme.faint)("  ·  "), fg(delta >= 0 ? theme.green : theme.red)(`${delta >= 0 ? "+" : ""}${delta}`)],
+            chunks: [fg(delta >= 0 ? theme.green : theme.red)(`${delta >= 0 ? "+" : ""}${delta}`)],
           })
         }
       }
+      return segments
     }
-    if (!this.finished) {
-      if (this.controlState !== "running") {
-        segments.push({
-          priority: 6,
-          chunks: [
-            fg(theme.faint)("  ·  "),
-            bold(fg(this.controlState === "paused" ? theme.yellow : theme.cyan)(
-              this.controlState === "paused" ? "paused · p resume" : `pausing · ${this.controlActivePhases} active`,
-            )),
-          ],
-        })
-      }
-      if (this.keepAwake?.status === "on") {
-        segments.push({ priority: 6, chunks: [fg(theme.faint)("  ·  "), bold(fg(theme.cyan)("☕ awake"))] })
-      }
+    // A failed goal-loop run keeps the trajectory it accumulated.
+    if (this.finished?.status === "failed" && view && view.scores.length > 0) {
+      segments.push(trajectorySegment(view.scores))
     }
-    if (this.finished) {
-      const isGoalLoop = this.finished.goalLoop !== undefined
-      if (!isGoalLoop || this.finished.status === "failed") {
-        segments.push({
-          priority: Infinity,
-          chunks: [
-            fg(theme.faint)("  ·  "),
-            this.finished.status === "completed" ? bold(fg(theme.green)("✓ run completed")) : bold(fg(theme.red)("✗ run failed")),
-          ],
-        })
-      }
-      // A failed goal-loop run keeps the trajectory it accumulated, trailing
-      // the failed verdict the same way the completed verdicts lead theirs.
-      if (this.finished.status === "failed" && view && view.scores.length > 0) {
-        segments.push(trajectorySegment(view.scores))
-      }
+    return segments
+  }
+
+  /**
+   * Second-row warning chips for the subscription meters, right-aligned. A
+   * meter only earns header space when it is about to stall the run (GPT
+   * window ≥85%, OpenRouter below openRouterLowBalance, or an auth problem);
+   * the full meters with their healthy states live behind [u].
+   */
+  private limitChips(now: number): { priority: number; chunks: TextChunk[] }[] {
+    const chips: { priority: number; chunks: TextChunk[] }[] = []
+    const gpt = this.limits?.gpt
+    if (gpt) {
+      const session = Math.round(gpt.sessionPct)
+      const weekly = gpt.weeklyPct === undefined ? undefined : Math.round(gpt.weeklyPct)
+      const resets = gpt.sessionResetsAt === undefined ? undefined : fmtCountdown(gpt.sessionResetsAt, now)
+      const chunks: TextChunk[] = [fg(theme.yellow)("⚠ GPT")]
+      if (session >= 85) chunks.push(fg(theme.yellow)(` ${session}%`), ...(resets ? [fg(theme.faint)(` resets ${resets}`)] : []))
+      else if (weekly !== undefined && weekly >= 85) chunks.push(fg(theme.yellow)(` wk ${weekly}%`))
+      if (session >= 85 && weekly !== undefined && weekly >= 85) chunks.push(fg(theme.yellow)(` · wk ${weekly}%`))
+      if (chunks.length > 1) chips.push({ priority: 0, chunks })
+    } else if (this.limits?.gptHint) {
+      chips.push({ priority: 0, chunks: [fg(theme.yellow)(`⚠ GPT — ${this.limits.gptHint}`)] })
     }
-    if (this.finished?.qualityScore !== undefined && !this.finished.goalLoop) {
-      segments.push({ priority: 5, chunks: [fg(theme.faint)("  ·  "), bold(fg(theme.accent)(`score ${this.finished.qualityScore}/100`))] })
+    const openrouter = this.limits?.openrouter
+    if (openrouter?.kind === "remaining" && openrouter.amount < openRouterLowBalance) {
+      chips.push({ priority: 0, chunks: [fg(theme.yellow)(`⚠ OpenRouter ${formatMoney(openrouter.amount)} left`)] })
     }
+    return chips
+  }
+
+  /**
+   * The finish screen's one-line quality summary: the single score, or the
+   * per-iteration trajectory of a score loop that ran without goal targets.
+   * The goal loop's own verdict lives in the header's goal row instead.
+   */
+  private titleSegments(): { priority: number; chunks: TextChunk[] }[] {
+    const segments: { priority: number; chunks: TextChunk[] }[] = []
     const finished = this.finished
+    if (finished?.qualityScore !== undefined && !finished.goalLoop) {
+      segments.push({ priority: 5, chunks: [bold(fg(theme.accent)(`score ${finished.qualityScore}/100`))] })
+    }
     const trajectory = finished?.goalTrajectory
     if (trajectory && trajectory.length > 1 && finished && !finished.goalLoop) {
       segments.push(trajectorySegment(trajectory))
@@ -3656,11 +3724,78 @@ export class TuiProgress implements ProgressUI {
       this.renderFinishModal(this.finishModal)
       return
     }
+    if (this.usageModal) {
+      this.renderUsageModal()
+      return
+    }
     if (this.commandPalette) {
       this.renderCommandPalette()
       return
     }
     this.overlay.visible = false
+  }
+
+  /**
+   * [u]: the subscription meters, moved out of the header so a healthy state
+   * costs zero rows. Everything degrades: no GPT auth yet, no OpenRouter key,
+   * and the first poll still in flight each say so in place.
+   */
+  private renderUsageModal() {
+    this.overlay.visible = true
+    this.modal.title = " usage "
+
+    const boxWidth = Math.max(48, Math.min(76, this.renderer.width - 8))
+    const width = boxWidth - 6
+    const lines: StyledText[] = []
+    const now = Date.now()
+
+    const gpt = this.limits?.gpt
+    const gptLabel = "GPT        "
+    if (gpt) {
+      const pct = Math.round(gpt.sessionPct)
+      const barColor = pct >= 85 ? theme.red : pct >= 60 ? theme.yellow : theme.accent
+      const label = fg(theme.dim)(gptLabel)
+      const bar = [...progressBar(pct / 100, 10, barColor), raw(" "), fg(pct >= 60 ? barColor : theme.text)(`${pct}%`)]
+      const tail: TextChunk[] = []
+      if (gpt.sessionResetsAt !== undefined) tail.push(fg(theme.faint)(" · resets "), fg(theme.dim)(fmtCountdown(gpt.sessionResetsAt, now)))
+      if (gpt.weeklyPct !== undefined) {
+        const wk = Math.round(gpt.weeklyPct)
+        tail.push(fg(theme.faint)(" · wk "), fg(wk >= 85 ? theme.red : wk >= 60 ? theme.yellow : theme.dim)(`${wk}%`))
+      }
+      const full = [...bar, ...tail]
+      // Drop the weekly window first, then the reset countdown, before ever
+      // clipping a value mid-token.
+      const budget = width - chunksLength([label])
+      let fitted = full
+      if (chunksLength(fitted) > budget) fitted = gpt.weeklyPct === undefined ? bar : [...bar, ...tail.slice(0, 2)]
+      if (chunksLength(fitted) > budget) fitted = bar
+      lines.push(new StyledText([label, ...fitted]))
+    } else if (this.limits?.gptHint) {
+      lines.push(new StyledText([fg(theme.dim)(gptLabel), fg(theme.yellow)(truncate(this.limits.gptHint, width - gptLabel.length))]))
+    } else {
+      lines.push(new StyledText([fg(theme.dim)(gptLabel), fg(theme.faint)(truncate("not configured — `codex login` meters the ChatGPT windows", width - gptLabel.length))]))
+    }
+
+    const openrouter = this.limits?.openrouter
+    const orLabel = "OpenRouter "
+    if (openrouter) {
+      const value = openrouter.kind === "remaining" ? `${formatMoney(openrouter.amount)} left` : `${formatMoney(openrouter.amount)} spent this month`
+      const color = openrouter.kind === "remaining" && openrouter.amount < openRouterLowBalance ? theme.yellow : theme.text
+      lines.push(new StyledText([fg(theme.dim)(orLabel), fg(color)(value)]))
+    } else {
+      lines.push(new StyledText([fg(theme.dim)(orLabel), fg(theme.faint)(truncate("not configured — `convoy auth openrouter` stores the balance key", width - orLabel.length))]))
+    }
+
+    lines.push(plain(""))
+    if (this.limits) {
+      lines.push(new StyledText([fg(theme.faint)(`updated ${formatAgo(now - this.limits.fetchedAt)}`)]))
+    } else {
+      lines.push(new StyledText([fg(theme.faint)("first poll still in flight…")]))
+    }
+    lines.push(plain(""))
+    lines.push(new StyledText([fg(theme.faint)("esc close")]))
+
+    this.modalText.content = joinLines(lines)
   }
 
   private renderFinishModal(modal: FinishModal) {
@@ -4385,29 +4520,9 @@ function pendingPhases(phases: readonly ProgressPhase[]): PhaseState[] {
   }))
 }
 
-/** The score trajectory (`71 → 84`, or `71 → …` while pending), among the first title segments to sacrifice. */
+/** The score trajectory (`71 → 84`, or `71 → …` while pending), among the first segments to sacrifice. */
 function trajectorySegment(scores: number[], pending = false): { priority: number; chunks: TextChunk[] } {
-  return { priority: 5, chunks: [fg(theme.faint)("  ·  "), fg(theme.dim)(`${scores.join(" → ")}${pending ? " → …" : ""}`)] }
-}
-
-/**
- * Drops the title's most droppable segments (highest `priority`) until it fits
- * the budget. Pinned segments (Infinity) — `◆ convoy`, the verdict — never
- * leave; everything else yields in priority order.
- */
-function fitTitleSegments(segments: { priority: number; chunks: TextChunk[] }[], budget: number): TextChunk[] {
-  const remaining = [...segments]
-  while (chunksLength(remaining.flatMap((segment) => segment.chunks)) > budget) {
-    let worstIndex = -1
-    for (let index = 0; index < remaining.length; index++) {
-      const segment = remaining[index]!
-      if (segment.priority === Infinity) continue
-      if (worstIndex === -1 || segment.priority > remaining[worstIndex]!.priority) worstIndex = index
-    }
-    if (worstIndex === -1) break
-    remaining.splice(worstIndex, 1)
-  }
-  return remaining.flatMap((segment) => segment.chunks)
+  return { priority: 5, chunks: [fg(theme.dim)(`${scores.join(" → ")}${pending ? " → …" : ""}`)] }
 }
 
 async function fileReadable(path: string) {
