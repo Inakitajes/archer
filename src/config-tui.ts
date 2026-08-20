@@ -32,7 +32,7 @@ import {
   type PipelineSpec,
   type StepSpec,
 } from "./pipeline"
-import { gatewayLabel, type ModelGateway } from "./model-routing"
+import { gatewayHint, gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { claudeCodeModelAliases, normalizeStepRunnerModel, stepRunnerFor } from "./step-runners"
 import {
   displayWidth,
@@ -643,11 +643,7 @@ export class ConfigEditor {
       index: 0,
       options: [
         { value: "", label: "inherit", hint: "clear this scope's override" },
-        { value: "configured", label: gatewayLabel("configured"), hint: "preserve pipeline model IDs literally" },
-        { value: "direct", label: gatewayLabel("direct"), hint: "use the model owner's provider" },
-        { value: "openrouter", label: gatewayLabel("openrouter") },
-        { value: "nitro", label: gatewayLabel("nitro"), hint: "use OpenRouter's highest-throughput providers" },
-        { value: "vercel", label: gatewayLabel("vercel") },
+        ...modelGateways.map((gateway) => ({ value: gateway, label: gatewayLabel(gateway), hint: gatewayHint(gateway) })),
       ],
       commit: (value) => {
         config.modelRouting ??= { overrides: {} }

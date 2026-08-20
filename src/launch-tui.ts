@@ -11,7 +11,7 @@ import { hooksForPipeline } from "./hooks"
 import { openRouterLowBalance, startLimitsPoller } from "./limits"
 import { builtInPipelines, defaultPipelineName, hasWritableStep, resolvePipeline } from "./pipeline"
 import { stepRunnerFor } from "./step-runners"
-import { gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
+import { gatewayHint, gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { consensusStep } from "./quality-score"
 import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
 import { runReviewLines } from "./review-tui"
@@ -241,6 +241,13 @@ type Modal =
   | { kind: "message"; title: string; message: string; footer?: string }
   | { kind: "loading"; title: string; message: string; footer?: string }
   | { kind: "confirm"; title: string; message: string; footer?: string; onConfirm: () => void }
+  | { kind: "gateway"; title: string; index: number }
+
+/** The gateway selector is always the first selectable row of the options step. */
+const gatewayOptionIndex = 0
+
+/** What the gateway row's description says: why you would touch it at all. */
+const gatewayRowDescription = "Route every model through one provider without changing pipeline YAML."
 
 const toggles: readonly ToggleSpec[] = [
   {
@@ -554,6 +561,21 @@ export class LaunchPicker {
     key.stopPropagation()
     const modal = this.modal
     if (modal) {
+      if (modal.kind === "gateway") {
+        // The gateway dropdown: a closed five-option list, so navigation
+        // clamps the way the config editor's pickers do. Enter applies the
+        // highlighted row; escape (or q) keeps the current gateway.
+        if (key.name === "up" || key.name === "k") modal.index = Math.max(0, modal.index - 1)
+        else if (key.name === "down" || key.name === "j") modal.index = Math.min(modelGateways.length - 1, modal.index + 1)
+        else if (key.name === "return" || key.name === "linefeed") {
+          this.gateway = modelGateways[modal.index]!
+          this.modal = undefined
+        } else if (key.name === "escape" || key.name === "q") {
+          this.modal = undefined
+        }
+        this.render()
+        return
+      }
       if (modal.kind === "confirm") {
         if (key.name === "return" || key.name === "linefeed") {
           this.modal = undefined
@@ -965,13 +987,15 @@ export class LaunchPicker {
         this.toggleOption()
         return
       case "left":
-        if (this.optionIndex >= toggles.length && this.goalEnabled) {
+        if (this.optionIndex === gatewayOptionIndex) this.cycleGateway(-1)
+        else if (this.optionIndex > toggles.length && this.goalEnabled) {
           this.goalTarget = adjustGoalTarget(this.goalTarget, -5)
           this.render()
         }
         return
       case "right":
-        if (this.optionIndex >= toggles.length && this.goalEnabled) {
+        if (this.optionIndex === gatewayOptionIndex) this.cycleGateway(1)
+        else if (this.optionIndex > toggles.length && this.goalEnabled) {
           this.goalTarget = adjustGoalTarget(this.goalTarget, 5)
           this.render()
         }
@@ -982,8 +1006,7 @@ export class LaunchPicker {
         this.startRun()
         return
       case "g":
-        this.gateway = modelGateways[(modelGateways.indexOf(this.gateway) + 1) % modelGateways.length]!
-        this.render()
+        this.openGatewayPicker()
         return
       case "p":
       case "escape":
@@ -1301,7 +1324,13 @@ export class LaunchPicker {
   }
 
   private toggleOption() {
-    const key = toggles[this.optionIndex]?.key
+    // The gateway row is a select, not a switch: activating it opens the
+    // dropdown instead of flipping a boolean.
+    if (this.optionIndex === gatewayOptionIndex) {
+      this.openGatewayPicker()
+      return
+    }
+    const key = toggles[this.optionIndex - 1]?.key
     if (!key) {
       // The goal row sits after the boolean toggles and only exists for scored pipelines.
       if (this.currentChoice().scored) this.goalEnabled = !this.goalEnabled
@@ -1346,9 +1375,22 @@ export class LaunchPicker {
     this.render()
   }
 
-  /** Number of selectable rows in the options step: the built-in toggles plus the goal row when the pipeline is scored. */
+  /** Opens the gateway dropdown with the cursor on the current gateway. */
+  private openGatewayPicker() {
+    this.modal = { kind: "gateway", title: "model gateway", index: modelGateways.indexOf(this.gateway) }
+    this.render()
+  }
+
+  /** Steps the gateway one entry along the list without opening the dropdown. */
+  private cycleGateway(delta: number) {
+    const next = clamp(modelGateways.indexOf(this.gateway) + delta, 0, modelGateways.length - 1)
+    this.gateway = modelGateways[next]!
+    this.render()
+  }
+
+  /** Number of selectable rows in the options step: the gateway selector, the built-in toggles, and the goal row when the pipeline is scored. */
   private optionCount(): number {
-    return toggles.length + (this.currentChoice().scored ? 1 : 0)
+    return 1 + toggles.length + (this.currentChoice().scored ? 1 : 0)
   }
 
   private currentChoice() {
@@ -1458,11 +1500,30 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     if (modal.kind === "loading") {
       const frame = spinnerFrame(Date.now())
       lines.push(new StyledText([fg(theme.accent)(frame), raw("  "), fg(theme.text)(truncate(modal.message, width - 3))]))
+    } else if (modal.kind === "gateway") {
+      // A dropdown over the options panel: every gateway at once, the cursor
+      // marked with ▸ and the applied value with ◆, mirroring the config
+      // editor's pickers so the two dialogs read as the same control.
+      for (const [index, gateway] of modelGateways.entries()) {
+        const selected = index === modal.index
+        const current = gateway === this.gateway
+        const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
+        const diamond = current ? fg(theme.accent)("◆ ") : fg(theme.dim)("◇ ")
+        const label = gatewayLabel(gateway)
+        const value = selected ? bold(fg(theme.text)(label)) : fg(theme.text)(label)
+        const hint = gatewayHint(gateway)
+        const hintChunk = hint ? fg(theme.faint)(`   ${truncate(hint, Math.max(8, width - label.length - 9))}`) : undefined
+        lines.push(new StyledText(hintChunk ? [marker, diamond, value, hintChunk] : [marker, diamond, value]))
+      }
     } else {
       for (const line of wrapWords(modal.message, width)) lines.push(new StyledText([fg(theme.text)(line)]))
     }
     lines.push(plain(""))
-    const footer = modal.footer ?? (modal.kind === "message" ? "press any key to dismiss" : modal.kind === "confirm" ? "enter confirm · esc cancel" : "please wait…")
+    const footer =
+      modal.kind === "gateway"
+        ? "↑/↓ select · enter apply · esc cancel"
+        : (modal.footer ??
+          (modal.kind === "message" ? "press any key to dismiss" : modal.kind === "confirm" ? "enter confirm · esc cancel" : "please wait…"))
     lines.push(new StyledText([fg(theme.dim)(footer)]))
 
     this.modalBox.width = boxWidth
@@ -1713,20 +1774,40 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     lines.push(new StyledText([fg(theme.faint)("prompt   "), fg(theme.text)(truncate(this.prompt, Math.max(10, width - 9)))]))
     this.pushHistoryNotice(lines, width, "options")
     lines.push(plain(""))
-    lines.push(t`${fg(theme.dim)("Toggle extra run parameters, then press Enter to review.")}`)
-    lines.push(new StyledText([fg(theme.faint)("gateway  "), bold(fg(theme.text)(gatewayLabel(this.gateway))), fg(theme.dim)("  (g to change)")]))
-    lines.push(plain(""))
+    lines.push(new StyledText([fg(theme.dim)(truncate("Choose a gateway and toggle extra run parameters, then press Enter to review.", width))]))
 
     this.optionRows = Array(lines.length).fill(undefined)
+
+    // The gateway selector leads the list: it reroutes every model in the run,
+    // so it gets room of its own — a blank line above, a description below —
+    // instead of a bare "gateway  … (g to change)" glued to the instruction.
+    lines.push(plain(""))
+    this.optionRows.push(undefined)
+    const gatewaySelected = this.optionIndex === gatewayOptionIndex
+    const gatewayMarker = gatewaySelected ? fg(theme.accent)("▸ ") : raw("  ")
+    const gatewayCaret = gatewaySelected ? fg(theme.accent)(" ▾") : fg(theme.dim)(" ▾")
+    lines.push(
+      padBetween(
+        [gatewayMarker, fg(theme.faint)("gateway  "), bold(fg(theme.text)(gatewayLabel(this.gateway))), gatewayCaret],
+        [fg(theme.green)("--gateway")],
+        width,
+      ),
+    )
+    this.optionRows.push(gatewayOptionIndex)
+    lines.push(new StyledText([raw("        "), fg(theme.dim)(truncate(gatewayRowDescription, Math.max(8, width - 8)))]))
+    this.optionRows.push(gatewayOptionIndex)
+    lines.push(plain(""))
+    this.optionRows.push(undefined)
+
     for (const [index, spec] of toggles.entries()) {
-      const selected = index === this.optionIndex
+      const selected = index + 1 === this.optionIndex
       const enabled = this.toggleState[spec.key]
       const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
       const toggle = toggleSwitch(enabled)
       const label = selected ? bold(fg(theme.text)(spec.label)) : fg(theme.text)(spec.label)
       const flag = fg(enabled ? theme.green : theme.dim)(spec.flag)
       lines.push(padBetween([marker, ...toggle, raw(" "), label], [flag], width))
-      this.optionRows.push(index)
+      this.optionRows.push(index + 1)
       // The worktree default depends on which branch you're on, so say why it
       // landed where it did — otherwise the checkbox looks like it moves on its own.
       const description =
@@ -1734,25 +1815,26 @@ this.detailBox.title = reviewing ? " review " : " run setup "
           ? `Default ${this.worktreeDefault.isolate ? "on" : "off"}: ${this.worktreeDefault.reason}. ${spec.description}`
           : spec.description
       lines.push(new StyledText([raw("        "), fg(theme.dim)(truncate(description, Math.max(8, width - 8)))]))
-      this.optionRows.push(index)
+      this.optionRows.push(index + 1)
     }
 
     // Goal mode toggle: only for scored pipelines. Sits after the boolean
     // toggles and uses left/right to adjust the target by 5.
     if (this.currentChoice().scored) {
-      const selected = this.optionIndex >= toggles.length
+      const goalOptionIndex = toggles.length + 1
+      const selected = this.optionIndex === goalOptionIndex
       const enabled = this.goalEnabled
       const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
       const toggle = toggleSwitch(enabled)
       const label = selected ? bold(fg(theme.text)("Goal mode")) : fg(theme.text)("Goal mode")
       const flag = fg(enabled ? theme.green : theme.dim)(enabled ? `--goal ${this.goalTarget}` : `--goal ${defaultGoalTarget}`)
       lines.push(padBetween([marker, ...toggle, raw(" "), label], [flag], width))
-      this.optionRows.push(toggles.length)
+      this.optionRows.push(goalOptionIndex)
       const description = enabled
         ? `Keep fixing until the quality score reaches ${this.goalTarget}/100. ←/→ adjust the target.`
         : "Keep fixing until the quality score reaches a target (default 90). Only for scored pipelines."
       lines.push(new StyledText([raw("        "), fg(theme.dim)(truncate(description, Math.max(8, width - 8)))]))
-      this.optionRows.push(toggles.length)
+      this.optionRows.push(goalOptionIndex)
     }
 
     const flags = this.enabledFlags()
