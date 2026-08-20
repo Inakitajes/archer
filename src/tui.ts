@@ -2694,7 +2694,11 @@ export class TuiProgress implements ProgressUI {
     this.pipelineBox.width = compact ? "100%" : pipelineWidth
     this.pipelineBox.height = compact ? pipelineHeight : "100%"
     this.rightBox.height = compact ? "auto" : "100%"
-    this.pipelineBox.borderColor = this.contentFocused ? theme.borderDim : theme.accent
+    // The pipeline panel keeps its dim border even while it owns the keyboard:
+    // the accent highlight lives on the content panel alone, so the focus
+    // state reads as "reading" versus "piloting" rather than two competing
+    // bright frames.
+    this.pipelineBox.borderColor = theme.borderDim
     this.feedBox.borderColor = this.contentFocused ? theme.accent : theme.borderDim
 
     // Detail panel: either one concrete phase or an aggregate for a selected
@@ -2748,12 +2752,13 @@ export class TuiProgress implements ProgressUI {
   }
 
   /**
-   * The header is one status row: run state on the left, session-wide totals
-   * (elapsed, cost, tokens) on the right. A second row appears only when the
-   * run is a goal loop (target, iteration, score trajectory) or a meter is
-   * hot enough to be worth an interruption (see limitChips); the panel grows
-   * to fit it. Phase status lives in the pipeline panel and the full meters
-   * behind [u].
+   * The header is one status row — run state (a ◆ marks the live state) on
+   * the left, session-wide totals (cost, tokens) on the right — plus a second
+   * row that always leads with the elapsed clock in the bottom-left spot, the
+   * same place in every run. In goal mode the loop's readout (target,
+   * iteration, score trajectory) follows the clock on that row, with hot meter
+   * chips right-aligned. Phase status lives in the pipeline panel and the full
+   * meters behind [u].
    */
   private headerContent(now: number, width: number): StyledText[] {
     const usage = totalUsage(this.phases)
@@ -2774,9 +2779,10 @@ export class TuiProgress implements ProgressUI {
     }
     // Elapsed time freezes at the moment the run ended.
     const endAt = this.finished?.at ?? now
+    const clock = fg(theme.text)(formatElapsed(endAt - this.startedAt))
+    const goal = this.goalRowSegments()
+    const chips = this.limitChips(now)
     const totals: TextChunk[] = [
-      fg(theme.text)(formatElapsed(endAt - this.startedAt)),
-      fg(theme.faint)("  ·  "),
       fg(theme.green)(formatMoney(merged.cost + merged.advisorCost)),
       ...(merged.advisorAttempted
         ? [fg(theme.faint)(` (${formatMoney(merged.cost)} exec + ${formatMoney(merged.advisorCost)} adv)`)]
@@ -2793,27 +2799,25 @@ export class TuiProgress implements ProgressUI {
         ? [bold(fg(theme.yellow)("paused")), fg(theme.faint)(" · p resume")]
         : this.controlState === "pausing"
           ? [bold(fg(theme.cyan)("pausing")), fg(theme.faint)(` · ${this.controlActivePhases} active`)]
-          : [fg(theme.dim)("running")]
+          : [fg(theme.accent)("◆ "), fg(theme.dim)("running")]
     if (this.keepAwake?.status === "on" && !this.finished) status.push(fg(theme.faint)("  ·  "), fg(theme.cyan)("☕ awake"))
-    const row1 = padBetween(status, totals, width)
+    const rows = [padBetween(status, totals, width)]
 
-    const rows = [row1]
-    const goal = this.goalRowSegments()
-    const chips = this.limitChips(now)
-    if (goal.length > 0 || chips.length > 0) {
-      const sep = fg(theme.faint)("  ·  ")
-      const left: TextChunk[] = []
-      for (const segment of goal) {
-        if (left.length > 0) left.push(sep)
-        left.push(...segment.chunks)
-      }
-      const right: TextChunk[] = []
-      for (const segment of chips) {
-        if (right.length > 0) right.push(sep)
-        right.push(...segment.chunks)
-      }
-      rows.push(padBetween(left, right, width))
+    // The second row always leads with the clock in the bottom-left spot —
+    // the same place in every run, goal or not — followed by the loop's
+    // readout when there is one; hot meter chips right-align.
+    const sep = fg(theme.faint)("  ·  ")
+    const left: TextChunk[] = [clock]
+    for (const segment of goal) {
+      left.push(sep)
+      left.push(...segment.chunks)
     }
+    const right: TextChunk[] = []
+    for (const segment of chips) {
+      if (right.length > 0) right.push(sep)
+      right.push(...segment.chunks)
+    }
+    rows.push(padBetween(left, right, width))
     return rows
   }
 
