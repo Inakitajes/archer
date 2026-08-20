@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
 import {
-  applyOpenRouterNitro,
   gatewayLabel,
   isModelGateway,
   logicalModel,
@@ -39,8 +38,8 @@ describe("model gateway routing", () => {
     expect(resolveModel("openai/gpt/reasoning/preview#high", "nitro")).toMatchObject({
       logical: "openai/gpt/reasoning/preview#high",
       providerID: "openrouter",
-      modelID: "openai/gpt/reasoning/preview:nitro",
-      target: "openrouter/openai/gpt/reasoning/preview:nitro#high",
+      modelID: "openai/gpt/reasoning/preview",
+      target: "openrouter/openai/gpt/reasoning/preview#high",
     })
   })
 
@@ -54,12 +53,12 @@ describe("model gateway routing", () => {
   test("routes Moonshot Kimi through gateways without an override", () => {
     expect(resolveModel("moonshotai/kimi-k3", "openrouter").target).toBe("openrouter/moonshotai/kimi-k3")
     expect(resolveModel("openrouter/moonshotai/kimi-k3", "vercel").target).toBe("vercel/moonshotai/kimi-k3")
-    expect(resolveModel("moonshotai/kimi-k3", "nitro").target).toBe("openrouter/moonshotai/kimi-k3:nitro")
+    expect(resolveModel("moonshotai/kimi-k3", "nitro").target).toBe("openrouter/moonshotai/kimi-k3")
   })
 
   test("routes xAI Grok through nitro with the dashed alias", () => {
-    expect(resolveModel("xai/grok-4.5", "nitro").target).toBe("openrouter/x-ai/grok-4.5:nitro")
-    expect(resolveModel("openrouter/x-ai/grok-4.5", "nitro").target).toBe("openrouter/x-ai/grok-4.5:nitro")
+    expect(resolveModel("xai/grok-4.5", "nitro").target).toBe("openrouter/x-ai/grok-4.5")
+    expect(resolveModel("openrouter/x-ai/grok-4.5", "nitro").target).toBe("openrouter/x-ai/grok-4.5")
   })
 
   test("configured remains literal", () => {
@@ -102,22 +101,27 @@ describe("model gateway routing", () => {
 })
 
 describe("OpenRouter nitro gateway", () => {
-  test("applies :nitro to every routable model", () => {
-    expect(resolveModel("openai/gpt-5.6-terra#xhigh", "nitro").target).toBe("openrouter/openai/gpt-5.6-terra:nitro#xhigh")
+  test("routes every routable model exactly like openrouter, without a suffix", () => {
+    expect(resolveModel("openai/gpt-5.6-terra#xhigh", "nitro").target).toBe("openrouter/openai/gpt-5.6-terra#xhigh")
     expect(resolveModel("openai/gpt-5.6-terra#xhigh", "nitro").providerID).toBe("openrouter")
-    expect(resolveModel("openai/gpt-5.6-terra#xhigh", "nitro").modelID).toBe("openai/gpt-5.6-terra:nitro")
-    expect(resolveModel("anthropic/claude-opus-5", "nitro").target).toBe("openrouter/anthropic/claude-opus-5:nitro")
-    expect(resolveModel("zai/glm-5.2", "nitro").target).toBe("openrouter/z-ai/glm-5.2:nitro")
-    expect(resolveModel("openrouter/z-ai/glm-5.2", "nitro").target).toBe("openrouter/z-ai/glm-5.2:nitro")
+    expect(resolveModel("openai/gpt-5.6-terra#xhigh", "nitro").modelID).toBe("openai/gpt-5.6-terra")
+    expect(resolveModel("anthropic/claude-opus-5", "nitro").target).toBe("openrouter/anthropic/claude-opus-5")
+    expect(resolveModel("zai/glm-5.2", "nitro").target).toBe("openrouter/z-ai/glm-5.2")
+    expect(resolveModel("openrouter/z-ai/glm-5.2", "nitro").target).toBe("openrouter/z-ai/glm-5.2")
+    // Throughput routing is provider options injected per run, so the nitro
+    // target must be byte-identical to the openrouter one.
+    for (const configured of ["openai/gpt-5.6-terra#xhigh", "zai/glm-5.2", "xai/grok-4.6#high", "moonshotai/kimi-k3"]) {
+      expect(resolveModel(configured, "nitro").target).toBe(resolveModel(configured, "openrouter").target)
+    }
   })
 
   test("unwraps a vercel-configured model and routes it through nitro", () => {
     expect(resolveModel("vercel/openai/gpt-5.6-sol#high", "nitro")).toMatchObject({
       logical: "openai/gpt-5.6-sol#high",
       providerID: "openrouter",
-      modelID: "openai/gpt-5.6-sol:nitro",
+      modelID: "openai/gpt-5.6-sol",
       variant: "high",
-      target: "openrouter/openai/gpt-5.6-sol:nitro#high",
+      target: "openrouter/openai/gpt-5.6-sol#high",
     })
   })
 
@@ -127,13 +131,13 @@ describe("OpenRouter nitro gateway", () => {
     expect(resolveModel("openrouter/z-ai/glm-5.2:nitro#high", "configured").logical).toBe("zai/glm-5.2#high")
   })
 
-  test("applying nitro to a pre-suffixed model is idempotent", () => {
-    expect(resolveModel("openrouter/z-ai/glm-5.2:nitro", "nitro").target).toBe("openrouter/z-ai/glm-5.2:nitro")
+  test("nitro strips a pre-existing :nitro from the physical target", () => {
+    expect(resolveModel("openrouter/z-ai/glm-5.2:nitro", "nitro").target).toBe("openrouter/z-ai/glm-5.2")
     expect(resolveModel("openrouter/z-ai/glm-5.2:nitro#xhigh", "nitro")).toMatchObject({
       providerID: "openrouter",
-      modelID: "z-ai/glm-5.2:nitro",
+      modelID: "z-ai/glm-5.2",
       variant: "xhigh",
-      target: "openrouter/z-ai/glm-5.2:nitro#xhigh",
+      target: "openrouter/z-ai/glm-5.2#xhigh",
     })
   })
 
@@ -154,22 +158,24 @@ describe("OpenRouter nitro gateway", () => {
     expect(resolveModel("openrouter/z-ai/glm-5.2:nitro:nitro", "nitro")).toMatchObject({
       logical: "zai/glm-5.2",
       providerID: "openrouter",
-      modelID: "z-ai/glm-5.2:nitro",
-      target: "openrouter/z-ai/glm-5.2:nitro",
+      modelID: "z-ai/glm-5.2",
+      target: "openrouter/z-ai/glm-5.2",
     })
     const overrides = { "zai/glm-5.2": { nitro: "openrouter/acme/private:nitro" } }
-    expect(resolveModel("openrouter/z-ai/glm-5.2:nitro:nitro", "nitro", overrides).target).toBe("openrouter/acme/private:nitro")
+    expect(resolveModel("openrouter/z-ai/glm-5.2:nitro:nitro", "nitro", overrides).target).toBe("openrouter/acme/private")
   })
 
-  test("nitro falls back to the openrouter override and applies the suffix", () => {
+  test("nitro falls back to the openrouter override without appending anything", () => {
     const overrides = { "custom/private-model": { openrouter: "openrouter/acme/private" } }
-    expect(resolveModel("custom/private-model", "nitro", overrides).target).toBe("openrouter/acme/private:nitro")
+    expect(resolveModel("custom/private-model", "nitro", overrides).target).toBe("openrouter/acme/private")
   })
 
-  test("an explicit nitro override is used as-is", () => {
+  test("an explicit nitro override is used as-is, with any legacy :nitro stripped", () => {
+    // Overrides written before throughput routing spell targets with `:nitro`;
+    // the suffix can never resolve in OpenCode's catalog, so nitro strips it.
     const suffixed = { "custom/private-model": { nitro: "openrouter/acme/private:nitro" } }
-    expect(resolveModel("custom/private-model", "nitro", suffixed).target).toBe("openrouter/acme/private:nitro")
-    // An explicit override without :nitro is also literal (overrides never auto-append).
+    expect(resolveModel("custom/private-model", "nitro", suffixed).target).toBe("openrouter/acme/private")
+    // An explicit override without :nitro stays literal (overrides never auto-append).
     const plain = { "custom/private-model": { nitro: "openrouter/acme/private" } }
     expect(resolveModel("custom/private-model", "nitro", plain).target).toBe("openrouter/acme/private")
   })
@@ -183,8 +189,6 @@ describe("OpenRouter nitro gateway", () => {
     expect(gatewayLabel("nitro")).toBe("OpenRouter Nitro")
     expect(isModelGateway("nitro")).toBe(true)
     expect(isModelGateway("openrouter-nitro")).toBe(false)
-    expect(applyOpenRouterNitro("openrouter/x:nitro")).toBe("openrouter/x:nitro")
-    expect(applyOpenRouterNitro("openrouter/x")).toBe("openrouter/x:nitro")
     expect(stripOpenRouterNitro("openrouter/x:nitro")).toBe("openrouter/x")
     expect(stripOpenRouterNitro("openrouter/x")).toBe("openrouter/x")
   })

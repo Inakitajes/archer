@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import { logicalModel } from "../src/model-routing"
-import { buildRunPlan, plannedStepAdvisor, routePipeline } from "../src/run-plan"
+import { buildRunPlan, plannedStepAdvisor, routePipeline, throughputRoutedModels } from "../src/run-plan"
 import { stepRunnerFor } from "../src/step-runners"
 import type { AgentStep, RunOptions } from "../src/types"
 
@@ -127,11 +127,9 @@ test("routing preserves every built-in pipeline's execution structure", () => {
             ? configured
             : gateway === "direct"
               ? `${recovered.model}${variant}`
-              : gateway === "openrouter"
+              : gateway === "openrouter" || gateway === "nitro"
                 ? `openrouter/${physicalModel}${variant}`
-                : gateway === "nitro"
-                  ? `openrouter/${physicalModel}:nitro${variant}`
-                  : `vercel/${recovered.model}${variant}`
+                : `vercel/${recovered.model}${variant}`
 
         expect(step.resolvedModel?.gateway).toBe(gateway)
         expect(step.resolvedModel?.target).toBe(expectedTarget)
@@ -331,9 +329,74 @@ test("nitro routes the smart judge and the goal-fix pipeline through the same ga
   }
 
   const plan = buildRunPlan(options)
-  expect(plan.smartJudge?.model).toMatchObject({ gateway: "nitro", target: "openrouter/anthropic/claude-haiku-4.5:nitro" })
+  expect(plan.smartJudge?.model).toMatchObject({ gateway: "nitro", target: "openrouter/anthropic/claude-haiku-4.5" })
   const fixer = plan.goal?.fixPipeline.steps[0]
-  expect(fixer?.type === "agent" && fixer.resolvedModel?.target).toBe("openrouter/openai/gpt-5.6-sol:nitro")
+  expect(fixer?.type === "agent" && fixer.resolvedModel?.target).toBe("openrouter/openai/gpt-5.6-sol")
+})
+
+test("throughputRoutedModels collects the run's OpenRouter models, deduplicated", () => {
+  const routed = routePipeline(
+    {
+      name: "review",
+      steps: [
+        {
+          type: "agent",
+          name: "scope",
+          stepName: "scope",
+          groupId: "g1",
+          agentName: "review-scope",
+          description: "Scope",
+          model: "zai/glm-5.2",
+          inputFiles: ["prd.md"],
+          inputDiff: false,
+          reportPath: "reports/scope.md",
+        },
+        {
+          type: "agent",
+          name: "audit",
+          stepName: "audit",
+          groupId: "g2",
+          agentName: "auditor",
+          description: "Audit",
+          model: "zai/glm-5.2",
+          advisor: "anthropic/claude-opus-5",
+          inputFiles: ["prd.md"],
+          inputDiff: false,
+          reportPath: "reports/audit.md",
+        },
+        {
+          type: "agent",
+          name: "external",
+          stepName: "external",
+          groupId: "g3",
+          agentName: "external",
+          description: "External audit",
+          runner: "claude-code",
+          model: "opus",
+          inputFiles: ["prd.md"],
+          inputDiff: false,
+          reportPath: "reports/external.md",
+          readOnly: true,
+        },
+      ],
+    },
+    "nitro",
+    {},
+  )
+
+  // GLM appears twice (scope + audit) but is collected once; the advisor and
+  // the judge are included; claude-code steps and non-OpenRouter judges are not.
+  expect(throughputRoutedModels(routed)).toEqual([
+    { providerID: "openrouter", modelID: "z-ai/glm-5.2" },
+    { providerID: "openrouter", modelID: "anthropic/claude-opus-5" },
+  ])
+  expect(throughputRoutedModels(routed, { providerID: "openrouter", modelID: "deepseek/deepseek-v4-flash-0731" })).toEqual([
+    { providerID: "openrouter", modelID: "z-ai/glm-5.2" },
+    { providerID: "openrouter", modelID: "anthropic/claude-opus-5" },
+    { providerID: "openrouter", modelID: "deepseek/deepseek-v4-flash-0731" },
+  ])
+  expect(throughputRoutedModels(routed, { providerID: "openai", modelID: "gpt-5.6-sol" })).toHaveLength(2)
+  expect(throughputRoutedModels({ name: "empty", steps: [] })).toEqual([])
 })
 
 describe("advisor routing", () => {
@@ -366,15 +429,15 @@ describe("advisor routing", () => {
     expect(routed.advisorVariant).toBe("high")
   })
 
-  test("routes the advisor through nitro with the :nitro suffix", () => {
+  test("routes the advisor through nitro exactly like openrouter, without a suffix", () => {
     const routed = route(step({ advisor: "anthropic/claude-opus-5", advisorVariant: "high" }), "nitro")
 
     expect(routed.resolvedAdvisor).toMatchObject({
       logical: "anthropic/claude-opus-5#high",
-      target: "openrouter/anthropic/claude-opus-5:nitro#high",
+      target: "openrouter/anthropic/claude-opus-5#high",
       providerID: "openrouter",
     })
-    expect(routed.advisor).toBe("openrouter/anthropic/claude-opus-5:nitro")
+    expect(routed.advisor).toBe("openrouter/anthropic/claude-opus-5")
     expect(routed.advisorVariant).toBe("high")
   })
 

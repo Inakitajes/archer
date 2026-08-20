@@ -3,18 +3,21 @@ import { splitModelVariant } from "./pipeline"
 export const modelGateways = ["configured", "direct", "openrouter", "nitro", "vercel"] as const
 export type ModelGateway = (typeof modelGateways)[number]
 
-/** The OpenRouter routing variant Convoy requests as `:nitro` (provider.sort: "throughput"). */
+/**
+ * The suffix older Convoy versions appended to nitro targets. OpenCode
+ * resolves model ids against its own catalog before OpenRouter sees the
+ * request, so a `:nitro`-suffixed id fails there with "Model not found" —
+ * the nitro gateway therefore expresses throughput routing through provider
+ * options injected into the run's OpenCode config (see agents.ts) and never
+ * produces the suffix. The strip below keeps reading configs and frozen
+ * plans written by those older versions.
+ */
 export const openRouterNitroSuffix = ":nitro"
 
 /** Removes every trailing `:nitro` suffix; otherwise a no-op. */
 export function stripOpenRouterNitro(value: string): string {
   while (value.endsWith(openRouterNitroSuffix)) value = value.slice(0, -openRouterNitroSuffix.length)
   return value
-}
-
-/** Ensures the value ends with exactly one trailing `:nitro` suffix. */
-export function applyOpenRouterNitro(value: string): string {
-  return value.endsWith(openRouterNitroSuffix) ? value : `${value}${openRouterNitroSuffix}`
 }
 
 /**
@@ -116,13 +119,18 @@ export function resolveModel(configured: string, gateway: ModelGateway, override
         physical = applied.model
         variant ??= applied.variant
       } else if (gateway === "nitro" && entry?.openrouter) {
-        // Fall back to the plain openrouter override, then apply `:nitro`.
+        // Fall back to the plain openrouter override: throughput routing is
+        // provider options injected per run, so nothing is appended to it.
         const applied = overrideFor(logical, "openrouter", entry.openrouter, logicalVariant)
-        physical = applyOpenRouterNitro(applied.model)
+        physical = applied.model
         variant ??= applied.variant
       } else {
         physical = autoWrap(gateway, configured, logical)
       }
+      // Legacy nitro overrides and pre-throughput configs spell their targets
+      // with a literal `:nitro`, which OpenCode's catalog can never resolve.
+      // The nitro gateway strips it wherever it reappears.
+      if (gateway === "nitro") physical = stripOpenRouterNitro(physical)
       break
     }
   }
@@ -158,8 +166,9 @@ function overrideFor(logical: string, key: string, target: string, logicalVarian
 
 /**
  * The no-override physical for a routable gateway. `logical` is already the
- * unsuffixed logical model, so direct/vercel/openrouter never leak `:nitro`;
- * only nitro re-appends the suffix.
+ * unsuffixed logical model, so no gateway ever emits `:nitro`: nitro shares
+ * openrouter's physical target and differs only in the throughput provider
+ * options injected into the run's OpenCode config.
  */
 function autoWrap(gateway: RoutableGateway, configured: string, logical: string): string {
   const [provider, ...model] = logical.split("/")
@@ -169,9 +178,8 @@ function autoWrap(gateway: RoutableGateway, configured: string, logical: string)
     case "direct":
       return `${provider}/${model.join("/")}`
     case "openrouter":
-      return `openrouter/${openRouterAliases[provider] ?? provider}/${model.join("/")}`
     case "nitro":
-      return applyOpenRouterNitro(`openrouter/${openRouterAliases[provider] ?? provider}/${model.join("/")}`)
+      return `openrouter/${openRouterAliases[provider] ?? provider}/${model.join("/")}`
     case "vercel":
       return `vercel/${provider}/${model.join("/")}`
   }

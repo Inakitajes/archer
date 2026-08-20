@@ -38,6 +38,12 @@ export type OpencodeConfigOptions = {
   advisorModels?: readonly ModelSelection[]
   /** Output cap for those aliases. */
   advisorMaxTokens?: number
+  /**
+   * OpenRouter models the run routes by throughput (the nitro gateway). Each
+   * gets `provider.sort: "throughput"` injected below — scoped to this run's
+   * OpenCode config, so the user's global config keeps its default routing.
+   */
+  throughputModels?: readonly ModelSelection[]
 }
 
 export function opencodeConfig(
@@ -70,7 +76,11 @@ export function opencodeConfig(
 
   return {
     agent,
-    provider: mergeProviders(providerTimeouts(), advisorProviderOverride(options.advisorModels ?? [], options.advisorMaxTokens)),
+    provider: mergeProviders(
+      providerTimeouts(),
+      throughputProviderOptions(options.throughputModels ?? []),
+      advisorProviderOverride(options.advisorModels ?? [], options.advisorMaxTokens),
+    ),
     permission: {
       question: "deny",
       doom_loop: doomLoopPermission,
@@ -78,13 +88,38 @@ export function opencodeConfig(
   }
 }
 
-/** Advisor aliases carry no options of their own; the timeout entries own the provider-level settings. */
-function mergeProviders(timeouts: Config["provider"], advisors: Config["provider"]): Config["provider"] {
-  const merged: NonNullable<Config["provider"]> = { ...timeouts }
-  for (const [providerID, entry] of Object.entries(advisors ?? {})) {
-    merged[providerID] = { ...merged[providerID], ...entry, models: { ...merged[providerID]?.models, ...entry.models } }
+/** Merges provider blocks later-source-wins per key, with per-model maps unioned. */
+function mergeProviders(...sources: Config["provider"][]): Config["provider"] {
+  const merged: NonNullable<Config["provider"]> = {}
+  for (const source of sources) {
+    for (const [providerID, entry] of Object.entries(source ?? {})) {
+      merged[providerID] = { ...merged[providerID], ...entry, models: { ...merged[providerID]?.models, ...entry.models } }
+    }
   }
   return merged
+}
+
+/**
+ * Declares `provider.sort: "throughput"` on every OpenRouter model the run
+ * routes through the nitro gateway. This is OpenCode's native spelling of
+ * "prefer OpenRouter's highest-throughput providers" — a `:nitro` model-id
+ * suffix cannot express it, because OpenCode resolves model ids against its
+ * own catalog (where the suffixed id does not exist) before OpenRouter ever
+ * sees the request.
+ *
+ * Options-only model entries: OpenCode merges them over the catalog's real
+ * model, so credentials, limits, and costs keep coming from the real entry.
+ */
+export function throughputProviderOptions(models: readonly ModelSelection[]): NonNullable<Config["provider"]> {
+  const provider: NonNullable<Config["provider"]> = {}
+
+  for (const model of models) {
+    if (model.providerID !== "openrouter") continue
+    const entry = (provider.openrouter ??= {})
+    const entryModels = (entry.models ??= {})
+    entryModels[model.modelID] = { options: { provider: { sort: "throughput" } } }
+  }
+  return provider
 }
 
 export type LoadAgentPromptOptions = {

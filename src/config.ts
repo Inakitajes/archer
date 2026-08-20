@@ -257,7 +257,7 @@ version: 1
 #   overrides:
 #     zai/glm-5.2:
 #       openrouter: openrouter/z-ai/glm-5.2
-#       nitro: openrouter/z-ai/glm-5.2:nitro # optional; openrouter fallback + :nitro is enough
+#       nitro: openrouter/z-ai/glm-5.2 # optional; the openrouter fallback alone is enough
 #       vercel: vercel/zai/glm-5.2
 
 defaults:
