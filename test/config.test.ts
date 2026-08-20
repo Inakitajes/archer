@@ -818,7 +818,7 @@ describe("model routing config", () => {
 
   test("the init template documents nitro in the gateway comment", () => {
     expect(defaultConvoyConfig).toContain(modelGateways.join(" | "))
-    expect(defaultConvoyConfig).toContain("nitro: openrouter/z-ai/glm-5.2:nitro")
+    expect(defaultConvoyConfig).toContain("nitro: openrouter/z-ai/glm-5.2 # optional; the openrouter fallback alone is enough")
   })
 
   test("global and project overrides merge after canonicalization", () => {

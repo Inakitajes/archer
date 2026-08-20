@@ -163,6 +163,30 @@ export function plannedStepModel(step: AgentStep): string {
   return step.resolvedModel?.target ?? `${step.model}${step.variant ? `#${step.variant}` : ""}`
 }
 
+/**
+ * Every OpenRouter model a nitro run must route by throughput: executors,
+ * advisors, and (when smart mode consults one) the permission judge. The goal
+ * loop's fix iterations run as their own `run()` with their own plan, so they
+ * collect from their own pipeline. Deduplicated by model id — a model shared
+ * by an executor and an advisor needs the option declared exactly once.
+ */
+export function throughputRoutedModels(
+  pipeline: Pipeline,
+  judge?: { providerID: string; modelID: string },
+): { providerID: string; modelID: string }[] {
+  const models = new Map<string, { providerID: string; modelID: string }>()
+  const add = (model: { providerID: string; modelID: string } | undefined) => {
+    if (model && model.providerID === "openrouter") models.set(model.modelID, { providerID: model.providerID, modelID: model.modelID })
+  }
+  for (const step of pipeline.steps) {
+    if (step.type !== "agent" || stepRunnerFor(step.runner).id !== "opencode") continue
+    add(step.resolvedModel)
+    add(step.resolvedAdvisor)
+  }
+  add(judge)
+  return [...models.values()]
+}
+
 /** The step's advising model as the reviewed plan shows it, or undefined when the step runs without one. */
 export function plannedStepAdvisor(step: AgentStep): string | undefined {
   if (!step.advisor) return undefined

@@ -28,7 +28,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     `  Worktree: ${plan.target.worktree ? `yes · branch ${plan.target.branch ? sanitizeInline(plan.target.branch) : "named at start"}` : "no"}`,
     ...prdHistoryPlanLines(plan),
     `Pipeline: ${sanitizeInline(plan.pipeline.name)} · ${plan.pipeline.steps.length} steps`,
-    `Gateway: ${gatewayLabel(plan.modelRouting.gateway)}`,
+    `Gateway: ${gatewayLabel(plan.modelRouting.gateway)}${plan.modelRouting.gateway === "nitro" ? " · every OpenRouter model routed by throughput (injected for this run only)" : ""}`,
     `Advisors: ${plan.pipeline.steps.filter((step) => step.type === "agent" && Boolean(plannedStepAdvisor(step))).length}/${plan.pipeline.steps.filter((step) => step.type === "agent").length} steps advised`,
   ]
   if (plan.goal) {

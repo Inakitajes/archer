@@ -31,6 +31,7 @@ import { agentsForPipeline, deliverableContractForPhase, splitModelVariant, vali
 import { pickPrdHistory, prdHistoryFile, readPrdHistoryIndex, writePrdHistory } from "./prd-history"
 import { installWriteReportTool, startReportBridge, type ReportBridge } from "./report-bridge"
 import { createReportRuntime, type ReportPhaseHandle, type ReportRuntime } from "./report-runtime"
+import { throughputRoutedModels } from "./run-plan"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
@@ -657,6 +658,14 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     // Derived from the frozen pipeline, so a resume rebuilds the same advisor
     // machinery the run started with.
     const advisorNeeds = advisorNeedsOf(pipeline.steps)
+    // The nitro gateway routes every OpenRouter model of this run by throughput.
+    // The routing is injected as per-model provider options in the run's own
+    // OpenCode config, never as a model-id suffix (OpenCode's catalog cannot
+    // resolve `:nitro`), so the user's global config keeps its default routing.
+    const throughputModels =
+      (options.plan?.modelRouting.gateway ?? options.gateway ?? "configured") === "nitro"
+        ? throughputRoutedModels(pipeline, autoAccept.mode === "smart" ? judgeModel : undefined)
+        : []
     // Every custom tool must exist before the server spawns: the SDK hands
     // OpenCode Convoy's environment at spawn time and OPENCODE_CONFIG_DIR is
     // scanned once at startup. Every OpenCode phase owns a report, so this path
@@ -682,6 +691,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
         opencodeConfig(workspace.dir, options.targetDir, agents, options.permissions, {
           advisorAgents: advisorNeeds.agents,
           advisorModels: advisorNeeds.models,
+          throughputModels,
         }),
         boot.signal,
       )

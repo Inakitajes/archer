@@ -58,6 +58,9 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   rows.push(plain(""))
 
   rows.push(labelRow("gateway", [fg(theme.text)(gatewayLabel(plan.modelRouting.gateway))]))
+  if (plan.modelRouting.gateway === "nitro") {
+    rows.push(continuation([fg(theme.dim)("every OpenRouter model routed by throughput (provider.sort), injected for this run only")]))
+  }
   if (plan.resume?.gatewayOverride) {
     const override = plan.resume.gatewayOverride
     rows.push(continuation([fg(theme.yellow)("resume override · "), fg(theme.dim)(`original ${gatewayLabel(override.original)} · pending phases ${gatewayLabel(override.pending)}`)]))
