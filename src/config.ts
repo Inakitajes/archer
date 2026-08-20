@@ -282,7 +282,7 @@ defaults:
 #   enabled: true
 #   identicalCalls: 4      # same tool + same args in a row
 #   sameToolFailures: 6    # same tool failing in a row (args may drift)
-#   maxSteps: 200          # hard budget gate; a model-only queued nudge arrives at half this value
+#   maxSteps: 200          # hard budget gate; a best-effort model-only nudge is queued at half this value
 #   maxPhaseCost: 20       # USD; false to disable the cost fuse
 
 # Agents are matched by name with Markdown prompts next to this config:

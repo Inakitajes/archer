@@ -2268,7 +2268,7 @@ export type SessionWatcher = {
   stop(): Promise<void>
 }
 
-/** A one-time, model-only queued reminder; it never opens a Convoy UI surface. */
+/** A one-time, best-effort, model-only queued reminder; it never opens a Convoy UI surface. */
 export const softBudgetNudgeText = [
   "You have used half of this phase's step budget.",
   "Review your progress now, avoid repeating work, and complete or persist the deliverable with the remaining budget.",
@@ -2276,9 +2276,11 @@ export const softBudgetNudgeText = [
 
 async function queueSoftBudgetNudge(client: OpencodeClient, sessionID: string, phaseName: string) {
   try {
-    // The v2 route explicitly queues this user message behind the in-flight turn.
+    // The v2 route queues this user message behind the in-flight turn.
     // It is intentionally separate from v1 promptAsync(), which created the
-    // phase session and cannot request non-interrupting delivery.
+    // phase session and cannot request non-interrupting delivery. Best-effort:
+    // OpenCode may accept the queue on a busy v1 session without injecting the
+    // instruction into later turns. The hard budget gate is the real stop.
     const queued = await client.v2.session.prompt({ sessionID, prompt: { text: softBudgetNudgeText }, delivery: "queue" })
     if (queued.error) log.warn(`[${phaseName}] couldn't queue the soft step-budget nudge: ${formatSdkError(queued.error)}`)
   } catch (error) {
