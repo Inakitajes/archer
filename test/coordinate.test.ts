@@ -4,6 +4,7 @@ import { join } from "node:path"
 
 import { afterAll, describe, expect, test } from "bun:test"
 
+import { ControlProgress } from "../src/control-progress"
 import {
   convoyCoordinateArgv,
   assertInternalLaunchPath,
@@ -11,12 +12,15 @@ import {
   launchPayload,
   readLaunchFile,
   rmPendingLaunch,
+  runCoordinateBoot,
   spawnCoordinator,
   sweepPendingLaunches,
   waitForCoordinatorReady,
   writePendingLaunch,
 } from "../src/coordinate"
-import type { RunOptions } from "../src/types"
+import type { RunOutcome } from "../src/progress"
+import { UserAbortError } from "../src/runner"
+import type { RunOptions, RunPlan } from "../src/types"
 
 const dirs: string[] = []
 afterAll(async () => {
@@ -111,7 +115,13 @@ describe("waitForCoordinatorReady", () => {
 
   test("times out when the coordinator never writes it", async () => {
     const dir = await scratch()
-    await expect(waitForCoordinatorReady(join(dir, "never"), 120)).rejects.toThrow(/did not become ready/)
+    const error = await waitForCoordinatorReady(join(dir, "never"), 120).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    )
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toMatch(/did not become ready/)
+    expect((error as Error).name).toBe("CoordinatorBootTimeoutError")
   })
 })
 
@@ -186,6 +196,137 @@ describe("forwardCoordinatorLogs", () => {
     await rmPendingLaunch(dir) // no throw the second time
   })
 })
+
+describe("runCoordinateBoot", () => {
+  const previousControlUrl = process.env.CONVOY_CONTROL_URL
+  afterAll(() => {
+    if (previousControlUrl === undefined) delete process.env.CONVOY_CONTROL_URL
+    else process.env.CONVOY_CONTROL_URL = previousControlUrl
+  })
+
+  async function writeBootLaunch(root: string) {
+    return writePendingLaunch(launchPayload({ ...minimalOptions() } as RunOptions, minimalPlan(), undefined), root)
+  }
+
+  test("a non-goal run releases the hosted teardown and drives the finish hold", async () => {
+    const root = await scratch()
+    const pending = await writeBootLaunch(root)
+    let released = 0
+    const finished: RunOutcome[] = []
+
+    const code = await runCoordinateBoot(pending.launchPath, pending.readyPath, {
+      launchRoot: root,
+      createProgress: (opts) => {
+        const progress = new ControlProgress(opts)
+        const orig = progress.runFinished.bind(progress)
+        progress.runFinished = async (outcome) => {
+          finished.push(outcome)
+          return orig(outcome)
+        }
+        return progress
+      },
+      run: async () => ({
+        runID: "20260101-000000-ab12",
+        dir: "/tmp/run",
+        release: async () => {
+          released += 1
+        },
+      }),
+    })
+
+    expect(code).toBe(0)
+    expect(released).toBe(1)
+    expect(finished).toEqual([{ status: "completed", runDir: "/tmp/run" }])
+  })
+
+  test("a thrown hosted run still releases via hostedTeardownFromError after the failed finish hold", async () => {
+    const root = await scratch()
+    const pending = await writeBootLaunch(root)
+    const boom = new Error("phase tests failed")
+    let released = 0
+    const finished: RunOutcome[] = []
+
+    await expect(
+      runCoordinateBoot(pending.launchPath, pending.readyPath, {
+        launchRoot: root,
+        createProgress: (opts) => {
+          const progress = new ControlProgress(opts)
+          const orig = progress.runFinished.bind(progress)
+          progress.runFinished = async (outcome) => {
+            finished.push(outcome)
+            return orig(outcome)
+          }
+          return progress
+        },
+        run: async () => {
+          throw boom
+        },
+        hostedTeardownFromError: (error) =>
+          error === boom
+            ? {
+                runDir: "/tmp/run",
+                release: async () => {
+                  released += 1
+                },
+              }
+            : undefined,
+      }),
+    ).rejects.toThrow(/phase tests failed/)
+
+    expect(released).toBe(1)
+    expect(finished).toEqual([{ status: "failed", runDir: "/tmp/run", error: "phase tests failed" }])
+  })
+
+  test("a user abort releases without driving the finish hold", async () => {
+    const root = await scratch()
+    const pending = await writeBootLaunch(root)
+    const abort = new UserAbortError()
+    let released = 0
+    const finished: RunOutcome[] = []
+
+    await expect(
+      runCoordinateBoot(pending.launchPath, pending.readyPath, {
+        launchRoot: root,
+        createProgress: (opts) => {
+          const progress = new ControlProgress(opts)
+          const orig = progress.runFinished.bind(progress)
+          progress.runFinished = async (outcome) => {
+            finished.push(outcome)
+            return orig(outcome)
+          }
+          return progress
+        },
+        run: async () => {
+          throw abort
+        },
+        hostedTeardownFromError: (error) =>
+          error === abort
+            ? {
+                runDir: "/tmp/run",
+                release: async () => {
+                  released += 1
+                },
+              }
+            : undefined,
+      }),
+    ).rejects.toBe(abort)
+
+    expect(released).toBe(1)
+    expect(finished).toEqual([])
+  })
+})
+
+function minimalPlan(): RunPlan {
+  return {
+    prompt: { source: "inline", text: "do the thing" },
+    target: { directory: "/tmp/repo", baseRef: "main", worktree: false, dirty: false },
+    pipeline: { name: "implement", steps: [] },
+    modelRouting: { gateway: "openrouter" },
+    hooks: { pre: [], post: [] },
+    attachments: [],
+    permissions: "interactive",
+  }
+}
 
 function minimalOptions(): Partial<RunOptions> {
   return {

@@ -3,11 +3,11 @@ import { mkdir, open, readFile, readdir, rm, stat, writeFile, type FileHandle } 
 import { join, resolve, sep } from "node:path"
 
 import { startControlServer } from "./control-server"
-import { ControlProgress } from "./control-progress"
+import { ControlProgress, type ControlProgressOptions } from "./control-progress"
 import { runGoalLoop, type GoalLoopConfig } from "./goal-loop"
 import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { pidAlive } from "./runs"
-import { run } from "./runner"
+import { hostedTeardownFromError, isUserAbortError, run } from "./runner"
 import { isOfficialStandaloneExecutable } from "./update"
 import { convoyHome } from "./workspace"
 import type { RunOptions, RunPlan } from "./types"
@@ -137,6 +137,13 @@ export async function rmPendingLaunch(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true }).catch(() => {})
 }
 
+export class CoordinatorBootTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`coordinator did not become ready within ${timeoutMs / 1000}s; it may have failed to boot`)
+    this.name = "CoordinatorBootTimeoutError"
+  }
+}
+
 export async function waitForCoordinatorReady(readyPath: string, timeoutMs = 10_000): Promise<CoordinateReady> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
@@ -149,7 +156,7 @@ export async function waitForCoordinatorReady(readyPath: string, timeoutMs = 10_
     if (Date.now() + 100 >= deadline) break
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
-  throw new Error(`coordinator did not become ready within ${timeoutMs / 1000}s; it may have failed to boot`)
+  throw new CoordinatorBootTimeoutError(timeoutMs)
 }
 
 export type SpawnResult = {
@@ -257,33 +264,80 @@ export function assertInternalLaunchPath(launchPath: string, root = pendingRoot(
 }
 
 /**
+ * Injected dependencies for `runCoordinateBoot`. Tests replace `run` /
+ * `runGoalLoop` so the boot contract (release, finish hold, error teardown)
+ * can be asserted without spawning a real pipeline.
+ */
+export type CoordinateBootDeps = {
+  run: typeof run
+  runGoalLoop: typeof runGoalLoop
+  startControlServer: typeof startControlServer
+  createProgress: (options: ControlProgressOptions) => ControlProgress
+  hostedTeardownFromError: typeof hostedTeardownFromError
+  /** Override for `assertInternalLaunchPath`; tests point this at a scratch dir. */
+  launchRoot?: string
+}
+
+const defaultCoordinateBootDeps: CoordinateBootDeps = {
+  run,
+  runGoalLoop,
+  startControlServer,
+  createProgress: (options) => new ControlProgress(options),
+  hostedTeardownFromError,
+}
+
+/**
  * The child side of `--coordinate <launch.json>`. The control server starts
  * here, before run() boot, so a client can attach during OpenCode boot. The
  * runID is only known after the workspace exists, so the ready file is written
  * by ControlProgress when run() calls progress.start().
  */
-export async function runCoordinateBoot(launchPath: string, readyPath?: string): Promise<number> {
-  assertInternalLaunchPath(launchPath)
+export async function runCoordinateBoot(
+  launchPath: string,
+  readyPath?: string,
+  overrides: Partial<CoordinateBootDeps> = {},
+): Promise<number> {
+  const deps = { ...defaultCoordinateBootDeps, ...overrides }
+  assertInternalLaunchPath(launchPath, deps.launchRoot ?? pendingRoot())
   const launch = await readLaunchFile(launchPath)
-  const server = await startControlServer()
-  const progress = new ControlProgress({ server, readyPath })
-  // The gate/control cycle shares exactly the adapter's AutoAccept object.
-  const options: RunOptions = { ...launch.options, progress, autoAccept: progress.autoAccept, tui: false }
-  // metadata.server gains the control URL (no token) for liveness/debug.
-  process.env.CONVOY_CONTROL_URL = server.url
-
   const plan = launch.plan
   if (!plan) throw new Error(`launch file ${launchPath} carries no reviewed plan`)
 
-  if (launch.goal) {
-    const config: GoalLoopConfig = {
-      goal: launch.goal.goal,
-      maxIterations: launch.goal.maxIterations ?? defaultGoalMaxIterations,
-      plateau: launch.goal.plateau ?? defaultGoalPlateau,
+  const server = await deps.startControlServer()
+  try {
+    const progress = deps.createProgress({ server, readyPath })
+    // The gate/control cycle shares exactly the adapter's AutoAccept object.
+    const options: RunOptions = { ...launch.options, progress, autoAccept: progress.autoAccept, tui: false }
+    // metadata.server gains the control URL (no token) for liveness/debug.
+    process.env.CONVOY_CONTROL_URL = server.url
+
+    if (launch.goal) {
+      const config: GoalLoopConfig = {
+        goal: launch.goal.goal,
+        maxIterations: launch.goal.maxIterations ?? defaultGoalMaxIterations,
+        plateau: launch.goal.plateau ?? defaultGoalPlateau,
+      }
+      await deps.runGoalLoop(options, plan, config)
+      return 0
     }
-    await runGoalLoop(options, plan, config)
-    return 0
+    try {
+      const result = await deps.run(options)
+      await progress.runFinished({ status: "completed", runDir: result.dir })
+      await result.release?.()
+      return 0
+    } catch (error) {
+      const teardown = deps.hostedTeardownFromError(error)
+      if (!isUserAbortError(error)) {
+        await progress.runFinished({
+          status: "failed",
+          runDir: teardown?.runDir ?? "",
+          ...(error instanceof Error ? { error: error.message } : { error: String(error) }),
+        })
+      }
+      await teardown?.release?.()
+      throw error
+    }
+  } finally {
+    server.close()
   }
-  await run(options)
-  return 0
 }

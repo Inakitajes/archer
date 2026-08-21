@@ -13,7 +13,7 @@ import { buildRunPlan, type BuildRunPlanInput } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
 import { loadPrdHistoryPreview } from "./prd-history"
 import { isModelGateway, modelGatewayChoices, modelGateways, type ModelGateway } from "./model-routing"
-import { browseRuns, isServerLive, pidAlive, tcpReachable } from "./runs"
+import { browseRuns, isControlLive, isServerLive } from "./runs"
 import { deleteKeychainSecret, keychainAvailable, storeKeychainSecret } from "./secrets"
 import type { Pipeline, RunOptions, RunPlan } from "./types"
 import type { GoalLoopConfig } from "./goal-loop"
@@ -307,16 +307,16 @@ function goalConfigFor(decision: GoalModeDecision, options: RunOptions): GoalLoo
 }
 
 /**
- * Slice 2+ run path: every production run becomes a detached coordinator plus,
- * on a TTY, an auto-attached controller dashboard. Tests keep calling
- * `run()` / `runGoalLoop()` in-process with an injected `progress`.
+ * Every production run becomes a detached coordinator plus, on a TTY, an
+ * auto-attached controller dashboard. Tests keep calling `run()` /
+ * `runGoalLoop()` in-process with an injected `progress`.
  */
 async function spawnAndAttachRun(
   options: RunOptions,
   plan: RunPlan,
   goal: GoalLoopConfig | undefined,
 ): Promise<void> {
-  const { forwardCoordinatorLogs, launchPayload, rmPendingLaunch, spawnCoordinator, waitForCoordinatorReady, writePendingLaunch } = await import("./coordinate")
+  const { CoordinatorBootTimeoutError, forwardCoordinatorLogs, launchPayload, rmPendingLaunch, spawnCoordinator, waitForCoordinatorReady, writePendingLaunch } = await import("./coordinate")
   const pending = await writePendingLaunch(launchPayload(options, plan, goal))
   let child: { pid: number; exited: Promise<number> } | undefined
   try {
@@ -367,7 +367,7 @@ async function spawnAndAttachRun(
       }
     }
     log.warn(`coordinator failed to start; pending launch left at ${pending.launchPath}`)
-    if (error instanceof Error && error.message.includes("did not become ready")) {
+    if (error instanceof CoordinatorBootTimeoutError) {
       log.error(`  → ${error.message}`)
       log.error(`  → coordinator log: ${pending.logPath}`)
       // The friendly lines above are the error; a zero exit would hide the
@@ -407,7 +407,7 @@ async function isServerLiveFor(runID: string): Promise<boolean> {
 async function isCoordinatorLiveFor(runID: string): Promise<boolean> {
   const control = await readControlFile(runID)
   if (!control) return isServerLiveFor(runID)
-  return pidAlive(control.pid) && (await tcpReachable(control.url, 250))
+  return isControlLive(control)
 }
 
 /**

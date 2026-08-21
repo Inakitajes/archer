@@ -29,6 +29,7 @@ describe("control client", () => {
     // The server returns 401 for anything but the exact token, so a client
     // that stops sending it fails immediately instead of missing a handler.
     const client = createControlClient({ url: s.url, token: s.token })
+    expect(await client.claimController()).toBe("controller")
     await client.pause()
     await client.abort()
     await client.keepAwake()
@@ -51,6 +52,7 @@ describe("control client", () => {
   test("resolves a pending permission gate through the POST endpoint", async () => {
     const s = await server()
     const client = createControlClient({ url: s.url, token: s.token })
+    expect(await client.claimController()).toBe("controller")
     const wait = s.pending.holdPermission({ ...permissionInfo })
     await client.permission("perm-1", "always")
     expect(await wait).toBe("always")
@@ -59,14 +61,18 @@ describe("control client", () => {
   test("resolves a pending human gate through the POST endpoint", async () => {
     const s = await server()
     const client = createControlClient({ url: s.url, token: s.token })
+    expect(await client.claimController()).toBe("controller")
     const wait = s.pending.holdHuman({ stepName: "review", iterations: 0, kind: "failure", canRetry: true })
-    await client.human("retry")
+    const id = (await client.pending()).human?.requestId
+    expect(id).toBeTruthy()
+    await client.human(id!, "retry")
     expect(await wait).toBe("retry")
   })
 
   test("dismisses the finish hold through the POST endpoint", async () => {
     const s = await server()
     const client = createControlClient({ url: s.url, token: s.token })
+    expect(await client.claimController()).toBe("controller")
     const wait = s.pending.holdFinish({ status: "completed" })
     await client.finishDismiss()
     await expect(wait).resolves.toBeUndefined()
@@ -75,6 +81,7 @@ describe("control client", () => {
   test("empty auto-accept cycles and an explicit mode sets", async () => {
     const s = await server()
     const client = createControlClient({ url: s.url, token: s.token })
+    expect(await client.claimController()).toBe("controller")
     // No shared object configured: the server still answers and reports mode.
     await client.autoAccept()
     await client.autoAccept("off")

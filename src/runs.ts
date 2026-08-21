@@ -115,7 +115,10 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
   const dir = join(root, runID)
   const metadata = await readRunMetadata(join(dir, "metadata.json"))
   const summary = statusSummary(metadata)
-  const live = await isServerLive(metadata?.server)
+  const serverLive = await isServerLive(metadata?.server)
+  const control = await readControlFile(runID, root)
+  const coordinatorLive = control ? await isControlLive(control) : false
+  const live = serverLive || coordinatorLive
   const split = await readAdvisorSplit(dir)
   const executorCost = totalCost(metadata, split.executorPhases) ?? (split.executor.cost > 0 ? split.executor.cost : undefined)
   const advisorCost = split.advisor.cost
@@ -127,9 +130,10 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
     status: summary.label,
     statusKind: summary.kind,
     live,
-    serverUrl: live ? metadata?.server?.url : undefined,
-    // Only live runs pay for a control probe, and only coordinated ones have
-    // a control.json to read; everything else stays undefined.
+    serverUrl: serverLive ? metadata?.server?.url : undefined,
+    // Coordinated runs stay live through the control server even when the
+    // per-iteration OpenCode server is down between goal-loop iterations;
+    // only then is the waiting probe worth paying for.
     waiting: live ? await probeRunWaiting(runID, root) : undefined,
     cost: executorCost === undefined && advisorCost === 0 ? undefined : (executorCost ?? 0) + advisorCost,
     executorCost,
@@ -176,6 +180,15 @@ export async function refreshRunWaiting(run: RunEntry, root = runsRoot()): Promi
 export async function isServerLive(server: RunMetadata["server"]): Promise<boolean> {
   if (!server || !pidAlive(server.pid)) return false
   return tcpReachable(server.url, 250)
+}
+
+/**
+ * Whether a coordinated run is live through its control server. The
+ * coordinator outlives every per-iteration OpenCode server, so this (not
+ * `isServerLive`) is what "the run is still going" means mid-goal-loop.
+ */
+export async function isControlLive(control: { url: string; pid: number }, timeoutMs = 250): Promise<boolean> {
+  return pidAlive(control.pid) && (await tcpReachable(control.url, timeoutMs))
 }
 
 export function pidAlive(pid: number): boolean {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { createControlClient } from "../src/control-client"
-import { ControlPendingQueue, startControlServer, type ControlServer } from "../src/control-server"
+import { CONTROLLER_ID_HEADER, ControlPendingQueue, startControlServer, type ControlServer } from "../src/control-server"
 import type { AutoAccept, PermissionPromptInfo } from "../src/progress"
 
 const permissionInfo: PermissionPromptInfo = {
@@ -12,13 +12,20 @@ const permissionInfo: PermissionPromptInfo = {
   sessionID: "sess-1",
 }
 
-async function post(srv: ControlServer, path: string, body?: unknown) {
-  const headers = { "content-type": "application/json", authorization: `Bearer ${srv.token}` }
+async function post(srv: ControlServer, path: string, body?: unknown, controllerId?: string) {
+  const headers: Record<string, string> = { "content-type": "application/json", authorization: `Bearer ${srv.token}` }
+  if (controllerId) headers[CONTROLLER_ID_HEADER] = controllerId
   return fetch(`${srv.url}${path}`, {
     method: "POST",
     headers,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
+}
+
+async function claim(srv: ControlServer): Promise<string> {
+  const hello = await post(srv, "/hello", { role: "controller" })
+  const { controllerId } = (await hello.json()) as { controllerId: string }
+  return controllerId
 }
 
 describe("control server", () => {
@@ -108,10 +115,11 @@ describe("control server", () => {
       },
     })
     try {
-      await post(server, "/pause")
-      await post(server, "/resume")
-      await post(server, "/abort")
-      await post(server, "/keep-awake")
+      const id = await claim(server)
+      await post(server, "/pause", undefined, id)
+      await post(server, "/resume", undefined, id)
+      await post(server, "/abort", undefined, id)
+      await post(server, "/keep-awake", undefined, id)
       expect(calls).toEqual(["pause", "resume", "abort", "keep-awake"])
     } finally {
       server.close()
@@ -126,15 +134,16 @@ describe("control server", () => {
       },
     })
     try {
+      const id = await claim(server)
       // [i] lives on the server's armed set, readable by the gate adapter.
-      await post(server, "/interactive", { phase: "design", armed: true })
-      await post(server, "/interactive", { phase: "design", armed: false })
+      await post(server, "/interactive", { phase: "design", armed: true }, id)
+      await post(server, "/interactive", { phase: "design", armed: false }, id)
       expect(server.isInteractiveArmed("design")).toBe(false)
-      await post(server, "/interactive", { phase: "tests", armed: true })
+      await post(server, "/interactive", { phase: "tests", armed: true }, id)
       expect(server.isInteractiveArmed("tests")).toBe(true)
-      await post(server, "/finish-dismiss")
+      await post(server, "/finish-dismiss", undefined, id)
       expect(calls).toEqual(["finish-dismiss"])
-      expect((await post(server, "/interactive", { phase: 1 })).status).toBe(400)
+      expect((await post(server, "/interactive", { phase: 1 }, id)).status).toBe(400)
     } finally {
       server.close()
     }
@@ -144,12 +153,13 @@ describe("control server", () => {
     const shared: AutoAccept = { mode: "off" }
     const server = await startControlServer({ handlers: { autoAccept: shared } })
     try {
-      const first = await post(server, "/auto-accept")
+      const id = await claim(server)
+      const first = await post(server, "/auto-accept", undefined, id)
       expect((await first.json())).toMatchObject({ mode: "all" })
       expect(shared.mode).toBe("all")
 
-      expect((await (await post(server, "/auto-accept")).json())).toMatchObject({ mode: "smart" })
-      expect((await (await post(server, "/auto-accept", { mode: "off" })).json())).toMatchObject({ mode: "off" })
+      expect((await (await post(server, "/auto-accept", undefined, id)).json())).toMatchObject({ mode: "smart" })
+      expect((await (await post(server, "/auto-accept", { mode: "off" }, id)).json())).toMatchObject({ mode: "off" })
       expect(shared.mode).toBe("off")
     } finally {
       server.close()
@@ -162,15 +172,16 @@ describe("control server", () => {
     try {
       expect(pending.snapshot()).toEqual({})
 
+      const id = await claim(server)
       const wait = pending.holdPermission({ ...permissionInfo })
       expect(pending.snapshot()).toMatchObject({
         permission: { requestId: "perm-1", permission: "bash", patterns: ["bash"], command: "ls -la" },
       })
 
-      expect((await post(server, "/permission", { id: "nope", reply: "once" })).status).toBe(404)
-      expect((await post(server, "/permission", { id: "perm-1" })).status).toBe(400)
+      expect((await post(server, "/permission", { id: "nope", reply: "once" }, id)).status).toBe(404)
+      expect((await post(server, "/permission", { id: "perm-1" }, id)).status).toBe(400)
 
-      expect((await post(server, "/permission", { id: "perm-1", reply: "once" })).status).toBe(200)
+      expect((await post(server, "/permission", { id: "perm-1", reply: "once" }, id)).status).toBe(200)
       expect(await wait).toBe("once")
       expect(pending.snapshot()).toEqual({})
     } finally {
@@ -182,6 +193,7 @@ describe("control server", () => {
     const pending = new ControlPendingQueue()
     const server = await startControlServer({ pending })
     try {
+      const id = await claim(server)
       // Parallel phases can ask concurrently; dropping a waiter would hang the
       // coordinator on a promise nobody can resolve anymore.
       const first = pending.holdPermission({ ...permissionInfo })
@@ -191,10 +203,10 @@ describe("control server", () => {
       expect(pending.snapshot().permission?.requestId).toBe("perm-1")
 
       // Resolving out of order (by id) must not orphan the other waiter.
-      expect((await post(server, "/permission", { id: "perm-2", reply: "reject" })).status).toBe(200)
+      expect((await post(server, "/permission", { id: "perm-2", reply: "reject" }, id)).status).toBe(200)
       expect(await second).toBe("reject")
       expect(pending.snapshot().permission?.requestId).toBe("perm-1")
-      expect((await post(server, "/permission", { id: "perm-1", reply: "once" })).status).toBe(200)
+      expect((await post(server, "/permission", { id: "perm-1", reply: "once" }, id)).status).toBe(200)
       expect(await first).toBe("once")
       expect(pending.snapshot()).toEqual({})
     } finally {
@@ -253,6 +265,90 @@ describe("control server", () => {
       await client.permission("perm-1", "reject")
       expect(await wait).toBe("reject")
       expect(server.pending.snapshot()).toEqual({})
+    } finally {
+      server.close()
+    }
+  })
+
+  test("mutating routes require a live controller claim, not just the bearer token", async () => {
+    const calls: string[] = []
+    const pending = new ControlPendingQueue()
+    const server = await startControlServer({
+      pending,
+      handlers: {
+        onPause: () => void calls.push("pause"),
+        onResume: () => void calls.push("resume"),
+        onAbort: () => void calls.push("abort"),
+        onKeepAwakeToggle: () => void calls.push("keep-awake"),
+        onFinishDismiss: () => void calls.push("finish-dismiss"),
+      },
+    })
+    try {
+      const mutating: Array<[string, unknown?]> = [
+        ["/pause"],
+        ["/resume"],
+        ["/abort"],
+        ["/keep-awake"],
+        ["/finish-dismiss"],
+        ["/auto-accept", { mode: "off" }],
+        ["/interactive", { phase: "design", armed: true }],
+        ["/permission", { id: "perm-1", reply: "once" }],
+        ["/human", { id: "human-1", action: "continue" }],
+      ]
+      for (const [path, body] of mutating) {
+        expect((await post(server, path, body)).status).toBe(403)
+      }
+      expect(calls).toEqual([])
+      // Reads and the claim protocol stay token-open.
+      expect((await fetch(`${server.url}/pending`, { headers: { authorization: `Bearer ${server.token}` } })).status).toBe(200)
+      expect((await fetch(`${server.url}/status`, { headers: { authorization: `Bearer ${server.token}` } })).status).toBe(200)
+
+      const hello = await post(server, "/hello", { role: "controller" })
+      const { controllerId } = (await hello.json()) as { controllerId: string }
+      expect((await post(server, "/abort", undefined, controllerId)).status).toBe(200)
+      expect(calls).toEqual(["abort"])
+      // Bearer-only after a claim is still refused — observers share the token.
+      expect((await post(server, "/pause")).status).toBe(403)
+      expect(calls).toEqual(["abort"])
+    } finally {
+      server.close()
+    }
+  })
+
+  test("concurrent human gates resolve by id, not by queue head", async () => {
+    const pending = new ControlPendingQueue()
+    const server = await startControlServer({ pending })
+    try {
+      const hello = await post(server, "/hello", { role: "controller" })
+      const { controllerId } = (await hello.json()) as { controllerId: string }
+
+      const first = pending.holdHuman({ stepName: "review-a", iterations: 0 })
+      const second = pending.holdHuman({ stepName: "review-b", iterations: 1, kind: "failure", canRetry: true })
+
+      const headId = pending.snapshot().human?.requestId
+      expect(headId).toBeTruthy()
+      expect(pending.snapshot().human?.stepName).toBe("review-a")
+
+      const bad = await post(server, "/human", { id: headId, action: "nope" }, controllerId)
+      expect(bad.status).toBe(400)
+      expect(await bad.text()).toMatch(/reset/)
+
+      // A missing id must not shift the head (permissions already resolve by id).
+      expect((await post(server, "/human", { id: "nope", action: "continue" }, controllerId)).status).toBe(404)
+      expect(pending.snapshot().human?.stepName).toBe("review-a")
+
+      expect((await post(server, "/human", { id: headId, action: "iterate" }, controllerId)).status).toBe(200)
+      expect(await first).toBe("iterate")
+      const next = pending.snapshot().human
+      expect(next?.stepName).toBe("review-b")
+      expect(next?.requestId).toBeTruthy()
+      expect(next?.requestId).not.toBe(headId)
+      // A stale POST naming the already-resolved head must not consume the tail.
+      expect((await post(server, "/human", { id: headId, action: "abort" }, controllerId)).status).toBe(404)
+      expect(pending.snapshot().human?.stepName).toBe("review-b")
+      expect((await post(server, "/human", { id: next?.requestId, action: "retry" }, controllerId)).status).toBe(200)
+      expect(await second).toBe("retry")
+      expect(pending.snapshot()).toEqual({})
     } finally {
       server.close()
     }

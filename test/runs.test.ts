@@ -284,6 +284,39 @@ describe("waiting state (coordinated live runs)", () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  test("a coordinated run stays live when its OpenCode server is down between iterations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "convoy-runs-coord-live-"))
+    try {
+      const runID = "20260613-000005-wa12"
+      const server = await startControlServer()
+      servers.push(server)
+      const dir = join(root, runID)
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, "prd.md"), "# Between iterations\n")
+      await writeFile(
+        join(dir, "metadata.json"),
+        JSON.stringify({
+          schemaVersion: 3,
+          runID,
+          targetDir: "/tmp/repo",
+          createdAt: 1,
+          updatedAt: 2,
+          // Per-iteration server is gone; the coordinator is not.
+          phases: { implementer: { status: "completed" } },
+        }),
+      )
+      await writeFile(join(dir, "control.json"), JSON.stringify({ url: server.url, token: server.token, pid: process.pid }))
+      void server.pending.holdPermission({ id: "p-between", permission: "bash", patterns: ["bash"] })
+
+      const runs = await listRuns(root)
+      const run = runs.find((entry) => entry.runID === runID)
+      expect(run?.live).toBe(true)
+      expect(run?.waiting).toBe("permission")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("statusSummary (pure function exercised through listRuns)", () => {

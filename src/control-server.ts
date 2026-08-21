@@ -21,10 +21,10 @@ import type { Pipeline } from "./types"
  * Bearer <uuid>`), but a deliberately separate server: no shared tokens, no
  * shared paths.
  *
- * Slice 1 ships the protocol server on its own, decoupled from the runner, so
- * it can be unit-tested with a fake RunControl / shutdown / AutoAccept. Later
- * slices wire the real coordinator objects into `ControlServerHandlers` and
- * drive the pending gate queue from `ControlProgress`.
+ * The protocol server is decoupled from the runner so it can be unit-tested
+ * with a fake RunControl / shutdown / AutoAccept. `ControlProgress` wires the
+ * real coordinator objects into `ControlServerHandlers` and drives the pending
+ * gate queue.
  */
 
 export type ControlRole = "controller" | "observer"
@@ -43,6 +43,7 @@ export type PendingPermissionView = {
 
 /** Serializable shape of a waiting human gate, as GET /pending returns it. */
 export type PendingHumanView = {
+  requestId: string
   stepName: string
   iterations: number
   kind?: "interactive" | "failure" | "budget-gate"
@@ -100,7 +101,7 @@ export type PendingSnapshot = {
  */
 export class ControlPendingQueue {
   private permissions: Array<{ info: PermissionPromptInfo; resolve: (reply: PermissionReply) => void }> = []
-  private humans: Array<{ info: HumanReviewPromptInfo; resolve: (action: HumanReviewAction) => void }> = []
+  private humans: Array<{ id: string; info: HumanReviewPromptInfo; resolve: (action: HumanReviewAction) => void }> = []
   private finish?: { outcome: PendingFinishView; resolve: () => void }
   private reset?: ControlReset
 
@@ -109,7 +110,7 @@ export class ControlPendingQueue {
     const permission = this.permissions[0]
     if (permission) out.permission = permissionView(permission.info)
     const human = this.humans[0]
-    if (human) out.human = humanView(human.info)
+    if (human) out.human = humanView(human.info, human.id)
     if (this.finish) out.finish = this.finish.outcome
     if (this.reset) out.reset = this.reset
     return out
@@ -125,7 +126,7 @@ export class ControlPendingQueue {
   /** Waits until a controller resolves this human gate. */
   holdHuman(info: HumanReviewPromptInfo): Promise<HumanReviewAction> {
     return new Promise<HumanReviewAction>((resolve) => {
-      this.humans.push({ info, resolve })
+      this.humans.push({ id: crypto.randomUUID(), info, resolve })
     })
   }
 
@@ -159,10 +160,11 @@ export class ControlPendingQueue {
     return true
   }
 
-  resolveHuman(action: HumanReviewAction): boolean {
-    const slot = this.humans.shift()
-    if (!slot) return false
-    slot.resolve(action)
+  resolveHuman(requestId: string, action: HumanReviewAction): boolean {
+    const index = this.humans.findIndex((slot) => slot.id === requestId)
+    if (index === -1) return false
+    const [slot] = this.humans.splice(index, 1)
+    slot?.resolve(action)
     return true
   }
 
@@ -187,8 +189,9 @@ export function permissionView(info: PermissionPromptInfo): PendingPermissionVie
   }
 }
 
-export function humanView(h: HumanReviewPromptInfo): PendingHumanView {
+export function humanView(h: HumanReviewPromptInfo, requestId: string): PendingHumanView {
   return {
+    requestId,
     stepName: h.stepName,
     iterations: h.iterations,
     ...(h.kind ? { kind: h.kind } : {}),
@@ -198,9 +201,8 @@ export function humanView(h: HumanReviewPromptInfo): PendingHumanView {
 }
 
 /**
- * The coordinator-side objects the control routes act on. Slice 1 wires fakes
- * (tests); the ControlProgress adapter wires the real RunControl, RunShutdown,
- * Caffeinate, and AutoAccept.
+ * The coordinator-side objects the control routes act on. Tests wire fakes;
+ * ControlProgress wires the real RunControl, RunShutdown, Caffeinate, and AutoAccept.
  */
 export type ControlServerHandlers = {
   /** `POST /pause` — `RunControl.toggle()` toward pause. */
@@ -299,6 +301,7 @@ export async function startControlServer(options: ControlServerOptions = {}): Pr
         refreshController: (id) => {
           if (controllerId !== undefined && id === controllerId) controllerLastSeen = Date.now()
         },
+        isClaimant: (id) => controllerActive() && id !== null && id === controllerId,
         isInteractiveArmed: (phase) => interactiveArmed.get(phase) === true,
         setInteractiveArmed: (phase, armed) => void interactiveArmed.set(phase, armed),
       }),
@@ -326,6 +329,8 @@ type ControllerState = {
   releaseController(id: string): boolean
   /** Refreshes the claim's heartbeat; requests from anyone else don't. */
   refreshController(id: string | undefined): void
+  /** True only for the live claimant's id — mutating routes require this. */
+  isClaimant(id: string | null): boolean
   isInteractiveArmed(phase: string): boolean
   setInteractiveArmed(phase: string, armed: boolean): void
 }
@@ -346,6 +351,10 @@ async function handleControl(
   state.refreshController(heartbeat === null ? undefined : heartbeat)
   const handlers = getHandlers()
   const url = new URL(request.url)
+  const denyUnlessController = (): Response | undefined => {
+    if (state.isClaimant(heartbeat)) return undefined
+    return new Response("only the attached controller may do that", { status: 403 })
+  }
   try {
     switch (`${request.method} ${url.pathname}`) {
       case "POST /hello": {
@@ -379,6 +388,8 @@ async function handleControl(
       case "GET /pending":
         return Response.json(pending.snapshot())
       case "POST /permission": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         const body = await readJson(request)
         const requestId = typeof body?.id === "string" ? body.id : ""
         const reply = body?.reply
@@ -391,34 +402,53 @@ async function handleControl(
         return Response.json({ ok: true })
       }
       case "POST /human": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         const body = await readJson(request)
+        const requestId = typeof body?.id === "string" ? body.id : ""
         const action = body?.action
-        if (!["continue", "iterate", "abort", "retry", "reset"].includes(String(action ?? ""))) {
-          return new Response("human requires { action: \"continue\" | \"iterate\" | \"abort\" | \"retry\" }", { status: 400 })
+        if (!requestId || !["continue", "iterate", "abort", "retry", "reset"].includes(String(action ?? ""))) {
+          return new Response("human requires { id, action: \"continue\" | \"iterate\" | \"abort\" | \"retry\" | \"reset\" }", { status: 400 })
         }
-        if (!pending.resolveHuman(action as HumanReviewAction)) {
+        if (!pending.resolveHuman(requestId, action as HumanReviewAction)) {
           return new Response("no matching pending human gate", { status: 404 })
         }
         return Response.json({ ok: true })
       }
       case "POST /finish-dismiss": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         await handlers.onFinishDismiss?.()
         pending.resolveFinish()
         return Response.json({ ok: true })
       }
-      case "POST /pause":
+      case "POST /pause": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         await handlers.onPause?.()
         return Response.json({ ok: true })
-      case "POST /resume":
+      }
+      case "POST /resume": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         await handlers.onResume?.()
         return Response.json({ ok: true })
-      case "POST /abort":
+      }
+      case "POST /abort": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         await handlers.onAbort?.()
         return Response.json({ ok: true })
-      case "POST /keep-awake":
+      }
+      case "POST /keep-awake": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         await handlers.onKeepAwakeToggle?.()
         return Response.json({ ok: true })
+      }
       case "POST /interactive": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         const body = await readJson(request)
         if (typeof body?.phase !== "string" || typeof body?.armed !== "boolean") {
           return new Response("interactive requires { phase: string, armed: boolean }", { status: 400 })
@@ -427,6 +457,8 @@ async function handleControl(
         return Response.json({ ok: true })
       }
       case "POST /auto-accept": {
+        const denied = denyUnlessController()
+        if (denied) return denied
         const body = await readJson(request)
         const mode = body?.mode
         if (mode !== undefined && !["off", "all", "smart"].includes(String(mode))) {

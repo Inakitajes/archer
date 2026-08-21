@@ -133,6 +133,41 @@ describe("controller pending poller", () => {
       poller2.stop()
     }
   })
+
+  test("overlapping polls do not double-prompt the same gate", async () => {
+    const asked: string[] = []
+    let pendingInFlight = 0
+    let maxOverlap = 0
+    const tui = {
+      askPermission: async (info: PermissionPromptInfo) => {
+        asked.push(info.id)
+        await Bun.sleep(40)
+        return "once" as PermissionReply
+      },
+    } as Partial<ProgressUI> as ProgressUI
+    const spy = sessionSpy(tui)
+    const client = {
+      pending: async (): Promise<PendingSnapshot> => {
+        pendingInFlight += 1
+        maxOverlap = Math.max(maxOverlap, pendingInFlight)
+        await Bun.sleep(40)
+        pendingInFlight -= 1
+        return { permission: { requestId: "perm-1", permission: "bash", patterns: ["bash"] } }
+      },
+      permission: async () => {},
+      human: async () => {},
+      finishDismiss: async () => {},
+    } as unknown as ControlClient
+    const poller = startPendingPoller(client, spy.session, 10)
+    try {
+      await Bun.sleep(120)
+      expect(maxOverlap).toBe(1)
+      expect(asked).toHaveLength(1)
+      expect(asked[0]).toBe("perm-1")
+    } finally {
+      poller.stop()
+    }
+  })
 })
 
 describe("observer reset follower", () => {

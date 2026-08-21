@@ -3,15 +3,33 @@ import { stdout } from "node:process"
 
 import { LiveAttach, overallStatus, reconcileAdvisorJournal, replayHistory, waitForServerUrl } from "./attach-runtime"
 import { createControlClient, readControlFile, type ControlClient } from "./control-client"
-import type { ControlReset, PendingSnapshot } from "./control-server"
+import type { ControlReset, ControlRole, PendingSnapshot } from "./control-server"
 import { readRunMetadata } from "./metadata"
 import { connectOpencode } from "./opencode"
 import type { AutoAccept, PermissionPromptInfo, ProgressPhase, ProgressUI } from "./progress"
-import { isServerLive, pidAlive, tcpReachable } from "./runs"
+import { isControlLive, isServerLive } from "./runs"
 import { progressPhases } from "./runner"
 import { stepRunnerFor } from "./step-runners"
 import { createTuiProgress } from "./tui"
 import { runsRoot } from "./workspace"
+
+/**
+ * Claims the controller slot for an attach session. A 409 (slot taken) is
+ * mapped to observer by the client. A transient transport failure is retried
+ * once so a momentary coordinator hiccup doesn't permanently demote the
+ * attach (the menu promise is "pressing enter attaches with control").
+ */
+export async function claimAttachRole(client: ControlClient): Promise<ControlRole> {
+  try {
+    return await client.claimController()
+  } catch {
+    try {
+      return await client.claimController()
+    } catch {
+      return "observer"
+    }
+  }
+}
 
 export type AttachOptions = {
   /**
@@ -71,9 +89,7 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
   // A coordinated run is live through its control server even when its
   // OpenCode server is momentarily down: a goal loop releases iteration N's
   // server before N+1 boots, and the coordinator answers throughout.
-  const controlLive = controlFile
-    ? pidAlive(controlFile.pid) && (await tcpReachable(controlFile.url, 250))
-    : false
+  const controlLive = controlFile ? await isControlLive(controlFile) : false
   const controlServer = controlFile && controlLive ? controlFile : undefined
 
   let userDetached = false
@@ -97,7 +113,7 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
   let controlClient: ControlClient | undefined
   if (controlServer) {
     const candidate = createControlClient({ url: controlServer.url, token: controlServer.token })
-    const role = await candidate.claimController().catch(() => "observer" as const)
+    const role = await claimAttachRole(candidate)
     controlClient = candidate
     if (role === "controller") controller = candidate
   }
@@ -215,15 +231,15 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
   // built, so a client that lost the slot has no client and no controls here.
   const pollers: Array<{ stop(): void }> = []
   if (controlServer) {
-  const session: AttachSession = {
-    tui,
-    view: () => view,
-    applyReset,
-    coordinatorGone: markCoordinatorGone,
-    onFinishDismissed: () => {
-      finishDismissed = true
-    },
-  }
+    const session: AttachSession = {
+      tui,
+      view: () => view,
+      applyReset,
+      coordinatorGone: markCoordinatorGone,
+      onFinishDismissed: () => {
+        finishDismissed = true
+      },
+    }
     if (controller) {
       pollers.push(startPendingPoller(controller, session))
       pollers.push(pollStatus(controller, tui, controllerAutoAccept))
@@ -294,19 +310,19 @@ export function startPendingPoller(controller: ControlClient, session: AttachSes
   let misses = 0
   const poll = async () => {
     if (busy) return
-    let snapshot: PendingSnapshot
+    busy = true
     try {
-      snapshot = await controller.pending()
-      misses = 0
-    } catch {
-      // The coordinator stopped answering; the main race handles teardown.
-      if (++misses >= 5) session.coordinatorGone()
-      return
-    }
-    const { tui, view } = session
-    if (snapshot.permission) {
-      busy = true
+      let snapshot: PendingSnapshot
       try {
+        snapshot = await controller.pending()
+        misses = 0
+      } catch {
+        // The coordinator stopped answering; the main race handles teardown.
+        if (++misses >= 5) session.coordinatorGone()
+        return
+      }
+      const { tui, view } = session
+      if (snapshot.permission) {
         const info: PermissionPromptInfo = {
           id: snapshot.permission.requestId,
           permission: snapshot.permission.permission,
@@ -319,12 +335,7 @@ export function startPendingPoller(controller: ControlClient, session: AttachSes
         }
         const reply = (await tui.askPermission?.(info)) ?? "reject"
         await controller.permission(snapshot.permission.requestId, reply).catch(() => {})
-      } finally {
-        busy = false
-      }
-    } else if (snapshot.human) {
-      busy = true
-      try {
+      } else if (snapshot.human) {
         const action =
           (await tui.askHumanReview?.({
             stepName: snapshot.human.stepName,
@@ -333,15 +344,10 @@ export function startPendingPoller(controller: ControlClient, session: AttachSes
             ...(snapshot.human.error ? { error: snapshot.human.error } : {}),
             ...(snapshot.human.canRetry !== undefined ? { canRetry: snapshot.human.canRetry } : {}),
           })) ?? "abort"
-        await controller.human(action).catch(() => {})
-      } finally {
-        busy = false
-      }
-    } else if (snapshot.reset) {
-      session.applyReset(snapshot.reset)
-    } else if (snapshot.finish) {
-      busy = true
-      try {
+        await controller.human(snapshot.human.requestId, action).catch(() => {})
+      } else if (snapshot.reset) {
+        session.applyReset(snapshot.reset)
+      } else if (snapshot.finish) {
         const finish = snapshot.finish
         const latest = await readRunMetadata(view().metaPath)
         if (latest) {
@@ -359,9 +365,9 @@ export function startPendingPoller(controller: ControlClient, session: AttachSes
         })
         await controller.finishDismiss().catch(() => {})
         session.onFinishDismissed()
-      } finally {
-        busy = false
       }
+    } finally {
+      busy = false
     }
   }
   const timer = setInterval(async () => void poll(), pollMs)

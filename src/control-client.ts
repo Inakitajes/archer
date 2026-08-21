@@ -26,11 +26,12 @@ export async function readControlFile(runID: string, root = runsRoot()): Promise
 
 /**
  * The attach-side fetch client for the run control server. Every request
- * carries the Bearer token from `~/.convoy/runs/<id>/control.json` (slice 2+),
- * so the token never travels in metadata or the process argv. Once this client
+ * carries the Bearer token from `~/.convoy/runs/<id>/control.json`, so the
+ * token never travels in metadata or the process argv. Once this client
  * holds the controller slot, every request also echoes its per-claim
  * controller id: that header is the heartbeat that keeps the slot alive and
- * the credential that lets only this client release it with /bye.
+ * the credential that lets only this client mutate the run and release the
+ * slot with /bye. Mutating routes 403 without a live claim.
  */
 
 export type ControlClientOptions = {
@@ -56,7 +57,7 @@ export type ControlClient = {
   /** Empty body cycles the shared AutoAccept; a mode sets it directly. */
   autoAccept(mode?: AutoAcceptMode): Promise<void>
   permission(requestId: string, reply: PermissionReply): Promise<void>
-  human(action: HumanReviewAction): Promise<void>
+  human(requestId: string, action: HumanReviewAction): Promise<void>
 }
 
 export type ControlClientStatus = {
@@ -140,8 +141,8 @@ export function createControlClient(options: ControlClientOptions): ControlClien
     async permission(requestId: string, reply: PermissionReply) {
       ok(await post("/permission", { id: requestId, reply }))
     },
-    async human(action: HumanReviewAction) {
-      ok(await post("/human", { action }))
+    async human(requestId: string, action: HumanReviewAction) {
+      ok(await post("/human", { id: requestId, action }))
     },
   }
 }

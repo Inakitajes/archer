@@ -4,6 +4,7 @@ import { join } from "node:path"
 
 import { afterAll, describe, expect, test } from "bun:test"
 
+import { claimAttachRole } from "../src/attach"
 import { createControlClient } from "../src/control-client"
 import { ControlProgress } from "../src/control-progress"
 import { ControlPendingQueue, startControlServer, type ControlServer } from "../src/control-server"
@@ -58,6 +59,31 @@ describe("attach controller role", () => {
     } finally {
       server.close()
     }
+  })
+
+  test("retries a transient claim failure once before falling back to observer", async () => {
+    let calls = 0
+    const flaky = {
+      claimController: async () => {
+        calls += 1
+        if (calls === 1) throw new Error("coordinator briefly unreachable")
+        return "controller" as const
+      },
+    }
+    expect(await claimAttachRole(flaky as never)).toBe("controller")
+    expect(calls).toBe(2)
+  })
+
+  test("two claim failures fall back to observer", async () => {
+    let calls = 0
+    const dead = {
+      claimController: async () => {
+        calls += 1
+        throw new Error("timeout")
+      },
+    }
+    expect(await claimAttachRole(dead as never)).toBe("observer")
+    expect(calls).toBe(2)
   })
 })
 
