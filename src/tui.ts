@@ -1529,7 +1529,10 @@ export class TuiProgress implements ProgressUI {
   }
 
   setHostControls(controls: ProgressHostControls): void {
-    this.hostControls = controls
+    // Merge so a live attach can add pause/background without dropping a
+    // finish seam that was already wired, and so a goal-loop hold can install
+    // [f] without wiping the rest of the host callbacks.
+    this.hostControls = { ...this.hostControls, ...controls }
   }
 
   /**

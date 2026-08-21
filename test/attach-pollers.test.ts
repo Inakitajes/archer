@@ -114,6 +114,59 @@ describe("controller pending poller", () => {
     }
   })
 
+  test("a stale boot reset in the same snapshot does not hide the finish hold", async () => {
+    // Hosted run() always pushReset()s at boot and never clears it. When the
+    // coordinator later holdFinish()s, GET /pending returns both. The poller
+    // used to take the reset branch, no-op applyReset (same runID), and never
+    // reach finish — dashboard stuck in live/running, coordinator waiting
+    // forever on finish-dismiss.
+    const tui = tuiSpy()
+    const spy = sessionSpy(tui.tui)
+    const reset: ControlReset = {
+      runID: "20260101-000000-ab12",
+      targetDir: "/repo",
+      runDir: view.runDir,
+      pipelineName: "implement",
+      phases: [{ name: "implement", description: "" }],
+      pipeline: { name: "implement", steps: [] },
+    }
+    const { client, calls } = clientSpy([{ reset, finish: { status: "completed" } }])
+    const poller = startPendingPoller(client, spy.session, fast)
+    try {
+      await Bun.sleep(80)
+      expect(tui.outcomes).toEqual([{ status: "completed", runDir: view.runDir }])
+      expect(calls.finishDismiss).toBe(1)
+      expect(spy.finishDismissed).toBe(true)
+    } finally {
+      poller.stop()
+    }
+  })
+
+  test("a new goal-loop reset still applies when no finish is pending", async () => {
+    const tui = tuiSpy()
+    const spy = sessionSpy(tui.tui)
+    const reset: ControlReset = {
+      runID: "20260101-000001-cd34",
+      targetDir: "/repo",
+      runDir: "/runs/20260101-000001-cd34",
+      pipelineName: "goal-fix",
+      phases: [{ name: "goal-fixer", description: "" }],
+      pipeline: { name: "goal-fix", steps: [] },
+    }
+    const { client } = clientSpy([{ reset }])
+    const poller = startPendingPoller(client, spy.session, fast)
+    try {
+      await Bun.sleep(80)
+      // Reset is sticky on the control server, so every poll re-delivers it.
+      // applyReset itself dedupes by runID; the poller must still forward it.
+      expect(spy.resets.length).toBeGreaterThan(0)
+      expect(spy.resets.every((seen) => seen.runID === reset.runID)).toBe(true)
+      expect(tui.outcomes).toHaveLength(0)
+    } finally {
+      poller.stop()
+    }
+  })
+
   test("consecutive failures end the session; a single miss does not", async () => {
     const tui = tuiSpy()
     // One failed poll between successful ones: the poller keeps going.

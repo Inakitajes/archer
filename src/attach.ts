@@ -141,7 +141,10 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
       observer: !controller,
       mode: live ? "live" : "historical",
       ctrlC: options.ctrlC ?? "detach",
-      finish: live ? undefined : createFinishSeam({ cwd: targetDir, runDir: dir }),
+      // [f] is gated on `finished`, so wiring the seam on a live attach is
+      // inert until the finish hold lands. Skipping it here used to leave a
+      // coordinated finish screen without Finalize.
+      finish: createFinishSeam({ cwd: targetDir, runDir: dir }),
     },
   )
   tui.start(runID, targetDir, dir)
@@ -217,6 +220,9 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
       pipeline: reset.pipeline,
       ...(reset.retainMessage ? { retainMessage: reset.retainMessage } : {}),
     })
+    // Point [f] at this iteration's workspace so the squash reads the latest
+    // SUMMARY.md / prd.md after a goal-loop reset.
+    tui.setHostControls?.({ finish: createFinishSeam({ cwd: reset.targetDir, runDir: reset.runDir }) })
     if (reset.goalLoop) tui.setGoalLoop?.(reset.goalLoop)
     void startView({
       runID: reset.runID,
@@ -346,26 +352,32 @@ export function startPendingPoller(controller: ControlClient, session: AttachSes
             ...(snapshot.human.canRetry !== undefined ? { canRetry: snapshot.human.canRetry } : {}),
           })) ?? "abort"
         await controller.human(snapshot.human.requestId, action).catch(() => {})
-      } else if (snapshot.reset) {
-        session.applyReset(snapshot.reset)
-      } else if (snapshot.finish) {
-        const finish = snapshot.finish
-        const latest = await readRunMetadata(view().metaPath)
-        if (latest) {
-          await reconcileAdvisorJournal(latest, view().runDir)
-          replayHistory(tui, latest)
+      } else {
+        // Reset is a sticky one-shot: hosted `run()` publishes it at boot and
+        // never clears it. A later finish hold shares the snapshot with that
+        // leftover reset. Treating them as exclusive left the dashboard in
+        // live/running (clock ticking, Abort instead of Finalize) while the
+        // coordinator waited forever on finish-dismiss.
+        if (snapshot.reset) session.applyReset(snapshot.reset)
+        if (snapshot.finish) {
+          const finish = snapshot.finish
+          const latest = await readRunMetadata(view().metaPath)
+          if (latest) {
+            await reconcileAdvisorJournal(latest, view().runDir)
+            replayHistory(tui, latest)
+          }
+          // The finish hold carries the coordinator's real outcome (status,
+          // error, goal-loop verdict) so the screen matches what an in-process
+          // owner would see.
+          await tui.runFinished?.({
+            status: finish.status,
+            runDir: view().runDir,
+            ...(finish.error ? { error: finish.error } : {}),
+            ...(finish.goalLoop ? { goalLoop: finish.goalLoop } : {}),
+          })
+          await controller.finishDismiss().catch(() => {})
+          session.onFinishDismissed()
         }
-        // The finish hold carries the coordinator's real outcome (status,
-        // error, goal-loop verdict) so the screen matches what an in-process
-        // owner would see.
-        await tui.runFinished?.({
-          status: finish.status,
-          runDir: view().runDir,
-          ...(finish.error ? { error: finish.error } : {}),
-          ...(finish.goalLoop ? { goalLoop: finish.goalLoop } : {}),
-        })
-        await controller.finishDismiss().catch(() => {})
-        session.onFinishDismissed()
       }
     } finally {
       busy = false

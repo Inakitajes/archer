@@ -13,6 +13,7 @@ import { noopProgress } from "../src/progress"
 import { builtInAgents } from "../src/pipeline"
 import { prdHistoryDir, readPrdHistoryIndex, writePrdHistory } from "../src/prd-history"
 import { prepareWorktreeForRun } from "../src/cli"
+import { HerdrReporter } from "../src/herdr"
 
 // The runner's run() spawns a real opencode server. Inject the fake through
 // run()'s deps seam rather than `mock.module("../src/opencode", …)`: that mock
@@ -157,6 +158,41 @@ describe("run() with a hosted progress", () => {
       await result.release?.()
       const after = JSON.parse(await readFile(join(result.dir, "metadata.json"), "utf8"))
       expect(after.server).toBeUndefined()
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps the Herdr agent claimed through the finish hold and only then release-agent", async () => {
+    // Hosted run() used to herdr.stop() in its finally — before the coordinator
+    // holds the finish screen — so Herdr dropped Convoy from the agents list
+    // (back to spaces) without ever publishing idle/completed.
+    const repo = await cleanRepo()
+    const dashboard = fakeDashboard()
+    const commands: string[][] = []
+    const herdr = new HerdrReporter({
+      env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
+      spawn: (command) => {
+        commands.push(command)
+        return { exited: Promise.resolve(0) }
+      },
+      now: () => 1_000,
+    })
+    try {
+      const result = await realRun(makeOptions(repo, { progress: dashboard.progress }), {
+        startOpencode: fakeStartOpencode,
+        createHerdrReporter: () => herdr,
+      })
+
+      const verbs = () => commands.map((command) => command[2])
+      expect(verbs()).toContain("report-agent")
+      expect(verbs()).not.toContain("release-agent")
+      const lastAgent = [...commands].reverse().find((command) => command[2] === "report-agent")
+      expect(lastAgent?.[lastAgent.indexOf("--state") + 1]).toBe("idle")
+
+      await result.release?.()
+      expect(verbs()).toContain("release-agent")
+      expect(verbs().at(-1)).toBe("release-agent")
     } finally {
       await rm(repo, { recursive: true, force: true })
     }

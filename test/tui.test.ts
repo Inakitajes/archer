@@ -565,6 +565,44 @@ describe("footer hints and the command palette", () => {
     }
   })
 
+  test("setHostControls without a finish field keeps the existing [f] seam", async () => {
+    // Live attach wires pause/background after construction and used to replace
+    // the whole hostControls object, dropping the finish seam so a coordinated
+    // finish screen never offered [f].
+    const seam: FinishSeam = {
+      async prepare() {
+        return { ok: false, message: "nothing to squash" }
+      },
+      async apply() {
+        throw new Error("apply should not run")
+      },
+      async edit() {
+        return undefined
+      },
+      async push() {},
+      canOpenPullRequest: () => false,
+      async openPullRequest() {},
+    }
+    const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(120, 40, [{ name: "implement", description: "" }], {
+      finishSeam: seam,
+      onPauseToggle: () => {},
+      onBackground: () => {},
+    })
+    try {
+      dashboard.start("abc1234", process.cwd())
+      void dashboard.runFinished({ status: "completed", runDir: "" })
+      dashboard.setHostControls({
+        onPauseToggle: () => {},
+        onBackground: () => {},
+      })
+      mockInput.pressKey("p", { ctrl: true })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("Squash into one commit")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
   test("the shortcuts view documents every content tab, not just three", async () => {
     const { dashboard, mockInput, captureCharFrame, waitForFrame } = await createDashboard(120, 40)
     try {

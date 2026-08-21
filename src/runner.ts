@@ -439,6 +439,8 @@ export function hostedTeardownFromError(error: unknown): HostedRunTeardown | und
  */
 export type RunDeps = {
   startOpencode: typeof startOpencode
+  /** Hosted-run tests inject a recorder; production constructs a real reporter. */
+  createHerdrReporter?: (input: { runID: string }) => HerdrReporter
 }
 
 const defaultRunDeps: RunDeps = { startOpencode }
@@ -494,6 +496,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
   let caffeinate: Caffeinate | undefined
   let notifier: Notifier | undefined
   let herdr: HerdrReporter | undefined
+  let statusTracker: RunStatusTracker | undefined
   let titleSaved = false
   let releaseLease: (() => Promise<void>) | undefined
   let hookSet = options.plan?.hooks ?? hooksForPipeline(options.hooks, options.pipeline.name)
@@ -562,8 +565,8 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     notifier = new Notifier({ settings: notificationSettings })
     // Outside a Herdr pane this is a silent no-op; inside one it claims the
     // pane as agent "convoy" and publishes the live pipeline state.
-    herdr = new HerdrReporter({ runID: workspace.runID })
-    const statusTracker = new RunStatusTracker({
+    herdr = (deps.createHerdrReporter ?? ((input) => new HerdrReporter(input)))({ runID: workspace.runID })
+    statusTracker = new RunStatusTracker({
       phases,
       identity,
       sinks: {
@@ -844,6 +847,15 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       // finish screen: the loop runs unattended instead of waiting on a keypress.
       ...(options.goalContinues ? { goalContinues: true } : {}),
     }, Boolean(options.progress))
+    // Hosted runs skip the finish hold, so the tracker's runFinished wrapper
+    // never fires here. Publish the terminal snapshot now so Herdr shows
+    // idle/completed while the coordinator holds the finish screen — instead
+    // of vanishing from the agents list via a premature release-agent.
+    statusTracker.finished({
+      status: "completed",
+      runDir: workspace.dir,
+      ...(runScoreResult ? { qualityScore: runScoreResult.score.score } : {}),
+    })
     return {
       runID: workspace.runID,
       dir: workspace.dir,
@@ -885,6 +897,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     if (!isUserAbortError(failure)) {
       await caffeinate?.stop()
       await holdFinishScreen(progress, shutdown, { status: "failed", error: formatSdkError(failure), runDir: workspace.dir }, Boolean(options.progress))
+      statusTracker?.finished({ status: "failed", error: formatSdkError(failure), runDir: workspace.dir })
     }
     throw failure
   } finally {
@@ -916,6 +929,9 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
         // whether the workspace may go. In-process runs settle in the finally
         // below — they have already left their own finish screen.
         await settleRunWorkspace(workspace, options, progress, runErr)
+        // After the finish hold: publish happened at pipeline end, so this
+        // release-agent is the last Herdr command and the pane returns to spaces.
+        await herdr?.stop()
       }
       if (runErr && typeof runErr === "object") {
         hostedTeardowns.set(runErr, { release: deferredRelease, runDir: workspace.dir })
@@ -935,10 +951,9 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
       progress.stop()
     }
-    // The tracker's stop() above publishes the final stopped snapshot (idle /
-    // blocked); release the Herdr lifecycle authority right after so the
-    // release-agent command is the last one for this source.
-    await herdr?.stop()
+    // In-process runs stop the tracker (and publish idle/blocked) above;
+    // hosted runs keep Herdr claimed until release(), after the finish hold.
+    if (!options.progress) await herdr?.stop()
     // After the renderer is gone: restoring the title while it still owns the
     // alternate screen would be overwritten by its teardown.
     if (titleSaved) popTerminalTitle()
