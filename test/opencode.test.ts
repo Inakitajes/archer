@@ -180,6 +180,15 @@ describe("runDirAccessConfig", () => {
     const parsed = JSON.parse(runDirAccessConfig("/tmp/convoy runs/it's"))
     expect(parsed).toBeTruthy()
   })
+
+  // Fail closed, not open: "" and "." normalize to "**" (every external
+  // directory) and "/" — or anything normalizing to it — to "/**" (the whole
+  // filesystem); a degenerate run dir must not silently widen the grant.
+  test("throws instead of widening the grant for a degenerate run dir", () => {
+    for (const degenerate of ["", ".", "relative/run", "/", "/x/..", "~/convoy-run"]) {
+      expect(() => runDirAccessConfig(degenerate)).toThrow(/absolute directory/)
+    }
+  })
 })
 
 describe("sessionShellCommand", () => {
@@ -276,6 +285,15 @@ describe("sessionShellCommand", () => {
   test("quotes env values containing double quotes", () => {
     const cmd = sessionShellCommand("opencode /repo", "/repo", "", { FOO: '{"permission":{}}' })
     expect(cmd).toContain("export FOO='{\"permission\":{}}'")
+  })
+
+  // The key is interpolated unquoted into a shell `export` line; a key with
+  // shell metacharacters would inject into the typed command.
+  test("rejects env keys that are not plain identifiers", () => {
+    expect(() => sessionShellCommand("opencode /repo", "/repo", "", { "FOO; touch /tmp/pwned": "x" })).toThrow(
+      /invalid environment variable name/,
+    )
+    expect(() => sessionShellCommand("opencode /repo", "/repo", "", { "FOO=1": "x" })).toThrow(/invalid environment variable name/)
   })
 
   test("omits env exports when env is undefined", () => {

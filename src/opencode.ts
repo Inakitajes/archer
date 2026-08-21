@@ -3,7 +3,7 @@ import "./polyfills"
 import { stat } from "node:fs/promises"
 import { createServer } from "node:net"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 
 import { createOpencodeClient, createOpencodeServer } from "@opencode-ai/sdk/v2"
 
@@ -171,6 +171,13 @@ export async function openIterateOpencodeWindow(input: {
  */
 export function runDirAccessConfig(runDir: string): string {
   const glob = join(runDir, "**")
+  // Fail closed: an empty or relative run dir normalizes to "**" (allow every
+  // external directory) and "/" — or any path normalizing to it — to "/**"
+  // (the whole filesystem). Both would silently widen this run-scoped grant
+  // into a universal read allow instead of prompting, so refuse them.
+  if (!isAbsolute(glob) || glob === "/**") {
+    throw new Error(`run dir must be an absolute directory, got: ${JSON.stringify(runDir)}`)
+  }
   return JSON.stringify({
     permission: {
       external_directory: { [glob]: "allow" },
@@ -303,7 +310,10 @@ async function openInHerdr(command: string, cwd?: string, label?: string, env?: 
     ...(cwd ? ["--cwd", cwd] : []),
     ...(path ? ["--env", `PATH=${path}`] : []),
     "--env", "ZDOTDIR=/var/empty",
-    ...(env ? Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]) : []),
+    ...(env ? Object.entries(env).flatMap(([key, value]) => {
+      assertEnvKey(key)
+      return ["--env", `${key}=${value}`]
+    }) : []),
     "--focus",
   ]
   const stdout = await spawnCapture(splitArgs)
@@ -383,7 +393,10 @@ async function openInZellij(command: string, cwd?: string, label?: string) {
 export function sessionShellCommand(coreCommand: string, cwd?: string, path = process.env.PATH, env?: Record<string, string>): string {
   return [
     path ? `export PATH=${shellQuote(path)}:$PATH` : "",
-    ...(env ? Object.entries(env).map(([key, value]) => `export ${key}=${shellQuote(value)}`) : []),
+    ...(env ? Object.entries(env).map(([key, value]) => {
+      assertEnvKey(key)
+      return `export ${key}=${shellQuote(value)}`
+    }) : []),
     cwd ? `cd ${shellQuote(cwd)}` : "",
     coreCommand,
   ]
@@ -456,6 +469,17 @@ async function freePort() {
 
 export function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * Env keys ride shell `export` lines and herdr `--env` pairs, both of which
+ * are re-parsed downstream — a key carrying shell metacharacters would inject
+ * into the typed command. Only plain identifiers may pass through.
+ */
+function assertEnvKey(key: string) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+    throw new Error(`invalid environment variable name: ${JSON.stringify(key)}`)
+  }
 }
 
 function appleScriptString(value: string) {
