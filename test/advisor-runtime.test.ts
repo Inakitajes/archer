@@ -81,6 +81,20 @@ describe("advisor phase registration", () => {
     handle.end()
     expect(advisors.handleFor("ses_1")).toBeUndefined()
   })
+
+  test("an advisor handle remains available until end() is called", async () => {
+    const { runtime: advisors, calls } = runtime()
+    advisors.begin("ses_1", step())
+
+    // The on-demand advisor tool must keep resolving the phase's session while
+    // the human gate is open, not just while the attempt prompt is running.
+    expect(advisors.handleFor("ses_1")).toBeDefined()
+    expect((await advisors.handleFor("ses_1")!.consult("on-demand")).ok).toBe(true)
+    expect(calls).toHaveLength(1)
+
+    advisors.handleFor("ses_1")!.end()
+    expect(advisors.handleFor("ses_1")).toBeUndefined()
+  })
 })
 
 describe("advisor budget", () => {

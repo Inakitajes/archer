@@ -1349,41 +1349,158 @@ export async function runPhaseUntilResolved(
   // Read fresh at each decision point: the user can arm/disarm [i] mid-attempt.
   const armed = () => Boolean(takeover && progress.isInteractiveTakeover?.(phase.name))
 
-  for (let attempt = 1; ; attempt++) {
-    shutdown.throwIfRequested()
-    const loopGuard = budgetGuard ?? new LoopGuard(prepared.loopGuard)
-    budgetGuard = undefined
-    progress.phaseAttempt(phase.name, { attempt, model: formatModel(prepared.model) })
-    log.info(`[${phase.name}] attempt ${attempt} with ${formatModel(prepared.model)}`)
-    try {
-      const text = await deps.runPhaseAttempt(
-        client,
-        workspace,
-        phase,
-        targetDir,
-        prepared,
-        attempt,
-        progress,
-        shutdown,
-        sessionRef,
-        advisors,
-        reports,
-        deliverableContract,
-        weights,
-        loopGuard,
-      )
-      const candidate = await resolveDeliverableCandidate(workspace, phase, text, reports?.candidateFor(sessionRef.id ?? ""))
-      const validation = validateDeliverable(deliverableContract, candidate, weights)
-      if (!validation.valid) {
-        await persistInvalidPhaseReport(workspace, phase, attempt, candidate)
-        // An armed takeover owns the step even when its deliverable fails
-        // validation: hand it to the user instead of auto-retrying or failing
-        // terminally behind their back.
+  try {
+    for (let attempt = 1; ; attempt++) {
+      shutdown.throwIfRequested()
+      const loopGuard = budgetGuard ?? new LoopGuard(prepared.loopGuard)
+      budgetGuard = undefined
+      progress.phaseAttempt(phase.name, { attempt, model: formatModel(prepared.model) })
+      log.info(`[${phase.name}] attempt ${attempt} with ${formatModel(prepared.model)}`)
+      try {
+        const text = await deps.runPhaseAttempt(
+          client,
+          workspace,
+          phase,
+          targetDir,
+          prepared,
+          attempt,
+          progress,
+          shutdown,
+          sessionRef,
+          advisors,
+          reports,
+          deliverableContract,
+          weights,
+          loopGuard,
+        )
+        let candidate = await resolveDeliverableCandidate(workspace, phase, text, reports?.candidateFor(sessionRef.id ?? ""))
+        const validation = validateDeliverable(deliverableContract, candidate, weights)
+        if (!validation.valid) {
+          await persistInvalidPhaseReport(workspace, phase, attempt, candidate)
+          // An armed takeover owns the step even when its deliverable fails
+          // validation: hand it to the user instead of auto-retrying or failing
+          // terminally behind their back. Continue re-resolves the report — a
+          // write_report made in the reopened session ends the phase; without a
+          // valid report the gate re-opens instead of advancing.
+          if (armed()) {
+            for (;;) {
+              const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
+                kind: "interactive",
+                canRetry: false,
+                error: validation.error,
+                signal: shutdown.signal,
+                onAbort: () => {
+                  if (!shutdown.aborted) shutdown.request("phase gate abort")
+                },
+                runner: phase.runner,
+                runDir: workspace.dir,
+              })
+              // "unavailable": nobody can take over, so the automatic policy below applies.
+              if (outcome !== "continue") break
+              const rescued = await resolveDeliverableCandidate(workspace, phase, "", reports?.candidateFor(sessionRef.id ?? ""))
+              const rescuedValidation = validateDeliverable(deliverableContract, rescued, weights)
+              if (rescuedValidation.valid) return rescued
+            }
+          }
+          const totalAttempts = deliverableContract.kind === "quality-score-report" ? deliverableContract.retryOnMissingOrInvalid + 1 : undefined
+          const attemptContext = totalAttempts === undefined ? `attempt ${attempt}` : `attempt ${attempt} of ${totalAttempts}`
+          const canRetryAutomatically =
+            deliverableContract.kind === "quality-score-report" && automaticDeliverableRetries < deliverableContract.retryOnMissingOrInvalid
+          if (canRetryAutomatically) {
+            automaticDeliverableRetries++
+            log.warn(
+              `[${phase.name}] deliverable validation failed (${attemptContext}): ${validation.error}; retrying automatically`,
+            )
+            await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, new DeliverableValidationError(validation.error)))
+            await removePhaseReport(workspace, phase)
+            // The retry starts a fresh session: release the old session's handles so a
+            // late write_report from its window cannot reach the new attempt.
+            releasePhaseSession(sessionRef, reports, advisors)
+            continue
+          }
+          log.error(`[${phase.name}] deliverable validation failed (${attemptContext}): ${validation.error}`)
+          // Only the scored contract is terminal by policy: accepting a missing
+          // score through the human failure gate would complete a scored run with
+          // no machine-readable result. A markdown-report failure is an ordinary
+          // attempt failure — the human gate ([r]/[o]/[a]) decides.
+          if (deliverableContract.kind === "quality-score-report") throw new DeliverableValidationError(validation.error)
+          throw new Error(validation.error)
+        }
         if (armed()) {
+          // Armed means "this step is mine": even a clean finish waits for the
+          // user's decision before the step commits and the pipeline moves on.
+          // Continue re-resolves the deliverable so a write_report made while the
+          // gate was open wins over the candidate computed before the gate.
+          log.info(`[${phase.name}] attempt succeeded with interactive mode armed; waiting for manual action`)
+          for (;;) {
+            const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
+              kind: "interactive",
+              canRetry: false,
+              signal: shutdown.signal,
+              onAbort: () => {
+                if (!shutdown.aborted) shutdown.request("phase gate abort")
+              },
+              runner: phase.runner,
+              runDir: workspace.dir,
+            })
+            // A gate that cannot be asked (no TUI, no controller) must not spin
+            // on re-resolution: keep the already-validated candidate, exactly
+            // like the pre-gate behavior. Only a real continue re-resolves.
+            if (outcome !== "continue") break
+            candidate = await resolveDeliverableCandidate(workspace, phase, text, reports?.candidateFor(sessionRef.id ?? ""))
+            if (validateDeliverable(deliverableContract, candidate, weights).valid) break
+          }
+        }
+        return candidate
+      } catch (error) {
+        if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
+        if (error instanceof LoopGuardError && error.trip.reason === "max-steps") {
+          // The budget gate replaces the failure gate for this trip, so journal
+          // the attempt here — the generic path below is never reached for it.
+          if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
           const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
-            kind: "interactive",
+            kind: "budget-gate",
+            error: formatSdkError(error),
             canRetry: false,
-            error: validation.error,
+            signal: shutdown.signal,
+            onAbort: () => {
+              if (!shutdown.aborted) shutdown.request("budget gate abort")
+            },
+            runner: phase.runner,
+            runDir: workspace.dir,
+          })
+          // A noninteractive budget gate cannot choose reset, so preserve the
+          // original hard-limit failure instead of allowing a silent continuation.
+          // Any unexpected outcome fails too: falling through to the failure gate
+          // below would re-offer [o]+[c], continuing a budget-exhausted phase
+          // without the reset the budget contract requires.
+          if (outcome !== "reset") throw error
+          loopGuard.resetSteps()
+          budgetGuard = loopGuard
+          // The reset starts a new prompt with a new session: end the pre-reset
+          // attempt's handles so its write_report window cannot leak into the reset.
+          releasePhaseSession(sessionRef, reports, advisors)
+          continue
+        }
+        // A scored-contract failure is terminal after its bounded automatic retry:
+        // accepting a missing score through the human failure gate would turn a
+        // missing score into a successful scored run with no machine-readable
+        // result. Other contract failures (empty markdown) are ordinary attempt
+        // failures and reach the gate like any other failed attempt.
+        if (error instanceof DeliverableValidationError && deliverableContract.kind === "quality-score-report") throw error
+        if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
+        progress.phaseRunning(phase.name, "step failed — waiting for your decision")
+        log.warn(`[${phase.name}] attempt ${attempt} failed: ${formatSdkError(error)}`)
+        // The failure/interactive gate decides the failed attempt. A continue
+        // re-resolves the deliverable from the recovered session's write_report:
+        // with a valid report the step advances with it, and without one the gate
+        // re-opens with the validation error instead of skipping the deliverable.
+        let gateError = formatSdkError(error)
+        for (;;) {
+          const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
+            kind: armed() ? "interactive" : "failure",
+            error: gateError,
+            canRetry: Boolean(baseline),
             signal: shutdown.signal,
             onAbort: () => {
               if (!shutdown.aborted) shutdown.request("phase gate abort")
@@ -1391,111 +1508,54 @@ export async function runPhaseUntilResolved(
             runner: phase.runner,
             runDir: workspace.dir,
           })
-          // "continue": the user owns the tree and accepts it as-is, so nothing
-          // is committed from this attempt. "unavailable": nobody can take over,
-          // so the automatic policy below applies.
-          if (outcome === "continue") return ""
+          if (outcome === "continue") {
+            // The failed attempt's chat text is gone; the rescued deliverable can
+            // only come from the report runtime or the phase file.
+            const rescued = await resolveDeliverableCandidate(workspace, phase, "", reports?.candidateFor(sessionRef.id ?? ""))
+            const rescuedValidation = validateDeliverable(deliverableContract, rescued, weights)
+            if (rescuedValidation.valid) return rescued
+            gateError = rescuedValidation.error
+            continue
+          }
+          if (outcome === "unavailable") throw error
+          if (outcome === "retry") {
+            await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, error))
+            // An agent can write its report before the attempt fails. A clean retry
+            // must not later commit or feed that stale report to following phases.
+            await removePhaseReport(workspace, phase)
+            // Retrying starts a fresh session; the stale handle must release so a
+            // late write_report from the old window cannot reach the next attempt.
+            releasePhaseSession(sessionRef, reports, advisors)
+            break
+          }
         }
-        const totalAttempts = deliverableContract.kind === "quality-score-report" ? deliverableContract.retryOnMissingOrInvalid + 1 : undefined
-        const attemptContext = totalAttempts === undefined ? `attempt ${attempt}` : `attempt ${attempt} of ${totalAttempts}`
-        const canRetryAutomatically =
-          deliverableContract.kind === "quality-score-report" && automaticDeliverableRetries < deliverableContract.retryOnMissingOrInvalid
-        if (canRetryAutomatically) {
-          automaticDeliverableRetries++
-          log.warn(
-            `[${phase.name}] deliverable validation failed (${attemptContext}): ${validation.error}; retrying automatically`,
-          )
-          await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, new DeliverableValidationError(validation.error)))
-          await removePhaseReport(workspace, phase)
-          continue
-        }
-        log.error(`[${phase.name}] deliverable validation failed (${attemptContext}): ${validation.error}`)
-        // Only the scored contract is terminal by policy: accepting a missing
-        // score through the human failure gate would complete a scored run with
-        // no machine-readable result. A markdown-report failure is an ordinary
-        // attempt failure — the human gate ([r]/[o]/[a]) decides.
-        if (deliverableContract.kind === "quality-score-report") throw new DeliverableValidationError(validation.error)
-        throw new Error(validation.error)
       }
-      if (armed()) {
-        // Armed means "this step is mine": even a clean finish waits for the
-        // user's decision before the step commits and the pipeline moves on.
-        log.info(`[${phase.name}] attempt succeeded with interactive mode armed; waiting for manual action`)
-        await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
-          kind: "interactive",
-          canRetry: false,
-          signal: shutdown.signal,
-          onAbort: () => {
-            if (!shutdown.aborted) shutdown.request("phase gate abort")
-          },
-          runner: phase.runner,
-          runDir: workspace.dir,
-        })
-      }
-      return candidate
-    } catch (error) {
-      if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
-      if (error instanceof LoopGuardError && error.trip.reason === "max-steps") {
-        // The budget gate replaces the failure gate for this trip, so journal
-        // the attempt here — the generic path below is never reached for it.
-        if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
-        const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
-          kind: "budget-gate",
-          error: formatSdkError(error),
-          canRetry: false,
-          signal: shutdown.signal,
-          onAbort: () => {
-            if (!shutdown.aborted) shutdown.request("budget gate abort")
-          },
-          runner: phase.runner,
-          runDir: workspace.dir,
-        })
-        // A noninteractive budget gate cannot choose reset, so preserve the
-        // original hard-limit failure instead of allowing a silent continuation.
-        // Any unexpected outcome fails too: falling through to the failure gate
-        // below would re-offer [o]+[c], continuing a budget-exhausted phase
-        // without the reset the budget contract requires.
-        if (outcome !== "reset") throw error
-        loopGuard.resetSteps()
-        budgetGuard = loopGuard
-        continue
-      }
-      // A scored-contract failure is terminal after its bounded automatic retry:
-      // accepting a missing score through the human failure gate would turn a
-      // missing score into a successful scored run with no machine-readable
-      // result. Other contract failures (empty markdown) are ordinary attempt
-      // failures and reach the gate like any other failed attempt.
-      if (error instanceof DeliverableValidationError && deliverableContract.kind === "quality-score-report") throw error
-      if (!(error instanceof LoggedAttemptError)) await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
-      progress.phaseRunning(phase.name, "step failed — waiting for your decision")
-      log.warn(`[${phase.name}] attempt ${attempt} failed: ${formatSdkError(error)}`)
-      const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
-        kind: armed() ? "interactive" : "failure",
-        error: formatSdkError(error),
-        canRetry: Boolean(baseline),
-        signal: shutdown.signal,
-        onAbort: () => {
-          if (!shutdown.aborted) shutdown.request("phase gate abort")
-        },
-        runner: phase.runner,
-        runDir: workspace.dir,
-      })
-      if (outcome === "unavailable") throw error
-      if (outcome === "retry") {
-        await gitLock(() => deps.restorePhaseBaseline(phase, baseline, targetDir, error))
-        // An agent can write its report before the attempt fails. A clean retry
-        // must not later commit or feed that stale report to following phases.
-        await removePhaseReport(workspace, phase)
-        continue
-      }
-      // "continue": the tree is accepted as-is and the step commits.
-      return ""
     }
+  } finally {
+    // The report/advisor handles must not outlive the phase's decision. Every
+    // exit — a delivered candidate, a terminal failure, an abort, or a
+    // budget/reset continue — releases the attempt's session so a late
+    // write_report from a resolved window cannot touch a later phase.
+    releasePhaseSession(sessionRef, reports, advisors)
   }
 }
 
 /** Last session created for the phase's attempts, so the interactive gate can reopen its window. */
 type SessionRef = { id?: string }
+
+/**
+ * Ends the report/advisor handles of the phase's last live session. Idempotent:
+ * a handle that was already ended, or a session that never began one, is a
+ * no-op. The map entry has to outlive an idle/failed prompt — the human gate
+ * reopens the same session with [o] and writes through write_report — so it is
+ * released at the phase's decision point, never while the gate is open.
+ */
+function releasePhaseSession(sessionRef: SessionRef, reports?: ReportRuntime, advisors?: AdvisorRuntime): void {
+  const sessionID = sessionRef.id
+  if (!sessionID) return
+  reports?.handleFor(sessionID)?.end()
+  advisors?.handleFor(sessionID)?.end()
+}
 
 type PhaseGateDeps = {
   openWindow: typeof openOpencodeSessionWindow
@@ -2091,9 +2151,16 @@ export async function promptPhase(
     }
     throw error
   } finally {
-    report?.end()
-    advisor?.end()
-    if (input.shutdown.aborted) await input.shutdown.abortActiveSessions(input.progress)
+    // The report/advisor handles must outlive the idle/failed prompt: the human
+    // gate reopens the SAME session with [o] and writes through write_report, so
+    // ending them here would answer 404/400 during the gate. Only a run-wide
+    // abort tears the attempt down immediately; normal cleanup happens when
+    // runPhaseUntilResolved resolves the gate (continue/retry/success).
+    if (input.shutdown.aborted) {
+      report?.end()
+      advisor?.end()
+      await input.shutdown.abortActiveSessions(input.progress)
+    }
     input.shutdown.clearActiveSession(input.phase.name, session.data.id)
     await watcher.stop()
   }

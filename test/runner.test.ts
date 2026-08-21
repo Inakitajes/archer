@@ -48,7 +48,8 @@ import {
 import type { AgentStep, DeliverableContract, HumanStep, Pipeline, Step } from "../src/types"
 import type { Workspace } from "../src/workspace"
 import { LoopGuard, LoopGuardError, resolveLoopGuard } from "../src/loop-guard"
-import { createReportRuntime } from "../src/report-runtime"
+import { createReportRuntime, type ReportPhaseHandle } from "../src/report-runtime"
+import { startReportBridge } from "../src/report-bridge"
 import { qualityDimensionWeights } from "../src/quality-score"
 
 const recoveryDirs: string[] = []
@@ -514,6 +515,8 @@ describe("run phase gate", () => {
     const prompts: HumanReviewPromptInfo[] = []
     let restores = 0
     const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
     const progress: ProgressUI = {
       ...noopProgress,
       isInteractiveTakeover: () => true,
@@ -526,7 +529,7 @@ describe("run phase gate", () => {
     const result = await runPhaseUntilResolved(
       {} as never,
       workspace,
-      agentStep("implementer"),
+      phase,
       "/repo",
       prepared,
       { head: "baseline" },
@@ -535,19 +538,28 @@ describe("run phase gate", () => {
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
-        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
           attempts.push(attempt)
+          sessionRef!.id = "ses_esc"
+          // The report written before the Esc cancellation stays owned by the
+          // session while the interactive gate is open, so [c] delivers it.
+          const handle = reports.begin("ses_esc", phase, phase.deliverableContract, qualityDimensionWeights)
+          await handle.write({ markdown: "# Esc report" })
           throw new SessionAbortedError({ name: "MessageAbortedError", data: { message: "stopped from OpenCode" } })
         },
         restorePhaseBaseline: async () => {
           restores++
         },
       },
+      undefined,
+      reports,
     )
 
-    expect(result).toBe("")
+    expect(result).toContain("Esc report")
     expect(attempts).toEqual([1])
     expect(restores).toBe(0)
+    // After [c] the interactive gate is resolved and the phase's report becomes
+    // the deliverable — no silent "" skip past the step's report.
     expect(prompts).toEqual([{ stepName: "implementer", iterations: 0, kind: "interactive", error: expect.any(String), canRetry: false }])
   })
 
@@ -556,6 +568,8 @@ describe("run phase gate", () => {
     const prompts: HumanReviewPromptInfo[] = []
     let restores = 0
     const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
     const progress: ProgressUI = {
       ...noopProgress,
       askHumanReview: (info) => {
@@ -567,7 +581,7 @@ describe("run phase gate", () => {
     const result = await runPhaseUntilResolved(
       {} as never,
       workspace,
-      agentStep("implementer"),
+      phase,
       "/repo",
       prepared,
       { head: "baseline" },
@@ -576,17 +590,24 @@ describe("run phase gate", () => {
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
-        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
           attempts.push(attempt)
+          sessionRef!.id = "ses_failed"
+          const handle = reports.begin("ses_failed", phase, phase.deliverableContract, qualityDimensionWeights)
+          await handle.write({ markdown: "# Survived the failure" })
           throw new Error("provider temporarily unavailable")
         },
         restorePhaseBaseline: async () => {
           restores++
         },
       },
+      undefined,
+      reports,
     )
 
-    expect(result).toBe("")
+    // Continue resolves the gate and re-delivers the report the attempt already
+    // persisted before dying — the step still produces its deliverable.
+    expect(result).toContain("Survived the failure")
     expect(attempts).toEqual([1])
     expect(restores).toBe(0)
     expect(prompts[0]?.kind).toBe("failure")
@@ -598,6 +619,8 @@ describe("run phase gate", () => {
     const prompts: HumanReviewPromptInfo[] = []
     let restores = 0
     const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
     const progress: ProgressUI = {
       ...noopProgress,
       askHumanReview: (info) => {
@@ -612,7 +635,7 @@ describe("run phase gate", () => {
     const result = await runPhaseUntilResolved(
       {} as never,
       workspace,
-      agentStep("implementer"),
+      phase,
       "/repo",
       prepared,
       { head: "baseline" },
@@ -621,8 +644,11 @@ describe("run phase gate", () => {
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
-        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
           attempts.push(attempt)
+          sessionRef!.id = "ses_guard"
+          const handle = reports.begin("ses_guard", phase, phase.deliverableContract, qualityDimensionWeights)
+          await handle.write({ markdown: "# Guard report" })
           throw new LoopGuardError({
             reason: "identical-calls",
             message: "read called 4 times in a row. The phase was aborted to stop a runaway session.",
@@ -634,9 +660,11 @@ describe("run phase gate", () => {
           restores++
         },
       },
+      undefined,
+      reports,
     )
 
-    expect(result).toBe("")
+    expect(result).toContain("Guard report")
     expect(attempts).toEqual([1])
     expect(restores).toBe(0)
     expect(prompts).toHaveLength(1)
@@ -1021,36 +1049,39 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       ...noopProgress,
       askHumanReview: (info) => {
         prompts.push(info)
-        return Promise.resolve("continue")
+        return Promise.resolve("abort")
       },
     }
     const phase = { ...agentStep("scope"), readOnly: true, deliverableContract: { kind: "markdown-report" } as const }
 
-    const result = await runPhaseUntilResolved(
-      {} as never,
-      workspace,
-      phase,
-      "/repo",
-      prepared,
-      { head: "baseline" },
-      progress,
-      new RunShutdown(),
-      createGitLock(),
-      { serverUrl: "http://127.0.0.1:1" },
-      {
-        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
-          attempts.push(attempt)
-          return ""
+    await expect(
+      runPhaseUntilResolved(
+        {} as never,
+        workspace,
+        phase,
+        "/repo",
+        prepared,
+        { head: "baseline" },
+        progress,
+        new RunShutdown(),
+        createGitLock(),
+        { serverUrl: "http://127.0.0.1:1" },
+        {
+          runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+            attempts.push(attempt)
+            return ""
+          },
+          restorePhaseBaseline: async () => {
+            restores++
+          },
         },
-        restorePhaseBaseline: async () => {
-          restores++
-        },
-      },
-    )
+      ),
+    ).rejects.toThrow(UserAbortError)
 
     // SC-1: an empty read-only report is an ordinary attempt failure — the human
     // gate decides ([r]/[o]/[a]) instead of a terminal throw with no recourse.
-    expect(result).toBe("")
+    // A continue without a report reopens the gate (covered below), so the test
+    // aborts to prove the phase never advances past the gate silently.
     expect(attempts).toEqual([1])
     expect(restores).toBe(0)
     expect(prompts).toHaveLength(1)
@@ -1068,40 +1099,45 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       isInteractiveTakeover: () => true,
       askHumanReview: (info) => {
         prompts.push(info)
-        return Promise.resolve("continue")
+        // A continue with no valid deliverable reopens the gate instead of
+        // advancing; aborting here proves the step stayed where it was.
+        return Promise.resolve(prompts.length === 1 ? "continue" : "abort")
       },
     }
 
-    const result = await runPhaseUntilResolved(
-      {} as never,
-      workspace,
-      qualityScorePhase(),
-      "/repo",
-      prepared,
-      { head: "baseline" },
-      progress,
-      new RunShutdown(),
-      createGitLock(),
-      { serverUrl: "http://127.0.0.1:1" },
-      {
-        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
-          attempts.push(attempt)
-          return "# no score block"
+    await expect(
+      runPhaseUntilResolved(
+        {} as never,
+        workspace,
+        qualityScorePhase(),
+        "/repo",
+        prepared,
+        { head: "baseline" },
+        progress,
+        new RunShutdown(),
+        createGitLock(),
+        { serverUrl: "http://127.0.0.1:1" },
+        {
+          runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+            attempts.push(attempt)
+            return "# no score block"
+          },
+          restorePhaseBaseline: async () => {
+            restores++
+          },
         },
-        restorePhaseBaseline: async () => {
-          restores++
-        },
-      },
-    )
+      ),
+    ).rejects.toThrow(UserAbortError)
 
     // SC-2: armed means the step is the user's — an invalid deliverable is shown
     // to them interactively, not auto-retried or terminally thrown behind their back.
-    expect(result).toBe("")
     expect(attempts).toEqual([1])
     expect(restores).toBe(0)
-    expect(prompts).toHaveLength(1)
+    expect(prompts).toHaveLength(2)
     expect(prompts[0]?.kind).toBe("interactive")
     expect(prompts[0]?.canRetry).toBe(false)
+    // The reopened gate surfaces the deliverable validation error.
+    expect(prompts[1]?.error).toContain("invalid quality-score report")
   })
 
   test("abort throws UserAbortError and requests a run-wide shutdown", async () => {
@@ -1197,6 +1233,301 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
     ).rejects.toThrow(UserAbortError)
     expect(prompts[0]?.kind).toBe("failure")
     expect(prompts[0]?.canRetry).toBe(false)
+  })
+
+  test("continue after a rescued write_report delivers the report to the step", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
+    // The gate parks on a promise only the test resolves, standing in for the
+    // [o] window being opened in another terminal / a late controller connect.
+    let resumeGate!: (action: "continue") => void
+    const parked = new Promise<"continue">((resolve) => {
+      resumeGate = resolve
+    })
+    let writeHandle: ReportPhaseHandle | undefined
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return parked
+      },
+    }
+
+    let result = ""
+    const run = runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
+          attempts.push(attempt)
+          sessionRef!.id = "ses_failed"
+          writeHandle = reports.begin("ses_failed", phase, phase.deliverableContract, qualityDimensionWeights)
+          // No end(): the recovered window keeps this handle alive through the gate.
+          throw new Error("provider temporarily unavailable")
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+      undefined,
+      reports,
+    ).then((value) => {
+      result = value
+    })
+
+    // While the gate is open and the coordinator detached, the report bridge has
+    // to keep accepting write_report for the same session: that is exactly the
+    // lost/regained controller window, not a 404-answerable stale session.
+    while (prompts.length === 0) await Bun.sleep(5)
+    expect(reports.handleFor("ses_failed")).toBeDefined()
+    await writeHandle!.write({ markdown: "# Rescued in the reopened session" })
+    resumeGate("continue")
+
+    await run
+    expect(result).toContain("Rescued in the reopened session")
+    expect(attempts).toEqual([1])
+    expect(restores).toBe(0)
+    // The gate decided continue, and the rescued report is now the deliverable — the
+    // step advances instead of skipping the report.
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("failure")
+  })
+
+  test("an armed clean finish delivers the report written during the gate over the pre-gate candidate", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
+    // The armed gate parks on a promise only the test resolves: the user is in
+    // the [o] window of a step that already finished cleanly.
+    let resumeGate!: (action: "continue") => void
+    const parked = new Promise<"continue">((resolve) => {
+      resumeGate = resolve
+    })
+    let writeHandle: ReportPhaseHandle | undefined
+    const progress: ProgressUI = {
+      ...noopProgress,
+      isInteractiveTakeover: () => true,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return parked
+      },
+    }
+
+    let result = ""
+    const run = runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
+          attempts.push(attempt)
+          sessionRef!.id = "ses_armed"
+          writeHandle = reports.begin("ses_armed", phase, phase.deliverableContract, qualityDimensionWeights)
+          // A clean finish: the pre-gate candidate is the assistant text.
+          return "# Pre-gate report"
+        },
+        restorePhaseBaseline: async () => {},
+      },
+      undefined,
+      reports,
+    ).then((value) => {
+      result = value
+    })
+
+    // The armed gate is open and the session is still registered. A write_report
+    // from the reopened window must win over the candidate computed before the
+    // gate — continue re-resolves instead of delivering the stale text.
+    while (prompts.length === 0) await Bun.sleep(5)
+    expect(reports.handleFor("ses_armed")).toBeDefined()
+    await writeHandle!.write({ markdown: "# Rescued during the armed gate" })
+    resumeGate("continue")
+
+    await run
+    expect(result).toContain("Rescued during the armed gate")
+    expect(attempts).toEqual([1])
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("interactive")
+  })
+
+  test("a write_report posted over the bridge while the gate is held with no controller still delivers on continue", async () => {
+    const prompts: HumanReviewPromptInfo[] = []
+    const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
+    // Hold harness shaped like ControlProgress (#84): askHumanReview parks on a
+    // promise only a late controller can resolve. No TTY, no attached client.
+    let resumeGate!: (action: "continue") => void
+    const parked = new Promise<"continue">((resolve) => {
+      resumeGate = resolve
+    })
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return parked
+      },
+    }
+
+    let result = ""
+    const run = runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
+          sessionRef!.id = "ses_hold"
+          reports.begin("ses_hold", phase, phase.deliverableContract, qualityDimensionWeights)
+          throw new Error("provider temporarily unavailable")
+        },
+        restorePhaseBaseline: async () => {},
+      },
+      undefined,
+      reports,
+    ).then((value) => {
+      result = value
+    })
+
+    // The gate is open and nobody has answered yet. The user re-attaches via
+    // `convoy runs`, presses [o], and the reopened session's write_report posts
+    // to the report bridge — the same HTTP path production uses. The deferred
+    // end() keeps the session owned, so the bridge answers 200 instead of the
+    // 404 "unknown report session" that used to detach the rescued window.
+    while (prompts.length === 0) await Bun.sleep(5)
+    const bridge = await startReportBridge({ reports: () => reports })
+    try {
+      const response = await fetch(bridge.url, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${bridge.token}` },
+        body: JSON.stringify({ sessionID: "ses_hold", payload: { markdown: "# Rescued over the bridge" } }),
+      })
+      expect(response.status).toBe(200)
+      expect(await readFile(join(workspace.dir, phase.reportPath), "utf8")).toBe("# Rescued over the bridge")
+    } finally {
+      bridge.close()
+    }
+
+    // The controller finally connects and answers [c]: the bridged report is
+    // re-resolved and becomes the step's deliverable.
+    resumeGate("continue")
+    await run
+    expect(result).toContain("Rescued over the bridge")
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("failure")
+  })
+
+  test("continue with no valid report reopens the gate instead of advancing", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    const workspace = await retryWorkspace()
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        // First [c] finds no report; the gate reopens. The second answer shows
+        // the run did not silently advance — aborting surfaces the reopened gate.
+        return Promise.resolve(prompts.length === 1 ? "continue" : "abort")
+      },
+    }
+
+    await expect(
+      runPhaseUntilResolved(
+        {} as never,
+        workspace,
+        agentStep("implementer"),
+        "/repo",
+        prepared,
+        { head: "baseline" },
+        progress,
+        new RunShutdown(),
+        createGitLock(),
+        { serverUrl: "http://127.0.0.1:1" },
+        {
+          runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt) => {
+            attempts.push(attempt)
+            throw new Error("provider temporarily unavailable")
+          },
+          restorePhaseBaseline: async () => {},
+        },
+      ),
+    ).rejects.toThrow(UserAbortError)
+
+    expect(attempts).toEqual([1])
+    // The gate asked twice: first the failure gate, then the same gate re-opened
+    // with the validation error because continue had no report to deliver.
+    expect(prompts).toHaveLength(2)
+    expect(prompts[0]?.kind).toBe("failure")
+    expect(prompts[1]?.error).toContain("phase produced an empty report")
+  })
+
+  test("retry ends the previous session's report handle before the next attempt", async () => {
+    let restores = 0
+    const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: () => Promise.resolve("retry"),
+    }
+
+    const result = await runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
+          sessionRef!.id = attempt === 1 ? "ses_old" : "ses_new"
+          reports.begin(sessionRef!.id, phase, phase.deliverableContract, qualityDimensionWeights)
+          if (attempt === 1) throw new Error("network blip")
+          return "# report"
+        },
+        restorePhaseBaseline: async () => {
+          restores++
+        },
+      },
+      undefined,
+      reports,
+    )
+
+    expect(result).toBe("# report")
+    expect(restores).toBe(1)
+    // Retrying starts a fresh session; the stale handle must release so a late
+    // write_report from the old window cannot reach the next attempt.
+    expect(reports.handleFor("ses_old")).toBeUndefined()
   })
 })
 
@@ -2711,35 +3042,41 @@ describe("applyReportCheckpoint", () => {
       ...noopProgress,
       askHumanReview: (info) => {
         gates.push(info)
-        return Promise.resolve("continue")
+        // First [c] has no report to deliver; the gate reopens. Aborting after
+        // that proves the step did not silently advance past an empty deliverable.
+        return Promise.resolve(gates.length === 1 ? "continue" : "abort")
       },
     }
 
-    const result = await runPhaseUntilResolved(
-      reminders.client,
-      workspace,
-      phase,
-      "/repo",
-      reportPrepared,
-      { head: "baseline" },
-      progress,
-      new RunShutdown(),
-      createGitLock(),
-      { serverUrl: "http://127.0.0.1:1" },
-      {
-        runPhaseAttempt: async () => {
-          const checkpoint = await applyReportCheckpoint(reminders.client, inputFor(workspace, phase), first, emptyReport as never)
-          return extractAssistantText(checkpoint.lastAssistantParts)
+    await expect(
+      runPhaseUntilResolved(
+        reminders.client,
+        workspace,
+        phase,
+        "/repo",
+        reportPrepared,
+        { head: "baseline" },
+        progress,
+        new RunShutdown(),
+        createGitLock(),
+        { serverUrl: "http://127.0.0.1:1" },
+        {
+          runPhaseAttempt: async () => {
+            const checkpoint = await applyReportCheckpoint(reminders.client, inputFor(workspace, phase), first, emptyReport as never)
+            return extractAssistantText(checkpoint.lastAssistantParts)
+          },
+          restorePhaseBaseline: async () => {},
         },
-        restorePhaseBaseline: async () => {},
-      },
-    )
+      ),
+    ).rejects.toThrow(UserAbortError)
 
-    expect(result).toBe("")
     expect(reminders.promptCount()).toBe(2)
     expect(reminders.sessionIDs).toEqual(["ses_1", "ses_1"])
-    expect(gates).toHaveLength(1)
+    // An empty fallback reaches the failure gate once, and a continue without a
+    // valid report reopens it with the validation error instead of advancing.
+    expect(gates).toHaveLength(2)
     expect(gates[0]).toMatchObject({ kind: "failure", error: "phase produced an empty report" })
+    expect(gates[1]).toMatchObject({ kind: "failure", error: "phase produced an empty report" })
   })
 })
 

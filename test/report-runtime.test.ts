@@ -71,6 +71,26 @@ describe("report runtime", () => {
     expect(reports.candidateFor("ses_1")).toBe("completed")
   })
 
+  test("a phase handle remains resolvable until end() is called", async () => {
+    const reports = createReportRuntime(await workspace())
+    const handle = reports.begin("ses_1", phase(), markdown, qualityDimensionWeights)
+
+    // The session must stay owned while its phase attempt is still open — the
+    // human gate reopens that window with [o] and writes through write_report,
+    // so idle/complete is not the end of the session's life.
+    expect(reports.handleFor("ses_1")).toBeDefined()
+    await handle.write({ markdown: "# Draft" })
+    expect(reports.handleFor("ses_1")).toBeDefined()
+    expect(await reports.handleFor("ses_1")!.write({ markdown: "# Rescued" })).toEqual({
+      markdown: "# Rescued",
+    })
+
+    // Only the explicit release makes the session unknown to the bridge.
+    reports.handleFor("ses_1")!.end()
+    expect(reports.handleFor("ses_1")).toBeUndefined()
+    expect(reports.candidateFor("ses_1")).toBe("# Rescued")
+  })
+
   test("rejects empty markdown and score arguments from ordinary agents", async () => {
     const dir = await workspace()
     const handle = createReportRuntime(dir).begin("ses_1", phase(), markdown, qualityDimensionWeights)
