@@ -307,7 +307,16 @@ export async function runCoordinateBoot(
   try {
     const progress = deps.createProgress({ server, readyPath })
     // The gate/control cycle shares exactly the adapter's AutoAccept object.
-    const options: RunOptions = { ...launch.options, progress, autoAccept: progress.autoAccept, tui: false }
+    // Seed it from the launch flags: run() uses options.autoAccept when
+    // present and only falls back to yolo/smart when it is absent. Handing
+    // over the default `{ mode: "off" }` would advertise --yolo in the log
+    // and then prompt (or hang, on --no-tui) on the first ask-level permission.
+    progress.autoAccept.mode = launch.options.yolo ? "all" : launch.options.smart ? "smart" : "off"
+    // `plan` is the reviewed pipeline (resolvedAdvisor, routed models). The
+    // launch options carry the unresolved config; run() only swaps in the
+    // reviewed steps when options.plan is set. Dropping it here silently
+    // turns every advised pipeline into an unadvised one.
+    const options: RunOptions = { ...launch.options, plan, progress, autoAccept: progress.autoAccept, tui: false }
     // metadata.server gains the control URL (no token) for liveness/debug.
     process.env.CONVOY_CONTROL_URL = server.url
 

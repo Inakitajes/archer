@@ -52,6 +52,8 @@ export type ControlClient = {
   resume(): Promise<void>
   abort(): Promise<void>
   keepAwake(): Promise<void>
+  /** Tell the coordinator the run dir must survive teardown (an iterate/[o] session is using it). */
+  keepRunDir(): Promise<void>
   setInteractive(phase: string, armed: boolean): Promise<void>
   finishDismiss(): Promise<void>
   /** Empty body cycles the shared AutoAccept; a mode sets it directly. */
@@ -128,6 +130,9 @@ export function createControlClient(options: ControlClientOptions): ControlClien
     },
     async keepAwake() {
       ok(await post("/keep-awake"))
+    },
+    async keepRunDir() {
+      ok(await post("/keep-run-dir"))
     },
     async setInteractive(phase: string, armed: boolean) {
       ok(await post("/interactive", { phase, armed }))

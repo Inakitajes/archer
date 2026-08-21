@@ -251,6 +251,13 @@ export type ProgressHostControls = {
   onBackground?: () => void | Promise<void>
   /** Called after the dashboard cycled its local auto-accept mode; the controller POSTs it over the wire. */
   onCycleAutoAccept?: (mode: AutoAcceptMode) => void
+  /**
+   * Called when the dashboard opens a session that still needs the run dir
+   * ([i] iterate, or [o] on a runner without live-attach). The controller
+   * POSTs it so the coordinator does not delete the workspace out from under
+   * that session after the finish hold.
+   */
+  onKeepRunDirRequested?: () => void
   finish?: FinishSeam
 }
 

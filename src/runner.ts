@@ -911,6 +911,11 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
         await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
         await releaseLease?.().catch((error) => log.warn(`couldn't release run lease: ${String(error)}`))
         opencode?.close()
+        // Hosted teardown runs after the coordinator's finish hold, so an
+        // attached [i]/[o] can still flip keepRunDirRequested before we decide
+        // whether the workspace may go. In-process runs settle in the finally
+        // below — they have already left their own finish screen.
+        await settleRunWorkspace(workspace, options, progress, runErr)
       }
       if (runErr && typeof runErr === "object") {
         hostedTeardowns.set(runErr, { release: deferredRelease, runDir: workspace.dir })
@@ -939,17 +944,10 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     if (titleSaved) popTerminalTitle()
     shutdown.dispose()
 
-    if (runErr) {
-      log.warn(`Run dir preserved at ${workspace.dir}`)
-    } else if (options.deferPostHooks) {
-      // The deferred post-hooks still resolve CONVOY_RUN_DIR and `cwd: run`
-      // against this workspace, so it outlives the run; the caller deletes it
-      // once it has run them.
-    } else if (options.keepRunDir || progress.keepRunDirRequested?.()) {
-      log.info(`Run dir kept at ${workspace.dir}`)
-    } else {
-      await cleanupWorkspace(workspace).catch((error) => log.warn(`couldn't clean ${workspace.dir}: ${String(error)}`))
-    }
+    // Hosted runs settle the workspace in release(), after the coordinator
+    // (or goal loop) has held the finish screen. Doing it here would delete
+    // the run dir before [i] iterate can ask to keep it.
+    if (!options.progress) await settleRunWorkspace(workspace, options, progress, runErr)
 
     // Kill the server last and return immediately: once it dies, any event
     // stream still held open by the SDK starts failing, and those failures
@@ -957,6 +955,29 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     // their release so the goal loop's finish hold can still serve [o].
     if (!options.progress) opencode?.close()
   }
+}
+
+async function settleRunWorkspace(
+  workspace: Workspace,
+  options: Pick<RunOptions, "keepRunDir" | "deferPostHooks">,
+  progress: ProgressUI,
+  runErr: unknown,
+) {
+  if (runErr) {
+    log.warn(`Run dir preserved at ${workspace.dir}`)
+    return
+  }
+  if (options.deferPostHooks) {
+    // The deferred post-hooks still resolve CONVOY_RUN_DIR and `cwd: run`
+    // against this workspace, so it outlives the run; the caller deletes it
+    // once it has run them.
+    return
+  }
+  if (options.keepRunDir || progress.keepRunDirRequested?.()) {
+    log.info(`Run dir kept at ${workspace.dir}`)
+    return
+  }
+  await cleanupWorkspace(workspace).catch((error) => log.warn(`couldn't clean ${workspace.dir}: ${String(error)}`))
 }
 
 // The finish screen holds the run open while the opencode server and the run

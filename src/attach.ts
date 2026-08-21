@@ -247,6 +247,7 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
         onPauseToggle: () => void controller!.pause().catch(() => {}),
         onKeepAwakeToggle: () => void controller!.keepAwake().catch(() => {}),
         onCycleAutoAccept: (mode) => void controller!.autoAccept(mode).catch(() => {}),
+        onKeepRunDirRequested: () => void controller!.keepRunDir().catch(() => {}),
         onBackground: () => {
           // Send to background / menu-detach: release the slot and resolve so
           // executeRun can land on the runs browser with this run selected.

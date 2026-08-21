@@ -1480,6 +1480,12 @@ export class TuiProgress implements ProgressUI {
     return this.iterateRequested
   }
 
+  private markIterateRequested(): void {
+    if (this.iterateRequested) return
+    this.iterateRequested = true
+    this.hostControls.onKeepRunDirRequested?.()
+  }
+
   runControlState(state: RunControlState, activePhases: number): void {
     const previous = this.controlState
     this.controlState = state
@@ -2569,7 +2575,7 @@ export class TuiProgress implements ProgressUI {
       return
     }
 
-    if (!runner.capabilities.liveAttach) this.iterateRequested = true
+    if (!runner.capabilities.liveAttach) this.markIterateRequested()
     this.addEvent("convoy", "system", `[o]: opening ${name} ${runner.sessionName} session ${shortID(phase.sessionID)}`)
     open
       .then((backend) => {
@@ -2603,7 +2609,7 @@ export class TuiProgress implements ProgressUI {
       return
     }
 
-    this.iterateRequested = true
+    this.markIterateRequested()
     this.addEvent("convoy", "system", `[i]: opening a new opencode session with ${files.length} context file${files.length === 1 ? "" : "s"}`)
     openIterateOpencodeWindow({
       targetDir: this.targetDir || process.cwd(),

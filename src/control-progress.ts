@@ -60,6 +60,8 @@ export class ControlProgress implements ProgressUI {
   private controlState: RunControlState = "running"
   private keepAwakeStatus?: "on" | "off" | "unavailable"
   private goalLoopView?: GoalLoopView
+  /** Set when the attached dashboard opens a session that still needs the run dir. */
+  private keepRunDir = false
 
   constructor(options: ControlProgressOptions) {
     this.server = options.server
@@ -117,7 +119,7 @@ export class ControlProgress implements ProgressUI {
   }
 
   keepRunDirRequested(): boolean {
-    return false
+    return this.keepRunDir
   }
 
   runControlState(state: RunControlState): void {
@@ -185,6 +187,9 @@ export class ControlProgress implements ProgressUI {
       onResume: () => this.pauseToggle?.(),
       onAbort: () => this.abortHandler?.(),
       onKeepAwakeToggle: () => this.keepAwakeToggle?.(),
+      onKeepRunDirRequested: () => {
+        this.keepRunDir = true
+      },
     }
   }
 

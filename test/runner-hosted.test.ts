@@ -162,6 +162,37 @@ describe("run() with a hosted progress", () => {
     }
   })
 
+  test("a hosted --no-keep-run-dir run keeps the workspace until release, then deletes it", async () => {
+    // The coordinator holds the finish screen AFTER run() returns. Deleting
+    // the workspace in run()'s finally would yank reports out from under [i].
+    const repo = await cleanRepo()
+    const dashboard = fakeDashboard()
+    try {
+      const result = await run(makeOptions(repo, { progress: dashboard.progress, keepRunDir: false }))
+      expect(existsSync(result.dir)).toBe(true)
+      await result.release?.()
+      expect(existsSync(result.dir)).toBe(false)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("a hosted --no-keep-run-dir run keeps the workspace when the dashboard asked to keep it before release", async () => {
+    const repo = await cleanRepo()
+    let keep = false
+    const dashboard = fakeDashboard()
+    dashboard.progress.keepRunDirRequested = () => keep
+    try {
+      const result = await run(makeOptions(repo, { progress: dashboard.progress, keepRunDir: false }))
+      expect(existsSync(result.dir)).toBe(true)
+      keep = true
+      await result.release?.()
+      expect(existsSync(result.dir)).toBe(true)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
   test("a failing hosted run never holds and hands its teardown back on the error", async () => {
     const repo = await cleanRepo()
     const dashboard = fakeDashboard()

@@ -213,6 +213,8 @@ export type ControlServerHandlers = {
   onAbort?: () => void | Promise<void>
   /** `POST /keep-awake` — `Caffeinate.toggle()`. */
   onKeepAwakeToggle?: () => void | Promise<void>
+  /** `POST /keep-run-dir` — an attached dashboard opened a session that still needs the run dir. */
+  onKeepRunDirRequested?: () => void | Promise<void>
   /** `POST /finish-dismiss` — caller-side unblock of the finish hold. */
   onFinishDismiss?: () => void | Promise<void>
   /** When set, `POST /auto-accept` runs this instead of mutating `autoAccept`. */
@@ -444,6 +446,12 @@ async function handleControl(
         const denied = denyUnlessController()
         if (denied) return denied
         await handlers.onKeepAwakeToggle?.()
+        return Response.json({ ok: true })
+      }
+      case "POST /keep-run-dir": {
+        const denied = denyUnlessController()
+        if (denied) return denied
+        await handlers.onKeepRunDirRequested?.()
         return Response.json({ ok: true })
       }
       case "POST /interactive": {

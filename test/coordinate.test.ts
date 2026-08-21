@@ -4,6 +4,7 @@ import { join } from "node:path"
 
 import { afterAll, describe, expect, test } from "bun:test"
 
+import { advisorNeedsOf } from "../src/advisor"
 import { ControlProgress } from "../src/control-progress"
 import {
   convoyCoordinateArgv,
@@ -18,9 +19,9 @@ import {
   waitForCoordinatorReady,
   writePendingLaunch,
 } from "../src/coordinate"
-import type { RunOutcome } from "../src/progress"
+import type { AutoAccept, RunOutcome } from "../src/progress"
 import { UserAbortError } from "../src/runner"
-import type { RunOptions, RunPlan } from "../src/types"
+import type { AgentStep, RunOptions, RunPlan } from "../src/types"
 
 const dirs: string[] = []
 afterAll(async () => {
@@ -277,6 +278,122 @@ describe("runCoordinateBoot", () => {
     expect(finished).toEqual([{ status: "failed", runDir: "/tmp/run", error: "phase tests failed" }])
   })
 
+  test("hands the reviewed plan to run so resolvedAdvisor survives the coordinator hop", async () => {
+    // Mirrors a real launch.json: options.pipeline is the unresolved config
+    // (advisor string only), while plan.pipeline carries the routed
+    // resolvedAdvisor. Dropping the plan here is what silently turns an
+    // advised pipeline into an unadvised one — advisorNeedsOf only looks at
+    // resolvedAdvisor, and run() only swaps in the reviewed pipeline when
+    // options.plan is set.
+    const root = await scratch()
+    const unresolved = advisedImplementerStep()
+    const resolved = {
+      ...unresolved,
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      resolvedModel: {
+        configured: "nan/deepseek-v4-flash#high",
+        logical: "nan/deepseek-v4-flash#high",
+        gateway: "nitro" as const,
+        providerID: "openrouter",
+        modelID: "deepseek/deepseek-v4-flash-0731",
+        variant: "high",
+        target: "openrouter/deepseek/deepseek-v4-flash-0731#high",
+      },
+      resolvedAdvisor: {
+        configured: "openrouter/x-ai/grok-4.6#high",
+        logical: "xai/grok-4.6#high",
+        gateway: "nitro" as const,
+        providerID: "openrouter",
+        modelID: "x-ai/grok-4.6",
+        variant: "high",
+        target: "openrouter/x-ai/grok-4.6#high",
+      },
+    }
+    const pending = await writePendingLaunch(
+      launchPayload(
+        { ...minimalOptions(), pipeline: { name: "implement-lite", steps: [unresolved] } } as RunOptions,
+        { ...minimalPlan(), pipeline: { name: "implement-lite", steps: [resolved] } },
+        undefined,
+      ),
+      root,
+    )
+    let received: RunOptions | undefined
+
+    const code = await runCoordinateBoot(pending.launchPath, pending.readyPath, {
+      launchRoot: root,
+      run: async (options) => {
+        received = options
+        return { runID: "20260101-000000-ab12", dir: "/tmp/run" }
+      },
+    })
+
+    expect(code).toBe(0)
+    expect(received).toBeDefined()
+    // The unresolved options.pipeline is what a boot that forgets the plan
+    // would execute — and it has no advisor at all.
+    expect(advisorNeedsOf(received!.pipeline.steps).agents.size).toBe(0)
+    expect(received?.plan).toBeDefined()
+    // Same selection run() makes: the reviewed plan's pipeline, not the
+    // unresolved options.pipeline that launch.json also carries.
+    const executed = received?.plan ? received.plan.pipeline : received!.pipeline
+    expect(advisorNeedsOf(executed.steps).agents.size).toBe(1)
+    expect([...advisorNeedsOf(executed.steps).agents]).toEqual(["implementer"])
+  })
+
+  test("a --yolo launch seeds the shared autoAccept so the gate starts in all mode", async () => {
+    // launch.json carries yolo/smart as booleans and no autoAccept object.
+    // run() uses options.autoAccept when present and only falls back to
+    // yolo/smart when it is absent. The boot currently hands run() the
+    // ControlProgress default ({ mode: "off" }), so --yolo advertises itself
+    // in the log but the first ask-level permission is not auto-allowed.
+    const root = await scratch()
+    const pending = await writePendingLaunch(
+      launchPayload({ ...minimalOptions(), yolo: true } as RunOptions, minimalPlan(), undefined),
+      root,
+    )
+    let received: RunOptions | undefined
+    let shared: AutoAccept | undefined
+
+    const code = await runCoordinateBoot(pending.launchPath, pending.readyPath, {
+      launchRoot: root,
+      createProgress: (opts) => {
+        const progress = new ControlProgress(opts)
+        shared = progress.autoAccept
+        return progress
+      },
+      run: async (options) => {
+        received = options
+        return { runID: "20260101-000000-ab12", dir: "/tmp/run" }
+      },
+    })
+
+    expect(code).toBe(0)
+    expect(received?.yolo).toBe(true)
+    expect(received?.autoAccept).toBe(shared)
+    expect(received?.autoAccept?.mode).toBe("all")
+  })
+
+  test("a --smart launch seeds the shared autoAccept so the judge is on from the first permission", async () => {
+    const root = await scratch()
+    const pending = await writePendingLaunch(
+      launchPayload({ ...minimalOptions(), smart: true } as RunOptions, minimalPlan(), undefined),
+      root,
+    )
+    let received: RunOptions | undefined
+
+    const code = await runCoordinateBoot(pending.launchPath, pending.readyPath, {
+      launchRoot: root,
+      run: async (options) => {
+        received = options
+        return { runID: "20260101-000000-ab12", dir: "/tmp/run" }
+      },
+    })
+
+    expect(code).toBe(0)
+    expect(received?.smart).toBe(true)
+    expect(received?.autoAccept?.mode).toBe("smart")
+  })
+
   test("a user abort releases without driving the finish hold", async () => {
     const root = await scratch()
     const pending = await writeBootLaunch(root)
@@ -315,6 +432,25 @@ describe("runCoordinateBoot", () => {
     expect(finished).toEqual([])
   })
 })
+
+function advisedImplementerStep(): AgentStep {
+  return {
+    type: "agent",
+    name: "implementer",
+    stepName: "implementer",
+    groupId: "g1",
+    agentName: "implementer",
+    description: "Implements the feature",
+    model: "nan/deepseek-v4-flash",
+    variant: "high",
+    advisor: "openrouter/x-ai/grok-4.6",
+    advisorVariant: "high",
+    inputFiles: ["prd.md"],
+    inputDiff: false,
+    reportPath: "reports/implementer.md",
+    deliverableContract: { kind: "markdown-report" },
+  }
+}
 
 function minimalPlan(): RunPlan {
   return {

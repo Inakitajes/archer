@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { createControlClient } from "../src/control-client"
+import { ControlProgress } from "../src/control-progress"
 import { CONTROLLER_ID_HEADER, ControlPendingQueue, startControlServer, type ControlServer } from "../src/control-server"
 import type { AutoAccept, PermissionPromptInfo } from "../src/progress"
 
@@ -166,6 +167,19 @@ describe("control server", () => {
     }
   })
 
+  test("POST /keep-run-dir flips ControlProgress.keepRunDirRequested so release can keep the workspace", async () => {
+    const server = await startControlServer()
+    try {
+      const progress = new ControlProgress({ server })
+      expect(progress.keepRunDirRequested()).toBe(false)
+      const id = await claim(server)
+      expect((await post(server, "/keep-run-dir", undefined, id)).status).toBe(200)
+      expect(progress.keepRunDirRequested()).toBe(true)
+    } finally {
+      server.close()
+    }
+  })
+
   test("a pending permission shows in GET /pending and resolves on POST /permission", async () => {
     const pending = new ControlPendingQueue()
     const server = await startControlServer({ pending })
@@ -281,6 +295,7 @@ describe("control server", () => {
         onAbort: () => void calls.push("abort"),
         onKeepAwakeToggle: () => void calls.push("keep-awake"),
         onFinishDismiss: () => void calls.push("finish-dismiss"),
+        onKeepRunDirRequested: () => void calls.push("keep-run-dir"),
       },
     })
     try {
@@ -289,6 +304,7 @@ describe("control server", () => {
         ["/resume"],
         ["/abort"],
         ["/keep-awake"],
+        ["/keep-run-dir"],
         ["/finish-dismiss"],
         ["/auto-accept", { mode: "off" }],
         ["/interactive", { phase: "design", armed: true }],

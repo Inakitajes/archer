@@ -33,6 +33,7 @@ describe("control client", () => {
     await client.pause()
     await client.abort()
     await client.keepAwake()
+    await client.keepRunDir()
     await expect(client.pending()).resolves.toEqual({})
   })
 
