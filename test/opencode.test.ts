@@ -1114,6 +1114,35 @@ describe("openStoredSessionWindow", () => {
       mockSpawn.mockRestore()
     }
   })
+
+  // [o] must stay prompt-free in every backend, so the stored-session opener
+  // needs the same Herdr guarantee as iterate: the config travels as `--env`
+  // on the pane split and is never typed into the pane.
+  test("passes the env as a Herdr --env pair, not typed into the pane", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = ((name: string) => (name === "herdr" ? "/usr/bin/herdr" : null)) as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
+
+    try {
+      await openStoredSessionWindow({
+        targetDir: "/repo",
+        sessionID: "sess-2",
+        runDir: "/tmp/convoy-run",
+      })
+      const splitArgs = mockSpawn.mock.calls[0]![0] as string[]
+      expect(splitArgs).toContain("--env")
+      expect(splitArgs).toContain(`OPENCODE_CONFIG_CONTENT=${runDirAccessConfig("/tmp/convoy-run")}`)
+      // The `pane run` call's command is the bare core command — the env rides
+      // the split as --env and is never typed as a visible export line.
+      const runArgs = mockSpawn.mock.calls.find((call) => (call[0] as string[])[2] === "run")![0] as string[]
+      expect(runArgs[0]).toBe("herdr")
+      expect(runArgs[runArgs.length - 1]).not.toContain("export OPENCODE_CONFIG_CONTENT")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
 })
 
 describe("openIterateOpencodeWindow", () => {
@@ -1210,6 +1239,29 @@ describe("openIterateOpencodeWindow", () => {
       expect(backend).toBe("zellij")
       const args = mockSpawn.mock.calls[0]![0] as string[]
       expect(args.slice(0, 5)).toEqual(["zellij", "action", "new-pane", "--name", "opencode iterate"])
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // The Zellij backend launches `sh -lc <command>`; the config must ride that
+  // wrapper as a shell-quoted export, not only the osascript (Terminal) path.
+  test("exports OPENCODE_CONFIG_CONTENT in the Zellij pane command", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.ZELLIJ = "0"
+    Bun.which = (() => "/usr/bin/zellij") as typeof Bun.which
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      const backend = await openIterateOpencodeWindow({ targetDir: "/repo", prompt: "hello", runDir: "/tmp/convoy-run" })
+      expect(backend).toBe("zellij")
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      expect(args).toContain("sh")
+      expect(args).toContain("-lc")
+      const command = args[args.length - 1]!
+      expect(command).toContain("export OPENCODE_CONFIG_CONTENT=")
+      expect(command).toContain("/tmp/convoy-run/**")
     } finally {
       mockSpawn.mockRestore()
     }
