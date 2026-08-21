@@ -1411,7 +1411,7 @@ export async function runPhaseUntilResolved(
           // gate was open wins over the candidate computed before the gate.
           log.info(`[${phase.name}] attempt succeeded with interactive mode armed; waiting for manual action`)
           for (;;) {
-            await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
+            const outcome = await waitForPhaseGate(phase.name, targetDir, sessionRef.id, takeover, progress, {
               kind: "interactive",
               canRetry: false,
               signal: shutdown.signal,
@@ -1421,6 +1421,10 @@ export async function runPhaseUntilResolved(
               runner: phase.runner,
               runDir: workspace.dir,
             })
+            // A gate that cannot be asked (no TUI, no controller) must not spin
+            // on re-resolution: keep the already-validated candidate, exactly
+            // like the pre-gate behavior. Only a real continue re-resolves.
+            if (outcome !== "continue") break
             candidate = await resolveDeliverableCandidate(workspace, phase, text, reports?.candidateFor(sessionRef.id ?? ""))
             if (validateDeliverable(deliverableContract, candidate, weights).valid) break
           }

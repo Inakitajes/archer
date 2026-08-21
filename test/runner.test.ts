@@ -1305,6 +1305,71 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
     expect(prompts[0]?.kind).toBe("failure")
   })
 
+  test("an armed clean finish delivers the report written during the gate over the pre-gate candidate", async () => {
+    const attempts: number[] = []
+    const prompts: HumanReviewPromptInfo[] = []
+    const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
+    // The armed gate parks on a promise only the test resolves: the user is in
+    // the [o] window of a step that already finished cleanly.
+    let resumeGate!: (action: "continue") => void
+    const parked = new Promise<"continue">((resolve) => {
+      resumeGate = resolve
+    })
+    let writeHandle: ReportPhaseHandle | undefined
+    const progress: ProgressUI = {
+      ...noopProgress,
+      isInteractiveTakeover: () => true,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return parked
+      },
+    }
+
+    let result = ""
+    const run = runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
+          attempts.push(attempt)
+          sessionRef!.id = "ses_armed"
+          writeHandle = reports.begin("ses_armed", phase, phase.deliverableContract, qualityDimensionWeights)
+          // A clean finish: the pre-gate candidate is the assistant text.
+          return "# Pre-gate report"
+        },
+        restorePhaseBaseline: async () => {},
+      },
+      undefined,
+      reports,
+    ).then((value) => {
+      result = value
+    })
+
+    // The armed gate is open and the session is still registered. A write_report
+    // from the reopened window must win over the candidate computed before the
+    // gate — continue re-resolves instead of delivering the stale text.
+    while (prompts.length === 0) await Bun.sleep(5)
+    expect(reports.handleFor("ses_armed")).toBeDefined()
+    await writeHandle!.write({ markdown: "# Rescued during the armed gate" })
+    resumeGate("continue")
+
+    await run
+    expect(result).toContain("Rescued during the armed gate")
+    expect(attempts).toEqual([1])
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("interactive")
+  })
+
   test("a write_report posted over the bridge while the gate is held with no controller still delivers on continue", async () => {
     const prompts: HumanReviewPromptInfo[] = []
     const workspace = await retryWorkspace()
