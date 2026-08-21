@@ -45,6 +45,7 @@ export type ActionID =
   | "keep-awake"
   | "interactive"
   | "usage"
+  | "background"
   | "commands"
   | "help"
   | "abort"
@@ -101,11 +102,15 @@ export type DashboardActionState = {
   humanReviewGate?: "interactive" | "failure" | "budget-gate" | "review"
   /** Whether a failure gate can offer [r]: true only when a baseline snapshot exists. */
   reviewCanRetry: boolean
+  /** First-attach aborts; a menu-opened controller detaches to the runs menu. */
+  ctrlC: "abort" | "detach"
   autoAccept?: AutoAcceptMode
   keepAwake?: KeepAwakeState["status"]
   controlState: RunControlState
   canPause: boolean
   canKeepAwake: boolean
+  /** Whether the host wired a background handler (a controller attach has one; a bare in-process dashboard does not). */
+  canBackground: boolean
   finishSeam: boolean
   interactiveArmed: boolean
   reportCopyable: boolean
@@ -298,6 +303,19 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       priority: 9,
     },
     {
+      // Palette-only, no key binding (Ctrl+P opens the palette, not the
+      // background command). Releases this terminal; the coordinator keeps
+      // running and `convoy runs` can re-attach with the same controls. Only
+      // offered when the host wired a handler — otherwise the command would
+      // close the palette and silently do nothing.
+      id: "background",
+      group: "run",
+      available: live && !state.observer && state.canBackground,
+      label: "Send to background",
+      detail: "release this terminal · recover from runs",
+      priority: 9,
+    },
+    {
       id: "commands",
       group: "run",
       available: navigable,
@@ -314,16 +332,22 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       priority: 9,
     },
     {
-      // Deliberately has no palette label. The palette filters as you type and
-      // fires on Enter; "a" + Enter must never be able to kill a run.
+      // On a first-attach dashboard Ctrl+C aborts (today's muscle memory); on
+      // a menu-opened controller it detaches back to the runs menu instead.
+      // When detaching, the palette gains "Abort the run" — the full phrase is
+      // the list item, and Enter on it opens a y/n confirm modal, so "a"+Enter
+      // can never kill a run. Observers never get the label: their Ctrl+C only
+      // detaches, so offering an abort that cannot abort would be a lie.
       id: "abort",
       group: "run",
       available: live,
       keys: "ctrl+c",
-      hint: "abort",
+      hint: state.ctrlC === "detach" ? "detach" : "abort",
       style: "spaced",
       tone: "yellow",
-      help: "abort the run",
+      label: state.ctrlC === "detach" && !state.observer ? "Abort the run" : undefined,
+      detail: state.ctrlC === "detach" && !state.observer ? "end the pipeline · y/n confirm" : undefined,
+      help: state.ctrlC === "detach" ? "detach to the runs menu; abort needs the palette confirm" : "abort the run",
       priority: 1,
     },
 

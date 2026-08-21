@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import type { ProgressUI, RunOutcome } from "../src/progress"
+import type { PermissionPromptInfo, PermissionReply, ProgressUI, RunOutcome } from "../src/progress"
 import type { RunOptions } from "../src/types"
 
 import { preparePhaseRun, run as realRun, hostedTeardownFromError, type RunDeps } from "../src/runner"
@@ -215,6 +215,88 @@ describe("run() with a hosted progress", () => {
       const metadata = JSON.parse(await readFile(join(result.dir, "metadata.json"), "utf8"))
       expect(metadata.server).toBeUndefined()
     } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("a hosted askPermission is honoured without a TTY — the run never auto-rejects it", async () => {
+    const repo = await cleanRepo()
+    // A coordinated run has no TTY on the coordinator: "interactive" there
+    // means "a controller can answer", i.e. progress.askPermission exists.
+    // Force the no-TTY world for the whole run window and prove the hosted
+    // prompt is asked and its reply forwarded, not auto-rejected.
+    const stdinTty = process.stdin.isTTY
+    const stdoutTty = process.stdout.isTTY
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true })
+    Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true })
+
+    const asked: PermissionPromptInfo[] = []
+    const replies: Array<{ reply: string }> = []
+    let resolveAsk!: (reply: PermissionReply) => void
+    const open = new Promise<PermissionReply>((resolve) => {
+      resolveAsk = resolve
+    })
+
+    const permissionClient = {
+      ...fakeClient,
+      event: {
+        subscribe: async () => ({
+          stream: (async function* () {
+            yield {
+              type: "permission.asked",
+              properties: { id: "perm-hosted", sessionID: "sess-hosted", permission: "bash", patterns: ["bash"], metadata: { command: "ls -la" }, always: [] },
+            }
+          })(),
+        }),
+      },
+      permission: {
+        reply: async ({ reply }: { reply: string }) => {
+          replies.push({ reply })
+          return { data: undefined, error: undefined }
+        },
+      },
+    }
+    const gatedStart: RunDeps["startOpencode"] = async () => ({
+      client: permissionClient as never,
+      url: "http://127.0.0.1:41235",
+      close: () => {},
+    })
+
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askPermission: (info) => {
+        asked.push(info)
+        return open
+      },
+    }
+
+    try {
+      // The pre-hook keeps the run (and its permission gate) alive long enough
+      // for the event pump to deliver permission.asked before teardown.
+      const promise = realRun(
+        makeOptions(repo, {
+          progress,
+          hooks: { pre: [{ name: "hold-gate-open", command: "sleep 0.3" }], post: [], pipelines: {} },
+        }),
+        { startOpencode: gatedStart },
+      )
+
+      const deadline = Date.now() + 5_000
+      while (asked.length === 0 && Date.now() < deadline) await Bun.sleep(10)
+      expect(asked).toMatchObject([{ id: "perm-hosted", permission: "bash", patterns: ["bash"] }])
+      // Nothing auto-rejected while the controller had not answered.
+      expect(replies).toEqual([])
+
+      // The controller answers; the gate forwards the reply to OpenCode.
+      resolveAsk("once")
+      const replied = Date.now() + 5_000
+      while (replies.length === 0 && Date.now() < replied) await Bun.sleep(10)
+      expect(replies).toEqual([{ reply: "once" }])
+
+      await promise
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", { value: stdinTty, configurable: true })
+      Object.defineProperty(process.stdout, "isTTY", { value: stdoutTty, configurable: true })
       await rm(repo, { recursive: true, force: true })
     }
   })

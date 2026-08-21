@@ -2,20 +2,21 @@ import { readFile, stat } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 
 import { buildAgentRegistry, ejectAgentPrompt, emptyHooksConfig, globalConfigPath, loadMergedConvoyConfig, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ConvoyDefaults } from "./config"
+import { readControlFile } from "./control-client"
 import { detectBaseRef, currentBranch, resolveWorktreeDefault } from "./git"
 import { openRouterKeySources } from "./limits"
 import { log } from "./log"
 import { builtInAgents, defaultGptModel, defaultGptVariant, defaultPipeline, defaultPipelineName, hasWritableStep, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { consensusStep, defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
-import { runGoalLoop } from "./goal-loop"
-import { defaultMaxConcurrentAgents, parseModel, run } from "./runner"
+import { defaultMaxConcurrentAgents, parseModel } from "./runner"
 import { buildRunPlan, type BuildRunPlanInput } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
 import { loadPrdHistoryPreview } from "./prd-history"
 import { isModelGateway, modelGatewayChoices, modelGateways, type ModelGateway } from "./model-routing"
-import { browseRuns } from "./runs"
+import { browseRuns, isControlLive, isServerLive } from "./runs"
 import { deleteKeychainSecret, keychainAvailable, storeKeychainSecret } from "./secrets"
 import type { Pipeline, RunOptions, RunPlan } from "./types"
+import type { GoalLoopConfig } from "./goal-loop"
 import { isValidRunID, resumeWorkspace } from "./workspace"
 import { readRunMetadata } from "./metadata"
 import { preflightRunPlan } from "./preflight"
@@ -94,6 +95,7 @@ export type CliCommand =
   | { type: "auth"; provider: "openrouter"; action: "set" | "remove" | "status" }
   | { type: "version" }
   | { type: "update"; checkOnly: boolean }
+  | { type: "coordinate"; launchPath: string }
 
 export async function parseAndRun(argv: string[]) {
   if (argv.length === 0 && process.stdin.isTTY && process.stdout.isTTY) {
@@ -102,6 +104,15 @@ export async function parseAndRun(argv: string[]) {
   }
 
   const command = await parseCommand(argv)
+  if (command.type === "coordinate") {
+    // Internal: the detached coordinator's child boot (`--coordinate` is not
+    // advertised in --help). CONVOY_COORDINATE_READY points at the parent's
+    // ready file, which ControlProgress writes as soon as the run exists.
+    const { runCoordinateBoot } = await import("./coordinate")
+    const code = await runCoordinateBoot(command.launchPath, process.env.CONVOY_COORDINATE_READY)
+    process.exitCode = code
+    return
+  }
   if (command.type === "help") {
     process.stdout.write(command.text)
     return
@@ -277,22 +288,148 @@ function assertGoalMode(options: { goal?: number; goalFixPipeline?: Pipeline }, 
 
 /** Runs the plan, entering the goal loop when goal mode is configured for this run. */
 async function executeRun(options: RunOptions, plan: RunPlan): Promise<void> {
-  const decision = goalModeFor(options, plan)
-  if (decision.mode === "off") {
-    await run({ ...options, plan })
-    return
-  }
   // Defensive re-check: the early refusal in parseAndRun/launchInteractiveRun
   // should have already caught rejections before any side effect, but executeRun
   // is also called from paths that might bypass that check (e.g. resume).
+  const decision = goalModeFor(options, plan)
   if (decision.mode === "rejected") throw goalModeRejectionError(decision, plan)
-  // options.goal/maxIterations/plateau are already resolved by resolveRunOptions;
-  // consume them directly instead of re-deriving from the plan (single source of truth).
-  await runGoalLoop(options, plan, {
+  await spawnAndAttachRun(options, plan, goalConfigFor(decision, options))
+}
+
+/** The goal-loop config to hand the coordinator, or undefined when goal mode is off. */
+function goalConfigFor(decision: GoalModeDecision, options: RunOptions): GoalLoopConfig | undefined {
+  if (decision.mode !== "on") return undefined
+  return {
     goal: decision.goal,
     maxIterations: options.goalMaxIterations ?? defaultGoalMaxIterations,
     plateau: options.goalPlateau ?? defaultGoalPlateau,
-  })
+  }
+}
+
+/**
+ * Every production run becomes a detached coordinator plus, on a TTY, an
+ * auto-attached controller dashboard. Tests keep calling `run()` /
+ * `runGoalLoop()` in-process with an injected `progress`.
+ */
+async function spawnAndAttachRun(
+  options: RunOptions,
+  plan: RunPlan,
+  goal: GoalLoopConfig | undefined,
+): Promise<void> {
+  const { CoordinatorBootTimeoutError, forwardCoordinatorLogs, launchPayload, rmPendingLaunch, spawnCoordinator, waitForCoordinatorReady, writePendingLaunch } = await import("./coordinate")
+  const pending = await writePendingLaunch(launchPayload(options, plan, goal))
+  let child: { pid: number; exited: Promise<number> } | undefined
+  try {
+    child = await spawnCoordinator(pending)
+    const ready = await waitForCoordinatorReady(pending.readyPath)
+    // The coordinator is live; attach or wait, depending on the terminal.
+    if (options.tui && process.stdout.isTTY) {
+      const { openRunDashboard } = await import("./attach")
+      await openRunDashboard(ready.runID, { ctrlC: "abort" })
+      // The attach resolved because the user backgrounded the run; land on the
+      // runs menu with it selected (the coordinator keeps running). Liveness
+      // is the coordinator's, not iteration 1's OpenCode server: a goal loop
+      // releases each iteration's server while the coordinator lives on.
+      if (await isCoordinatorLiveFor(ready.runID)) {
+        const resumed = await openRunsBrowser(await currentCoordinatedRunID(ready.runID))
+        // A resume/retry ran its own coordinator inside the browser and owns
+        // the exit code; a run still alive after the browser was backgrounded
+        // on purpose — a successful handoff is exit 0.
+        if (resumed || (await isCoordinatorLiveFor(ready.runID))) return
+      }
+      // The run is over and the user watched it end: the CLI's exit code is
+      // the coordinator's (0 on success, non-zero on failure or abort).
+      const code = await child.exited
+      process.exitCode = code
+      // A failed run's error went to the coordinator's log, not this terminal;
+      // a deliberate abort (130) already said goodbye on the dashboard.
+      if (code !== 0 && code !== 130) await printCoordinatorFailure(pending.logPath)
+      await rmPendingLaunch(pending.dir)
+      return
+    }
+    // --no-tui / CI: don't attach; stream the coordinator's log to the
+    // terminal, wait for its exit, and forward the exit code.
+    process.stdout.write(`coordinator ${child.pid} running; logs: ${pending.logPath}\n`)
+    const forwarder = await forwardCoordinatorLogs(pending.logPath, (chunk) => process.stdout.write(chunk))
+    const code = await child.exited
+    await forwarder.stop()
+    process.exitCode = code
+    // The log was forwarded in full — the pending dir holds nothing the
+    // parent hasn't already shown.
+    await rmPendingLaunch(pending.dir)
+  } catch (error) {
+    // Boot timeout or spawn failure: surface it, keep the workspace resumable.
+    if (child) {
+      try {
+        process.kill(child.pid, "SIGTERM")
+      } catch {
+        // Already gone.
+      }
+    }
+    log.warn(`coordinator failed to start; pending launch left at ${pending.launchPath}`)
+    if (error instanceof CoordinatorBootTimeoutError) {
+      log.error(`  → ${error.message}`)
+      log.error(`  → coordinator log: ${pending.logPath}`)
+      // The friendly lines above are the error; a zero exit would hide the
+      // failure from scripts and CI. The workspace stays resumable with `R`.
+      process.exitCode = 1
+    } else {
+      throw error
+    }
+  }
+}
+
+/** Surfaces the coordinator's last words on a failed TTY run: its stderr went to the pending log, not this terminal. */
+async function printCoordinatorFailure(logPath: string): Promise<void> {
+  try {
+    const body = await readFile(logPath, "utf8")
+    const tail = body.trimEnd().split("\n").slice(-30)
+    if (tail.length > 0) process.stderr.write(`coordinator failed (last log lines):\n${tail.join("\n")}\n`)
+  } catch {
+    // Log unreadable; the exit code already says it failed.
+  }
+}
+
+/** Reads the run's liveness through the run-history module (pid + TCP probe). */
+async function isServerLiveFor(runID: string): Promise<boolean> {
+  const workspace = await resumeWorkspace(runID).catch(() => undefined)
+  if (!workspace) return false
+  const metadata = await readRunMetadata(resolve(workspace.dir, "metadata.json"))
+  return Boolean(metadata && (await isServerLive(metadata.server)))
+}
+
+/**
+ * Whether the run's *coordinator* is still alive. The control server outlives
+ * every per-iteration OpenCode server, so this (not server liveness) is what
+ * "the run is still going" means for a backgrounded run — especially mid-goal-
+ * loop, where each iteration's server dies while the loop continues.
+ */
+async function isCoordinatorLiveFor(runID: string): Promise<boolean> {
+  const control = await readControlFile(runID)
+  if (!control) return isServerLiveFor(runID)
+  return isControlLive(control)
+}
+
+/**
+ * The runID a coordinated run is currently on. A goal loop moves to a fresh
+ * run dir every iteration while the control server (and its control.json
+ * entries) stay put, so /status is the only place that knows which iteration
+ * a backgrounded browser should select.
+ */
+async function currentCoordinatedRunID(fallback: string): Promise<string> {
+  const control = await readControlFile(fallback)
+  if (!control) return fallback
+  try {
+    const response = await fetch(`${control.url}/status`, {
+      headers: { authorization: `Bearer ${control.token}` },
+      signal: AbortSignal.timeout(500),
+    })
+    if (!response.ok) return fallback
+    const status = (await response.json()) as { runID?: string }
+    return status.runID ?? fallback
+  } catch {
+    return fallback
+  }
 }
 
 /**
@@ -412,7 +549,11 @@ async function checkInteractiveBranchName(targetDir: string, name: string): Prom
   return { branch: free, dir: worktreeDirFor(free), ...(free === cleaned ? {} : { suffixed: true }) }
 }
 
-async function openRunsBrowser(initialRunID?: string) {
+/**
+ * @returns true when the browser left via a resume/retry (which started its
+ *   own coordinator and owns the CLI's exit code), false when the user quit.
+ */
+async function openRunsBrowser(initialRunID?: string): Promise<boolean> {
   // The browser can open a run's dashboard and come back, so loop until the
   // user resumes (which hands off to a real run) or quits.
   let currentRunID = initialRunID
@@ -421,27 +562,30 @@ async function openRunsBrowser(initialRunID?: string) {
     if (resolution.type === "retry") {
       const options = await retryOptions(resolution.runID, resolution.targetDir)
       const plan = options.plan ?? (await buildReviewedPlan({ ...options, promptSource: "retry" }))
-      if (!(await confirmRunPlan(plan))) return
+      if (!(await confirmRunPlan(plan))) return false
       await preflightRunPlan(plan)
-      await run({ ...options, plan })
-      return
+      // A resumed/retried run is also a coordinator: same spawn + auto-attach path.
+      await executeRun(options, plan)
+      return true
     }
     if (resolution.type === "resume") {
       const options = await resumeOptions(resolution.runID, resolution.targetDir)
       const plan = options.plan ?? (await buildReviewedPlan({ ...options, promptSource: "resume" }))
-      if (!(await confirmRunPlan(plan))) return
+      if (!(await confirmRunPlan(plan))) return false
       await preflightRunPlan(plan)
-      await run({ ...options, plan })
-      return
+      await executeRun(options, plan)
+      return true
     }
     if (resolution.type === "open") {
       // Lazily imported: attaching pulls in the dashboard + opencode client.
+      // A menu attach is a controller (ctrlC detaches); observer while a
+      // controller is already attached.
       const { openRunDashboard } = await import("./attach")
-      await openRunDashboard(resolution.runID)
+      await openRunDashboard(resolution.runID, { ctrlC: "detach" })
       currentRunID = resolution.runID
       continue
     }
-    return
+    return false
   }
 }
 
@@ -538,6 +682,13 @@ async function runAuthCommand(action: "set" | "remove" | "status") {
 }
 
 export async function parseCommand(argv: string[]): Promise<CliCommand> {
+  if (argv[0] === "--coordinate") {
+    const launchPath = argv[1]
+    if (launchPath === undefined || launchPath.startsWith("-")) {
+      throw new Error("--coordinate requires a launch file path (internal use)")
+    }
+    return { type: "coordinate", launchPath }
+  }
   if (argv.length === 1 && (argv[0] === "--version" || argv[0] === "-V")) return { type: "version" }
   if (argv[0] === "update") {
     if (argv.length === 1) return { type: "update", checkOnly: false }

@@ -47,7 +47,7 @@ export type RunMetadata = {
   pipeline?: Pipeline
   modelRouting?: { gateway: ModelGateway }
   /** The live opencode server for this run while it executes; cleared on shutdown, so a lingering entry means the run process died mid-flight. Lets `convoy runs` attach to a running run. */
-  server?: { url: string; pid: number; startedAt: number }
+  server?: { url: string; pid: number; startedAt: number; controlUrl?: string }
   control: { state: RunControlState; requestedAt?: number; pausedAt?: number }
   phases: Record<string, PhaseMetadata>
 }
@@ -204,7 +204,11 @@ export async function openRunMetadata(
       return data.phases[name]?.status
     },
     serverStarted(url) {
-      data.server = { url, pid: process.pid, startedAt: Date.now() }
+      // The coordinator sets CONVOY_CONTROL_URL before run() boots; the token
+      // never lives in metadata — only the no-secret control URL does, so
+      // liveness/debug can see the control plane without exposing auth.
+      const controlUrl = process.env.CONVOY_CONTROL_URL
+      data.server = { url, pid: process.pid, startedAt: Date.now(), ...(controlUrl ? { controlUrl } : {}) }
       void persist()
     },
     async serverStopped() {

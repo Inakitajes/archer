@@ -19,18 +19,23 @@ async function createDashboard(
   phases: ProgressPhase[] = [{ name: "implement", description: "" }],
   options: {
     observer?: boolean
+    onAbort?: () => void
     onPauseToggle?: () => void
     onKeepAwakeToggle?: () => void
+    onBackground?: () => void | Promise<void>
+    onCycleAutoAccept?: (mode: "off" | "all" | "smart") => void
+    ctrlC?: "abort" | "detach"
+    autoAccept?: { mode: "off" | "all" | "smart" }
     copyResult?: ClipboardResult
     finishSeam?: FinishSeam
   } = {},
 ) {
   const testRenderer = await createTestRenderer({ width, height })
   const copied: string[] = []
-  const dashboard = new TuiProgress(testRenderer.renderer, phases, undefined, undefined, false, options.observer ?? false, "session", async (text) => {
+  const dashboard = new TuiProgress(testRenderer.renderer, phases, options.onAbort, options.autoAccept, false, options.observer ?? false, "session", async (text) => {
     copied.push(text)
     return options.copyResult ?? "copied-native"
-  }, options.onPauseToggle, options.onKeepAwakeToggle, options.finishSeam)
+  }, options.onPauseToggle, options.onKeepAwakeToggle, options.onBackground, options.onCycleAutoAccept, options.ctrlC, options.finishSeam)
   testRenderer.renderer.copyToClipboardOSC52 = (text) => {
     copied.push(text)
     return true
@@ -290,6 +295,107 @@ describe("run dashboard defaults", () => {
       mockInput.pressEnter()
 
       expect(toggles).toBe(1)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("palette Enter on Send to background calls onBackground", async () => {
+    let backgrounds = 0
+    const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(120, 40, [{ name: "implement", description: "" }], { onBackground: () => { backgrounds++ } })
+    try {
+      mockInput.pressKey("p", { ctrl: true })
+      // "background" contains both j and k, which the palette treats as arrow
+      // keys — "send" keeps the filter free of navigation letters.
+      await mockInput.typeText("send")
+      mockInput.pressEnter()
+      await renderOnce()
+
+      expect(backgrounds).toBe(1)
+      // The palette closed after dispatching.
+      expect(captureCharFrame()).not.toContain("⌘ commands")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("Ctrl+C aborts on a first-attach (abort-mode) controller dashboard", async () => {
+    let aborts = 0
+    const { dashboard, mockInput } = await createDashboard(120, 40, [{ name: "implement", description: "" }], {
+      onAbort: () => aborts++,
+      ctrlC: "abort",
+    })
+    try {
+      await mockInput.pressKey("c", { ctrl: true })
+      expect(aborts).toBe(1)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("Ctrl+C detaches on a menu-opened (detach-mode) controller dashboard instead of aborting", async () => {
+    let aborts = 0
+    let backgrounds = 0
+    const { dashboard, mockInput } = await createDashboard(120, 40, [{ name: "implement", description: "" }], {
+      onAbort: () => { aborts++ },
+      onBackground: () => { backgrounds++ },
+      ctrlC: "detach",
+    })
+    try {
+      await mockInput.pressKey("c", { ctrl: true })
+      expect(aborts).toBe(0)
+      expect(backgrounds).toBe(1)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("Abort the run is palette-only on a detach mode and opens a confirm modal", async () => {
+    let aborts = 0
+    const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(120, 40, [{ name: "implement", description: "" }], {
+      onAbort: () => { aborts++ },
+      ctrlC: "detach",
+    })
+    try {
+      const openAbort = async () => {
+        mockInput.pressKey("p", { ctrl: true })
+        // No j/k in "Abort the run": every letter lands in the filter.
+        await mockInput.typeText("Abort the run")
+        mockInput.pressEnter()
+        await renderOnce()
+      }
+
+      await openAbort()
+      // The list item opens the modal; it must not have killed anything yet.
+      expect(aborts).toBe(0)
+      expect(captureCharFrame()).toContain("abort run")
+
+      // Default No: escape cancels without aborting.
+      mockInput.pressEscape()
+      await renderOnce()
+      expect(aborts).toBe(0)
+
+      // An isolated Escape needs a beat to settle before the next printable
+      // key; otherwise the terminal parser can read the pair as Meta+P.
+      await Bun.sleep(20)
+
+      // A deliberate y confirms.
+      await openAbort()
+      mockInput.pressKey("y")
+      await renderOnce()
+      expect(aborts).toBe(1)
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("shift+tab on a controller routes the cycled mode through onCycleAutoAccept", async () => {
+    const modes: Array<"off" | "all" | "smart"> = []
+    const { dashboard, mockInput } = await createDashboard(120, 40, [{ name: "implement", description: "" }], { autoAccept: { mode: "off" }, onCycleAutoAccept: (mode) => void modes.push(mode) })
+    try {
+      mockInput.pressTab({ shift: true })
+      await mockInput.pressTab({ shift: true })
+      expect(modes).toEqual(["all", "smart"])
     } finally {
       dashboard.stop()
     }

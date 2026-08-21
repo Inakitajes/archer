@@ -210,21 +210,28 @@ async function handleRequest(
     verdictReason = verdict.reason
   }
 
-  if (!interactive) {
-    log.warn(`[permission] auto-rejecting ${request.permission} (no TTY): ${summary}`)
-    await reply(client, request.id, directory, "reject", "Convoy rejected: non-interactive run")
-    return
-  }
-
-  // The TUI resolves the prompt in-place; suspending to readline is only the
-  // plain-logs fallback so the run never drops to a bare black screen. That
-  // fallback goes through the shared terminal-input arbiter so it can never
-  // race a phase-gate readline for the same stdin in a --no-tui parallel run.
+  // The UI (dashboard, or the control adapter on a coordinated run) resolves
+  // the prompt in-place; it wins even without a TTY — a coordinated run has no
+  // terminal on the coordinator, so "interactive" means "a controller can
+  // answer", not `stdin.isTTY`. Without a controller the adapter's promise
+  // simply holds: prompts are never auto-rejected just because nobody is
+  // attached right now. The readline fallback is only for the plain-logs case
+  // and goes through the shared terminal-input arbiter so it can never race a
+  // phase-gate readline for the same stdin in a --no-tui parallel run.
   const ask = progress.askPermission?.bind(progress)
   if (ask) {
     const answer = await ask(promptInfoForUser(request, judgeReason, verdictReason, judgeModel, client, directory, signal))
     log.info(`[permission] replied ${answer} for ${request.permission}`)
     await reply(client, request.id, directory, answer, answer === "reject" ? "rejected by user" : undefined)
+    return
+  }
+
+  // True non-interactive CI (no UI at all) must not hang. Once executeRun
+  // always coordinates, this branch is unreachable in production; it stays as
+  // a failsafe for unit tests that build a bare gate.
+  if (!interactive) {
+    log.warn(`[permission] auto-rejecting ${request.permission} (no TTY): ${summary}`)
+    await reply(client, request.id, directory, "reject", "Convoy rejected: non-interactive run")
     return
   }
 

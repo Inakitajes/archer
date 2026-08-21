@@ -337,6 +337,8 @@ export async function createTuiProgress(
     offlineSessions?: boolean
     observer?: boolean
     mode?: TuiDashboardMode
+    /** Ctrl+C behavior on this dashboard: abort (first auto-attach) or detach (menu attach). */
+    ctrlC?: "abort" | "detach"
   } & ProgressHostControls,
 ): Promise<ProgressUI> {
   // No backgroundColor yet: the palette is only chosen after the terminal
@@ -362,6 +364,9 @@ export async function createTuiProgress(
     copyReportToClipboard,
     options?.onPauseToggle,
     options?.onKeepAwakeToggle,
+    options?.onBackground,
+    options?.onCycleAutoAccept,
+    options?.ctrlC,
     options?.finish,
   )
 }
@@ -497,6 +502,9 @@ export class TuiProgress implements ProgressUI {
   private commandPalette?: CommandPalette
   private usageModal = false
   private finishModal?: FinishModal
+  // The palette's "Abort the run" confirm on a menu-opened controller. Default
+  // No — a stray key must never kill the coordinator.
+  private abortConfirm = false
   // ScrollBarRenderable emits change events for programmatic state updates as
   // well as mouse drags. Ignore the former so a layout recalculation cannot
   // overwrite the reader's just-computed scroll position.
@@ -558,6 +566,24 @@ export class TuiProgress implements ProgressUI {
 
   private readonly handleKeyPress = (key: KeyEvent) => {
     if (this.inSubshell) return
+    if (this.abortConfirm) {
+      // The abort confirm modal owns the keyboard while it is up (same as the
+      // finish modal). Default No: only a deliberate "y" confirms — a stray
+      // Enter, Ctrl+C, or any other key cancels, so reflexive keypresses can't
+      // kill the coordinator.
+      key.preventDefault()
+      key.stopPropagation()
+      if (key.name === "y") {
+        this.abortConfirm = false
+        this.addEvent("convoy", "system", "abort confirmed; shutting down")
+        this.render()
+        ;(this.abortHandler ?? this.onAbort)?.()
+      } else {
+        this.abortConfirm = false
+        this.render()
+      }
+      return
+    }
     if ((key.ctrl && key.name === "c") || key.raw === "\u0003") {
       key.preventDefault()
       key.stopPropagation()
@@ -565,6 +591,15 @@ export class TuiProgress implements ProgressUI {
       // a finished run would only race the cleanup it already triggers.
       if (this.finished) {
         this.finished.resolve()
+        return
+      }
+      // A menu-opened controller detaches to the runs menu instead of aborting
+      // (abort lives in the palette under a confirm modal). The first auto-attach
+      // keeps today's muscle memory: Ctrl+C aborts.
+      if (this.ctrlC === "detach" && this.hostControls.onBackground) {
+        this.addEvent("convoy", "system", "ctrl+c received; detaching to the runs menu")
+        this.render()
+        void this.hostControls.onBackground?.()
         return
       }
       this.addEvent("convoy", "system", "ctrl+c received; shutting down")
@@ -888,10 +923,19 @@ export class TuiProgress implements ProgressUI {
     private readonly copyReport = copyReportToClipboard,
     onPauseToggle?: () => void,
     onKeepAwakeToggle?: () => void,
+    onBackground?: () => void | Promise<void>,
+    onCycleAutoAccept?: (mode: AutoAcceptMode) => void,
+    private readonly ctrlC: "abort" | "detach" = "abort",
     finishSeam?: FinishSeam,
   ) {
     this.contentTab = initialTab
-    this.hostControls = { onPauseToggle, onKeepAwakeToggle, finish: finishSeam }
+    this.hostControls = {
+      onPauseToggle,
+      onKeepAwakeToggle,
+      ...(onBackground ? { onBackground } : {}),
+      ...(onCycleAutoAccept ? { onCycleAutoAccept } : {}),
+      finish: finishSeam,
+    }
     this.phases = pendingPhases(phases)
 
     const shell = new BoxRenderable(renderer, {
@@ -1830,11 +1874,13 @@ export class TuiProgress implements ProgressUI {
                 ? "review"
                 : undefined,
       reviewCanRetry: this.humanReviewQueue[0]?.info.canRetry ?? false,
+      ctrlC: this.ctrlC,
       autoAccept: this.autoAccept?.mode,
       keepAwake: this.keepAwake?.status,
       controlState: this.controlState,
       canPause: this.hostControls.onPauseToggle !== undefined,
       canKeepAwake: this.hostControls.onKeepAwakeToggle !== undefined && this.keepAwake?.status !== "unavailable",
+      canBackground: this.hostControls.onBackground !== undefined,
       finishSeam: this.hostControls.finish !== undefined,
       interactiveArmed: this.interactiveTakeover.has(this.focusedPhase()?.name ?? ""),
       reportCopyable: fullscreen !== undefined && Array.isArray(this.reports.get(fullscreen.phase)),
@@ -1957,6 +2003,23 @@ export class TuiProgress implements ProgressUI {
       case "permissions":
         // Stays open on purpose: cycling the policy is often done twice.
         this.cycleAutoAccept()
+        return
+      case "background":
+        // Send to background: release this terminal. The host (attach) POSTs
+        // /bye, stops the dashboard, and resolves the attach so the caller can
+        // land on the runs browser with this run selected.
+        close()
+        void this.hostControls.onBackground?.()
+        break
+      case "abort":
+        // Only reachable on a menu-opened controller (the abort action carries
+        // a label exactly then — never for an observer). The list item is the
+        // full phrase; Enter opens a confirm modal — it is not the kill itself.
+        close()
+        if (this.ctrlC === "detach" && !this.observer) {
+          this.abortConfirm = true
+          this.render()
+        }
         return
       case "interactive":
         close()
@@ -2336,6 +2399,9 @@ export class TuiProgress implements ProgressUI {
     const order = ["off", "all", "smart"] as const
     const next = order[(order.indexOf(this.autoAccept.mode) + 1) % order.length]!
     this.autoAccept.mode = next
+    // A controller dashboard's toggle is authoritative on the coordinator: tell
+    // the host (who POSTs it over the control channel) about the new mode.
+    this.hostControls.onCycleAutoAccept?.(next)
     this.addEvent("convoy", "permission", autoAcceptAnnouncement[next])
     // Only "all" clears the backlog blindly; "smart" leaves already-escalated
     // prompts for the user (re-judging an open prompt would be surprising).
@@ -3767,6 +3833,10 @@ export class TuiProgress implements ProgressUI {
       this.renderFinishModal(this.finishModal)
       return
     }
+    if (this.abortConfirm) {
+      this.renderAbortConfirmModal()
+      return
+    }
     if (this.usageModal) {
       this.renderUsageModal()
       return
@@ -3776,6 +3846,27 @@ export class TuiProgress implements ProgressUI {
       return
     }
     this.overlay.visible = false
+  }
+
+  // The palette's "Abort the run" lands here: the coordinator is someone
+  // else's process and an accidental kill is not recoverable, so the modal
+  // defaults to No and only a deliberate y goes through. Same shape as the
+  // runs browser's retry confirm — no title glyph (⚿ belongs to permission).
+  private renderAbortConfirmModal() {
+    this.overlay.visible = true
+    this.modal.title = " abort run "
+    const boxWidth = Math.max(44, this.renderer.width - 10)
+    this.modal.width = boxWidth
+    const lines: StyledText[] = [
+      t`${bold(fg(theme.yellow)("Abort the running pipeline?"))}`,
+      plain(""),
+      t`${fg(theme.faint)("There is no undo: the current turn is cancelled")}`,
+      t`${fg(theme.faint)("and the run lease is released.")}`,
+      plain(""),
+      t`${fg(theme.accent)("y")} ${fg(theme.text)("abort")}   ${fg(theme.faint)("n / esc")} ${fg(theme.dim)("cancel")}`,
+    ]
+    this.modal.height = lines.length + 4
+    this.modalText.content = joinLines(lines)
   }
 
   /**

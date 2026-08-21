@@ -35,7 +35,6 @@ import { throughputRoutedModels } from "./run-plan"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
-  createProgressUI,
   noopProgress,
   type ActivityKind,
   type AutoAccept,
@@ -594,20 +593,19 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: workspace.dir }),
     }
     if (options.progress) {
-      // Hosted by the goal loop: reuse its dashboard, repoint it at this run's
-      // controls and shutdown, and let this run's finally never tear it down.
+      // Hosted by the coordinator (or the goal loop): reuse its dashboard or
+      // control adapter, repoint it at this run's controls and shutdown, and
+      // let this run's finally never tear it down.
       options.progress.setHostControls?.(hostControls)
       options.progress.setAbortHandler?.(() => shutdown.request("Ctrl+C"))
       options.progress.resetPipeline?.(phases, { runID: workspace.runID, targetDir: options.targetDir, runDir: workspace.dir, pipeline, ...(options.retainFeedMessage ? { retainMessage: options.retainFeedMessage } : {}) })
       progress = trackRunStatus(recordProgress(options.progress, metadata), statusTracker)
     } else {
-      progress = trackRunStatus(
-        recordProgress(
-          await createProgressUI(phases, options.tui, () => shutdown.request("Ctrl+C"), autoAccept, hostControls),
-          metadata,
-        ),
-        statusTracker,
-      )
+      // Production CLI never reaches here: every run is a coordinated process
+      // with a ControlProgress adapter (slice 2+). Direct programmatic callers
+      // and tests that pass no `progress` get a silent noop renderer — no TUI
+      // is created inside run() anymore (slice 4).
+      progress = trackRunStatus(recordProgress(noopProgress, metadata), statusTracker)
     }
     control.bind(progress)
     caffeinate.bind(progress)

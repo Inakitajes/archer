@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 
 import { runGoalLoop, type GoalLoopDeps } from "../src/goal-loop"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
@@ -10,16 +10,15 @@ import type { RepoSnapshot } from "../src/git"
 import type { RunOptions } from "../src/types"
 import type { QualityScore } from "../src/quality-score"
 
-// The loop builds the dashboard it OWNS (options.progress unset) through
-// createProgressUI, which lazily imports ./tui; replacing that factory here
-// lets the tests watch the loop-owned dashboard — created, held, and stopped —
-// without booting a real renderer. Like test/runner-hosted.test.ts, the mock
-// is registered before anything can import the module.
+// Slice 4: runGoalLoop never creates a TUI of its own. A loop's dashboard (or
+// control adapter) is always injected as options.progress, exactly as the
+// coordinator spawns it. These tests watch that borrowed progress's lifecycle:
+// one object across the whole loop, exactly one hold at the end, the abort
+// handler cleared on exit (SC-6), and never a stop from the loop itself.
 const order: string[] = []
-let created = 0
 let capturedAutoAccept: AutoAccept | undefined
 
-type OwnedDashboard = {
+type HostedDashboard = {
   progress: ProgressUI
   views: GoalLoopView[]
   finishCalls: RunOutcome[]
@@ -27,32 +26,29 @@ type OwnedDashboard = {
   dismiss: () => void
 }
 
-const dashboards: OwnedDashboard[] = []
+const dashboards: HostedDashboard[] = []
 
-mock.module("../src/tui", () => ({
-  createTuiProgress: async (_phases: unknown, _onAbort: unknown, autoAccept?: AutoAccept): Promise<ProgressUI> => {
-    created++
-    order.push("create")
-    capturedAutoAccept = autoAccept
-    const views: GoalLoopView[] = []
-    const finishCalls: RunOutcome[] = []
-    const dismissers: (() => void)[] = []
-    const progress: ProgressUI = {
-      ...noopProgress,
-      setGoalLoop: (view) => void views.push(view),
-      setAbortHandler: (handler) => void order.push(handler ? "abort-handler" : "clear-abort-handler"),
-      stop: () => void order.push("stop"),
-      runFinished: (outcome) => {
-        finishCalls.push(outcome)
-        order.push("hold")
-        return new Promise<void>((resolve) => dismissers.push(resolve))
-      },
-    }
-    const dashboard: OwnedDashboard = { progress, views, finishCalls, dismiss: () => dismissers.shift()?.() }
-    dashboards.push(dashboard)
-    return progress
-  },
-}))
+function hostedProgress(autoAccept: AutoAccept): ProgressUI {
+  const views: GoalLoopView[] = []
+  const finishCalls: RunOutcome[] = []
+  const dismissers: (() => void)[] = []
+  order.push("create")
+  capturedAutoAccept = { ...autoAccept }
+  const progress: ProgressUI = {
+    ...noopProgress,
+    autoAccept,
+    setGoalLoop: (view) => void views.push(view),
+    setAbortHandler: (handler) => void order.push(handler ? "abort-handler" : "clear-abort-handler"),
+    stop: () => void order.push("stop"),
+    runFinished: (outcome) => {
+      finishCalls.push(outcome)
+      order.push("hold")
+      return new Promise<void>((resolve) => dismissers.push(resolve))
+    },
+  }
+  dashboards.push({ progress, views, finishCalls, dismiss: () => dismissers.shift()?.() })
+  return progress
+}
 
 const dimensions: QualityScore["dimensions"] = { prd: 92, tests: 70, security: 95, maintainability: 88, operational: 90, scope: 85 }
 
@@ -75,8 +71,7 @@ function makeOptions(overrides: Partial<RunOptions> = {}): RunOptions {
     modelOverride: "",
     advisorOverride: "",
     advisorDisabled: false,
-    // The loop only mounts a dashboard of its own when the TUI is enabled.
-    tui: true,
+    tui: false,
     notify: false,
     notifications: {},
     humanReview: false,
@@ -117,71 +112,50 @@ function makeDeps(scores: number[], failOnCall?: { call: number; error: Error })
   }
 }
 
-/** createProgressUI only mounts a TUI on a TTY; force one for the test window. */
-async function withTty(fn: () => Promise<void>): Promise<void> {
-  const original = process.stdout.isTTY
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true })
-  try {
-    await fn()
-  } finally {
-    Object.defineProperty(process.stdout, "isTTY", { value: original, configurable: true })
-  }
-}
-
-describe("runGoalLoop with an owned dashboard", () => {
+describe("runGoalLoop with a hosted control adapter", () => {
   beforeEach(() => {
     order.length = 0
-    created = 0
     capturedAutoAccept = undefined
     dashboards.length = 0
   })
 
-  // createProgressUI mutes the log while the TUI is up; restore it after each
-  // test so the rest of the process keeps logging normally.
   afterEach(() => log.mute(false))
 
-  test("builds one dashboard for the whole loop and stops it exactly once, after the hold", async () => {
-    const options = makeOptions()
-    await withTty(async () => {
-      const promise = runGoalLoop(options, buildRunPlan(options), { goal: 90, maxIterations: 3, plateau: 3 }, makeDeps([71, 84, 92]))
-      const deadline = Date.now() + 1_000
-      while (dashboards.length === 0 && Date.now() < deadline) await Bun.sleep(1)
-      const dashboard = dashboards[0]!
-      while (dashboard.finishCalls.length === 0 && Date.now() < deadline) await Bun.sleep(1)
+  test("borrows one progress for the whole loop and holds once, never stopping it", async () => {
+    const autoAccept: AutoAccept = { mode: "off" }
+    const options = makeOptions({ progress: hostedProgress(autoAccept) })
+    const promise = runGoalLoop(options, buildRunPlan(options), { goal: 90, maxIterations: 3, plateau: 3 }, makeDeps([71, 84, 92]))
+    const dashboard = dashboards[0]!
+    const deadline = Date.now() + 1_000
+    while (dashboard.finishCalls.length === 0 && Date.now() < deadline) await Bun.sleep(1)
 
-      // While the finish hold is up, the dashboard is still live: the loop has
-      // neither remounted it for iteration 2 nor stopped it yet.
-      expect(created).toBe(1)
-      expect(order.filter((event) => event === "stop")).toHaveLength(0)
-      dashboard.dismiss()
-
-      const outcome = await promise
-      expect(outcome.reached).toBe(true)
-      expect(outcome.scores).toEqual([71, 84, 92])
-    })
-
-    // One dashboard for both runs, stopped exactly once — after the hold. The
-    // shared auto-accept reference was handed to it once, at creation. The
-    // abort handler is cleared on loop exit (SC-6) before the dashboard stops.
-    expect(created).toBe(1)
-    expect(order).toEqual(["create", "abort-handler", "hold", "clear-abort-handler", "stop"])
+    // The adapter borrowed the shared auto-accept reference (the permission
+    // gate and the control /auto-accept route share it).
     expect(capturedAutoAccept).toEqual({ mode: "off" })
+    expect(order.filter((event) => event === "stop")).toHaveLength(0)
+    dashboard.dismiss()
+
+    const outcome = await promise
+    expect(outcome.reached).toBe(true)
+    expect(outcome.scores).toEqual([71, 84, 92])
+
+    // One host object for both runs, one hold, abort handler cleared on exit,
+    // and the loop never stops a borrowed dashboard (the coordinator owns its
+    // shutdown).
+    expect(order).toEqual(["create", "abort-handler", "hold", "clear-abort-handler"])
     expect(dashboards[0]!.finishCalls[0]?.goalLoop?.scores).toEqual([71, 84, 92])
   })
 
-  test("an aborted loop never holds but still stops its owned dashboard once", async () => {
-    const options = makeOptions()
-    await withTty(async () => {
-      await expect(
-        runGoalLoop(options, buildRunPlan(options), { goal: 90, maxIterations: 3, plateau: 3 }, makeDeps([71], { call: 2, error: new UserAbortError("Ctrl+C received") })),
-      ).rejects.toThrow("Ctrl+C")
-    })
+  test("an aborted loop never holds but still clears the abort handler on the borrowed progress", async () => {
+    const options = makeOptions({ progress: hostedProgress({ mode: "off" }) })
+    await expect(
+      runGoalLoop(options, buildRunPlan(options), { goal: 90, maxIterations: 3, plateau: 3 }, makeDeps([71], { call: 2, error: new UserAbortError("Ctrl+C received") })),
+    ).rejects.toThrow("Ctrl+C")
 
-    // No finish screen for an abort, but the dashboard the loop owns must not
-    // outlive the loop: exactly one stop, from the loop's finally. The abort
-    // handler is cleared on loop exit (SC-6) before the dashboard stops.
-    expect(created).toBe(1)
+    // No finish screen for an abort; the abort handler is cleared so a stray
+    // Ctrl+C after the loop exits cannot fire against a dead shutdown.
     expect(dashboards[0]!.finishCalls).toHaveLength(0)
-    expect(order).toEqual(["create", "clear-abort-handler", "stop"])
+    expect(order).toEqual(["create", "clear-abort-handler"])
+    expect(dashboards[0]!.views.length).toBeGreaterThan(0)
   })
 })

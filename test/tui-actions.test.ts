@@ -12,9 +12,11 @@ function state(overrides: Partial<DashboardActionState> = {}): DashboardActionSt
     contentTab: "session",
     permissionPending: false,
     reviewCanRetry: false,
+    ctrlC: "abort",
     controlState: "running",
     canPause: true,
     canKeepAwake: true,
+    canBackground: true,
     finishSeam: true,
     interactiveArmed: false,
     reportCopyable: false,
@@ -53,7 +55,7 @@ describe("dashboard action registry", () => {
   })
 
   test("a live run offers the run controls", () => {
-    expect(commands()).toEqual(["keep-awake", "pause", "permissions", "interactive", "usage", "session", "fullscreen", "tab-session", "tab-reports", "tab-logs", "tab-advisor", "help"])
+    expect(commands()).toEqual(["keep-awake", "pause", "permissions", "interactive", "usage", "background", "session", "fullscreen", "tab-session", "tab-reports", "tab-logs", "tab-advisor", "help"])
   })
 
   test("an attached observer cannot pause, keep awake, or take over", () => {
@@ -70,6 +72,33 @@ describe("dashboard action registry", () => {
 
   test("pause disappears when the runner wired no toggle", () => {
     expect(commands({ canPause: false })).not.toContain("pause")
+  })
+
+  test("background disappears when the host wired no handler", () => {
+    // A bare in-process dashboard (smoke script, tests) has nothing to release
+    // the terminal to; offering the command would dispatch into a no-op.
+    expect(commands({ canBackground: false })).not.toContain("background")
+  })
+
+  test("a menu-opened controller detaches with ctrl+c and keeps abort behind the palette confirm", () => {
+    const detach = state({ ctrlC: "detach" })
+    const abort = dashboardActions(detach).find((action) => action.id === "abort")!
+    expect(abort.hint).toBe("detach")
+    // The full phrase is the list item; Enter on it opens the y/n modal.
+    expect(abort.label).toBe("Abort the run")
+    // The first-attach dashboard keeps abort on ctrl+c and out of the palette.
+    const first = dashboardActions(state({ ctrlC: "abort" })).find((action) => action.id === "abort")!
+    expect(first.hint).toBe("abort")
+    expect(first.label).toBeUndefined()
+  })
+
+  test("a menu-opened observer is never offered the palette abort", () => {
+    // An observer's ctrl+c only detaches — offering "Abort the run" would be
+    // an abort that cannot abort (and must never become one).
+    const abort = dashboardActions(state({ ctrlC: "detach", observer: true })).find((action) => action.id === "abort")!
+    expect(abort.hint).toBe("detach")
+    expect(abort.label).toBeUndefined()
+    expect(abort.detail).toBeUndefined()
   })
 
   // The bug this registry exists to kill: the finish screen used to gate every

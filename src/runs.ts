@@ -3,6 +3,8 @@ import { readdir, readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { stdin, stdout } from "node:process"
 
+import { readControlFile } from "./control-client"
+import type { PendingSnapshot } from "./control-server"
 import { readRunMetadata, type PhaseMetadataStatus, type RunMetadata } from "./metadata"
 import { isValidRunID, runsRoot } from "./workspace"
 import { readAdvisorSplit } from "./advisor-report"
@@ -29,6 +31,8 @@ export type RunEntry = {
   live: boolean
   /** The live server URL, present only when `live`. */
   serverUrl?: string
+  /** A live coordinated run is parked on a gate nobody answered yet. */
+  waiting?: "permission" | "review"
   cost?: number
   executorCost?: number
   advisorCost?: number
@@ -111,7 +115,10 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
   const dir = join(root, runID)
   const metadata = await readRunMetadata(join(dir, "metadata.json"))
   const summary = statusSummary(metadata)
-  const live = await isServerLive(metadata?.server)
+  const serverLive = await isServerLive(metadata?.server)
+  const control = await readControlFile(runID, root)
+  const coordinatorLive = control ? await isControlLive(control) : false
+  const live = serverLive || coordinatorLive
   const split = await readAdvisorSplit(dir)
   const executorCost = totalCost(metadata, split.executorPhases) ?? (split.executor.cost > 0 ? split.executor.cost : undefined)
   const advisorCost = split.advisor.cost
@@ -123,13 +130,46 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
     status: summary.label,
     statusKind: summary.kind,
     live,
-    serverUrl: live ? metadata?.server?.url : undefined,
+    serverUrl: serverLive ? metadata?.server?.url : undefined,
+    // Coordinated runs stay live through the control server even when the
+    // per-iteration OpenCode server is down between goal-loop iterations;
+    // only then is the waiting probe worth paying for.
+    waiting: live ? await probeRunWaiting(runID, root) : undefined,
     cost: executorCost === undefined && advisorCost === 0 ? undefined : (executorCost ?? 0) + advisorCost,
     executorCost,
     advisorCost,
     createdAt: metadata?.createdAt,
     phases: phaseInfos(metadata),
   }
+}
+
+/** What a live run is parked on, for the runs browser's "waiting" details line. */
+export async function probeRunWaiting(runID: string, root = runsRoot()): Promise<"permission" | "review" | undefined> {
+  const control = await readControlFile(runID, root)
+  if (!control) return undefined
+  try {
+    const response = await fetch(`${control.url}/pending`, {
+      headers: { authorization: `Bearer ${control.token}` },
+      // A wedged-but-listening coordinator must not stall the run list.
+      signal: AbortSignal.timeout(500),
+    })
+    if (!response.ok) return undefined
+    const snapshot = (await response.json()) as PendingSnapshot
+    if (snapshot.permission) return "permission"
+    if (snapshot.human) return "review"
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Re-probes a live run's pending gate so an open browser can show waiting state as it changes. */
+export async function refreshRunWaiting(run: RunEntry, root = runsRoot()): Promise<void> {
+  if (!run.live) {
+    run.waiting = undefined
+    return
+  }
+  run.waiting = await probeRunWaiting(run.runID, root)
 }
 
 // A run is live if its recorded server process is still alive and its port
@@ -142,7 +182,16 @@ export async function isServerLive(server: RunMetadata["server"]): Promise<boole
   return tcpReachable(server.url, 250)
 }
 
-function pidAlive(pid: number): boolean {
+/**
+ * Whether a coordinated run is live through its control server. The
+ * coordinator outlives every per-iteration OpenCode server, so this (not
+ * `isServerLive`) is what "the run is still going" means mid-goal-loop.
+ */
+export async function isControlLive(control: { url: string; pid: number }, timeoutMs = 250): Promise<boolean> {
+  return pidAlive(control.pid) && (await tcpReachable(control.url, timeoutMs))
+}
+
+export function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
@@ -152,7 +201,7 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function tcpReachable(url: string, timeoutMs: number): Promise<boolean> {
+export function tcpReachable(url: string, timeoutMs: number): Promise<boolean> {
   let host: string
   let port: number
   try {
@@ -230,7 +279,8 @@ function phaseInfos(metadata: RunMetadata | undefined): RunPhaseInfo[] {
 }
 
 function printRunList(runs: RunEntry[]) {
-  const statusText = (run: RunEntry) => (run.live ? "running" : run.status)
+  const statusText = (run: RunEntry) =>
+    run.live ? (run.waiting ? `running · waiting for a ${run.waiting === "permission" ? "permission" : "review"}` : "running") : run.status
   const numberWidth = String(runs.length).length
   const statusWidth = Math.max(...runs.map((run) => statusText(run).length))
   stdout.write(`\nruns in ${runsRoot()}:\n`)

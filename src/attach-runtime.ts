@@ -140,3 +140,23 @@ export function overallStatus(metadata: RunMetadata): "completed" | "failed" {
   const allDone = statuses.length > 0 && statuses.every((status) => status === "completed" || status === "skipped")
   return allDone ? "completed" : "failed"
 }
+
+/**
+ * Waits until the run recorded at `metaPath` has a live OpenCode server entry,
+ * then returns its URL. The coordinator writes `metadata.server` when the
+ * server is ready — before that (a fresh iteration booting, a run just
+ * spawned) the entry is absent. `abort` races the wait: when it resolves the
+ * caller is leaving (detach) or the coordinator died, and undefined comes
+ * back so nobody starts an attach against a server that will never exist.
+ */
+export async function waitForServerUrl(metaPath: string, abort: Promise<unknown>, pollMs = 250): Promise<string | undefined> {
+  for (;;) {
+    const metadata = await readRunMetadata(metaPath).catch(() => undefined)
+    if (metadata?.server?.url) return metadata.server.url
+    const winner = await Promise.race([
+      Bun.sleep(pollMs).then(() => "poll" as const),
+      Promise.resolve(abort).then(() => "abort" as const),
+    ])
+    if (winner === "abort") return undefined
+  }
+}
