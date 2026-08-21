@@ -135,7 +135,7 @@ const runnerSessionOpeners: Record<StepRunnerId, (context: RunnerSessionContext)
     context.serverUrl
       ? openOpencodeSessionWindow({ url: context.serverUrl, targetDir: context.targetDir, sessionID: context.sessionID })
       : context.offlineSessions
-        ? openStoredSessionWindow({ targetDir: context.targetDir, sessionID: context.sessionID })
+        ? openStoredSessionWindow({ targetDir: context.targetDir, sessionID: context.sessionID, runDir: context.runDir })
         : undefined,
   "claude-code": (context) => openClaudeSessionWindow({ targetDir: context.targetDir, sessionID: context.sessionID, runDir: context.runDir }),
 }
@@ -2614,6 +2614,7 @@ export class TuiProgress implements ProgressUI {
     openIterateOpencodeWindow({
       targetDir: this.targetDir || process.cwd(),
       prompt: iteratePrompt(this.runID, files),
+      runDir: this.runDir,
     })
       .then((backend) => {
         this.addEvent("convoy", "system", `iterate session opened in ${backend}`)

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
+  runDirAccessConfig,
   shellQuote,
   sessionShellCommand,
   openSessionCommand,
@@ -158,6 +159,29 @@ describe("shellQuote", () => {
   })
 })
 
+describe("runDirAccessConfig", () => {
+  test("returns a JSON whose external_directory and read allow exactly the run dir glob", () => {
+    const parsed = JSON.parse(runDirAccessConfig("/tmp/convoy-run"))
+    const permission = (parsed as { permission: Record<string, Record<string, string>> }).permission
+    expect(permission.external_directory[join("/tmp/convoy-run", "**")]).toBe("allow")
+    expect(permission.read[join("/tmp/convoy-run", "**")]).toBe("allow")
+  })
+
+  test("contains no wildcard allow rule", () => {
+    const parsed = JSON.parse(runDirAccessConfig("/tmp/convoy-run"))
+    const permission = (parsed as { permission: Record<string, Record<string, string>> }).permission
+    expect(permission.external_directory).not.toHaveProperty("*")
+    expect(permission.read).not.toHaveProperty("*")
+    expect(Object.keys(permission.external_directory)).toHaveLength(1)
+    expect(Object.keys(permission.read)).toHaveLength(1)
+  })
+
+  test("handles a run dir with spaces and quotes", () => {
+    const parsed = JSON.parse(runDirAccessConfig("/tmp/convoy runs/it's"))
+    expect(parsed).toBeTruthy()
+  })
+})
+
 describe("sessionShellCommand", () => {
   test("does not launch the command when changing directory fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "convoy-session-command-"))
@@ -236,6 +260,27 @@ describe("sessionShellCommand", () => {
     const cmd = sessionShellCommand("echo 'hello world'", "/dir", "")
     expect(cmd).toContain("echo 'hello world'")
     expect(cmd).toContain("cd '/dir'")
+  })
+
+  test("exports env vars before the cd when env is provided", () => {
+    const cmd = sessionShellCommand("opencode /repo", "/repo", "/usr/bin:/bin", { FOO: "bar" })
+    expect(cmd).toContain("export FOO='bar'")
+    expect(cmd.indexOf("export FOO='bar'")).toBeLessThan(cmd.indexOf("cd '/repo'"))
+  })
+
+  test("quotes env values containing single quotes", () => {
+    const cmd = sessionShellCommand("opencode /repo", "/repo", "", { FOO: "it's" })
+    expect(cmd).toContain("export FOO='it'\\''s'")
+  })
+
+  test("quotes env values containing double quotes", () => {
+    const cmd = sessionShellCommand("opencode /repo", "/repo", "", { FOO: '{"permission":{}}' })
+    expect(cmd).toContain("export FOO='{\"permission\":{}}'")
+  })
+
+  test("omits env exports when env is undefined", () => {
+    const cmd = sessionShellCommand("opencode /repo", "/repo", "/usr/bin:/bin")
+    expect(cmd).not.toContain("OPENCODE_CONFIG_CONTENT")
   })
 })
 
@@ -901,6 +946,25 @@ describe("openOpencodeSessionWindow", () => {
       mockSpawn.mockRestore()
     }
   })
+
+  // Live-attach windows talk to a server that already allows the run dir, so
+  // they must not inject the standalone-only OPENCODE_CONFIG_CONTENT export.
+  test("does not export OPENCODE_CONFIG_CONTENT", async () => {
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await openOpencodeSessionWindow({
+        url: "http://127.0.0.1:12345",
+        targetDir: "/repo",
+        sessionID: "sess-1",
+      })
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      const scriptArg = args[args.length - 1]!
+      expect(scriptArg).not.toContain("OPENCODE_CONFIG_CONTENT")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
 })
 
 describe("openInteractiveOpencodeWindow", () => {
@@ -947,6 +1011,22 @@ describe("openInteractiveOpencodeWindow", () => {
       mockSpawn.mockRestore()
     }
   })
+
+  test("does not export OPENCODE_CONFIG_CONTENT", async () => {
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await openInteractiveOpencodeWindow({
+        url: "http://127.0.0.1:12345",
+        targetDir: "/repo",
+      })
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      const scriptArg = args[args.length - 1]!
+      expect(scriptArg).not.toContain("OPENCODE_CONFIG_CONTENT")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
 })
 
 describe("openStoredSessionWindow", () => {
@@ -970,6 +1050,7 @@ describe("openStoredSessionWindow", () => {
       await openStoredSessionWindow({
         targetDir: "/repo",
         sessionID: "session-abc",
+        runDir: "/tmp/convoy-run",
       })
       const args = mockSpawn.mock.calls[0]![0] as string[]
       const scriptArg = args[args.length - 1]!
@@ -987,11 +1068,30 @@ describe("openStoredSessionWindow", () => {
       await openStoredSessionWindow({
         targetDir: "/repo",
         sessionID: "sess-2",
+        runDir: "/tmp/convoy-run",
       })
       const args = mockSpawn.mock.calls[0]![0] as string[]
       const scriptArg = args[args.length - 1]!
       expect(scriptArg).toMatch(/'\/repo'/)
       expect(scriptArg).toMatch(/'sess-2'/)
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("exports OPENCODE_CONFIG_CONTENT with the run dir glob", async () => {
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await openStoredSessionWindow({
+        targetDir: "/repo",
+        sessionID: "sess-2",
+        runDir: "/tmp/convoy-run",
+      })
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      const scriptArg = args[args.length - 1]!
+      expect(scriptArg).toContain("export OPENCODE_CONFIG_CONTENT=")
+      expect(scriptArg).toContain("/tmp/convoy-run/**")
     } finally {
       mockSpawn.mockRestore()
     }
@@ -1019,6 +1119,7 @@ describe("openIterateOpencodeWindow", () => {
       await openIterateOpencodeWindow({
         targetDir: "/repo",
         prompt: "Fix the bug",
+        runDir: "/tmp/convoy-run",
       })
       const args = mockSpawn.mock.calls[0]![0] as string[]
       const scriptArg = args[args.length - 1]!
@@ -1035,6 +1136,7 @@ describe("openIterateOpencodeWindow", () => {
       await openIterateOpencodeWindow({
         targetDir: "/my repo",
         prompt: "hello",
+        runDir: "/tmp/convoy-run",
       })
       const args = mockSpawn.mock.calls[0]![0] as string[]
       const scriptArg = args[args.length - 1]!
@@ -1051,8 +1153,27 @@ describe("openIterateOpencodeWindow", () => {
       const backend = await openIterateOpencodeWindow({
         targetDir: "/repo",
         prompt: "hello",
+        runDir: "/tmp/convoy-run",
       })
       expect(backend).toBe("terminal")
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  test("exports OPENCODE_CONFIG_CONTENT with the run dir glob", async () => {
+    const mockSpawn = mockSpawnResult()
+
+    try {
+      await openIterateOpencodeWindow({
+        targetDir: "/repo",
+        prompt: "hello",
+        runDir: "/tmp/convoy-run",
+      })
+      const args = mockSpawn.mock.calls[0]![0] as string[]
+      const scriptArg = args[args.length - 1]!
+      expect(scriptArg).toContain("export OPENCODE_CONFIG_CONTENT=")
+      expect(scriptArg).toContain("/tmp/convoy-run/**")
     } finally {
       mockSpawn.mockRestore()
     }
@@ -1067,7 +1188,7 @@ describe("openIterateOpencodeWindow", () => {
     const mockSpawn = mockSpawnResult()
 
     try {
-      const backend = await openIterateOpencodeWindow({ targetDir: "/repo", prompt: "hello" })
+      const backend = await openIterateOpencodeWindow({ targetDir: "/repo", prompt: "hello", runDir: "/tmp/convoy-run" })
       expect(backend).toBe("zellij")
       const args = mockSpawn.mock.calls[0]![0] as string[]
       expect(args.slice(0, 5)).toEqual(["zellij", "action", "new-pane", "--name", "opencode iterate"])
@@ -1085,12 +1206,36 @@ describe("openIterateOpencodeWindow", () => {
     const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
 
     try {
-      const backend = await openIterateOpencodeWindow({ targetDir: "/repo", prompt: "hello" })
+      const backend = await openIterateOpencodeWindow({ targetDir: "/repo", prompt: "hello", runDir: "/tmp/convoy-run" })
       expect(backend).toBe("herdr")
       const splitArgs = mockSpawn.mock.calls[0]![0] as string[]
       expect(splitArgs.slice(0, 6)).toEqual(["herdr", "pane", "split", "--current", "--direction", "right"])
       // The pane is named "opencode iterate", matching the Zellij backend.
       expect(mockSpawn.mock.calls[1]![0]).toEqual(["herdr", "pane", "rename", "pane-42", "opencode iterate"])
+    } finally {
+      mockSpawn.mockRestore()
+    }
+  })
+
+  // The config travels as `--env` on the pane split; `pane run` must never type
+  // it as a visible export line.
+  test("passes the env as a Herdr --env pair, not typed into the pane", async () => {
+    setPlatform("linux")
+    delete process.env.CONVOY_TERMINAL
+    process.env.HERDR_ENV = "1"
+    Bun.which = ((name: string) => (name === "herdr" ? "/usr/bin/herdr" : null)) as typeof Bun.which
+    const mockSpawn = mockSpawnResult(0, "", HERDR_SPLIT_JSON)
+
+    try {
+      await openIterateOpencodeWindow({ targetDir: "/repo", prompt: "hello", runDir: "/tmp/convoy-run" })
+      const splitArgs = mockSpawn.mock.calls[0]![0] as string[]
+      expect(splitArgs).toContain("--env")
+      expect(splitArgs).toContain(`OPENCODE_CONFIG_CONTENT=${runDirAccessConfig("/tmp/convoy-run")}`)
+      // The `pane run` call's command is the bare core command — the env rides
+      // the split as --env and is never typed as a visible export line.
+      const runArgs = mockSpawn.mock.calls.find((call) => (call[0] as string[])[2] === "run")![0] as string[]
+      expect(runArgs[0]).toBe("herdr")
+      expect(runArgs[runArgs.length - 1]).not.toContain("export OPENCODE_CONFIG_CONTENT")
     } finally {
       mockSpawn.mockRestore()
     }

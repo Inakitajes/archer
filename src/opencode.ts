@@ -3,6 +3,7 @@ import "./polyfills"
 import { stat } from "node:fs/promises"
 import { createServer } from "node:net"
 import { homedir } from "node:os"
+import { join } from "node:path"
 
 import { createOpencodeClient, createOpencodeServer } from "@opencode-ai/sdk/v2"
 
@@ -137,12 +138,37 @@ export async function openInteractiveOpencodeWindow(input: {
 export async function openStoredSessionWindow(input: {
   targetDir: string
   sessionID: string
+  runDir: string
 }): Promise<SessionWindowBackend> {
   return openSessionCommand(
     ["opencode", input.targetDir, "--session", input.sessionID].map(shellQuote).join(" "),
     input.targetDir,
     "opencode session",
+    runDirSessionEnv(input.runDir),
   )
+}
+
+/**
+ * Builds the compact OpenCode config granting read access to exactly the run
+ * directory, so a standalone session window can read prd.md and report files
+ * without prompting. Injected as OPENCODE_CONFIG_CONTENT because that loads
+ * after the project opencode.json (so a project-level "*": "ask" cannot
+ * override the narrower run-dir rule) and deep-merges with global + project
+ * config. Only `external_directory` and `read` are added; there is no "*".
+ */
+export function runDirAccessConfig(runDir: string): string {
+  const glob = join(runDir, "**")
+  return JSON.stringify({
+    permission: {
+      external_directory: { [glob]: "allow" },
+      read: { [glob]: "allow" },
+    },
+  })
+}
+
+/** The env pair the standalone openers pass on to openSessionCommand. */
+function runDirSessionEnv(runDir: string): Record<string, string> {
+  return { OPENCODE_CONFIG_CONTENT: runDirAccessConfig(runDir) }
 }
 
 // Opens a standalone opencode TUI on a brand-new session seeded with an
@@ -152,9 +178,10 @@ export async function openStoredSessionWindow(input: {
 export async function openIterateOpencodeWindow(input: {
   targetDir: string
   prompt: string
+  runDir: string
 }): Promise<SessionWindowBackend> {
   const coreCommand = ["opencode", input.targetDir, "--prompt", input.prompt].map(shellQuote).join(" ")
-  return openSessionCommand(coreCommand, input.targetDir, "opencode iterate")
+  return openSessionCommand(coreCommand, input.targetDir, "opencode iterate", runDirSessionEnv(input.runDir))
 }
 
 /**
@@ -162,18 +189,18 @@ export async function openIterateOpencodeWindow(input: {
  * Shared with the claude-code runner. `label` names the pane and is ignored by
  * the window backends, which have no equivalent.
  */
-export async function openSessionCommand(coreCommand: string, cwd?: string, label?: string): Promise<SessionWindowBackend> {
-  return openShellCommand(coreCommand, cwd, label)
+export async function openSessionCommand(coreCommand: string, cwd?: string, label?: string, env?: Record<string, string>): Promise<SessionWindowBackend> {
+  return openShellCommand(coreCommand, cwd, label, env)
 }
 
-async function openShellCommand(coreCommand: string, cwd?: string, label?: string): Promise<SessionWindowBackend> {
+async function openShellCommand(coreCommand: string, cwd?: string, label?: string, env?: Record<string, string>): Promise<SessionWindowBackend> {
   const forced = forcedBackend()
   // An explicit choice always wins, which leaves an escape hatch for users who
   // intentionally want a separate macOS window from inside a multiplexer.
   // Herdr's `pane run` types into an interactive shell, so it gets the core
   // command — not the PATH-export wrapper the exec backends need.
   if (forced === "herdr") {
-    await openInHerdr(coreCommand, cwd, label)
+    await openInHerdr(coreCommand, cwd, label, env)
     return "herdr"
   }
   // Herdr exports HERDR_ENV for every process in a session — truthy in JS, so
@@ -189,13 +216,13 @@ async function openShellCommand(coreCommand: string, cwd?: string, label?: strin
   const insideHerdr = Boolean(process.env.HERDR_ENV)
   if (!forced && insideHerdr && Bun.which("herdr") !== null) {
     try {
-      await openInHerdr(coreCommand, cwd, label)
+      await openInHerdr(coreCommand, cwd, label, env)
       return "herdr"
     } catch (error) {
       if (process.platform !== "darwin") throw error
     }
   }
-  const command = sessionShellCommand(coreCommand, cwd)
+  const command = sessionShellCommand(coreCommand, cwd, process.env.PATH, env)
   if (forced === "zellij") {
     await openInZellij(command, cwd, label)
     return "zellij"
@@ -269,13 +296,14 @@ function detectedMultiplexer(): "herdr" | "zellij" | undefined {
 // instead of two seconds later. Then we wait for any output (the prompt) and
 // `pane run` types only the short command. Typing `export PATH=...` or `cd`
 // would be visible keystrokes and, with retries, look like several commands.
-async function openInHerdr(command: string, cwd?: string, label?: string) {
+async function openInHerdr(command: string, cwd?: string, label?: string, env?: Record<string, string>) {
   const path = process.env.PATH
   const splitArgs = [
     "herdr", "pane", "split", "--current", "--direction", "right",
     ...(cwd ? ["--cwd", cwd] : []),
     ...(path ? ["--env", `PATH=${path}`] : []),
     "--env", "ZDOTDIR=/var/empty",
+    ...(env ? Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]) : []),
     "--focus",
   ]
   const stdout = await spawnCapture(splitArgs)
@@ -352,9 +380,10 @@ async function openInZellij(command: string, cwd?: string, label?: string) {
 }
 
 /** Builds the login-shell command, stopping before launch if setup or `cd` fails. */
-export function sessionShellCommand(coreCommand: string, cwd?: string, path = process.env.PATH): string {
+export function sessionShellCommand(coreCommand: string, cwd?: string, path = process.env.PATH, env?: Record<string, string>): string {
   return [
     path ? `export PATH=${shellQuote(path)}:$PATH` : "",
+    ...(env ? Object.entries(env).map(([key, value]) => `export ${key}=${shellQuote(value)}`) : []),
     cwd ? `cd ${shellQuote(cwd)}` : "",
     coreCommand,
   ]
