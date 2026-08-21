@@ -49,6 +49,7 @@ import type { AgentStep, DeliverableContract, HumanStep, Pipeline, Step } from "
 import type { Workspace } from "../src/workspace"
 import { LoopGuard, LoopGuardError, resolveLoopGuard } from "../src/loop-guard"
 import { createReportRuntime, type ReportPhaseHandle } from "../src/report-runtime"
+import { startReportBridge } from "../src/report-bridge"
 import { qualityDimensionWeights } from "../src/quality-score"
 
 const recoveryDirs: string[] = []
@@ -1300,6 +1301,79 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
     expect(restores).toBe(0)
     // The gate decided continue, and the rescued report is now the deliverable — the
     // step advances instead of skipping the report.
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.kind).toBe("failure")
+  })
+
+  test("a write_report posted over the bridge while the gate is held with no controller still delivers on continue", async () => {
+    const prompts: HumanReviewPromptInfo[] = []
+    const workspace = await retryWorkspace()
+    const reports = createReportRuntime(workspace.dir)
+    const phase = { ...agentStep("implementer"), deliverableContract: { kind: "markdown-report" } as const }
+    // Hold harness shaped like ControlProgress (#84): askHumanReview parks on a
+    // promise only a late controller can resolve. No TTY, no attached client.
+    let resumeGate!: (action: "continue") => void
+    const parked = new Promise<"continue">((resolve) => {
+      resumeGate = resolve
+    })
+    const progress: ProgressUI = {
+      ...noopProgress,
+      askHumanReview: (info) => {
+        prompts.push(info)
+        return parked
+      },
+    }
+
+    let result = ""
+    const run = runPhaseUntilResolved(
+      {} as never,
+      workspace,
+      phase,
+      "/repo",
+      prepared,
+      { head: "baseline" },
+      progress,
+      new RunShutdown(),
+      createGitLock(),
+      { serverUrl: "http://127.0.0.1:1" },
+      {
+        runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
+          sessionRef!.id = "ses_hold"
+          reports.begin("ses_hold", phase, phase.deliverableContract, qualityDimensionWeights)
+          throw new Error("provider temporarily unavailable")
+        },
+        restorePhaseBaseline: async () => {},
+      },
+      undefined,
+      reports,
+    ).then((value) => {
+      result = value
+    })
+
+    // The gate is open and nobody has answered yet. The user re-attaches via
+    // `convoy runs`, presses [o], and the reopened session's write_report posts
+    // to the report bridge — the same HTTP path production uses. The deferred
+    // end() keeps the session owned, so the bridge answers 200 instead of the
+    // 404 "unknown report session" that used to detach the rescued window.
+    while (prompts.length === 0) await Bun.sleep(5)
+    const bridge = await startReportBridge({ reports: () => reports })
+    try {
+      const response = await fetch(bridge.url, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${bridge.token}` },
+        body: JSON.stringify({ sessionID: "ses_hold", payload: { markdown: "# Rescued over the bridge" } }),
+      })
+      expect(response.status).toBe(200)
+      expect(await readFile(join(workspace.dir, phase.reportPath), "utf8")).toBe("# Rescued over the bridge")
+    } finally {
+      bridge.close()
+    }
+
+    // The controller finally connects and answers [c]: the bridged report is
+    // re-resolved and becomes the step's deliverable.
+    resumeGate("continue")
+    await run
+    expect(result).toContain("Rescued over the bridge")
     expect(prompts).toHaveLength(1)
     expect(prompts[0]?.kind).toBe("failure")
   })
