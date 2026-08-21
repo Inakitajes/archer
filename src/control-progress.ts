@@ -185,7 +185,17 @@ export class ControlProgress implements ProgressUI {
       }),
       onPause: () => this.pauseToggle?.(),
       onResume: () => this.pauseToggle?.(),
-      onAbort: () => this.abortHandler?.(),
+      onAbort: () => {
+        this.abortHandler?.()
+        // The runner's finally clears its abort handler before the coordinator
+        // holds the finish screen (the run's shutdown object is disposed by
+        // then), so a remote abort during that hold would find no handler and
+        // leave the coordinator waiting forever on a finish-dismiss that may
+        // never come (detached client, dead terminal). Unwind the hold the
+        // same way a dismiss would: the coordinator proceeds to release and
+        // exits instead of hanging. With no hold parked this is a no-op.
+        this.server.pending.resolveFinish()
+      },
       onKeepAwakeToggle: () => this.keepAwakeToggle?.(),
       onKeepRunDirRequested: () => {
         this.keepRunDir = true

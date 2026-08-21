@@ -7,7 +7,7 @@ import { join } from "node:path"
 import type { PermissionPromptInfo, PermissionReply, ProgressUI, RunOutcome } from "../src/progress"
 import type { RunOptions } from "../src/types"
 
-import { preparePhaseRun, run as realRun, hostedTeardownFromError, type RunDeps } from "../src/runner"
+import { preparePhaseRun, run as realRun, hostedTeardownFromError, UserAbortError, type RunDeps } from "../src/runner"
 import { buildRunPlan } from "../src/run-plan"
 import { noopProgress } from "../src/progress"
 import { builtInAgents } from "../src/pipeline"
@@ -196,6 +196,62 @@ describe("run() with a hosted progress", () => {
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
+  })
+
+  test("a hosted user abort publishes the stopped snapshot to Herdr before release-agent", async () => {
+    // A user abort in hosted mode: the coordinator owns the UI so run()'s
+    // finally never calls progress.stop() (which is what publishes the
+    // terminal snapshot in-process). Without an explicit publish the Herdr
+    // agent used to vanish via release-agent without ever showing stopped.
+    const repo = await cleanRepo()
+    const dashboard = fakeDashboard()
+    const commands: string[][] = []
+    const herdr = new HerdrReporter({
+      env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
+      spawn: (command) => {
+        commands.push(command)
+        return { exited: Promise.resolve(0) }
+      },
+      now: () => 1_000,
+    })
+    // POST /abort lands while run() is still booting: the handler run() arms
+    // at boot fires the real shutdown request, and the pre-hook's
+    // throwIfAborted surfaces it as the run's UserAbortError.
+    const progress: ProgressUI = {
+      ...dashboard.progress,
+      setAbortHandler: (handler) => {
+        dashboard.progress.setAbortHandler?.(handler)
+        if (handler) handler()
+      },
+    }
+    let aborted: unknown
+    try {
+      await realRun(
+        makeOptions(repo, {
+          progress,
+          hooks: { pre: [{ name: "gate", command: "true" }], post: [], pipelines: {} },
+        }),
+        { startOpencode: fakeStartOpencode, createHerdrReporter: () => herdr },
+      )
+      throw new Error("expected the aborted run to reject")
+    } catch (error) {
+      aborted = error
+    }
+    expect(aborted).toBeInstanceOf(UserAbortError)
+
+    // Before release: the last report-agent state must be idle (the terminal
+    // "stopped" snapshot), not a bare vanish.
+    const verbs = () => commands.map((command) => command[2])
+    expect(verbs()).not.toContain("release-agent")
+    const lastAgent = [...commands].reverse().find((command) => command[2] === "report-agent")
+    expect(lastAgent?.[lastAgent.indexOf("--state") + 1]).toBe("idle")
+
+    // The coordinator releases the aborted run's teardown, like
+    // coordinate.ts does for a user abort.
+    const teardown = hostedTeardownFromError(aborted)
+    await teardown?.release?.()
+    expect(verbs()).toContain("release-agent")
+    expect(verbs().at(-1)).toBe("release-agent")
   })
 
   test("a hosted --no-keep-run-dir run keeps the workspace until release, then deletes it", async () => {

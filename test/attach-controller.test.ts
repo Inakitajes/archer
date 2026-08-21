@@ -187,6 +187,30 @@ describe("ControlProgress wiring", () => {
     }
   })
 
+  test("an abort during the finish hold unwinds it like a dismiss", async () => {
+    const dir = await scratch()
+    const server = await startControlServer()
+    const progress = new ControlProgress({ server })
+    try {
+      const client = createControlClient({ url: server.url, token: server.token })
+      await client.claimController()
+      // Production state during coordinate.ts's finish hold: run()'s finally
+      // has already cleared the runner's abort handler (its shutdown object
+      // is disposed), so POST /abort used to find no handler at all and the
+      // coordinator waited forever on a finish-dismiss that never came — e.g.
+      // after the client that armed the abort died or detached.
+      progress.setAbortHandler(undefined)
+      const held = progress.runFinished({ status: "completed", runDir: dir })
+      await Bun.sleep(20)
+      expect(server.pending.snapshot().finish?.status).toBe("completed")
+      await client.abort()
+      const settled = await Promise.race([held.then(() => true), Bun.sleep(250).then(() => false)])
+      expect(settled).toBe(true)
+    } finally {
+      server.close()
+    }
+  })
+
   test("adapter rejects nothing without a controller: the hold resolves on the controller reply", async () => {
     const server = await startControlServer()
     const progress = new ControlProgress({ server })

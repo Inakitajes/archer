@@ -898,6 +898,13 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       await caffeinate?.stop()
       await holdFinishScreen(progress, shutdown, { status: "failed", error: formatSdkError(failure), runDir: workspace.dir }, Boolean(options.progress))
       statusTracker?.finished({ status: "failed", error: formatSdkError(failure), runDir: workspace.dir })
+    } else if (options.progress) {
+      // A hosted abort never reaches progress.stop() below (the coordinator
+      // owns the shared UI and skips it), so the tracker's terminal snapshot
+      // would never publish: Herdr's agent vanished with the release-agent
+      // command instead of showing the run stopped. In-process aborts still
+      // publish through progress.stop() in the finally.
+      statusTracker?.stopped()
     }
     throw failure
   } finally {
