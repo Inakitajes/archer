@@ -58,6 +58,24 @@ describe("report bridge", () => {
     }
   })
 
+  test("a write after end() is rejected as an unknown session", async () => {
+    const dir = await scratch()
+    const reports = createReportRuntime(dir)
+    const handle = reports.begin("ses_1", phase, { kind: "markdown-report" }, qualityDimensionWeights)
+    await handle.write({ markdown: "# First save" })
+    handle.end()
+    const bridge = await startReportBridge({ reports: () => reports })
+    try {
+      // After the phase released the session, a late write_report from the [o]
+      // window must be a protocol miss, not silently overwrite the saved report.
+      const response = await post(bridge.url, bridge.token, { sessionID: "ses_1", payload: { markdown: "late rewrite" } })
+      expect(response.status).toBe(404)
+      expect(await readFile(join(dir, phase.reportPath), "utf8")).toBe("# First save")
+    } finally {
+      bridge.close()
+    }
+  })
+
   test("requires a sessionID and rejects invalid report content with the error body", async () => {
     const dir = await scratch()
     const reports = createReportRuntime(dir)
