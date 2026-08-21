@@ -48,7 +48,7 @@ import {
 import type { AgentStep, DeliverableContract, HumanStep, Pipeline, Step } from "../src/types"
 import type { Workspace } from "../src/workspace"
 import { LoopGuard, LoopGuardError, resolveLoopGuard } from "../src/loop-guard"
-import { createReportRuntime } from "../src/report-runtime"
+import { createReportRuntime, type ReportPhaseHandle } from "../src/report-runtime"
 import { qualityDimensionWeights } from "../src/quality-score"
 
 const recoveryDirs: string[] = []
@@ -1247,7 +1247,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
     const parked = new Promise<"continue">((resolve) => {
       resumeGate = resolve
     })
-    let writeHandle: import("../src/report-runtime").ReportPhaseHandle | undefined
+    let writeHandle: ReportPhaseHandle | undefined
     const progress: ProgressUI = {
       ...noopProgress,
       askHumanReview: (info) => {
@@ -1272,7 +1272,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
         runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
           attempts.push(attempt)
           sessionRef!.id = "ses_failed"
-          writeHandle = reports.begin("ses_failed", _phase, _phase.deliverableContract ?? { kind: "markdown-report" }, qualityDimensionWeights)
+          writeHandle = reports.begin("ses_failed", phase, phase.deliverableContract, qualityDimensionWeights)
           // No end(): the recovered window keeps this handle alive through the gate.
           throw new Error("provider temporarily unavailable")
         },
@@ -1372,7 +1372,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       {
         runPhaseAttempt: async (_client, _workspace, _phase, _targetDir, _prepared, attempt, _progress, _shutdown, sessionRef) => {
           sessionRef!.id = attempt === 1 ? "ses_old" : "ses_new"
-          reports.begin(sessionRef!.id, phase, phase.deliverableContract ?? { kind: "markdown-report" }, qualityDimensionWeights)
+          reports.begin(sessionRef!.id, phase, phase.deliverableContract, qualityDimensionWeights)
           if (attempt === 1) throw new Error("network blip")
           return "# report"
         },

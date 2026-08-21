@@ -1377,10 +1377,7 @@ export async function runPhaseUntilResolved(
               if (outcome !== "continue") break
               const rescued = await resolveDeliverableCandidate(workspace, phase, "", reports?.candidateFor(sessionRef.id ?? ""))
               const rescuedValidation = validateDeliverable(deliverableContract, rescued, weights)
-              if (rescuedValidation.valid) {
-                releasePhaseSession(sessionRef, reports, advisors)
-                return rescued
-              }
+              if (rescuedValidation.valid) return rescued
             }
           }
           const totalAttempts = deliverableContract.kind === "quality-score-report" ? deliverableContract.retryOnMissingOrInvalid + 1 : undefined
@@ -1428,7 +1425,6 @@ export async function runPhaseUntilResolved(
             if (validateDeliverable(deliverableContract, candidate, weights).valid) break
           }
         }
-        releasePhaseSession(sessionRef, reports, advisors)
         return candidate
       } catch (error) {
         if (shutdown.aborted || isUserAbortError(error)) throw shutdown.abortError(error)
@@ -1491,10 +1487,7 @@ export async function runPhaseUntilResolved(
             // only come from the report runtime or the phase file.
             const rescued = await resolveDeliverableCandidate(workspace, phase, "", reports?.candidateFor(sessionRef.id ?? ""))
             const rescuedValidation = validateDeliverable(deliverableContract, rescued, weights)
-            if (rescuedValidation.valid) {
-              releasePhaseSession(sessionRef, reports, advisors)
-              return rescued
-            }
+            if (rescuedValidation.valid) return rescued
             gateError = rescuedValidation.error
             continue
           }
@@ -2136,7 +2129,7 @@ export async function promptPhase(
     // gate reopens the SAME session with [o] and writes through write_report, so
     // ending them here would answer 404/400 during the gate. Only a run-wide
     // abort tears the attempt down immediately; normal cleanup happens when
-    // runPhaseUntilClosed resolves the gate (continue/retry/success).
+    // runPhaseUntilResolved resolves the gate (continue/retry/success).
     if (input.shutdown.aborted) {
       report?.end()
       advisor?.end()
