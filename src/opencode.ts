@@ -148,6 +148,19 @@ export async function openStoredSessionWindow(input: {
   )
 }
 
+// Opens a standalone opencode TUI on a brand-new session seeded with an
+// initial prompt (--prompt submits it on startup). Standalone on purpose: the
+// run's server dies when the finish screen closes, and this window must
+// outlive convoy so the user can keep iterating.
+export async function openIterateOpencodeWindow(input: {
+  targetDir: string
+  prompt: string
+  runDir: string
+}): Promise<SessionWindowBackend> {
+  const coreCommand = ["opencode", input.targetDir, "--prompt", input.prompt].map(shellQuote).join(" ")
+  return openSessionCommand(coreCommand, input.targetDir, "opencode iterate", runDirSessionEnv(input.runDir))
+}
+
 /**
  * Builds the compact OpenCode config granting read access to exactly the run
  * directory, so a standalone session window can read prd.md and report files
@@ -169,19 +182,6 @@ export function runDirAccessConfig(runDir: string): string {
 /** The env pair the standalone openers pass on to openSessionCommand. */
 function runDirSessionEnv(runDir: string): Record<string, string> {
   return { OPENCODE_CONFIG_CONTENT: runDirAccessConfig(runDir) }
-}
-
-// Opens a standalone opencode TUI on a brand-new session seeded with an
-// initial prompt (--prompt submits it on startup). Standalone on purpose: the
-// run's server dies when the finish screen closes, and this window must
-// outlive convoy so the user can keep iterating.
-export async function openIterateOpencodeWindow(input: {
-  targetDir: string
-  prompt: string
-  runDir: string
-}): Promise<SessionWindowBackend> {
-  const coreCommand = ["opencode", input.targetDir, "--prompt", input.prompt].map(shellQuote).join(" ")
-  return openSessionCommand(coreCommand, input.targetDir, "opencode iterate", runDirSessionEnv(input.runDir))
 }
 
 /**
