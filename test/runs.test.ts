@@ -5,7 +5,8 @@ import { join } from "node:path"
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 
-import { isServerLive, listRuns } from "../src/runs"
+import { isServerLive, listRuns, probeRunWaiting, refreshRunWaiting } from "../src/runs"
+import { startControlServer, type ControlServer } from "../src/control-server"
 
 function listen(): Promise<{ port: number; close: () => void }> {
   return new Promise((resolve, reject) => {
@@ -149,6 +150,138 @@ describe("run liveness detection", () => {
       expect(await isServerLive({ url: `http://127.0.0.1:${server.port}`, pid: process.pid, startedAt: Date.now() })).toBe(true)
     } finally {
       server.close()
+    }
+  })
+
+  test("a coordinated run's server entry stays live with its optional controlUrl", async () => {
+    // metadata.server gains controlUrl (no token) on a coordinated run;
+    // liveness is still keyed on pid + the OpenCode TCP probe alone.
+    const server = await listen()
+    try {
+      expect(
+        await isServerLive({ url: `http://127.0.0.1:${server.port}`, pid: process.pid, startedAt: Date.now(), controlUrl: "http://127.0.0.1:59998" }),
+      ).toBe(true)
+    } finally {
+      server.close()
+    }
+  })
+})
+
+describe("waiting state (coordinated live runs)", () => {
+  const servers: ControlServer[] = []
+  afterAll(() => {
+    for (const server of servers) server.close()
+  })
+
+  async function coordinatedRun(root: string, runID: string): Promise<ControlServer> {
+    // A "live" coordinated run: a listening server whose pid is this process,
+    // plus a control.json pointing at a real control server.
+    const server = await startControlServer()
+    servers.push(server)
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "# Waiting run\n")
+    await writeFile(
+      join(dir, "metadata.json"),
+      JSON.stringify({
+        schemaVersion: 3,
+        runID,
+        targetDir: "/tmp/repo",
+        createdAt: 1,
+        updatedAt: 2,
+        server: { url: server.url, pid: process.pid, startedAt: Date.now() },
+        phases: { implementer: { status: "running" } },
+      }),
+    )
+    await writeFile(join(dir, "control.json"), JSON.stringify({ url: server.url, token: server.token, pid: process.pid }))
+    return server
+  }
+
+  test("a parked permission shows as waiting for a permission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "convoy-runs-waiting-"))
+    try {
+      const runID = "20260613-000000-wa12"
+      const server = await coordinatedRun(root, runID)
+      void server.pending.holdPermission({ id: "p1", permission: "bash", patterns: ["bash"] })
+
+      expect(await probeRunWaiting(runID, root)).toBe("permission")
+      const runs = await listRuns(root)
+      expect(runs.find((run) => run.runID === runID)?.waiting).toBe("permission")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a parked human gate shows as waiting for review", async () => {
+    const root = await mkdtemp(join(tmpdir(), "convoy-runs-waiting-"))
+    try {
+      const runID = "20260613-000001-wa34"
+      const server = await coordinatedRun(root, runID)
+      void server.pending.holdHuman({ stepName: "review", iterations: 0 })
+
+      expect(await probeRunWaiting(runID, root)).toBe("review")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("an idle coordinated run and non-coordinated runs are not waiting", async () => {
+    const root = await mkdtemp(join(tmpdir(), "convoy-runs-waiting-"))
+    try {
+      const runID = "20260613-000002-wa56"
+      await coordinatedRun(root, runID)
+      // No pending gate: not waiting.
+      expect(await probeRunWaiting(runID, root)).toBeUndefined()
+
+      // A legacy live run (no control.json) never probes.
+      const legacyID = "20260613-000003-wa78"
+      const listener = await listen()
+      try {
+        const dir = join(root, legacyID)
+        await mkdir(dir, { recursive: true })
+        await writeFile(
+          join(dir, "metadata.json"),
+          JSON.stringify({
+            schemaVersion: 3,
+            runID: legacyID,
+            targetDir: "/tmp/repo",
+            createdAt: 1,
+            updatedAt: 2,
+            server: { url: `http://127.0.0.1:${listener.port}`, pid: process.pid, startedAt: Date.now() },
+            phases: {},
+          }),
+        )
+        expect(await probeRunWaiting(legacyID, root)).toBeUndefined()
+      } finally {
+        listener.close()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("refreshRunWaiting updates a live entry in place", async () => {
+    const root = await mkdtemp(join(tmpdir(), "convoy-runs-waiting-"))
+    try {
+      const runID = "20260613-000004-wa90"
+      const server = await coordinatedRun(root, runID)
+      const runs = await listRuns(root)
+      const run = runs.find((entry) => entry.runID === runID)!
+      expect(run.live).toBe(true)
+      expect(run.waiting).toBeUndefined()
+
+      // A gate lands after the list was loaded: the browser's refresh picks it up.
+      const held = server.pending.holdPermission({ id: "p3", permission: "bash", patterns: ["bash"] })
+      await refreshRunWaiting(run, root)
+      expect(run.waiting).toBe("permission")
+
+      // And clears again once the gate is answered.
+      await server.pending.resolvePermission("p3", "once")
+      void held
+      await refreshRunWaiting(run, root)
+      expect(run.waiting).toBeUndefined()
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 })

@@ -300,6 +300,19 @@ describe("parseCommand", () => {
     expect(cmd.type).toBe("help")
   })
 
+  test("--coordinate parses as the internal coordinator command", async () => {
+    const cmd = await parseCommand(["--coordinate", "/tmp/launch.json"])
+    expect(cmd).toEqual({ type: "coordinate", launchPath: "/tmp/launch.json" })
+    await expect(parseCommand(["--coordinate"])).rejects.toThrow(/internal/)
+  })
+
+  test("--coordinate is not advertised in the help text", async () => {
+    const cmd = await parseCommand(["--help"])
+    if (cmd.type === "help") {
+      expect(cmd.text).not.toContain("--coordinate")
+    }
+  })
+
   test("parses --version", async () => {
     const cmd = await parseCommand(["--version"])
     expect(cmd.type).toBe("version")

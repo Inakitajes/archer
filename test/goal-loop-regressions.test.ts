@@ -177,7 +177,7 @@ async function runHosted(
 // SC-1: Summary trajectory and restore warnings are emitted after stop()
 // ---------------------------------------------------------------------------
 
-describe("SC-1: summary trajectory and restore warnings are emitted after progress.stop()", () => {
+describe("SC-1: summary trajectory and restore warnings are emitted after the loop's live window", () => {
   beforeEach(() => {
     order.length = 0
     created = 0
@@ -187,42 +187,41 @@ describe("SC-1: summary trajectory and restore warnings are emitted after progre
 
   afterEach(() => log.mute(false))
 
-  test("the trajectory log lands after the dashboard stops, not during the muted TUI window", async () => {
+  test("the trajectory log lands after the loop's live window, not during the iterations", async () => {
     await withTty(async () => {
-      const promise = runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, makeDeps([71, 84, 92]))
+      const hosted = fakeHostedProgress()
+      const promise = runGoalLoop(makeOptions({ progress: hosted.progress }), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, makeDeps([71, 84, 92]))
       const deadline = Date.now() + 1_000
-      while (!order.includes("hold") && Date.now() < deadline) await Bun.sleep(1)
-      dismissHold()
+      while (hosted.finishCalls.length === 0 && Date.now() < deadline) await Bun.sleep(1)
+      const holdIndex = order.length
+      hosted.dismiss()
       const outcome = await promise
       expect(outcome.reached).toBe(true)
+      expect(outcome.scores).toEqual([71, 84, 92])
+      // The trajectory and "done" log lines are deferred past the live window
+      // (nothing emitted before the hold was dismissed).
+      expect(order.slice(0, holdIndex).some((entry) => entry.includes("trajectory"))).toBe(false)
+      expect(order.some((entry) => entry.startsWith("info:goal loop trajectory:"))).toBe(true)
+      expect(order.some((entry) => entry.startsWith("info:goal loop: done"))).toBe(true)
     })
-
-    // The trajectory and "done" log lines appear AFTER stop, not before.
-    const stopIndex = order.indexOf("stop")
-    expect(stopIndex).toBeGreaterThan(-1)
-    const trajectoryIndex = order.findIndex((e) => e.startsWith("info:goal loop trajectory:"))
-    expect(trajectoryIndex).toBeGreaterThan(stopIndex)
-    const doneIndex = order.findIndex((e) => e.startsWith("info:goal loop: done"))
-    expect(doneIndex).toBeGreaterThan(stopIndex)
-    // No trajectory log leaked during the muted window (before stop).
-    const preStopTrajectory = order.slice(0, stopIndex).find((e) => e.includes("trajectory"))
-    expect(preStopTrajectory).toBeUndefined()
   })
 
-  test("restore warnings are deferred until after stop on a plateau below goal", async () => {
+  test("restore warnings are deferred until the loop ends on a plateau below goal", async () => {
     await withTty(async () => {
-      const promise = runGoalLoop(makeOptions(), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, makeDeps([71, 86, 70]))
+      const hosted = fakeHostedProgress()
+      const promise = runGoalLoop(makeOptions({ progress: hosted.progress }), buildRunPlan(makeOptions()), { goal: 90, maxIterations: 3, plateau: 3 }, makeDeps([71, 86, 70]))
       const deadline = Date.now() + 1_000
-      while (!order.includes("hold") && Date.now() < deadline) await Bun.sleep(1)
-      dismissHold()
+      while (hosted.finishCalls.length === 0 && Date.now() < deadline) await Bun.sleep(1)
+      const holdIndex = order.length
+      hosted.dismiss()
       await promise
-    })
 
-    const stopIndex = order.indexOf("stop")
-    expect(stopIndex).toBeGreaterThan(-1)
-    // The "best effort" warning and trajectory all land after stop.
-    const warnIndex = order.findIndex((e) => e.startsWith("warn:goal loop: best effort"))
-    expect(warnIndex).toBeGreaterThan(stopIndex)
+      // The "best effort" warning and trajectory all land after the hold.
+      const warnIndex = order.findIndex((entry) => entry.startsWith("warn:goal loop: best effort"))
+      expect(warnIndex).toBeGreaterThan(-1)
+      expect(warnIndex).toBeGreaterThanOrEqual(holdIndex)
+      expect(order.slice(0, holdIndex).some((entry) => entry.includes("trajectory"))).toBe(false)
+    })
   })
 })
 

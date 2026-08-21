@@ -3,7 +3,7 @@ import { stdout } from "node:process"
 import { BoxRenderable, StyledText, TextRenderable, bold, fg, t } from "@opentui/core"
 
 import { parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
-import { loadRunSummary } from "./runs"
+import { loadRunSummary, refreshRunWaiting } from "./runs"
 import {
   formatElapsed,
   formatMoney,
@@ -56,6 +56,9 @@ export class RunsBrowser {
   // A subshell owns the terminal while the renderer is suspended; ignore keys.
   private inSubshell = false
   private readonly ticker: ReturnType<typeof setInterval>
+  // The run list is a snapshot; the selected live run's waiting state is the
+  // one part worth keeping fresh while the browser is open.
+  private readonly waitingTicker: ReturnType<typeof setInterval>
   private readonly headerText: TextRenderable
   private readonly bodyBox: BoxRenderable
   private readonly listText: TextRenderable
@@ -250,7 +253,19 @@ export class RunsBrowser {
     renderer.on("theme_mode", this.handleThemeMode)
 
     this.ticker = setInterval(() => this.render(), 250)
+    this.waitingTicker = setInterval(() => void this.refreshWaiting(), 1000)
+    this.waitingTicker.unref?.()
     this.render()
+  }
+
+  // A live run can park on a permission or review gate at any moment; the
+  // details line should say so without waiting for a browser reopen.
+  private refreshWaiting() {
+    const run = this.selectedRun()
+    if (!run.live || this.inSubshell) return
+    void refreshRunWaiting(run)
+      .then(() => this.render())
+      .catch(() => {})
   }
 
   private handleListKey(key: KeyEvent) {
@@ -421,6 +436,7 @@ export class RunsBrowser {
 
   private finish(resolution: RunsResolution) {
     clearInterval(this.ticker)
+    clearInterval(this.waitingTicker)
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
     this.renderer.off("theme_mode", this.handleThemeMode)
     if (!this.renderer.isDestroyed) this.renderer.destroy()
@@ -602,7 +618,13 @@ export class RunsBrowser {
       if (run.advisorCost) statusChunks.push(fg(theme.faint)(` · executor ${formatMoney(run.executorCost ?? 0)} + advisor ${formatMoney(run.advisorCost)}`))
     }
     lines.push(new StyledText(statusChunks))
-    if (run.live) lines.push(new StyledText([fg(theme.faint)("        "), fg(theme.dim)("enter to attach live")]))
+    if (run.live) {
+      lines.push(new StyledText([fg(theme.faint)("        "), fg(theme.dim)("enter to attach live")]))
+      // A coordinated run parked on an unanswered gate says so — that is the
+      // case where attaching is urgent, not just interesting.
+      if (run.waiting === "permission") lines.push(new StyledText([fg(theme.faint)("        "), fg(theme.yellow)("waiting for a permission")]))
+      else if (run.waiting === "review") lines.push(new StyledText([fg(theme.faint)("        "), fg(theme.yellow)("waiting for review")]))
+    }
 
     lines.push(plain(""))
     lines.push(t`${fg(theme.faint)("─".repeat(Math.max(1, width)))}`)

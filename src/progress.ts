@@ -243,6 +243,14 @@ export type KeepAwakeState = {
 export type ProgressHostControls = {
   onPauseToggle?: () => void
   onKeepAwakeToggle?: () => void
+  /**
+   * Send the run to the background: the client releases its controller role and
+   * stops its dashboard; the coordinator keeps running. The owner dashboard
+   * calls this from the palette ("Send to background").
+   */
+  onBackground?: () => void | Promise<void>
+  /** Called after the dashboard cycled its local auto-accept mode; the controller POSTs it over the wire. */
+  onCycleAutoAccept?: (mode: AutoAcceptMode) => void
   finish?: FinishSeam
 }
 

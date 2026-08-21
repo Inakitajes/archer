@@ -23,7 +23,7 @@ import { buildRunPlan } from "./run-plan"
 import { log } from "./log"
 import { createCleanRepoSnapshot, currentBranch, currentHead, restoreRepoSnapshot, statusPorcelain, type RepoSnapshot } from "./git"
 import { hooksForPipeline, runHooks, type GoalHookOutcome } from "./hooks"
-import { noopProgress, createProgressUI, type AutoAccept, type GoalLoopView, type ProgressUI } from "./progress"
+import { noopProgress, type AutoAccept, type GoalLoopView, type ProgressUI } from "./progress"
 import { holdFinishScreen, hostedTeardownFromError, installShutdownSignals, isUserAbortError, progressPhases, run, RunShutdown, type RunResult } from "./runner"
 import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { defaultNotificationSettings, Notifier } from "./notifications"
@@ -140,7 +140,7 @@ export async function runGoalLoop(
   // remove exactly their own handlers on the way out.
   const removeSignalHandlers = installShutdownSignals(shutdown)
   const phases = progressPhases(plan.pipeline, plan.hooks ?? hooksForPipeline(options.hooks, plan.pipeline.name))
-  let progress = options.progress ?? (await createProgressUI(phases, options.tui, () => shutdown.request("Ctrl+C"), autoAccept))
+  let progress = options.progress ?? noopProgress
   const owns = !options.progress
 
   // SC-3: The loop owns one status tracker for the overall loop outcome. Each

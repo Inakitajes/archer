@@ -3,6 +3,8 @@ import { readdir, readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { stdin, stdout } from "node:process"
 
+import { readControlFile } from "./control-client"
+import type { PendingSnapshot } from "./control-server"
 import { readRunMetadata, type PhaseMetadataStatus, type RunMetadata } from "./metadata"
 import { isValidRunID, runsRoot } from "./workspace"
 import { readAdvisorSplit } from "./advisor-report"
@@ -29,6 +31,8 @@ export type RunEntry = {
   live: boolean
   /** The live server URL, present only when `live`. */
   serverUrl?: string
+  /** A live coordinated run is parked on a gate nobody answered yet. */
+  waiting?: "permission" | "review"
   cost?: number
   executorCost?: number
   advisorCost?: number
@@ -124,12 +128,44 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
     statusKind: summary.kind,
     live,
     serverUrl: live ? metadata?.server?.url : undefined,
+    // Only live runs pay for a control probe, and only coordinated ones have
+    // a control.json to read; everything else stays undefined.
+    waiting: live ? await probeRunWaiting(runID, root) : undefined,
     cost: executorCost === undefined && advisorCost === 0 ? undefined : (executorCost ?? 0) + advisorCost,
     executorCost,
     advisorCost,
     createdAt: metadata?.createdAt,
     phases: phaseInfos(metadata),
   }
+}
+
+/** What a live run is parked on, for the runs browser's "waiting" details line. */
+export async function probeRunWaiting(runID: string, root = runsRoot()): Promise<"permission" | "review" | undefined> {
+  const control = await readControlFile(runID, root)
+  if (!control) return undefined
+  try {
+    const response = await fetch(`${control.url}/pending`, {
+      headers: { authorization: `Bearer ${control.token}` },
+      // A wedged-but-listening coordinator must not stall the run list.
+      signal: AbortSignal.timeout(500),
+    })
+    if (!response.ok) return undefined
+    const snapshot = (await response.json()) as PendingSnapshot
+    if (snapshot.permission) return "permission"
+    if (snapshot.human) return "review"
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Re-probes a live run's pending gate so an open browser can show waiting state as it changes. */
+export async function refreshRunWaiting(run: RunEntry, root = runsRoot()): Promise<void> {
+  if (!run.live) {
+    run.waiting = undefined
+    return
+  }
+  run.waiting = await probeRunWaiting(run.runID, root)
 }
 
 // A run is live if its recorded server process is still alive and its port
@@ -142,7 +178,7 @@ export async function isServerLive(server: RunMetadata["server"]): Promise<boole
   return tcpReachable(server.url, 250)
 }
 
-function pidAlive(pid: number): boolean {
+export function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
@@ -152,7 +188,7 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function tcpReachable(url: string, timeoutMs: number): Promise<boolean> {
+export function tcpReachable(url: string, timeoutMs: number): Promise<boolean> {
   let host: string
   let port: number
   try {
@@ -230,7 +266,8 @@ function phaseInfos(metadata: RunMetadata | undefined): RunPhaseInfo[] {
 }
 
 function printRunList(runs: RunEntry[]) {
-  const statusText = (run: RunEntry) => (run.live ? "running" : run.status)
+  const statusText = (run: RunEntry) =>
+    run.live ? (run.waiting ? `running · waiting for a ${run.waiting === "permission" ? "permission" : "review"}` : "running") : run.status
   const numberWidth = String(runs.length).length
   const statusWidth = Math.max(...runs.map((run) => statusText(run).length))
   stdout.write(`\nruns in ${runsRoot()}:\n`)
