@@ -7,19 +7,19 @@ export const defaultOpusModel = "anthropic/claude-opus-5"
 
 const fallbackModel = `${defaultGptModel}#${defaultGptVariant}`
 
-/** Lower-cost replacement for the GPT xhigh phases in the lightweight pipelines. */
+/** Lower-case replacement: GLM 5.2 remains the hunter pipeline's cheap track; the audits of `implement` now run on GLM 5.3 high. */
 const glmModel = "openrouter/z-ai/glm-5.2"
-/** GLM 5.2 with its reasoning turned up: what the audit phases of `implement` run on. */
-const glmXhighModel = `${glmModel}#xhigh`
-/** GLM 5.3 with reasoning raised: the correctness leg of `hunter` and the GLM leg of `hunter-max`. */
+/** GLM 5.3 with reasoning raised: the audit phases of `implement`, the cheap scorer legs, and the low-cost tracks of `hunter`/`hunter-max`. */
 const glm53HighModel = "openrouter/z-ai/glm-5.3#high"
 /** Opus reached through OpenRouter, so the hunter fan-outs share one provider across every track. */
 const opusViaOpenRouter = "openrouter/anthropic/claude-opus-5"
-/** Remaining specialty models the hunter pipelines fan their audit tracks across. */
+/** Grok 4.6 high: the default design and adversarial pass, and the second leg of every review/ship fan-out. */
 const grokModel = "openrouter/x-ai/grok-4.6#high"
 const kimiModel = "openrouter/moonshotai/kimi-k3"
-/** Kimi K3 with reasoning raised one notch: the design and adversarial passes earn it, the cheap fan-outs don't. */
-const kimiHighModel = `${kimiModel}#high`
+/** DeepSeek V4 Flash 0731 on OpenRouter: the cheap implementer for `implement-lite`, review-lite's report, and goal-fix's fixer. */
+const deepseekModel = "openrouter/deepseek/deepseek-v4-flash-0731"
+/** DeepSeek V4 Flash on OpenRouter with reasoning raised: same model the user's `modelRouting.overrides` maps local NaN to. */
+const deepseekHighModel = `${deepseekModel}#high`
 /** GPT 5.6 Sol: the advisor `implement` consults, and at xhigh the consensus reporter for the review/ship/hunter pipelines. */
 const solModel = "openai/gpt-5.6-sol"
 const solXhighModel = `${solModel}#xhigh`
@@ -29,9 +29,9 @@ const solXhighModel = `${solModel}#xhigh`
 export const defaultImplementerModel = fallbackModel
 /** The model `implement`'s implementer consults at its decision points. */
 export const defaultImplementAdvisorModel = solXhighModel
-export const defaultImplementAuditModel = glmXhighModel
-export const defaultImplementReviewModel = kimiHighModel
-export const defaultAdversarialModel = kimiHighModel
+export const defaultImplementAuditModel = glm53HighModel
+export const defaultImplementReviewModel = grokModel
+export const defaultAdversarialModel = grokModel
 
 /** The six specialty audit tracks shared by `hunter` and `hunter-max`; each maps to a `hunter-<track>` agent. */
 const hunterTracks = ["correctness", "memory", "performance", "security", "reliability", "supply-chain"] as const
@@ -64,7 +64,7 @@ export const builtInAgents: readonly AgentSpec[] = [
   {
     name: "design-polisher",
     description: "Polishes new UI following the repo's design system, without redesigning",
-    defaultModel: kimiModel,
+    defaultModel: grokModel,
     temperature: 0.2,
     builtIn: true,
   },
@@ -413,10 +413,10 @@ export const verifyAgentSuffix = "__verify"
 export const defaultPipelineName = "implement"
 
 export const builtInPipelines: Record<string, PipelineSpec> = {
-  // The audits are pinned to GLM 5.2 xhigh rather than left to inherit the run's
+  // The audits are pinned to GLM 5.3 high rather than left to inherit the run's
   // model: they read a diff that already exists, which is the work GLM does at
   // parity with the expensive models, so the budget belongs in the phase that
-  // writes (Terra xhigh, advised) and the one that judges (Kimi K3 high).
+  // writes (Terra xhigh, advised) and the one that judges (Grok 4.6 high).
   //
   // The advisor←executor pattern is the default, aimed at the one phase that
   // earns it: Terra xhigh writes the code and consults Sol xhigh at its decision
@@ -440,17 +440,17 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   },
   // implement's shape on low-cost models, advisor included: the second opinion
   // is what makes a cheap implementer worth running, so it is the last thing to
-  // drop. Kimi advises rather than a second GLM: it is already in this pipeline
-  // as the design model, so the cross-vendor disagreement costs no new provider.
+  // drop. DeepSeek V4 Flash (OpenRouter) writes instead of GLM, and Grok advises
+  // rather than a second GLM: the cross-vendor disagreement costs no new provider.
   "implement-lite": {
-    description: "Like implement, but drops every code-writing phase to GLM 5.2 to reduce cost; Kimi K3 advises the implementer and polishes design, and adversarial runs on Opus",
+    description: "Like implement, but drops every code-writing phase to DeepSeek V4 Flash 0731 and GLM 5.3 to reduce cost; Grok 4.6 advises the implementer and polishes design, and adversarial runs on GLM 5.3",
     steps: [
-      { agent: "implementer", model: glmModel, advisor: kimiHighModel, reports: "none" },
-      { agent: "patterns", model: glmModel, advisor: false },
-      { agent: "security", model: glmModel, advisor: false },
-      { agent: "design", model: kimiModel, advisor: false },
-      { agent: "tests", model: glmModel, advisor: false, reports: "none" },
-      { agent: "adversarial", model: defaultOpusModel, advisor: false, reports: "all" },
+      { agent: "implementer", model: deepseekHighModel, advisor: grokModel, reports: "none" },
+      { agent: "patterns", model: glm53HighModel, advisor: false },
+      { agent: "security", model: glm53HighModel, advisor: false },
+      { agent: "design", model: grokModel, advisor: false },
+      { agent: "tests", model: glm53HighModel, advisor: false, reports: "none" },
+      { agent: "adversarial", model: glm53HighModel, advisor: false, reports: "all" },
     ],
   },
   // The goal loop's fix iteration: applies exactly the gaps the previous
@@ -461,7 +461,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   "goal-fix": {
     description: "The goal loop's fix iteration: apply exactly the gaps from the previous scoring round, then re-score. Not run directly; ship's goal or --goal drives it.",
     steps: [
-      { agent: "goal-fixer", name: "fix", reports: "none", diff: true, prdHistory: true },
+      { agent: "goal-fixer", name: "fix", model: deepseekHighModel, advisor: grokModel, reports: "none", diff: true, prdHistory: true },
       {
         parallel: [
           // The re-scorers must stay blind to the previous score: the fixer's
@@ -469,14 +469,14 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
           // (they grade the artifact, not the round's history). They still get
           // the original PRD via prdHistory: the rubric's `prd` dimension (30%
           // of the score) cannot be graded without it.
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "none", prdHistory: true },
+          { agent: "quality-scorer", name: "score", models: [grokModel, glm53HighModel], reports: "none", prdHistory: true },
         ],
       },
       // The consensus sees only the fresh scorer reports, never the fixer's,
       // so its measurement cannot anchor on the number it is reconciling; the
       // original PRD is attached so disagreements on the `prd` dimension can be
       // judged against the actual requirements.
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: ["score"], verify: true, prdHistory: true },
+      { agent: "quality-score-report", name: "score-report", model: glm53HighModel, reports: ["score"], verify: true, prdHistory: true },
     ],
   },
   // Report-only review + the measurement layer: after the parallel audits, two
@@ -490,48 +490,49 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     defaultPrompt: "Review the current branch against its base and report prioritized findings with a verified quality score.",
     suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
-      { agent: "review-scope", name: "scope", model: defaultOpusModel, reports: "none", diff: true, verify: true, prdHistory: true },
+      { agent: "review-scope", name: "scope", model: grokModel, reports: "none", diff: true, verify: true, prdHistory: true },
       {
         parallel: [
-          { agent: "clean-code-auditor", name: "clean-code", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
-          { agent: "security-reviewer", name: "security", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
-          { agent: "bug-auditor", name: "bugs", models: [fallbackModel, defaultOpusModel], reports: ["scope"] },
+          { agent: "clean-code-auditor", name: "clean-code", models: [fallbackModel, grokModel], reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", models: [fallbackModel, grokModel], reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", models: [fallbackModel, grokModel], reports: ["scope"] },
         ],
       },
-      { agent: "review-report", name: "report", model: defaultOpusModel, reports: "all" },
+      { agent: "review-report", name: "report", model: grokModel, reports: "all" },
       {
         parallel: [
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all", prdHistory: true },
+          { agent: "quality-scorer", name: "score", models: [solXhighModel, grokModel], reports: "all", prdHistory: true },
         ],
       },
       { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all", verify: true, prdHistory: true },
     ],
   },
-  // review's shape with nothing on Opus. The scorer models are pinned rather
+  // review's shape on low-cost models. The scorer models are pinned rather
   // than left to the agent defaults precisely because those defaults are Opus:
   // omitting them here would quietly reintroduce the cost this pipeline exists
-  // to avoid.
+  // to avoid. GLM 5.3 scopes and reconciles the score, DeepSeek V4 Flash 0731
+  // writes the report, and the fan-outs pair GLM 5.3 with Grok 4.6.
   "review-lite": {
     description:
-      "Like review, but every phase runs on a low-cost model: GLM 5.2 scopes, writes the report and reconciles the score, and the audit and scorer fan-outs pair GLM 5.2 with Kimi K3 instead of Opus.",
+      "Like review, but every phase runs on a low-cost model: GLM 5.3 scopes and reconciles the score, DeepSeek V4 Flash 0731 writes the report, and the audit and scorer fan-outs pair GLM 5.3 with Grok 4.6 instead of Opus.",
     defaultPrompt: "Review the current branch against its base and report prioritized findings with a verified quality score.",
     suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
-      { agent: "review-scope", name: "scope", model: glmModel, reports: "none", diff: true, verify: true, prdHistory: true },
+      { agent: "review-scope", name: "scope", model: glm53HighModel, reports: "none", diff: true, verify: true, prdHistory: true },
       {
         parallel: [
-          { agent: "clean-code-auditor", name: "clean-code", models: [glmModel, kimiModel], reports: ["scope"] },
-          { agent: "security-reviewer", name: "security", models: [glmModel, kimiModel], reports: ["scope"] },
-          { agent: "bug-auditor", name: "bugs", models: [glmModel, kimiModel], reports: ["scope"] },
+          { agent: "clean-code-auditor", name: "clean-code", models: [glm53HighModel, grokModel], reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", models: [glm53HighModel, grokModel], reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", models: [glm53HighModel, grokModel], reports: ["scope"] },
         ],
       },
-      { agent: "review-report", name: "report", model: glmModel, reports: "all" },
+      { agent: "review-report", name: "report", model: deepseekHighModel, reports: "all" },
       {
         parallel: [
-          { agent: "quality-scorer", name: "score", models: [glmXhighModel, kimiHighModel], reports: "all", prdHistory: true },
+          { agent: "quality-scorer", name: "score", models: [glm53HighModel, grokModel], reports: "all", prdHistory: true },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: glmXhighModel, reports: "all", verify: true, prdHistory: true },
+      { agent: "quality-score-report", name: "score-report", model: glm53HighModel, reports: "all", verify: true, prdHistory: true },
     ],
   },
   // The close of the process: the branch is already shaped the way you want it,
@@ -557,13 +558,13 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
     goal: 85,
     defaultPrompt: "Sync this branch with its base and iterate until it clears the quality bar.",
     steps: [
-      { agent: "sync-with-base", name: "sync", model: fallbackModel, reports: "none" },
+      { agent: "sync-with-base", name: "sync", model: glm53HighModel, reports: "none" },
       {
         parallel: [
-          { agent: "quality-scorer", name: "score", models: [solXhighModel, defaultOpusModel], reports: "all", prdHistory: true },
+          { agent: "quality-scorer", name: "score", models: [grokModel, glm53HighModel], reports: "all", prdHistory: true },
         ],
       },
-      { agent: "quality-score-report", name: "score-report", model: solXhighModel, reports: "all", verify: true, prdHistory: true },
+      { agent: "quality-score-report", name: "score-report", model: grokModel, reports: "all", verify: true, prdHistory: true },
     ],
   },
   // The follow-up to a report-only run: feed it the findings (as the prompt or an

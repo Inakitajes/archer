@@ -72,7 +72,7 @@ describe("default pipeline", () => {
     ])
   })
 
-  test("pins Terra xhigh for implementation, GLM 5.2 xhigh for the audits, and Kimi K3 high for design and adversarial", () => {
+  test("pins Terra xhigh for implementation, GLM 5.3 high for the audits, and Grok 4.6 high for design and adversarial", () => {
     const byName = Object.fromEntries(
       defaultPipeline()
         .steps.filter((step): step is AgentStep => step.type === "agent")
@@ -80,11 +80,11 @@ describe("default pipeline", () => {
     )
 
     expect(byName.implementer).toMatchObject({ model: "openai/gpt-5.6-terra", variant: "xhigh" })
-    expect(byName.patterns).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
-    expect(byName.security).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
-    expect(byName.design).toMatchObject({ model: "openrouter/moonshotai/kimi-k3", variant: "high" })
-    expect(byName.tests).toMatchObject({ model: "openrouter/z-ai/glm-5.2", variant: "xhigh" })
-    expect(byName.adversarial).toMatchObject({ model: "openrouter/moonshotai/kimi-k3", variant: "high" })
+    expect(byName.patterns).toMatchObject({ model: "openrouter/z-ai/glm-5.3", variant: "high" })
+    expect(byName.security).toMatchObject({ model: "openrouter/z-ai/glm-5.3", variant: "high" })
+    expect(byName.design).toMatchObject({ model: "openrouter/x-ai/grok-4.6", variant: "high" })
+    expect(byName.tests).toMatchObject({ model: "openrouter/z-ai/glm-5.3", variant: "high" })
+    expect(byName.adversarial).toMatchObject({ model: "openrouter/x-ai/grok-4.6", variant: "high" })
   })
 
   test("advises the implementation phase only: Sol xhigh at Terra's decision points", () => {
@@ -154,7 +154,7 @@ describe("built-in implement-lite pipeline", () => {
   const implementLite = (defaultModel?: string) =>
     resolvePipeline({ name: "implement-lite", spec: builtInPipelines["implement-lite"]!, agents: builtInAgents, defaultModel })
 
-  test("keeps the implement workflow and agents while swapping GPT phases to GLM 5.2", () => {
+  test("keeps the implement workflow and agents while swapping the code-writing phases to DeepSeek V4 Flash 0731 and the audits to GLM 5.3", () => {
     const lite = implementLite().steps.filter((step): step is AgentStep => step.type === "agent")
     const standard = defaultPipeline().steps.filter((step): step is AgentStep => step.type === "agent")
 
@@ -169,12 +169,13 @@ describe("built-in implement-lite pipeline", () => {
     expect(lite.map(workflowShape)).toEqual(standard.map(workflowShape))
 
     const byName = Object.fromEntries(lite.map((step) => [step.name, step]))
-    expect(byName.implementer?.model).toBe("openrouter/z-ai/glm-5.2")
-    expect(byName.patterns?.model).toBe("openrouter/z-ai/glm-5.2")
-    expect(byName.security?.model).toBe("openrouter/z-ai/glm-5.2")
-    expect(byName.tests?.model).toBe("openrouter/z-ai/glm-5.2")
-    expect(byName.design?.model).toBe("openrouter/moonshotai/kimi-k3")
-    expect(byName.adversarial?.model).toBe("anthropic/claude-opus-5")
+    expect(byName.implementer?.model).toBe("openrouter/deepseek/deepseek-v4-flash-0731")
+    expect(byName.implementer?.variant).toBe("high")
+    expect(byName.patterns?.model).toBe("openrouter/z-ai/glm-5.3")
+    expect(byName.security?.model).toBe("openrouter/z-ai/glm-5.3")
+    expect(byName.tests?.model).toBe("openrouter/z-ai/glm-5.3")
+    expect(byName.design?.model).toBe("openrouter/x-ai/grok-4.6")
+    expect(byName.adversarial?.model).toBe("openrouter/z-ai/glm-5.3")
   })
 
   test("does not reintroduce GPT through defaults.model", () => {
@@ -184,25 +185,24 @@ describe("built-in implement-lite pipeline", () => {
         .map((step) => [step.name, step]),
     )
 
-    expect(byName.implementer).toMatchObject({ model: "openrouter/z-ai/glm-5.2" })
-    expect(byName.patterns).toMatchObject({ model: "openrouter/z-ai/glm-5.2" })
-    expect(byName.security).toMatchObject({ model: "openrouter/z-ai/glm-5.2" })
-    expect(byName.tests).toMatchObject({ model: "openrouter/z-ai/glm-5.2" })
-    expect(byName.design).toMatchObject({ model: "openrouter/moonshotai/kimi-k3" })
-    expect(byName.adversarial).toMatchObject({ model: "anthropic/claude-opus-5" })
+    expect(byName.implementer).toMatchObject({ model: "openrouter/deepseek/deepseek-v4-flash-0731", variant: "high" })
+    expect(byName.patterns).toMatchObject({ model: "openrouter/z-ai/glm-5.3", variant: "high" })
+    expect(byName.security).toMatchObject({ model: "openrouter/z-ai/glm-5.3", variant: "high" })
+    expect(byName.tests).toMatchObject({ model: "openrouter/z-ai/glm-5.3", variant: "high" })
+    expect(byName.design).toMatchObject({ model: "openrouter/x-ai/grok-4.6", variant: "high" })
+    expect(byName.adversarial).toMatchObject({ model: "openrouter/z-ai/glm-5.3", variant: "high" })
   })
 
   test("distinguishes itself from implement by the phases that write and judge, not the audits", () => {
     const lite = Object.fromEntries(implementLite().steps.filter((s): s is AgentStep => s.type === "agent").map((step) => [step.name, step]))
     const standard = Object.fromEntries(defaultPipeline().steps.filter((s): s is AgentStep => s.type === "agent").map((step) => [step.name, step]))
 
-    // Both run the audits on GLM 5.2; `implement` just turns its reasoning up.
-    // What the lite variant actually gives up is Sol writing the code and Kimi
-    // judging it at the end.
+    // Both run the audits on GLM 5.3 high; what the lite variant actually gives
+    // up is Sol writing the code and Grok judging it at the end.
     for (const step of ["patterns", "security", "tests"]) {
       expect(lite[step]?.model).toBe(standard[step]!.model)
-      expect(lite[step]?.variant).toBeUndefined()
-      expect(standard[step]?.variant).toBe("xhigh")
+      expect(lite[step]?.variant).toBe("high")
+      expect(standard[step]?.variant).toBe("high")
     }
     expect(lite.implementer?.model).not.toBe(standard.implementer?.model)
     expect(lite.adversarial?.model).not.toBe(standard.adversarial?.model)
@@ -221,8 +221,8 @@ describe("built-in ship pipeline", () => {
   test("is sync then the measurement layer: no open-ended audits in between", () => {
     expect(shipSteps().map((step) => step.name)).toEqual([
       "sync",
-      "score__openai-gpt-5-6-sol-xhigh",
-      "score__anthropic-claude-opus-5",
+      "score__openrouter-x-ai-grok-4-6-high",
+      "score__openrouter-z-ai-glm-5-3-high",
       "score-report",
     ])
   })
@@ -230,7 +230,7 @@ describe("built-in ship pipeline", () => {
   test("syncs the base in before anything reads the diff, so the score describes the merged result", () => {
     const [sync] = shipSteps()
 
-    expect(sync).toMatchObject({ agentName: "sync-with-base", model: "openai/gpt-5.6-terra", variant: "xhigh" })
+    expect(sync).toMatchObject({ agentName: "sync-with-base", model: "openrouter/z-ai/glm-5.3", variant: "high" })
     // The merge writes to the repository: goal mode refuses a report-only
     // pipeline, so this step is also what makes ship goal-eligible.
     expect(sync?.readOnly).toBeFalsy()
@@ -240,13 +240,13 @@ describe("built-in ship pipeline", () => {
     expect(ship().goal).toBe(85)
   })
 
-  test("fans the scorers across Sol xhigh + opus as forced read-only", () => {
+  test("fans the scorers across Grok 4.6 high + GLM 5.3 high as forced read-only", () => {
     const scorers = shipSteps().filter((step) => step.stepName === "score")
 
     expect(scorers).toHaveLength(2)
     expect(scorers.map((step) => ({ model: step.model, variant: step.variant }))).toEqual([
-      { model: "openai/gpt-5.6-sol", variant: "xhigh" },
-      { model: "anthropic/claude-opus-5", variant: undefined },
+      { model: "openrouter/x-ai/grok-4.6", variant: "high" },
+      { model: "openrouter/z-ai/glm-5.3", variant: "high" },
     ])
     // Fanned out across models: already read-only, so no __ro and no bash.
     for (const step of scorers) {
@@ -265,16 +265,16 @@ describe("built-in ship pipeline", () => {
 
     expect(report).toMatchObject({
       agentName: "quality-score-report",
-      model: "openai/gpt-5.6-sol",
-      variant: "xhigh",
+      model: "openrouter/x-ai/grok-4.6",
+      variant: "high",
       readOnly: true,
       verify: true,
     })
     expect(report?.inputFiles).toEqual([
       "prd.md",
       "reports/sync.md",
-      "reports/score__openai-gpt-5-6-sol-xhigh.md",
-      "reports/score__anthropic-claude-opus-5.md",
+      "reports/score__openrouter-x-ai-grok-4-6-high.md",
+      "reports/score__openrouter-z-ai-glm-5-3-high.md",
     ])
   })
 })
@@ -316,14 +316,14 @@ describe("built-in review pipeline", () => {
     expect(stepNames(scored())).toEqual([
       "scope",
       "clean-code__openai-gpt-5-6-terra-xhigh",
-      "clean-code__anthropic-claude-opus-5",
+      "clean-code__openrouter-x-ai-grok-4-6-high",
       "security__openai-gpt-5-6-terra-xhigh",
-      "security__anthropic-claude-opus-5",
+      "security__openrouter-x-ai-grok-4-6-high",
       "bugs__openai-gpt-5-6-terra-xhigh",
-      "bugs__anthropic-claude-opus-5",
+      "bugs__openrouter-x-ai-grok-4-6-high",
       "report",
       "score__openai-gpt-5-6-sol-xhigh",
-      "score__anthropic-claude-opus-5",
+      "score__openrouter-x-ai-grok-4-6-high",
       "score-report",
     ])
   })
@@ -335,11 +335,11 @@ describe("built-in review pipeline", () => {
       "prd.md",
       "reports/scope.md",
       "reports/clean-code__openai-gpt-5-6-terra-xhigh.md",
-      "reports/clean-code__anthropic-claude-opus-5.md",
+      "reports/clean-code__openrouter-x-ai-grok-4-6-high.md",
       "reports/security__openai-gpt-5-6-terra-xhigh.md",
-      "reports/security__anthropic-claude-opus-5.md",
+      "reports/security__openrouter-x-ai-grok-4-6-high.md",
       "reports/bugs__openai-gpt-5-6-terra-xhigh.md",
-      "reports/bugs__anthropic-claude-opus-5.md",
+      "reports/bugs__openrouter-x-ai-grok-4-6-high.md",
     ])
 
     const report = scored().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")
@@ -349,14 +349,14 @@ describe("built-in review pipeline", () => {
       "prd.md",
       "reports/scope.md",
       "reports/clean-code__openai-gpt-5-6-terra-xhigh.md",
-      "reports/clean-code__anthropic-claude-opus-5.md",
+      "reports/clean-code__openrouter-x-ai-grok-4-6-high.md",
       "reports/security__openai-gpt-5-6-terra-xhigh.md",
-      "reports/security__anthropic-claude-opus-5.md",
+      "reports/security__openrouter-x-ai-grok-4-6-high.md",
       "reports/bugs__openai-gpt-5-6-terra-xhigh.md",
-      "reports/bugs__anthropic-claude-opus-5.md",
+      "reports/bugs__openrouter-x-ai-grok-4-6-high.md",
       "reports/report.md",
       "reports/score__openai-gpt-5-6-sol-xhigh.md",
-      "reports/score__anthropic-claude-opus-5.md",
+      "reports/score__openrouter-x-ai-grok-4-6-high.md",
     ])
   })
 })
@@ -438,36 +438,36 @@ describe("built-in review-lite pipeline", () => {
     expect(scope).toMatchObject({ agentName: "review-scope", readOnly: true, verify: true })
   })
 
-  test("runs entirely on low-cost models: GLM 5.2 scopes and reports, and the fan-out pairs GLM 5.2 with Kimi K3", () => {
+  test("runs entirely on low-cost models: GLM 5.3 scopes and reconciles, DeepSeek V4 Flash 0731 reports, and the fan-outs pair GLM 5.3 with Grok 4.6", () => {
     const pipeline = reviewLite()
     expect(stepNames(pipeline)).toEqual([
       "scope",
-      "clean-code__openrouter-z-ai-glm-5-2",
-      "clean-code__openrouter-moonshotai-kimi-k3",
-      "security__openrouter-z-ai-glm-5-2",
-      "security__openrouter-moonshotai-kimi-k3",
-      "bugs__openrouter-z-ai-glm-5-2",
-      "bugs__openrouter-moonshotai-kimi-k3",
+      "clean-code__openrouter-z-ai-glm-5-3-high",
+      "clean-code__openrouter-x-ai-grok-4-6-high",
+      "security__openrouter-z-ai-glm-5-3-high",
+      "security__openrouter-x-ai-grok-4-6-high",
+      "bugs__openrouter-z-ai-glm-5-3-high",
+      "bugs__openrouter-x-ai-grok-4-6-high",
       "report",
-      "score__openrouter-z-ai-glm-5-2-xhigh",
-      "score__openrouter-moonshotai-kimi-k3-high",
+      "score__openrouter-z-ai-glm-5-3-high",
+      "score__openrouter-x-ai-grok-4-6-high",
       "score-report",
     ])
 
     const byName = Object.fromEntries(
       pipeline.steps.filter((step): step is AgentStep => step.type === "agent").map((step) => [step.name, step]),
     )
-    expect(byName.scope?.model).toBe("openrouter/z-ai/glm-5.2")
-    expect(byName.report?.model).toBe("openrouter/z-ai/glm-5.2")
+    expect(byName.scope?.model).toBe("openrouter/z-ai/glm-5.3")
+    expect(byName.report?.model).toBe("openrouter/deepseek/deepseek-v4-flash-0731")
     expect(byName.report?.inputFiles).toEqual([
       "prd.md",
       "reports/scope.md",
-      "reports/clean-code__openrouter-z-ai-glm-5-2.md",
-      "reports/clean-code__openrouter-moonshotai-kimi-k3.md",
-      "reports/security__openrouter-z-ai-glm-5-2.md",
-      "reports/security__openrouter-moonshotai-kimi-k3.md",
-      "reports/bugs__openrouter-z-ai-glm-5-2.md",
-      "reports/bugs__openrouter-moonshotai-kimi-k3.md",
+      "reports/clean-code__openrouter-z-ai-glm-5-3-high.md",
+      "reports/clean-code__openrouter-x-ai-grok-4-6-high.md",
+      "reports/security__openrouter-z-ai-glm-5-3-high.md",
+      "reports/security__openrouter-x-ai-grok-4-6-high.md",
+      "reports/bugs__openrouter-z-ai-glm-5-3-high.md",
+      "reports/bugs__openrouter-x-ai-grok-4-6-high.md",
     ])
   })
 
@@ -485,7 +485,7 @@ describe("built-in review-lite pipeline", () => {
 
   test("measures like review does, on its own models", () => {
     const report = reviewLite().steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")
-    expect(report).toMatchObject({ agentName: "quality-score-report", model: "openrouter/z-ai/glm-5.2", variant: "xhigh", readOnly: true, verify: true })
+    expect(report).toMatchObject({ agentName: "quality-score-report", model: "openrouter/z-ai/glm-5.3", variant: "high", readOnly: true, verify: true })
   })
 })
 
@@ -738,7 +738,7 @@ describe("pipeline resolution", () => {
     }
 
     const withoutDefault = agentSteps(spec)
-    expect(withoutDefault[1]).toMatchObject({ model: "openrouter/moonshotai/kimi-k3" })
+    expect(withoutDefault[1]).toMatchObject({ model: "openrouter/x-ai/grok-4.6", variant: "high" })
 
     const [implementer, design, tests] = resolvePipeline({
       name: "test",

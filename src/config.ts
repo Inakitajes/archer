@@ -17,7 +17,6 @@ import {
   defaultImplementAuditModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
-  defaultOpusModel,
   defaultPipelineName,
   humanStepType,
   humanReviewStep,
@@ -295,7 +294,7 @@ defaults:
 #     model: openai/gpt-5.6-terra#xhigh
 #   design-polisher:
 #     description: Polishes new UI following the repo's design system, without redesigning
-#     model: ${defaultOpusModel}
+#     model: openrouter/x-ai/grok-4.6#high
 #     temperature: 0.2
 #   api-reviewer:
 #     description: Reviews API consistency
@@ -303,7 +302,7 @@ defaults:
 
 # Convoy ships these pipelines built in; pick one with -p/--pipeline without redeclaring it here:
 #   implement            the default: advised implementation, then audit, polish, test, and adversarial review
-#   implement-lite       like implement, but drops the code-writing phases to GLM 5.2 (Kimi K3 advises)
+#   implement-lite       like implement, but the code-writing phase drops to DeepSeek V4 Flash 0731 (Grok 4.6 advises)
 #   ship                 the close: merge the advanced base in (resolving conflicts), score the merged
 #                        result against the rubric, and loop until it clears 85/100
 #                        wants permissions.allow: git merge*, git add*, git checkout --ours*|--theirs*
@@ -312,7 +311,7 @@ defaults:
 #   goal-fix             the goal loop's fix iteration (not run directly; ship's goal or --goal drives it)
 #   fixer                turn a list of findings into proven regression tests, minimal fixes, and a verdict each
 #   review               report-only: parallel audits across two models, one prioritized report, then a verified score
-#   review-lite          like review, but every phase runs on GLM 5.2 / Kimi K3 instead of Opus
+#   review-lite          like review, but every phase runs on GLM 5.3 / DeepSeek V4 Flash 0731 / Grok 4.6 instead of Opus
 #   review-cc            like review, but pairs each audit with a Claude Code run (needs the \`claude\` CLI on PATH)
 #   hunter               report-only repo audit: six specialty tracks on two models each, then one consensus report
 #   hunter-max           like hunter, with every track fanned across all five models (30 audits — slow and expensive)

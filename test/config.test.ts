@@ -441,7 +441,7 @@ describe("agent registry", () => {
     const design = registry.find((agent) => agent.name === "design-polisher")
     expect(design).toMatchObject({ model: "openai/gpt-5.5#xhigh", temperature: 0.5, readOnly: true, builtIn: true })
     // The built-in preference survives underneath the override.
-    expect(design?.defaultModel).toBe("openrouter/moonshotai/kimi-k3")
+    expect(design?.defaultModel).toBe("openrouter/x-ai/grok-4.6#high")
 
     const custom = registry.find((agent) => agent.name === "api-reviewer")
     expect(custom).toMatchObject({ description: "Reviews APIs", readOnly: true, builtIn: false })

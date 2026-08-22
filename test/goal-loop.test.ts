@@ -724,8 +724,8 @@ describe("goal-fix pipeline shape", () => {
     const steps = goalFixPipeline.steps
     expect(steps.map((step) => step.name)).toEqual([
       "fix",
-      "score__openai-gpt-5-6-sol-xhigh",
-      "score__anthropic-claude-opus-5",
+      "score__openrouter-x-ai-grok-4-6-high",
+      "score__openrouter-z-ai-glm-5-3-high",
       "score-report",
     ])
 
@@ -754,8 +754,8 @@ describe("goal-fix re-scoring is blind to the previous score", () => {
   test("the consensus step sees only the new scorer reports, not the fixer's", () => {
     const consensus = goalFixPipeline.steps.find((step): step is AgentStep => step.type === "agent" && step.agentName === "quality-score-report")
     expect(consensus?.inputFiles).not.toContain("reports/fix.md")
-    expect(consensus?.inputFiles).toContain("reports/score__openai-gpt-5-6-sol-xhigh.md")
-    expect(consensus?.inputFiles).toContain("reports/score__anthropic-claude-opus-5.md")
+    expect(consensus?.inputFiles).toContain("reports/score__openrouter-x-ai-grok-4-6-high.md")
+    expect(consensus?.inputFiles).toContain("reports/score__openrouter-z-ai-glm-5-3-high.md")
   })
 })
 
