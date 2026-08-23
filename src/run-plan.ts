@@ -1,4 +1,5 @@
 import { resolveModel, type ModelGateway, type ModelRoutingOverrides } from "./model-routing"
+import type { OpenSpecBundle } from "./openspec"
 import type { PrdHistoryPreview } from "./prd-history"
 import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { stepRunnerFor } from "./step-runners"
@@ -15,6 +16,8 @@ export type BuildRunPlanInput = RunOptions & {
   resumeGateway?: ModelGateway
   /** Precomputed checkout preview; `buildRunPlan` does not touch the filesystem. */
   prdHistoryPreview?: PrdHistoryPreview
+  /** Precomputed OpenSpec contract; `buildRunPlan` does not touch the filesystem. */
+  openspec?: OpenSpecBundle
 }
 
 /** Purely resolves the complete execution shape; it performs no filesystem or process effects. */
@@ -61,6 +64,7 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     ...(judge ? { smartJudge: { model: judge } } : {}),
     hooks,
     attachments: [...input.files],
+    ...(input.openspec ? { openspec: input.openspec } : {}),
     ...(input.prdHistoryPreview ? { prdHistory: input.prdHistoryPreview } : {}),
     permissions: input.yolo ? "yolo" : input.smart ? "smart" : "interactive",
     ...(goal ? { goal } : {}),

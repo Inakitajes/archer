@@ -1,0 +1,242 @@
+import { lstat, readdir, readFile } from "node:fs/promises"
+import { join, resolve } from "node:path"
+
+/**
+ * OpenSpec-native scoring contract.
+ *
+ * Convoy never writes OpenSpec state: `openspec/changes/<id>/{proposal.md,
+ * specs/**, design.md, tasks.md}` is produced by the OpenSpec authoring tool
+ * (outside this repo) and archived under `openspec/archive/`. This module only
+ * reads that layout and turns it into a spec bundle — the current specs under
+ * `openspec/specs/` plus the files of the active change(s) — that the runner
+ * attaches in place of the single oldest `.convoy/prd-history` entry.
+ *
+ * The selection order (shared by `/convoy` and the runtime) is:
+ *   1. explicit `--change <id>` (or `/convoy <id>`);
+ *   2. exactly one non-archived change in `openspec/changes/`;
+ *   3. multiple, and the current branch name matches a change id (`feat/add-foo`
+ *      ↔ `add-foo`);
+ *   4. multiple, no branch match: compose the changes whose touched files appear
+ *      in the diff against the base;
+ *   5. none → no OpenSpec contract.
+ *
+ * `resolveChange` is pure and free of I/O so the whole selection order is
+ * unit-testable; the thin `loadOpenSpecBundle` caller does the filesystem reads.
+ */
+
+export const openspecDirName = "openspec"
+
+export type OpenSpecChange = {
+  id: string
+  /**
+   * Files the change touches, matched against the working diff in the compose
+   * path. Derived best-effort from the change's own markdown (proposal/design/
+   * tasks and delta specs); an empty list simply means the compose rule will
+   * never auto-select this change, which is the safe direction.
+   */
+  touchedFiles: readonly string[]
+  /** Every markdown file the change carries, relative to the repo root. */
+  specFiles: readonly string[]
+}
+
+/** The resolved contract the run plan freezes and the runner attaches. */
+export type OpenSpecBundle = {
+  changeIds: readonly string[]
+  /** Spec bundle file paths relative to the repo root: current specs + the active changes' files. */
+  specFiles: readonly string[]
+  /**
+   * Absolute path of the checkout the bundle was resolved against (the launch
+   * checkout). An isolated worktree starts from the base ref, so a freshly
+   * proposed — still uncommitted — change exists only here; the runner falls
+   * back to this root when a spec file is absent from the run's checkout.
+   */
+  rootDir?: string
+}
+
+/**
+ * Whether a `openspec/changes/` entry names a change dir. The archive binder,
+ * dotfiles, and stray root drop-ins (a proposal.md accidentally left at the top
+ * level) are not changes.
+ */
+export function isOpenSpecChangeId(id: string): boolean {
+  if (!id) return false
+  if (id === "archive") return false
+  if (id.startsWith(".")) return false
+  if (id.endsWith(".md")) return false
+  return true
+}
+
+/** `feat/add-foo` (or a bare `add-foo`) → `add-foo`; `undefined` when there is no branch. */
+export function branchIdFromBranch(branch?: string): string | undefined {
+  if (!branch) return undefined
+  const slash = branch.indexOf("/")
+  const candidate = slash === -1 ? branch : branch.slice(slash + 1)
+  return candidate || undefined
+}
+
+export type ResolveChangeInput = {
+  /** Rule 1: the explicit `--change <id>`; wins over every heuristic. */
+  explicitId?: string
+  /** Raw basename entries of `openspec/changes/` (including `archive/` and stray files). */
+  changesDirEntries: readonly string[]
+  /** Per-change context (touched files, spec files) keyed by change id. */
+  changesById: ReadonlyMap<string, OpenSpecChange>
+  /** Current branch name, for rule 3. */
+  branch?: string
+  /** Files touched in the working-tree diff against the base, for rule 4. */
+  diffFiles: readonly string[]
+}
+
+/**
+ * The selection order as a pure function. Returns the ids of the changes that
+ * apply to the current directory, or an empty array when none does.
+ */
+export function resolveChange(input: ResolveChangeInput): readonly string[] {
+  const changes = input.changesDirEntries.filter(isOpenSpecChangeId)
+  if (changes.length === 0) return []
+
+  const explicit = input.explicitId?.trim()
+  if (explicit) return changes.includes(explicit) ? [explicit] : []
+
+  if (changes.length === 1) return changes
+
+  const branchId = branchIdFromBranch(input.branch)
+  if (branchId && changes.includes(branchId)) return [branchId]
+
+  // Rule 4: compose every change whose touched files appear in the diff. A
+  // change with no derived touched files can never match, and that is fine — the
+  // compose path is a heuristic, never the source of authority (--change is).
+  return changes.filter((id) => {
+    const touched = input.changesById.get(id)?.touchedFiles
+    if (!touched || touched.length === 0) return false
+    return touched.some((file) => input.diffFiles.includes(file))
+  })
+}
+
+/**
+ * Discovers the active change(s) and materializes the spec bundle. Returns
+ * `undefined` when the repository has no `openspec/` at all — that is the
+ * brownfield signal that keeps today's `.convoy/prd-history` behavior intact
+ * (the bundle must be additive on detection only). A bundle with empty
+ * `changeIds` (openspec present, nothing selected) also keeps the historical
+ * fallback: selection rule 5 explicitly falls back to today's review behavior.
+ */
+export async function loadOpenSpecBundle(input: {
+  targetDir: string
+  explicitId?: string
+  branch?: string
+  diffFiles?: readonly string[]
+}): Promise<OpenSpecBundle | undefined> {
+  const openspecRoot = join(input.targetDir, openspecDirName)
+  if (!(await dirExists(openspecRoot))) return undefined
+
+  const changesDir = join(openspecRoot, "changes")
+  const changesDirEntries = await readDirNames(changesDir)
+  const changesById = new Map<string, OpenSpecChange>()
+  for (const id of changesDirEntries.filter(isOpenSpecChangeId)) {
+    const changeRoot = join(changesDir, id)
+    const relativeMds = await collectMarkdownFiles(changeRoot)
+    const touchedFiles = new Set<string>()
+    for (const relative of relativeMds) {
+      try {
+        const body = await readFile(join(changeRoot, relative), "utf8")
+        for (const token of filePathTokens(body)) touchedFiles.add(stripLeadingDotSlash(token))
+      } catch {
+        // A change that loses a file mid-edit still resolves by its id.
+      }
+    }
+    changesById.set(id, {
+      id,
+      touchedFiles: [...touchedFiles].sort(),
+      specFiles: relativeMds.map((relative) => join(openspecDirName, "changes", id, relative)),
+    })
+  }
+
+  const currentSpecFiles = await collectDirRelativeMarkdown(join(openspecRoot, "specs"), join(openspecDirName, "specs"))
+
+  const selected = resolveChange({
+    explicitId: input.explicitId,
+    changesDirEntries,
+    changesById,
+    branch: input.branch,
+    diffFiles: input.diffFiles ?? [],
+  })
+
+  const changeSpecFiles = selected.flatMap((id) => changesById.get(id)?.specFiles ?? [])
+  return {
+    changeIds: selected,
+    specFiles: [...currentSpecFiles, ...changeSpecFiles],
+    rootDir: resolve(input.targetDir),
+  }
+}
+
+async function dirExists(dir: string): Promise<boolean> {
+  try {
+    await readdir(dir)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Returns every markdown file under `root`, as paths relative to `root`. */
+async function collectMarkdownFiles(root: string): Promise<string[]> {
+  return collectDirRelativeMarkdown(root, ".")
+}
+
+/**
+ * Walks `root` and returns every hidden-skipping `.md` path, relative to `root`,
+ * sorted. Symlinks are never followed — file links, directory links, and a
+ * symlinked walk root (e.g. `openspec/specs` → somewhere outside the repo)
+ * contribute nothing rather than attaching out-of-repo files to the contract.
+ */
+async function collectDirRelativeMarkdown(root: string, relativeRoot: string): Promise<string[]> {
+  let dirents
+  try {
+    // lstat, not stat/readdir: a symlinked root is not a directory here, so the
+    // walk stops instead of silently following the link out of the repository.
+    if (!(await lstat(root)).isDirectory()) return []
+    dirents = await readdir(root, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const out: string[] = []
+  for (const entry of dirents) {
+    if (entry.name.startsWith(".")) continue
+    if (entry.isSymbolicLink()) continue
+    const relative = join(relativeRoot, entry.name)
+    if (entry.isDirectory()) {
+      out.push(...(await collectDirRelativeMarkdown(join(root, entry.name), relative)))
+    } else if (entry.name.endsWith(".md")) {
+      out.push(relative)
+    }
+  }
+  return out.sort()
+}
+
+/**
+ * Returns the sorted names of a directory's real (non-symlink) entries, or an
+ * empty list when absent. A symlink named like a change id is not a change.
+ */
+async function readDirNames(dir: string): Promise<string[]> {
+  try {
+    const dirents = await readdir(dir, { withFileTypes: true })
+    return dirents
+      .filter((entry) => !entry.isSymbolicLink())
+      .map((entry) => entry.name)
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/** Relative path tokens that look like files (contain a `/` and an extension). */
+const filePathTokenPattern = /\b(?:\.{0,2}\/)?[\w.-]+(?:\/[\w.-]+)*\.[A-Za-z0-9]+\b/g
+
+function filePathTokens(content: string): string[] {
+  return [...new Set(content.match(filePathTokenPattern) ?? [])]
+}
+
+function stripLeadingDotSlash(path: string): string {
+  return path.startsWith("./") ? path.slice(2) : path
+}

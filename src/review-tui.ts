@@ -54,7 +54,7 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   } else {
     rows.push(continuation([fg(theme.dim)("runs in the current checkout")]))
   }
-  pushHistoryRows(rows, plan, value)
+  pushContractRows(rows, plan, value)
   rows.push(plain(""))
 
   rows.push(labelRow("gateway", [fg(theme.text)(gatewayLabel(plan.modelRouting.gateway))]))
@@ -98,6 +98,30 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   }
 
   return rows
+}
+
+function pushContractRows(rows: StyledText[], plan: RunPlan, value: number) {
+  const openspecWins = Boolean(plan.openspec && plan.openspec.changeIds.length > 0)
+  // One contract: an active OpenSpec change supersedes historical PRD, so the
+  // review must not claim both will attach.
+  if (openspecWins) {
+    pushOpenSpecRows(rows, plan, value)
+    return
+  }
+  pushHistoryRows(rows, plan, value)
+  pushOpenSpecRows(rows, plan, value)
+}
+
+function pushOpenSpecRows(rows: StyledText[], plan: RunPlan, value: number) {
+  if (!plan.openspec) return
+  if (plan.openspec.changeIds.length === 0) {
+    rows.push(labelRow("openspec", [fg(theme.dim)(truncate("no active change · scope will infer from the diff", value))]))
+    return
+  }
+  const ids = sanitizeReviewInline(plan.openspec.changeIds.join(", "))
+  const count = plan.openspec.specFiles.length
+  const headline = `${ids} · contract attached (${count} spec file${count === 1 ? "" : "s"})`
+  rows.push(labelRow("openspec", [fg(theme.teal)(truncate(headline, value))]))
 }
 
 function pushHistoryRows(rows: StyledText[], plan: RunPlan, value: number) {
