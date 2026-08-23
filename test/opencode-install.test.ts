@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, test } from "bun:test"
 import { existsSync } from "node:fs"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+import { builtInOpenCodePayload } from "../src/built-in-opencode"
 import { installOpenCode, openCodeConfigDir, openCodePayloadFiles, openCodeStatus, uninstallOpenCode } from "../src/opencode-install"
 
 const dirs: string[] = []
@@ -37,24 +38,41 @@ describe("convoy opencode install", () => {
       expect(existsSync(join(configDir, "commands", "convoy.md"))).toBe(true)
       expect(existsSync(join(configDir, "bin", "convoy-run"))).toBe(true)
 
-      const bundled = await openCodePayloadFiles()
+      const bundled = openCodePayloadFiles()
       for (const file of bundled) {
-        expect(await readFile(join(configDir, file.relPath), "utf8")).toBe(await readFile(file.source, "utf8"))
+        expect(await readFile(join(configDir, file.relPath), "utf8")).toBe(file.content)
       }
+      expect((await stat(join(configDir, "bin", "convoy-run"))).mode & 0o777).toBe(0o755)
     })
+  })
+
+  test("embedded OpenCode payload stays in sync with the opencode/ directory", async () => {
+    const root = join(import.meta.dir, "..", "opencode")
+    const onDisk: string[] = []
+    for (const kind of ["commands", "bin"] as const) {
+      for (const name of (await readdir(join(root, kind))).sort()) {
+        // convoy-run.d.ts is a tsc sibling, not payload.
+        if (name.startsWith(".") || name.endsWith(".d.ts")) continue
+        onDisk.push(join(kind, name))
+      }
+    }
+    expect(builtInOpenCodePayload.map((file) => file.relPath).sort()).toEqual(onDisk.sort())
+    for (const file of builtInOpenCodePayload) {
+      expect(file.content).toBe(await readFile(join(root, file.relPath), "utf8"))
+    }
   })
 
   test("re-running install is idempotent and refreshes a tampered copy", async () => {
     await withOpenCodeConfigDir(async (configDir) => {
       const first = await installOpenCode()
-      const payload = await openCodePayloadFiles()
+      const payload = openCodePayloadFiles()
       const spinDest = join(configDir, "commands", "spin.md")
-      const spinSource = payload.find((file) => file.relPath === "commands/spin.md")!.source
+      const spin = payload.find((file) => file.relPath === "commands/spin.md")!
 
       await writeFile(spinDest, "# tampered\n")
       const second = await installOpenCode()
       expect(second.installed).toEqual(first.installed)
-      expect(await readFile(spinDest, "utf8")).toBe(await readFile(spinSource, "utf8"))
+      expect(await readFile(spinDest, "utf8")).toBe(spin.content)
     })
   })
 

@@ -1,8 +1,9 @@
-import { copyFile, mkdir, readdir, readFile, rm } from "node:fs/promises"
+import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { homedir } from "node:os"
 
+import { builtInOpenCodePayload, type BuiltInOpenCodePayloadFile } from "./built-in-opencode"
 import { shortVersion } from "./version"
 
 /**
@@ -10,8 +11,9 @@ import { shortVersion } from "./version"
  *
  * Deploys Convoy's OpenSpec-native OpenCode payload — the `/spin` and `/convoy`
  * slash commands and the `convoy-run` helper — into OpenCode's config directory
- * so they sit next to `/opsx:propose`. The payload lives in this repo under
- * `opencode/commands/*.md` and `opencode/bin/*`.
+ * so they sit next to `/opsx:propose`. The payload is embedded at bundle time
+ * from `opencode/commands/*.md` and `opencode/bin/*`, so a standalone binary
+ * installs the same files a source checkout would.
  *
  * Resolution order for the destination dir: `--dir <path>` (explicitly supplied
  * to the CLI), else `OPENCODE_CONFIG_DIR` (the same variable Convoy already
@@ -26,8 +28,7 @@ export type OpenCodeInstallOptions = {
   dir?: string
 }
 
-/** The committed payload root: `<repo>/opencode`, relative to this module. */
-const payloadRoot = resolve(import.meta.dir, "..", "opencode")
+export type OpenCodePayloadFile = BuiltInOpenCodePayloadFile
 
 export function openCodeConfigDir(options: OpenCodeInstallOptions = {}): string {
   if (options.dir) return resolve(options.dir)
@@ -35,25 +36,9 @@ export function openCodeConfigDir(options: OpenCodeInstallOptions = {}): string 
   return join(homedir(), ".config", "opencode")
 }
 
-export type OpenCodePayloadFile = {
-  /** Path relative to the config dir (e.g. `commands/convoy.md`). */
-  relPath: string
-  /** Absolute source path in this repo. */
-  source: string
-}
-
 /** Lists the payload Convoy owns, relative to the config dir, sorted for determinism. */
-export async function openCodePayloadFiles(): Promise<OpenCodePayloadFile[]> {
-  const out: OpenCodePayloadFile[] = []
-  for (const kind of ["commands", "bin"]) {
-    const dir = join(payloadRoot, kind)
-    if (!(await dirExists(dir))) continue
-    for (const name of (await readdir(dir)).sort()) {
-      if (name.startsWith(".")) continue
-      out.push({ relPath: join(kind, name), source: join(dir, name) })
-    }
-  }
-  return out
+export function openCodePayloadFiles(): OpenCodePayloadFile[] {
+  return builtInOpenCodePayload.map((file) => ({ ...file }))
 }
 
 export type OpenCodeInstallResult = {
@@ -64,11 +49,12 @@ export type OpenCodeInstallResult = {
 
 export async function installOpenCode(options: OpenCodeInstallOptions = {}): Promise<OpenCodeInstallResult> {
   const dir = openCodeConfigDir(options)
-  const files = await openCodePayloadFiles()
+  const files = openCodePayloadFiles()
   for (const file of files) {
     const dest = join(dir, file.relPath)
     await mkdir(dirname(dest), { recursive: true })
-    await copyFile(file.source, dest)
+    await writeFile(dest, file.content, "utf8")
+    if (file.mode !== undefined) await chmod(dest, file.mode)
   }
   return { dir, installed: files.map((file) => file.relPath) }
 }
@@ -88,7 +74,7 @@ export type OpenCodeStatusResult = {
 
 export async function openCodeStatus(options: OpenCodeInstallOptions = {}): Promise<OpenCodeStatusResult> {
   const dir = openCodeConfigDir(options)
-  const files = await openCodePayloadFiles()
+  const files = openCodePayloadFiles()
   const records: OpenCodeStatusRecord[] = []
   for (const file of files) {
     const dest = join(dir, file.relPath)
@@ -96,7 +82,7 @@ export async function openCodeStatus(options: OpenCodeInstallOptions = {}): Prom
       records.push({ relPath: file.relPath, installed: false, matchesBundled: false })
       continue
     }
-    const same = (await readFile(dest, "utf8").catch(() => "")) === (await readFile(file.source, "utf8").catch(() => ""))
+    const same = (await readFile(dest, "utf8").catch(() => "")) === file.content
     records.push({ relPath: file.relPath, installed: true, matchesBundled: same })
   }
   return { dir, version: shortVersion(), records }
@@ -112,7 +98,7 @@ export type OpenCodeUninstallResult = {
 
 export async function uninstallOpenCode(options: OpenCodeInstallOptions = {}): Promise<OpenCodeUninstallResult> {
   const dir = openCodeConfigDir(options)
-  const files = await openCodePayloadFiles()
+  const files = openCodePayloadFiles()
   const removed: string[] = []
   const kept: string[] = []
   for (const file of files) {
