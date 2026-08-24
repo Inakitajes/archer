@@ -1249,7 +1249,7 @@ export async function preparePhaseRun(
 
   const phaseFiles = await fileParts(inputs, workspace.dir, "skip")
   const contextFiles = await projectContextFileParts(projectContextFiles, options.targetDir)
-  const historyFiles = options.prdHistory && phase.prdHistory ? await historicalPrdFileParts(options.targetDir, workspace.runID) : []
+  const historyFiles = options.prdHistory && phase.prdHistory ? await scopeContractFiles(options, workspace.runID) : []
   const attachments = [...contextFiles, ...phaseFiles, ...historyFiles, ...extraFiles]
   const prompt = buildPhasePrompt(workspace, phase)
   const model = selectedModel(phase, options.modelOverride)
@@ -1279,6 +1279,42 @@ async function historicalPrdFileParts(targetDir: string, excludeRunID: string): 
     log.warn(`couldn't read PRD history: ${formatSdkError(error)}`)
     return []
   }
+}
+
+/**
+ * The scope contract for a prdHistory-opted phase: the OpenSpec spec bundle when
+ * an active change resolved on this checkout, else the single oldest historical
+ * PRD. The bundle supersedes history only on detection — a repo without
+ * `openspec/`, or one with no active change, keeps today's behavior exactly.
+ */
+async function scopeContractFiles(options: RunOptions, excludeRunID: string): Promise<FilePartInput[]> {
+  const bundle = options.plan?.openspec
+  if (bundle && bundle.changeIds.length > 0) {
+    try {
+      // Prefer the run's checkout. An isolated worktree starts from the base
+      // ref, so a freshly proposed (uncommitted) change exists only in the
+      // launch checkout the plan was resolved against — fall back to it rather
+      // than silently dropping the contract the operator consented to.
+      const paths: string[] = []
+      for (const file of bundle.specFiles) {
+        const inRun = join(options.targetDir, file)
+        if (existsSync(inRun)) {
+          paths.push(inRun)
+          continue
+        }
+        const inLaunch = bundle.rootDir ? join(bundle.rootDir, file) : undefined
+        if (inLaunch && existsSync(inLaunch)) paths.push(inLaunch)
+      }
+      if (paths.length < bundle.specFiles.length) {
+        log.warn(`OpenSpec spec bundle: ${bundle.specFiles.length - paths.length} of ${bundle.specFiles.length} spec files resolved in neither the run's nor the launch checkout; skipped`)
+      }
+      return await fileParts(paths, options.targetDir, "skip")
+    } catch (error) {
+      log.warn(`couldn't attach OpenSpec spec bundle: ${formatSdkError(error)}`)
+      return []
+    }
+  }
+  return historicalPrdFileParts(options.targetDir, excludeRunID)
 }
 
 async function projectContextFileParts(paths: string[], targetDir: string) {

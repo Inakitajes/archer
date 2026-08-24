@@ -27,6 +27,7 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     `  Diff base: ${sanitizeInline(plan.target.baseRef)} · working tree: ${plan.target.dirty ? "include dirty" : "clean required"}`,
     `  Worktree: ${plan.target.worktree ? `yes · branch ${plan.target.branch ? sanitizeInline(plan.target.branch) : "named at start"}` : "no"}`,
     ...prdHistoryPlanLines(plan),
+    ...openspecPlanLines(plan),
     `Pipeline: ${sanitizeInline(plan.pipeline.name)} · ${plan.pipeline.steps.length} steps`,
     `Gateway: ${gatewayLabel(plan.modelRouting.gateway)}${plan.modelRouting.gateway === "nitro" ? " · every OpenRouter model routed by throughput (injected for this run only)" : ""}`,
     `Advisors: ${plan.pipeline.steps.filter((step) => step.type === "agent" && Boolean(plannedStepAdvisor(step))).length}/${plan.pipeline.steps.filter((step) => step.type === "agent").length} steps advised`,
@@ -107,12 +108,25 @@ export async function confirmRunPlan(plan: RunPlan): Promise<boolean> {
 }
 
 function prdHistoryPlanLines(plan: RunPlan): string[] {
+  // An active OpenSpec change is the contract; do not also claim the historical
+  // PRD will attach (the runner supersedes it).
+  if (plan.openspec && plan.openspec.changeIds.length > 0) return []
   if (!plan.prdHistory) return []
   const copy = prdHistoryPreviewCopy(plan.prdHistory)
   if (!copy) return []
   const headline = sanitizeInline(copy.headline)
   if (copy.detail) return [`PRD history: ${headline}`, `  ${sanitizeInline(copy.detail)}`]
   return [`PRD history: ${headline}`]
+}
+
+function openspecPlanLines(plan: RunPlan): string[] {
+  if (!plan.openspec) return []
+  if (plan.openspec.changeIds.length === 0) {
+    return ["OpenSpec: openspec/ present but no active change — scope falls back to the diff"]
+  }
+  const ids = sanitizeInline(plan.openspec.changeIds.join(", "))
+  const count = plan.openspec.specFiles.length
+  return [`OpenSpec change: ${ids} · contract attached (${count} spec files)`]
 }
 
 function sanitize(value: string) {

@@ -6,7 +6,7 @@ This is an audit-only phase: do not modify the repository. You have bash, so ver
 
 ## Inputs
 
-1. `prd.md` — the task brief.
+1. The working contract the scorers graded against: the attached **OpenSpec change bundle** (proposal + current specs + delta specs, whose Requirements/Scenarios are the `prd` contract) when an active change resolved; otherwise `prd.md` — the task brief.
 2. Two or more independent `quality-scorer` reports (each scored the same artifact against the same rubric, with no shared context).
 3. The cumulative diff and the repository around it.
 4. `.convoy/quality-rubric.md`, when present, and `.convoy/quality-bar.md`, when present — the same contracts the scorers used.
@@ -19,7 +19,7 @@ This is an audit-only phase: do not modify the repository. You have bash, so ver
    - Deduplicate. Keep the severity the taxonomy implies, not the one the scorer happened to assign.
 2. **Verify the load-bearing claims yourself.**
    - Re-run only the load-bearing or missing checks (test, typecheck, lint, build) and record real results. The scope step's Checks section covers the baseline, so do not repeat the whole suite when the evidence is already there. This confirms the `operational` and `tests` evidence the scorers could only reason about statically.
-   - Spot-check the top `mustFix` findings against the actual code: does each one name a real problem at a real location?
+   - Spot-check the top `mustFix` findings against the actual code: does each one name a real problem at a real location? When an OpenSpec bundle is attached, check contested `prd` findings against the change's Requirements/Scenarios rather than a reading of the diff alone.
    - If a claim fails verification, adjust the affected dimension and say exactly why.
 3. **Recompute.** Recalculate the weighted total from the reconciled dimensions (weights: `prd` 30, `tests` 20, `security` 15, `maintainability` 15, `operational` 10, `scope` 10 — unless the project rubric overrides them), then apply each surviving finding's deduction to its own dimension (critical −15, major −8, minor −2, floor at 0). A change whose only findings are minor cannot end below 80.
 4. **Persist the final score.** Call `write_report` with the report narrative in `markdown`, and `dimensions`, `mustFix`, optional `gaps`, and optional `confidence`. Do not pass or manufacture `score` or `verdict`: Convoy derives them and writes the canonical fence.

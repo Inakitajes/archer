@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#
+# convoy-run — run a Convoy pipeline against the OpenSpec change active in the
+# current directory. Installed by `convoy opencode install` into OpenCode's
+# config dir and invoked by the /convoy slash command.
+#
+# Usage:
+#   convoy-run [pipeline]
+#
+# The pipeline defaults to "review". The active OpenSpec change resolves inside
+# Convoy (single non-archived change, branch match, or an explicit
+# CONVOY_CHANGE id, which is forwarded as --change and wins every heuristic).
+
+set -euo pipefail
+
+pipeline="${1:-${CONVOY_PIPELINE:-review}}"
+
+command -v convoy >/dev/null 2>&1 || {
+  echo "convoy is not on PATH; install it first (see the Convoy README)." >&2
+  exit 1
+}
+
+# No arrays: macOS ships bash 3.2, where expanding an empty array under `set -u`
+# is an unbound-variable error.
+
+if [[ ! -d openspec ]]; then
+  echo "no openspec/ in this directory; run /opsx:propose first." >&2
+  exit 1
+fi
+
+echo "running convoy -p $pipeline against the active OpenSpec change"
+if [[ -n "${CONVOY_CHANGE:-}" ]]; then
+  exec convoy -p "$pipeline" --no-tui --no-confirm --change "$CONVOY_CHANGE"
+fi
+exec convoy -p "$pipeline" --no-tui --no-confirm

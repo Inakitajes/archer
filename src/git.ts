@@ -307,6 +307,20 @@ export async function writeDiff(path: string, baseRef: string, cwd: string) {
   await writeFile(path, diff.stdout)
 }
 
+/**
+ * The file paths changed in the working-tree diff against `baseRef`. Used by
+ * OpenSpec's compose rule (active-change selection when multiple changes exist
+ * and no branch matches). Best-effort: a failed diff resolves to an empty list.
+ */
+export async function listChangedFiles(baseRef: string, cwd: string): Promise<string[]> {
+  const names = await execFile("git", ["diff", "--name-only", baseRef], { cwd, allowFailure: true })
+  if (names.exitCode !== 0) return []
+  return names.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
 export async function addAllAndCommit(message: string, cwd: string) {
   await execFile("git", ["add", "-A"], { cwd })
 

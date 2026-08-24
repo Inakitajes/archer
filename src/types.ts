@@ -1,6 +1,7 @@
 import type { AdvisorAuditPolicy } from "./advisor-events"
 import type { LoopGuardSettings } from "./loop-guard"
 import type { NotificationSettings } from "./notifications"
+import type { OpenSpecBundle } from "./openspec"
 import type { PrdHistoryPreview } from "./prd-history"
 import type { AutoAccept, ProgressUI } from "./progress"
 import type { StepRunnerId } from "./step-runners"
@@ -10,6 +11,8 @@ export type RunOptions = {
   prompt: string
   /** Whether this run persists and attaches the project's git-ignored PRD history. */
   prdHistory: boolean
+  /** Explicit OpenSpec change id (`--change <id>`); resolves the spec bundle contract. */
+  change?: string
   files: string[]
   onlySteps: string[]
   skipSteps: string[]
@@ -310,6 +313,13 @@ export type RunPlan = {
   smartJudge?: { model: ResolvedModel }
   hooks: HookSet
   attachments: string[]
+  /**
+   * The frozen OpenSpec contract for this run, resolved before confirmation so
+   * the plan preview can name the active change and the runner can attach its
+   * spec bundle in place of the oldest historical PRD. Absent when the repo has
+   * no `openspec/` (brownfield: exact today's behavior).
+   */
+  openspec?: OpenSpecBundle
   /**
    * Operator-facing preview of the checkout's historical PRD. Computed before
    * confirmation (never inside `buildRunPlan`) so the launcher and CLI review

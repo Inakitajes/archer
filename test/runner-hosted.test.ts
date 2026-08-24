@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test"
 import { existsSync } from "node:fs"
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -12,6 +12,7 @@ import { buildRunPlan } from "../src/run-plan"
 import { noopProgress } from "../src/progress"
 import { builtInAgents } from "../src/pipeline"
 import { prdHistoryDir, readPrdHistoryIndex, writePrdHistory } from "../src/prd-history"
+import { loadOpenSpecBundle } from "../src/openspec"
 import { prepareWorktreeForRun } from "../src/cli"
 import { HerdrReporter } from "../src/herdr"
 
@@ -588,6 +589,90 @@ describe("run() with a hosted progress", () => {
     } finally {
       await rm(workspace, { recursive: true, force: true })
       await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("attaches the OpenSpec spec bundle instead of the historical PRD when a change resolved", async () => {
+    const repo = await cleanRepo()
+    const workspace = await mkdtemp(join(tmpdir(), "convoy-openspec-phase-"))
+    const phase = {
+      type: "agent" as const,
+      name: "scope",
+      stepName: "scope",
+      groupId: "g1",
+      agentName: "review-scope",
+      description: "scope",
+      model: "openai/gpt-5.6-terra",
+      inputFiles: [],
+      inputDiff: false,
+      reportPath: "reports/scope.md",
+      readOnly: true,
+      prdHistory: true,
+    }
+    try {
+      await writePrdHistory({ targetDir: repo, runID: "original", prompt: "original PRD", pipeline: "implement", branch: "main" })
+      await mkdir(join(repo, "openspec", "changes", "add-login", "specs", "auth"), { recursive: true })
+      await mkdir(join(repo, "openspec", "specs", "auth"), { recursive: true })
+      await writeFile(join(repo, "openspec", "changes", "add-login", "proposal.md"), "# Add Login\n")
+      await writeFile(join(repo, "openspec", "changes", "add-login", "specs", "auth", "spec.md"), "## ADDED Scenarios\n")
+      await writeFile(join(repo, "openspec", "specs", "auth", "spec.md"), "# Auth spec\n")
+
+      const bundle = await loadOpenSpecBundle({ targetDir: repo })
+      expect(bundle).toBeDefined()
+      const options = makeOptions(repo)
+      const plan = buildRunPlan({ ...options, openspec: bundle!, promptSource: "inline" })
+      const prepared = await preparePhaseRun({ dir: workspace, runID: "current" }, phase, { ...options, plan }, [], [])
+
+      const filenames = prepared.attachments.map((part) => part.filename)
+      expect(filenames).toContain("proposal.md")
+      expect(filenames).toContain("spec.md")
+      // The bundle supersedes the checkout's historical PRD.
+      expect(filenames).not.toContain("original.prd.md")
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("attaches the spec bundle from the launch checkout when the run's checkout lacks it (isolated worktree)", async () => {
+    // An isolated worktree starts from the base ref, so a freshly proposed —
+    // still uncommitted — change exists only in the launch checkout the plan
+    // was resolved against. The contract must not silently vanish there.
+    const launch = await cleanRepo()
+    const isolated = await cleanRepo()
+    const workspace = await mkdtemp(join(tmpdir(), "convoy-openspec-fallback-"))
+    const phase = {
+      type: "agent" as const,
+      name: "scope",
+      stepName: "scope",
+      groupId: "g1",
+      agentName: "review-scope",
+      description: "scope",
+      model: "openai/gpt-5.6-terra",
+      inputFiles: [],
+      inputDiff: false,
+      reportPath: "reports/scope.md",
+      readOnly: true,
+      prdHistory: true,
+    }
+    try {
+      await mkdir(join(launch, "openspec", "changes", "add-login"), { recursive: true })
+      await writeFile(join(launch, "openspec", "changes", "add-login", "proposal.md"), "# Add Login\n")
+
+      const bundle = await loadOpenSpecBundle({ targetDir: launch })
+      expect(bundle).toBeDefined()
+      expect(bundle!.rootDir).toBe(launch)
+      // The run executes in a checkout that does not carry the change files.
+      const options = makeOptions(isolated)
+      const plan = buildRunPlan({ ...options, openspec: bundle!, promptSource: "inline" })
+      const prepared = await preparePhaseRun({ dir: workspace, runID: "current" }, phase, { ...options, plan }, [], [])
+
+      const filenames = prepared.attachments.map((part) => part.filename)
+      expect(filenames).toContain("proposal.md")
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+      await rm(launch, { recursive: true, force: true })
+      await rm(isolated, { recursive: true, force: true })
     }
   })
 
