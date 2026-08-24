@@ -14,6 +14,7 @@ import { stepRunnerFor } from "./step-runners"
 import { gatewayHint, gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { consensusStep } from "./quality-score"
 import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
+import { listOpenSpecChanges, openSpecPromptFor, type OpenSpecChangeSummary } from "./openspec"
 import { runReviewLines } from "./review-tui"
 import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
@@ -46,6 +47,8 @@ export type LaunchRunSelection = {
   worktreeDir?: string
   /** Empty repositories are initialized only after the review is confirmed. */
   initializeGit?: boolean
+  /** OpenSpec change id picked in the prompt step; becomes `--change`. */
+  change?: string
 }
 
 /** A branch name suggested for the run, plus where it came from so the step can say so. */
@@ -332,7 +335,8 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
       ? await resolveWorktreeDefault(options.targetDir)
       : { isolate: config.defaults.worktree, reason: "set by defaults.worktree" }
   const history = await loadLaunchHistory(options.targetDir, config?.defaults.prdHistory ?? true)
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history).result
+  const specs = await listOpenSpecChanges(options.targetDir)
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs).result
 }
 
 async function loadLaunchHistory(targetDir: string, enabled: boolean): Promise<LaunchHistoryContext> {
@@ -456,6 +460,14 @@ export class LaunchPicker {
   private suggestionIndex = 0
   /** True once Tab has been used at all, so a repeat press advances past the first suggestion. */
   private hasCycledSuggestions = false
+  /** True while the prompt step is showing the OpenSpec picker instead of the editor. */
+  private promptChoosing = false
+  /** 0 = Manual prompt; 1..n = specs[index - 1]. */
+  private specIndex = 0
+  private specScroll = 0
+  /** The OpenSpec change id chosen as the contract; cleared on Manual prompt. */
+  private selectedChangeId?: string
+
   private optionIndex = 0
   private optionScroll = 0
   private message = ""
@@ -534,6 +546,7 @@ export class LaunchPicker {
 
   private readonly handlePaste = (event: PasteEvent) => {
     if (this.mode !== "prompt" && this.mode !== "branch") return
+    if (this.mode === "prompt" && this.promptChoosing) return
     event.preventDefault()
     event.stopPropagation()
     const text = sanitizePaste(stripAnsiSequences(decodePasteBytes(event.bytes)))
@@ -621,6 +634,7 @@ export class LaunchPicker {
     // Named `callbacks` rather than `hooks`: this file already uses "hooks" for the pipeline's shell hooks.
     private readonly callbacks: Pick<LaunchRunTuiOptions, "prepareRun" | "proposeBranchName" | "checkBranchName">,
     private readonly history: LaunchHistoryContext = { enabled: true, entries: [] },
+    private readonly specs: readonly OpenSpecChangeSummary[] = [],
   ) {
     this.toggleState.worktree = worktreeDefault.isolate
     const defaultIndex = choices.findIndex((choice) => choice.isDefault)
@@ -848,7 +862,17 @@ export class LaunchPicker {
   }
 
   private handlePromptKey(key: KeyEvent) {
+    if (this.promptChoosing) {
+      this.handleContractKey(key)
+      return
+    }
     if (key.name === "escape") {
+      if (this.specs.length > 0) {
+        this.promptChoosing = true
+        this.promptError = ""
+        this.render()
+        return
+      }
       this.mode = "pipelines"
       this.promptError = ""
       this.render()
@@ -943,6 +967,76 @@ export class LaunchPicker {
     this.render()
   }
 
+  private handleContractKey(key: KeyEvent) {
+    switch (key.name) {
+      case "up":
+      case "k":
+        this.specIndex = clamp(this.specIndex - 1, 0, this.specs.length)
+        this.render()
+        return
+      case "down":
+      case "j":
+        this.specIndex = clamp(this.specIndex + 1, 0, this.specs.length)
+        this.render()
+        return
+      case "pageup":
+        this.specIndex = clamp(this.specIndex - this.contractVisibleRows(), 0, this.specs.length)
+        this.render()
+        return
+      case "pagedown":
+        this.specIndex = clamp(this.specIndex + this.contractVisibleRows(), 0, this.specs.length)
+        this.render()
+        return
+      case "home":
+        this.specIndex = 0
+        this.render()
+        return
+      case "end":
+        this.specIndex = this.specs.length
+        this.render()
+        return
+      case "return":
+      case "linefeed":
+        this.acceptContract()
+        return
+      case "q":
+        this.finish(undefined)
+        return
+      case "escape":
+        this.mode = "pipelines"
+        this.promptError = ""
+        this.render()
+        return
+    }
+  }
+
+  /**
+   * Manual prompt (index 0) opens the editor. A spec row pins `change=<id>`
+   * and injects a short canned prompt — the spec files are the contract.
+   */
+  private acceptContract() {
+    if (this.specIndex === 0) {
+      this.selectedChangeId = undefined
+      this.promptChoosing = false
+      if (this.promptFromDefault) {
+        this.applyPromptFieldState(emptyPromptField())
+        this.cursor = 0
+      }
+      this.promptError = ""
+      this.render()
+      return
+    }
+    const spec = this.specs[this.specIndex - 1]
+    if (!spec) return
+    this.selectedChangeId = spec.id
+    this.applyPromptFieldState(cleanPromptField(openSpecPromptFor(this.currentChoice().name)))
+    this.cursor = this.prompt.length
+    this.promptError = ""
+    this.mode = "options"
+    this.optionIndex = 0
+    this.render()
+  }
+
   private insertPromptText(text: string) {
     this.prompt = this.prompt.slice(0, this.cursor) + text + this.prompt.slice(this.cursor)
     this.cursor += text.length
@@ -1011,6 +1105,15 @@ export class LaunchPicker {
       case "p":
       case "escape":
         this.mode = "prompt"
+        if (this.specs.length > 0) {
+          this.promptChoosing = true
+          if (this.selectedChangeId) {
+            const index = this.specs.findIndex((spec) => spec.id === this.selectedChangeId)
+            this.specIndex = index >= 0 ? index + 1 : 0
+          } else {
+            this.specIndex = 0
+          }
+        }
         this.cursor = this.prompt.length
         this.render()
         return
@@ -1174,13 +1277,24 @@ export class LaunchPicker {
       return
     }
     this.message = ""
+    this.mode = "prompt"
+    this.promptScroll = 0
+    if (this.specs.length > 0) {
+      this.promptChoosing = true
+      if (this.selectedChangeId) {
+        const index = this.specs.findIndex((spec) => spec.id === this.selectedChangeId)
+        this.specIndex = index >= 0 ? index + 1 : 0
+      } else {
+        this.specIndex = 0
+      }
+      this.render()
+      return
+    }
     // A clean field adopts the pipeline's default prompt on first open, so a
     // concrete-action pipeline launches without typing. An already-typed prompt
     // (returning from options, or a previous pipeline's preserved text) is kept.
     this.applyPromptFieldState(prefillPromptField(this.promptFieldState(), choice.defaultPrompt))
-    this.mode = "prompt"
     this.cursor = this.prompt.length
-    this.promptScroll = 0
     this.render()
   }
 
@@ -1320,6 +1434,7 @@ export class LaunchPicker {
       isolateWorktree: this.toggleState.worktree,
       ...(this.toggleState.worktree && this.branchName ? { branchName: this.branchName, worktreeDir: this.branchDir } : {}),
       ...(initializeGit ? { initializeGit: true } : {}),
+      ...(this.selectedChangeId ? { change: this.selectedChangeId } : {}),
     }
   }
 
@@ -1362,10 +1477,14 @@ export class LaunchPicker {
     this.selected = newIndex
     const newChoice = this.currentChoice()
 
-    // Swap the default prompt cleanly when the field is empty or still holds
-    // the previous pipeline's default; a user-typed prompt is preserved across
-    // the switch so moving away and back never discards work.
-    this.applyPromptFieldState(promptAfterPipelineSwitch(this.promptFieldState(), newChoice.defaultPrompt))
+    if (this.selectedChangeId) {
+      this.applyPromptFieldState(cleanPromptField(openSpecPromptFor(newChoice.name)))
+    } else {
+      // Swap the default prompt cleanly when the field is empty or still holds
+      // the previous pipeline's default; a user-typed prompt is preserved across
+      // the switch so moving away and back never discards work.
+      this.applyPromptFieldState(promptAfterPipelineSwitch(this.promptFieldState(), newChoice.defaultPrompt))
+    }
 
     this.render()
   }
@@ -1676,6 +1795,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
   }
 
   private promptDetail(width: number) {
+    if (this.promptChoosing) return this.contractDetail(width)
     const choice = this.currentChoice()
     const lines: StyledText[] = []
     lines.push(new StyledText([fg(theme.faint)("pipeline "), bold(fg(theme.text)(choice.name))]))
@@ -1767,11 +1887,53 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     return joinLines(lines)
   }
 
+  private contractDetail(width: number) {
+    const choice = this.currentChoice()
+    const lines: StyledText[] = []
+    lines.push(new StyledText([fg(theme.faint)("pipeline "), bold(fg(theme.text)(choice.name))]))
+    lines.push(plain(""))
+    const intro = wrapWords("An OpenSpec change is the contract. Pick one, or write a prompt by hand.", width)
+    for (const line of intro) lines.push(t`${fg(theme.dim)(line)}`)
+    lines.push(plain(""))
+
+    const rows = this.contractRows()
+    const visible = this.contractVisibleRows()
+    if (this.specIndex < this.specScroll) this.specScroll = this.specIndex
+    if (this.specIndex >= this.specScroll + visible) this.specScroll = this.specIndex - visible + 1
+    this.specScroll = clamp(this.specScroll, 0, Math.max(0, rows.length - visible))
+
+    const end = Math.min(rows.length, this.specScroll + visible)
+    for (let index = this.specScroll; index < end; index++) {
+      const selected = index === this.specIndex
+      const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
+      const label = selected ? bold(fg(theme.text)(truncate(rows[index]!, Math.max(8, width - 2)))) : fg(theme.text)(truncate(rows[index]!, Math.max(8, width - 2)))
+      lines.push(new StyledText([marker, label]))
+    }
+    return joinLines(lines)
+  }
+
+  private contractRows(): string[] {
+    return ["Manual prompt", ...this.specs.map((spec) => (spec.title === spec.id ? spec.id : `${spec.id} — ${spec.title}`))]
+  }
+
+  private contractVisibleRows() {
+    return Math.max(3, this.detailContentHeight() - 6)
+  }
+
+  private selectedSpec(): OpenSpecChangeSummary | undefined {
+    return this.selectedChangeId ? this.specs.find((spec) => spec.id === this.selectedChangeId) : undefined
+  }
+
   private optionsDetail(width: number) {
     const choice = this.currentChoice()
     const lines: StyledText[] = []
     lines.push(new StyledText([fg(theme.faint)("pipeline "), bold(fg(theme.text)(choice.name))]))
     lines.push(new StyledText([fg(theme.faint)("prompt   "), fg(theme.text)(truncate(this.prompt, Math.max(10, width - 9)))]))
+    const spec = this.selectedSpec()
+    if (spec) {
+      const label = spec.title === spec.id ? spec.id : `${spec.id} · ${spec.title}`
+      lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.teal)(truncate(label, Math.max(10, width - 9)))]))
+    }
     this.pushHistoryNotice(lines, width, "options")
     lines.push(plain(""))
     lines.push(new StyledText([fg(theme.dim)(truncate("Choose a gateway and toggle extra run parameters, then press Enter to review.", width))]))
@@ -1968,6 +2130,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     flags.push(this.toggleState.tui ? "--tui" : "--no-tui")
     flags.push(this.toggleState.worktree ? "--worktree" : "--no-worktree")
     if (this.goalEnabled && this.currentChoice().scored) flags.push(`--goal ${this.goalTarget}`)
+    if (this.selectedChangeId) flags.push(`--change ${this.selectedChangeId}`)
     return flags
   }
 
@@ -1992,6 +2155,16 @@ this.detailBox.title = reviewing ? " review " : " run setup "
       )
     }
     if (this.mode === "prompt") {
+      if (this.promptChoosing) {
+        return row(
+          [
+            { keys: "↑/↓", label: "select", priority: 2, tone: "dim" },
+            { keys: "enter", label: this.specIndex === 0 ? "write prompt" : "options", priority: 3 },
+            { keys: "esc", label: "back", priority: 1 },
+          ],
+          [fg(theme.faint)(`${this.specIndex + 1}/${this.specs.length + 1}`)],
+        )
+      }
       return row(
         [
           { keys: "type/paste", label: "", priority: 4, tone: "dim" },

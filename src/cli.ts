@@ -12,8 +12,7 @@ import { defaultMaxConcurrentAgents, parseModel } from "./runner"
 import { buildRunPlan, type BuildRunPlanInput } from "./run-plan"
 import { confirmRunPlan, renderRunPlan } from "./run-review"
 import { loadPrdHistoryPreview } from "./prd-history"
-import { loadOpenSpecBundle } from "./openspec"
-import type { OpenCodeInstallOptions } from "./opencode-install"
+import { loadOpenSpecBundle, openSpecPromptFor } from "./openspec"
 import { isModelGateway, modelGatewayChoices, modelGateways, type ModelGateway } from "./model-routing"
 import { browseRuns, isControlLive, isServerLive } from "./runs"
 import { deleteKeychainSecret, keychainAvailable, storeKeychainSecret } from "./secrets"
@@ -99,7 +98,6 @@ export type CliCommand =
   | { type: "auth"; provider: "openrouter"; action: "set" | "remove" | "status" }
   | { type: "version" }
   | { type: "update"; checkOnly: boolean }
-  | { type: "opencode"; action: "install" | "status" | "uninstall"; options: OpenCodeInstallOptions }
   | { type: "coordinate"; launchPath: string }
 
 export async function parseAndRun(argv: string[]) {
@@ -129,11 +127,6 @@ export async function parseAndRun(argv: string[]) {
   if (command.type === "update") {
     const { runUpdate } = await import("./update")
     writeUpdateResult(await runUpdate({ checkOnly: command.checkOnly }))
-    return
-  }
-  if (command.type === "opencode") {
-    const { runOpenCodeCommand } = await import("./opencode-install")
-    await runOpenCodeCommand(command.action, command.options)
     return
   }
   if (command.type === "runs") {
@@ -231,8 +224,8 @@ async function buildReviewedPlan(input: BuildRunPlanInput): Promise<RunPlan> {
     excludeRunID: input.resumeRunID || undefined,
   })
   // An OpenSpec contract, when the repo has one: discovered against the launch
-  // checkout (before any worktree isolate), so /convoy resolves the change the
-  // same way the runtime attaches it later in the same directory.
+  // checkout (before any worktree isolate), so the launcher and `--change`
+  // resolve the change the same way the runtime attaches it later.
   const openspec = await loadOpenSpecBundle({
     targetDir: input.targetDir,
     explicitId: input.change,
@@ -549,6 +542,7 @@ async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSele
   parsed.worktree = Boolean(selection.isolateWorktree)
   if (selection.branchName) parsed.branch = selection.branchName
   if (selection.goal !== undefined) parsed.goal = selection.goal
+  if (selection.change) parsed.change = selection.change
 
   const options = { ...(await resolveRunOptions(parsed)), prompt: selection.prompt }
   // The branch was named and confirmed in the launcher's branch step, so the
@@ -775,16 +769,7 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     return { type: "finish", options: parsed }
   }
   if (argv[0] === "opencode") {
-    const rest = argv.slice(1)
-    if (rest.length === 0 || rest[0] === "--help" || rest[0] === "-h") return { type: "help", text: opencodeHelp() }
-    const action = rest[0]
-    if (action !== "install" && action !== "status" && action !== "uninstall") {
-      throw new Error("usage: convoy opencode install|status|uninstall [--dir <path>]")
-    }
-    const parsed = parseOpenCodeArgs(rest.slice(1))
-    if (parsed.help) return { type: "help", text: opencodeHelp() }
-    const options: OpenCodeInstallOptions = { ...(parsed.dir ? { dir: parsed.dir } : {}) }
-    return { type: "opencode", action, options }
+    throw new Error("the OpenCode slash-command plugin was removed; open the launcher (convoy) and pick an OpenSpec change, or pass --change <id>")
   }
 
   const parsed = parseArgs(argv)
@@ -817,11 +802,15 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   // from the same merged-config snapshot.
   const resolvedOptions = await resolveRunOptions(parsed)
   if (!prompt && !hasResume) {
-    // A concrete-action pipeline (review, ship, hunter, ...) may carry a
-    // defaultPrompt so `convoy -p review` runs without typing one. Anything
-    // that counts as an explicit prompt source (positional, --prompt-file)
-    // was already read above, so only a genuinely empty invocation falls back.
-    if (!hasInlinePrompt && !hasPromptFile && resolvedOptions.pipeline.defaultPrompt) {
+    // A pinned OpenSpec change is the contract: inject a short canned prompt
+    // so `convoy --change add-login -p implement` does not require a brief.
+    if (parsed.change) {
+      prompt = openSpecPromptFor(resolvedOptions.pipeline.name)
+    } else if (!hasInlinePrompt && !hasPromptFile && resolvedOptions.pipeline.defaultPrompt) {
+      // A concrete-action pipeline (review, ship, hunter, ...) may carry a
+      // defaultPrompt so `convoy -p review` runs without typing one. Anything
+      // that counts as an explicit prompt source (positional, --prompt-file)
+      // was already read above, so only a genuinely empty invocation falls back.
       prompt = resolvedOptions.pipeline.defaultPrompt
     }
     if (!prompt) throw new Error(missingPromptMessage)
@@ -908,38 +897,6 @@ function parseInitArgs(argv: string[]): ParsedInitArgs {
   }
 
   if (parsed.global && hasDir) throw new Error("use either --global or --dir, not both")
-  return parsed
-}
-
-type ParsedOpenCodeArgs = OpenCodeInstallOptions & { help?: boolean }
-
-function parseOpenCodeArgs(argv: string[]): ParsedOpenCodeArgs {
-  const parsed: ParsedOpenCodeArgs = {}
-  for (let i = 0; i < argv.length; i++) {
-    const raw = argv[i]!
-    if (!raw.startsWith("-")) throw new Error("usage: convoy opencode install|status|uninstall [--dir <path>]")
-    const { flag, value } = splitFlag(raw)
-
-    const takeValue = () => {
-      if (value !== undefined) return value
-      const next = argv[++i]
-      if (next === undefined || (next.startsWith("-") && next !== "-")) throw new Error(`${flag} requires a value`)
-      return next
-    }
-
-    switch (flag) {
-      case "--help":
-      case "-h":
-        if (value !== undefined) throw new Error(`${flag} does not take a value`)
-        parsed.help = true
-        return parsed
-      case "--dir":
-        parsed.dir = resolve(process.cwd(), takeValue())
-        break
-      default:
-        throw new Error(`unknown opencode flag: ${flag}`)
-    }
-  }
   return parsed
 }
 
@@ -1279,11 +1236,10 @@ Usage:
   convoy runs [run-id]
   convoy config
   convoy auth openrouter
-  convoy opencode install|status|uninstall
 
 Commands:
   convoy                   Open an interactive TUI launcher to pick a pipeline,
-                           enter a prompt, and toggle run options
+                           enter a prompt or pick an OpenSpec change, and toggle run options
   init                     Create .convoy/config.yaml in the target repo
   init --global            Create ~/.convoy/config.yaml
   agents eject <agent>     Copy one built-in agent prompt to agents/<agent>.md to
@@ -1298,8 +1254,6 @@ Commands:
   config                   View and edit the global (~/.convoy) and current project config in a TUI
   auth openrouter          Store an OpenRouter management key in the macOS Keychain for the
                            header credits meter (--remove deletes it; "auth status" lists sources)
-  opencode ...             Install /spin and /convoy as OpenCode slash commands + the convoy-run
-                           helper into OpenCode's config dir ("convoy opencode --help" for options)
 
 Flags:
   --version, -V            Print Convoy's version, commit, and build platform
@@ -1338,9 +1292,11 @@ Flags:
                            (default: worktree on a trunk branch, current tree on any other)
   --branch <name>          Name for the worktree branch, instead of asking the naming model
   --change <id>            OpenSpec change id to review/implement (openspec/changes/<id>).
-                           Resolves the spec bundle (current specs + that change) as the scoring
-                           contract and overrides every selection heuristic. Runs without it
-                           on a single-change branch auto-resolve the active change.
+                           Resolves the spec bundle (current specs + that change) as the contract
+                           attached to every step, and overrides every selection heuristic.
+                           The launcher lists active changes so you can pick one instead of
+                           typing a prompt. A run without --change on a single-change branch
+                           auto-resolves the active change.
   --goal <1-100>           Goal mode: keep fixing until the quality score reaches this value.
                            Requires a writable scored pipeline (any pipeline ending in a
                            quality-score-report step with a writing step). The ship pipeline
@@ -1401,21 +1357,6 @@ function writeUpdateResult(result: UpdateResult) {
     case "updated":
       process.stdout.write(`updated convoy ${result.currentVersion} → v${result.latestVersion} (${result.assetName})\n`)
   }
-}
-
-function opencodeHelp() {
-  return `convoy opencode install|status|uninstall [--dir <path>]
-
-Install /spin and /convoy as OpenCode slash commands, plus the convoy-run
-helper, so they sit next to /opsx:propose in OpenCode's config directory.
-
-  install    Copy (or refresh) Convoy's own OpenCode payload. Idempotent.
-  status     Report which payload files are installed (and their convoy version).
-  uninstall  Remove only Convoy-owned files; anything else in <dir> is left alone.
-
-Options:
-  --dir <path>  OpenCode config directory (OPENCODE_CONFIG_DIR, else ~/.config/opencode)
-`
 }
 
 function initHelp() {

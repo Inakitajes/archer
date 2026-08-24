@@ -85,33 +85,8 @@ describe("resolveRunOptions", () => {
     expect(parseArgs(["--change=add-bar"]).change).toBe("add-bar")
   })
 
-  test("parseCommand parses opencode install|status|uninstall as a subcommand", async () => {
-    const install = await parseCommand(["opencode", "install"])
-    expect(install.type).toBe("opencode")
-    if (install.type === "opencode") {
-      expect(install.action).toBe("install")
-    }
-
-    const status = await parseCommand(["opencode", "status"])
-    expect(status.type).toBe("opencode")
-    if (status.type === "opencode") expect(status.action).toBe("status")
-
-    const uninstall = await parseCommand(["opencode", "uninstall", "--dir", "/tmp/oc"])
-    expect(uninstall.type).toBe("opencode")
-    if (uninstall.type === "opencode") {
-      expect(uninstall.action).toBe("uninstall")
-      expect(uninstall.options.dir).toBe("/tmp/oc")
-    }
-  })
-
-  test("parseCommand rejects an unknown opencode subcommand and unknown flags", async () => {
-    await expect(parseCommand(["opencode", "frobnicate"])).rejects.toThrow("usage: convoy opencode")
-    await expect(parseCommand(["opencode", "install", "--bogus"])).rejects.toThrow("unknown opencode flag")
-  })
-
-  test("parseCommand surfaces opencode help with no subcommand", async () => {
-    const cmd = await parseCommand(["opencode"])
-    expect(cmd.type).toBe("help")
-    if (cmd.type === "help") expect(cmd.text).toContain("convoy opencode install|status|uninstall")
+  test("parseCommand rejects the removed opencode plugin with a pointer to the launcher", async () => {
+    await expect(parseCommand(["opencode"])).rejects.toThrow("OpenCode slash-command plugin was removed")
+    await expect(parseCommand(["opencode", "install"])).rejects.toThrow("--change")
   })
 })

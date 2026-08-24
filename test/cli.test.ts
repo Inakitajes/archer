@@ -534,6 +534,27 @@ describe("parseCommand default prompt fallback", () => {
     await expect(parseCommand(["-p", "implement"])).rejects.toThrow("need a prompt")
   })
 
+  test("--change without a prompt injects the canned OpenSpec prompt", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "convoy-cli-change-"))
+    dirs.push(repo)
+    await mkdir(join(repo, "openspec", "changes", "add-login"), { recursive: true })
+    await writeFile(join(repo, "openspec", "changes", "add-login", "proposal.md"), "# Add Login\n")
+
+    const implement = await parseCommand(["--dir", repo, "-p", "implement", "--change", "add-login"])
+    expect(implement.type).toBe("run")
+    if (implement.type === "run") {
+      expect(implement.options.prompt).toBe("Implement the attached OpenSpec change.")
+      expect(implement.options.change).toBe("add-login")
+      expect(implement.options.plan?.openspec?.changeIds).toEqual(["add-login"])
+    }
+
+    const review = await parseCommand(["--dir", repo, "-p", "review", "--change", "add-login"])
+    expect(review.type).toBe("run")
+    if (review.type === "run") {
+      expect(review.options.prompt).toBe("Review the attached OpenSpec change.")
+    }
+  })
+
   test("a positional prompt beats the defaultPrompt", async () => {
     const cmd = await parseCommand(["-p", "review", "my own prompt"])
     expect(cmd.type).toBe("run")

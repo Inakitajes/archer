@@ -140,7 +140,7 @@ Verdicts map to the score: `ready` (≥90) · `ready-with-caveats` (75–89) · 
 
 **Calibrate before you trust it.** The first few scored runs will grade "differently" from your judgment. Run `review` against 2–3 PRs you already know are good or bad, compare your expectation to the score, and adjust `.convoy/quality-rubric.md` (weights, anchors, deductions) until the score matches your call. The rubric is a contract; like any contract, it is only useful once you agree with it — and since `ship` gates your pull requests on it, calibrate it before you rely on that gate.
 
-## OpenSpec-native reviews
+## OpenSpec-native runs
 
 When a repository uses [OpenSpec](https://openspec.dev/), Convoy reads the change contract from the repository instead of a `.convoy/prd-history` entry:
 
@@ -151,29 +151,26 @@ openspec/
   specs/<capability>/  spec.md
 ```
 
-The active change is resolved the same way by `/convoy` and the runtime:
+The active change is resolved:
 
-1. an explicit `--change <id>` (or `/convoy <id>`);
+1. an explicit `--change <id>` (or a spec picked in the launcher);
 2. exactly one non-archived change under `openspec/changes/`;
 3. multiple, and the branch name matches a change id (`feat/add-foo` ↔ `add-foo`);
 4. multiple, no branch match: compose the changes whose touched files appear in the diff;
 5. none: review falls back to today's behavior (default prompt + diff inference), and `implement` refuses with "no change; run /opsx:propose".
 
-When a change resolves, Convoy attaches the **spec bundle** — the current `openspec/specs/**` plus the change's proposal, design, and delta specs — in place of the oldest `.convoy/prd-history` entry (which stays untouched for non-OpenSpec repos, so nothing else changes). The `prd` (30%) and `scope` (10%) quality dimensions are graded against the change's **Requirements/Scenarios** instead of a diff-inferred brief. Convoy never writes the `openspec/` layout: `/opsx:propose` and archiving belong to OpenSpec itself.
+When a change resolves, Convoy attaches the **spec bundle** — the current `openspec/specs/**` plus the change's proposal, design, tasks, and delta specs — to **every agent step**. The `prd` (30%) and `scope` (10%) quality dimensions are graded against the change's **Requirements/Scenarios** instead of a diff-inferred brief. Convoy never writes the `openspec/` layout: `/opsx:propose` and archiving belong to OpenSpec itself.
+
+The fastest path is the launcher. After you pick a pipeline, the prompt step lists any active OpenSpec changes: pick one and the spec is the contract (no prompt to edit), or choose **Manual prompt** to type a brief yourself.
 
 ```bash
-# review the single active change on this branch
-convoy -p review
+# pick a pipeline and an active spec in the launcher
+convoy
 
-# or pin one explicitly
+# or pin one from the CLI — no prompt required
+convoy --change add-login -p implement
 convoy --change add-login -p review
-
-# install the OpenCode integration: /spin, /convoy, and the convoy-run helper
-convoy opencode install
-convoy opencode status
 ```
-
-`convoy opencode install` puts **/spin** (branch + worktree, then move this session there) and **/convoy [pipe]** (run the pipeline against the active change) next to `/opsx:propose`. They are Convoy's payload; `/opsx:propose` and archiving stay OpenSpec's, and the operator's global `/write-plan` and `/implement` stay the non-OpenSpec fallback.
 
 ## Goal mode
 

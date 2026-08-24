@@ -9,10 +9,10 @@ import { join, resolve } from "node:path"
  * (outside this repo) and archived under `openspec/archive/`. This module only
  * reads that layout and turns it into a spec bundle — the current specs under
  * `openspec/specs/` plus the files of the active change(s) — that the runner
- * attaches in place of the single oldest `.convoy/prd-history` entry.
+ * attaches to every agent step (proposal, design, tasks, and delta specs).
  *
- * The selection order (shared by `/convoy` and the runtime) is:
- *   1. explicit `--change <id>` (or `/convoy <id>`);
+ * The selection order (shared by the launcher, `--change`, and the runtime) is:
+ *   1. explicit `--change <id>` (or a spec picked in the launcher);
  *   2. exactly one non-archived change in `openspec/changes/`;
  *   3. multiple, and the current branch name matches a change id (`feat/add-foo`
  *      ↔ `add-foo`);
@@ -39,6 +39,13 @@ export type OpenSpecChange = {
   specFiles: readonly string[]
 }
 
+/** A change the launcher can offer without building the full spec bundle. */
+export type OpenSpecChangeSummary = {
+  id: string
+  /** First heading (or first non-empty line) of `proposal.md`; falls back to the id. */
+  title: string
+}
+
 /** The resolved contract the run plan freezes and the runner attaches. */
 export type OpenSpecBundle = {
   changeIds: readonly string[]
@@ -51,6 +58,66 @@ export type OpenSpecBundle = {
    * back to this root when a spec file is absent from the run's checkout.
    */
   rootDir?: string
+}
+
+/**
+ * The short prompt injected when a change is the contract and the operator
+ * did not type a brief. Pipeline-aware so review/ship/hunter do not say
+ * "implement". The spec files themselves are the contract; this is only the
+ * instruction that tells the agent to read them.
+ */
+export function openSpecPromptFor(pipelineName: string): string {
+  switch (pipelineName) {
+    case "review":
+    case "review-lite":
+    case "review-cc":
+      return "Review the attached OpenSpec change."
+    case "ship":
+      return "Ship the attached OpenSpec change."
+    case "fixer":
+    case "goal-fix":
+      return "Apply the attached OpenSpec change."
+    case "hunter":
+    case "hunter-max":
+      return "Audit the attached OpenSpec change."
+    default:
+      return "Implement the attached OpenSpec change."
+  }
+}
+
+/** Title shown in the launcher: first markdown heading, else first non-empty line. */
+export function titleFromProposal(body: string, fallback: string): string {
+  const stripped = stripYamlFrontmatter(body)
+  const heading = stripped.match(/^#\s+(.+)$/m)
+  const fromHeading = heading?.[1]?.trim()
+  if (fromHeading) return fromHeading
+  const line = stripped
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .find((entry) => entry.length > 0)
+  return line || fallback
+}
+
+/**
+ * Lists active (non-archived) changes for the launcher picker. Cheap: only
+ * reads each change's `proposal.md` for a title. Returns `[]` when `openspec/`
+ * is absent, so the launcher stays on today's manual-prompt path.
+ */
+export async function listOpenSpecChanges(targetDir: string): Promise<OpenSpecChangeSummary[]> {
+  const changesDir = join(targetDir, openspecDirName, "changes")
+  const entries = await readDirNames(changesDir)
+  const out: OpenSpecChangeSummary[] = []
+  for (const id of entries.filter(isOpenSpecChangeId)) {
+    let title = id
+    try {
+      const body = await readFile(join(changesDir, id, "proposal.md"), "utf8")
+      title = titleFromProposal(body, id)
+    } catch {
+      // A change without a readable proposal still lists by id.
+    }
+    out.push({ id, title })
+  }
+  return out
 }
 
 /**
@@ -239,4 +306,11 @@ function filePathTokens(content: string): string[] {
 
 function stripLeadingDotSlash(path: string): string {
   return path.startsWith("./") ? path.slice(2) : path
+}
+
+function stripYamlFrontmatter(body: string): string {
+  if (!body.startsWith("---")) return body
+  const end = body.indexOf("\n---", 3)
+  if (end === -1) return body
+  return body.slice(end + 4)
 }

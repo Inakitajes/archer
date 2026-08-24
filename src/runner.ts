@@ -1249,8 +1249,14 @@ export async function preparePhaseRun(
 
   const phaseFiles = await fileParts(inputs, workspace.dir, "skip")
   const contextFiles = await projectContextFileParts(projectContextFiles, options.targetDir)
-  const historyFiles = options.prdHistory && phase.prdHistory ? await scopeContractFiles(options, workspace.runID) : []
-  const attachments = [...contextFiles, ...phaseFiles, ...historyFiles, ...extraFiles]
+  // The spec bundle is the live contract: attach it to every agent step. Steps
+  // that already receive it through the prdHistory slot (scope/scorers) must
+  // not get it twice — `scopeContractFiles` either attaches the bundle or
+  // falls back to the historical PRD.
+  const historyCoversBundle = Boolean(options.prdHistory && phase.prdHistory)
+  const historyFiles = historyCoversBundle ? await scopeContractFiles(options, workspace.runID) : []
+  const specFiles = historyCoversBundle ? [] : await openSpecBundleFileParts(options)
+  const attachments = [...contextFiles, ...phaseFiles, ...historyFiles, ...specFiles, ...extraFiles]
   const prompt = buildPhasePrompt(workspace, phase)
   const model = selectedModel(phase, options.modelOverride)
 
@@ -1289,32 +1295,41 @@ async function historicalPrdFileParts(targetDir: string, excludeRunID: string): 
  */
 async function scopeContractFiles(options: RunOptions, excludeRunID: string): Promise<FilePartInput[]> {
   const bundle = options.plan?.openspec
-  if (bundle && bundle.changeIds.length > 0) {
-    try {
-      // Prefer the run's checkout. An isolated worktree starts from the base
-      // ref, so a freshly proposed (uncommitted) change exists only in the
-      // launch checkout the plan was resolved against — fall back to it rather
-      // than silently dropping the contract the operator consented to.
-      const paths: string[] = []
-      for (const file of bundle.specFiles) {
-        const inRun = join(options.targetDir, file)
-        if (existsSync(inRun)) {
-          paths.push(inRun)
-          continue
-        }
-        const inLaunch = bundle.rootDir ? join(bundle.rootDir, file) : undefined
-        if (inLaunch && existsSync(inLaunch)) paths.push(inLaunch)
-      }
-      if (paths.length < bundle.specFiles.length) {
-        log.warn(`OpenSpec spec bundle: ${bundle.specFiles.length - paths.length} of ${bundle.specFiles.length} spec files resolved in neither the run's nor the launch checkout; skipped`)
-      }
-      return await fileParts(paths, options.targetDir, "skip")
-    } catch (error) {
-      log.warn(`couldn't attach OpenSpec spec bundle: ${formatSdkError(error)}`)
-      return []
-    }
-  }
+  if (bundle && bundle.changeIds.length > 0) return openSpecBundleFileParts(options)
   return historicalPrdFileParts(options.targetDir, excludeRunID)
+}
+
+/**
+ * Attaches every markdown file of the resolved OpenSpec change (proposal,
+ * design, tasks, delta specs) plus the current `openspec/specs/**`. Empty when
+ * no change resolved, so callers can always concatenate it.
+ */
+async function openSpecBundleFileParts(options: RunOptions): Promise<FilePartInput[]> {
+  const bundle = options.plan?.openspec
+  if (!bundle || bundle.changeIds.length === 0) return []
+  try {
+    // Prefer the run's checkout. An isolated worktree starts from the base
+    // ref, so a freshly proposed (uncommitted) change exists only in the
+    // launch checkout the plan was resolved against — fall back to it rather
+    // than silently dropping the contract the operator consented to.
+    const paths: string[] = []
+    for (const file of bundle.specFiles) {
+      const inRun = join(options.targetDir, file)
+      if (existsSync(inRun)) {
+        paths.push(inRun)
+        continue
+      }
+      const inLaunch = bundle.rootDir ? join(bundle.rootDir, file) : undefined
+      if (inLaunch && existsSync(inLaunch)) paths.push(inLaunch)
+    }
+    if (paths.length < bundle.specFiles.length) {
+      log.warn(`OpenSpec spec bundle: ${bundle.specFiles.length - paths.length} of ${bundle.specFiles.length} spec files resolved in neither the run's nor the launch checkout; skipped`)
+    }
+    return await fileParts(paths, options.targetDir, "skip")
+  } catch (error) {
+    log.warn(`couldn't attach OpenSpec spec bundle: ${formatSdkError(error)}`)
+    return []
+  }
 }
 
 async function projectContextFileParts(paths: string[], targetDir: string) {
@@ -3127,7 +3142,7 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
         : "This phase may edit the target repository when the phase-specific instructions call for it. Call `write_report` to persist the final report rather than writing a report file directly.",
     "",
     "## Attachments",
-    "You will receive as file attachments: project context files when present, the original PRD, the project's historical PRD for this branch when present, previous phase reports, the cumulative diff against the base branch, and any `--file` passed by the user. Read them before acting.",
+    "You will receive as file attachments: project context files when present, the original PRD, the OpenSpec spec bundle (proposal, design, tasks, and delta specs) when an active change is attached, the project's historical PRD for this branch when present, previous phase reports, the cumulative diff against the base branch, and any `--file` passed by the user. Read them before acting. When an OpenSpec change is attached, those spec files are the contract — implement and grade against them, not a reconstructed brief.",
     "",
     "## Project context",
     "Convoy automatically attaches these target-repo files when they exist: `.convoy/rules.md`, `AGENTS.md`, and `CLAUDE.md`.",
