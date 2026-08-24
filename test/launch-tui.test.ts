@@ -52,7 +52,13 @@ function launcherChoices(count = 1) {
   }))
 }
 
-async function createLauncher(width: number, height = 30, choiceCount = 1, specs: readonly OpenSpecChangeSummary[] = []) {
+async function createLauncher(
+  width: number,
+  height = 30,
+  choiceCount = 1,
+  specs: readonly OpenSpecChangeSummary[] = [],
+  autoSpecIds: readonly string[] = [],
+) {
   const testRenderer = await createTestRenderer({ width, height })
   const picker = new LaunchPicker(
     testRenderer.renderer,
@@ -63,6 +69,7 @@ async function createLauncher(width: number, height = 30, choiceCount = 1, specs
     {} as never,
     { enabled: true, entries: [] },
     specs,
+    autoSpecIds,
   )
   return { ...testRenderer, picker }
 }
@@ -1222,6 +1229,84 @@ describe("launch TUI OpenSpec contract picker", () => {
       expect(view.promptChoosing).toBe(false)
       expect(view.selectedChangeId).toBeUndefined()
       expect(launcher.captureCharFrame()).toContain("Add onboarding, fix bug")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+})
+
+describe("launch TUI OpenSpec notice", () => {
+  const specs: OpenSpecChangeSummary[] = [
+    { id: "add-login", title: "Add Login" },
+    { id: "add-logout", title: "Add Logout" },
+  ]
+
+  test("picker shows the auto-resolved change that will attach without a pick", async () => {
+    const launcher = await createLauncher(100, 40, 1, specs, ["add-login"])
+    try {
+      await launcher.renderOnce()
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("add-login · bundle attaches to every step")
+      expect(frame).toContain("Add Login")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("options shows the auto-resolved change when nothing was picked", async () => {
+    const launcher = await createLauncher(100, 40, 1, specs, ["add-login"])
+    try {
+      launcher.mockInput.pressEnter() // open the contract list
+      launcher.mockInput.pressEnter() // Manual prompt -> editor
+      for (const ch of "ship it") launcher.mockInput.pressKey(ch)
+      launcher.mockInput.pressEnter() // submit -> options
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.mode).toBe("options")
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("add-login · bundle attaches to every step")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("no auto-selection says so and points at the picker", async () => {
+    const launcher = await createLauncher(110, 40, 1, specs, [])
+    try {
+      await launcher.renderOnce()
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("2 active changes · pick one when writing the prompt")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("a manual pick owns the notice instead of the auto-resolved id", async () => {
+    const launcher = await createLauncher(100, 40, 1, specs, ["add-login"])
+    try {
+      launcher.mockInput.pressEnter() // contract list
+      launcher.mockInput.pressKey("j") // index 1 (add-login)
+      launcher.mockInput.pressKey("j") // index 2 (add-logout)
+      launcher.mockInput.pressEnter() // pin add-logout -> options
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.mode).toBe("options")
+      expect(view.selectedChangeId).toBe("add-logout")
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("add-logout · Add Logout")
+      expect(frame).not.toContain("bundle attaches to every step")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("stays quiet with no active changes at all", async () => {
+    const launcher = await createLauncher(100, 40, 1, [], [])
+    try {
+      await launcher.renderOnce()
+      const frame = launcher.captureCharFrame()
+      expect(frame).not.toContain("bundle attaches to every step")
+      expect(frame).not.toContain("active changes · pick one")
     } finally {
       await closeLauncher(launcher)
     }

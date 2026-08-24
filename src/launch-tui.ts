@@ -14,7 +14,7 @@ import { stepRunnerFor } from "./step-runners"
 import { gatewayHint, gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { consensusStep } from "./quality-score"
 import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
-import { listOpenSpecChanges, openSpecPromptFor, type OpenSpecChangeSummary } from "./openspec"
+import { listOpenSpecChanges, loadOpenSpecBundle, openSpecPromptFor, type OpenSpecChangeSummary } from "./openspec"
 import { runReviewLines } from "./review-tui"
 import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
@@ -336,7 +336,19 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
       : { isolate: config.defaults.worktree, reason: "set by defaults.worktree" }
   const history = await loadLaunchHistory(options.targetDir, config?.defaults.prdHistory ?? true)
   const specs = await listOpenSpecChanges(options.targetDir)
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs).result
+  // The change the run would attach without being asked: same selection order
+  // the frozen plan applies (single change, branch match), minus the
+  // diff-composed rule that needs the run's base ref. That is exactly the
+  // information the notice owes the operator — which contract is about to
+  // attach silently — while nothing here is authoritative: `--change` (a pick)
+  // and the real resolution at launch both re-resolve against the full inputs.
+  const autoSpecIds =
+    specs.length > 0
+      ? await loadOpenSpecBundle({ targetDir: options.targetDir, branch: history.branch })
+          .then((bundle) => (bundle ? [...bundle.changeIds] : []))
+          .catch(() => [] as string[])
+      : []
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs, autoSpecIds).result
 }
 
 async function loadLaunchHistory(targetDir: string, enabled: boolean): Promise<LaunchHistoryContext> {
@@ -635,6 +647,8 @@ export class LaunchPicker {
     private readonly callbacks: Pick<LaunchRunTuiOptions, "prepareRun" | "proposeBranchName" | "checkBranchName">,
     private readonly history: LaunchHistoryContext = { enabled: true, entries: [] },
     private readonly specs: readonly OpenSpecChangeSummary[] = [],
+    /** Active change ids the run would attach without an explicit pick; see launchRunTui. */
+    private readonly autoSpecIds: readonly string[] = [],
   ) {
     this.toggleState.worktree = worktreeDefault.isolate
     const defaultIndex = choices.findIndex((choice) => choice.isDefault)
@@ -1785,6 +1799,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
       lines.push(plain(""), t`${fg(theme.teal)(`Advisors: ${choice.advisedSteps}/${agentSteps} steps advised`)}`)
     }
     this.pushHistoryNotice(lines, width, "picker")
+    this.pushOpenSpecNotice(lines, width)
     lines.push(plain(""))
     for (const line of hookLines(choice.hooks, width)) lines.push(line)
     if (this.message) {
@@ -1934,6 +1949,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
       const label = spec.title === spec.id ? spec.id : `${spec.id} · ${spec.title}`
       lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.teal)(truncate(label, Math.max(10, width - 9)))]))
     }
+    this.pushOpenSpecNotice(lines, width)
     this.pushHistoryNotice(lines, width, "options")
     lines.push(plain(""))
     lines.push(new StyledText([fg(theme.dim)(truncate("Choose a gateway and toggle extra run parameters, then press Enter to review.", width))]))
@@ -2117,6 +2133,30 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     if (copy.detail) {
       lines.push(new StyledText([raw("         "), fg(theme.dim)(truncate(copy.detail, Math.max(8, width - 9)))]))
     }
+  }
+
+  /**
+   * The OpenSpec counterpart of the history notice: which active change the run
+   * will attach without being asked. Quiet when the checkout has no active
+   * change, and when a pick exists the picked row already says it — the notice
+   * exists for the silent path, which is exactly where an operator needs to be
+   * told what is about to happen. Titles ride a detail line because the ids
+   * alone must survive a narrow detail pane.
+   */
+  private pushOpenSpecNotice(lines: StyledText[], width: number) {
+    if (this.specs.length === 0 || this.selectedChangeId) return
+    const value = Math.max(8, width - 9)
+    const auto = this.specs.filter((spec) => this.autoSpecIds.includes(spec.id))
+    lines.push(plain(""))
+    if (auto.length > 0) {
+      const titled = auto.filter((spec) => spec.title !== spec.id)
+      lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.teal)(truncate(`${auto.map((spec) => spec.id).join(", ")} · bundle attaches to every step`, value))]))
+      if (titled.length > 0) {
+        lines.push(new StyledText([raw("         "), fg(theme.dim)(truncate(titled.map((spec) => spec.title).join(" · "), value))]))
+      }
+      return
+    }
+    lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.dim)(truncate(`${this.specs.length} active changes · pick one when writing the prompt`, value))]))
   }
 
   private enabledFlags() {
