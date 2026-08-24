@@ -1,6 +1,6 @@
 ---
 description: Run a Convoy pipeline against the OpenSpec change active in this directory
-model: openrouter/deepseek/deepseek-v4-flash-0731#high
+model: openrouter/deepseek/deepseek-v4-flash-0731
 tools: bash
 ---
 

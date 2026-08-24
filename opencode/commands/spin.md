@@ -1,6 +1,6 @@
 ---
 description: Create a branch and worktree for this change and move this session there
-model: openrouter/deepseek/deepseek-v4-flash-0731#high
+model: openrouter/deepseek/deepseek-v4-flash-0731
 tools: bash
 ---
 
