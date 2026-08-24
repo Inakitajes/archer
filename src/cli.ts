@@ -1259,8 +1259,9 @@ Flags:
   --version, -V            Print Convoy's version, commit, and build platform
   --prompt-file <path>     Read the PRD/prompt from a file
   --file, -f <path>        Attach a file or directory to all steps (repeatable)
-  --pipeline, -p <name>    Pipeline to run (default: "implement"), which runs
-                           implementer,patterns,security,design,tests,adversarial
+   --pipeline, -p <name>    Pipeline to run (default: "implement"), which runs
+                            implementer,patterns,security,design,tests,adversarial,
+                            then distills every report into reports/run-report.md
   --only <steps>           Run only these pipeline steps
   --skip <steps>           Skip these pipeline steps
   --resume <id>            Resume a previous run by its ID (steps with an existing report are

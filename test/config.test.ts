@@ -37,6 +37,7 @@ import {
   defaultImplementAdvisorModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
+  defaultRunReportModel,
   defaultOpusModel,
   isHumanStepSpec,
   isParallelSpec,
@@ -482,6 +483,7 @@ describe("agent registry", () => {
       "quality-scorer",
       "quality-score-report",
       "goal-fixer",
+      "run-reporter",
     ])
   })
 })
@@ -1027,6 +1029,7 @@ describe("default config init", () => {
       { agent: "design", model: defaultImplementReviewModel, advisor: false },
       { agent: "tests", model: defaultImplementAuditModel, advisor: false, reports: "none" },
       { agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" },
+      { agent: "run-report", model: defaultRunReportModel, advisor: false, reports: "all", diff: false },
     ])
     expect(config.permissions).toEqual({ allow: [], deny: [] })
     expect(config.hooks).toEqual({ pre: [], post: [], pipelines: {} })

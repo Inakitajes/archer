@@ -29,6 +29,7 @@ import reviewFixer from "../prompts/review-fixer.md" with { type: "text" }
 import reviewReport from "../prompts/review-report.md" with { type: "text" }
 import reviewScope from "../prompts/review-scope.md" with { type: "text" }
 import reviewValidator from "../prompts/review-validator.md" with { type: "text" }
+import runReporter from "../prompts/run-reporter.md" with { type: "text" }
 import runtimeSafety from "../prompts/runtime-safety.md" with { type: "text" }
 import securityAuditor from "../prompts/security-auditor.md" with { type: "text" }
 import securityReviewer from "../prompts/security-reviewer.md" with { type: "text" }
@@ -73,6 +74,7 @@ export const builtInPrompts: Record<string, string> = {
   "review-report": reviewReport,
   "review-scope": reviewScope,
   "review-validator": reviewValidator,
+  "run-reporter": runReporter,
   "runtime-safety": runtimeSafety,
   "security-auditor": securityAuditor,
   "security-reviewer": securityReviewer,
