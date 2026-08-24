@@ -219,22 +219,34 @@ export async function forwardCoordinatorLogs(
   let handle: FileHandle | undefined
   let offset = 0
   let stopped = false
+  let pumping: Promise<void> | null = null
   const buffer = Buffer.alloc(64 * 1024)
   const pump = async () => {
+    // The interval and stop() can both call pump() while an earlier await on
+    // handle.read() is still pending. Without a re-entrancy guard they would
+    // interleave at the shared `offset`, each emitting the same chunk and
+    // duplicating it downstream. Serialize pump() into a single in-flight
+    // promise so offset only ever advances once.
     if (stopped && handle === undefined) return
-    if (handle === undefined) {
-      try {
-        handle = await open(logPath, "r")
-      } catch {
-        return
+    if (pumping !== null) return pumping
+    pumping = (async () => {
+      if (handle === undefined) {
+        try {
+          handle = await open(logPath, "r")
+        } catch {
+          return
+        }
       }
-    }
-    for (;;) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
-      if (bytesRead === 0) break
-      offset += bytesRead
-      write(buffer.toString("utf8", 0, bytesRead))
-    }
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
+        if (bytesRead === 0) break
+        offset += bytesRead
+        write(buffer.toString("utf8", 0, bytesRead))
+      }
+    })().finally(() => {
+      pumping = null
+    })
+    await pumping
   }
   const timer = setInterval(() => void pump().catch(() => {}), pollMs)
   timer.unref?.()
@@ -242,6 +254,9 @@ export async function forwardCoordinatorLogs(
     stop: async () => {
       stopped = true
       clearInterval(timer)
+      // Wait for any in-flight pump to finish before the final drain so the
+      // handle is only read by one pump at a time.
+      if (pumping) await pumping.catch(() => {})
       await pump().catch(() => {})
       if (handle) await handle.close().catch(() => {})
     },

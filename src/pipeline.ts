@@ -32,6 +32,8 @@ export const defaultImplementAdvisorModel = solXhighModel
 export const defaultImplementAuditModel = glm53HighModel
 export const defaultImplementReviewModel = grokModel
 export const defaultAdversarialModel = grokModel
+/** The model the implement pipelines' closing run recap runs on. */
+export const defaultRunReportModel = deepseekHighModel
 
 /** The six specialty audit tracks shared by `hunter` and `hunter-max`; each maps to a `hunter-<track>` agent. */
 const hunterTracks = ["correctness", "memory", "performance", "security", "reliability", "supply-chain"] as const
@@ -308,6 +310,18 @@ export const builtInAgents: readonly AgentSpec[] = [
     temperature: 0.1,
     builtIn: true,
   },
+  // The run's table of contents. `implement` ends in six reports and a
+  // mechanical SUMMARY.md dump; this agent distills them into the one page a
+  // human actually reads first. Read-only and extractive by contract: it may
+  // only restate what the phase reports already said, never add findings.
+  {
+    name: "run-reporter",
+    description: "Extractive one-page recap of the run: what each phase reported and what to read next",
+    defaultModel: deepseekHighModel,
+    temperature: 0.1,
+    readOnly: true,
+    builtIn: true,
+  },
 ]
 
 /** Short names accepted in pipeline steps for the built-in agents. */
@@ -317,6 +331,7 @@ export const agentAliases: Record<string, string> = {
   design: "design-polisher",
   tests: "test-engineer",
   adversarial: "adversarial-reviewer",
+  "run-report": "run-reporter",
 }
 
 /**
@@ -426,7 +441,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   // pipeline's job is a first draft worth shaping by hand, and grading a draft
   // you already intend to rework buys nothing.
   implement: {
-    description: "Advised implementation on Terra xhigh consulting Sol, then pattern/security audits, design polish, tests, and adversarial review",
+    description: "Advised implementation on Terra xhigh consulting Sol, then pattern/security audits, design polish, tests, adversarial review, and a one-page run recap",
     steps: [
       { agent: "implementer", model: defaultImplementerModel, advisor: defaultImplementAdvisorModel, reports: "none" },
       // `false` rather than an absent key: absent would inherit a project's
@@ -436,6 +451,11 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "design", model: defaultImplementReviewModel, advisor: false },
       { agent: "tests", model: defaultImplementAuditModel, advisor: false, reports: "none" },
       { agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" },
+      // The recap is an index, not an audit: read-only, no diff (the diff is
+      // what tempts a summarizer into re-reviewing), every report attached, and
+      // the cheapest model in the roster — all the substance already exists in
+      // the reports it distills.
+      { agent: "run-report", model: defaultRunReportModel, advisor: false, reports: "all", diff: false },
     ],
   },
   // implement's shape on low-cost models, advisor included: the second opinion
@@ -451,6 +471,7 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "design", model: grokModel, advisor: false },
       { agent: "tests", model: glm53HighModel, advisor: false, reports: "none" },
       { agent: "adversarial", model: glm53HighModel, advisor: false, reports: "all" },
+      { agent: "run-report", model: defaultRunReportModel, advisor: false, reports: "all", diff: false },
     ],
   },
   // The goal loop's fix iteration: applies exactly the gaps the previous

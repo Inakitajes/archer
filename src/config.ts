@@ -17,6 +17,7 @@ import {
   defaultImplementAuditModel,
   defaultImplementerModel,
   defaultImplementReviewModel,
+  defaultRunReportModel,
   defaultPipelineName,
   humanStepType,
   humanReviewStep,
@@ -301,7 +302,8 @@ defaults:
 #     model: openai/gpt-5.6-terra#xhigh
 
 # Convoy ships these pipelines built in; pick one with -p/--pipeline without redeclaring it here:
-#   implement            the default: advised implementation, then audit, polish, test, and adversarial review
+#   implement            the default: advised implementation, then audit, polish, test, adversarial review,
+#                        and a one-page extractive recap of the whole run (reports/run-report.md)
 #   implement-lite       like implement, but the code-writing phase drops to DeepSeek V4 Flash 0731 (Grok 4.6 advises)
 #   ship                 the close: merge the advanced base in (resolving conflicts), score the merged
 #                        result against the rubric, and loop until it clears 85/100
@@ -318,7 +320,7 @@ defaults:
 # The default \`implement\` pipeline is inlined below as an editable starting point; redefining a name here overrides the built-in.
 pipelines:
   implement:
-    description: Advised implementation, pattern/security audits, design polish, tests, and adversarial review
+    description: Advised implementation, pattern/security audits, design polish, tests, adversarial review, and a one-page run recap
     # defaultPrompt and suggestedPrompts are optional. A defaultPrompt is used
     # when the pipeline runs without an explicit prompt — the launcher prefills
     # its field and \`convoy -p <pipeline>\` falls back to it — and the
@@ -353,6 +355,11 @@ pipelines:
         model: ${defaultAdversarialModel}
         advisor: false
         reports: all
+      - agent: run-report
+        model: ${defaultRunReportModel}
+        advisor: false
+        reports: all
+        diff: false
 
 # Optional shell hooks. Top-level hooks run for every pipeline; hooks under
 # hooks.pipelines.<name> are appended only for that pipeline. Commands run from

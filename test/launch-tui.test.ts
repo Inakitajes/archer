@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 
 import { LaunchPicker, adjustGoalTarget, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultGoalTarget, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, pipelineRow, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, trimPromptField, typedText, wrapPromptLines } from "../src/launch-tui"
+import type { OpenSpecChangeSummary } from "../src/openspec"
 
 import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
 import { parseConvoyConfig } from "../src/config"
@@ -51,7 +52,13 @@ function launcherChoices(count = 1) {
   }))
 }
 
-async function createLauncher(width: number, height = 30, choiceCount = 1) {
+async function createLauncher(
+  width: number,
+  height = 30,
+  choiceCount = 1,
+  specs: readonly OpenSpecChangeSummary[] = [],
+  autoSpecIds: readonly string[] = [],
+) {
   const testRenderer = await createTestRenderer({ width, height })
   const picker = new LaunchPicker(
     testRenderer.renderer,
@@ -60,6 +67,9 @@ async function createLauncher(width: number, height = 30, choiceCount = 1) {
     "configured",
     { isolate: false, reason: "test" },
     {} as never,
+    { enabled: true, entries: [] },
+    specs,
+    autoSpecIds,
   )
   return { ...testRenderer, picker }
 }
@@ -76,10 +86,14 @@ type LaunchPickerView = {
   gateway: string
   modal: { kind: string; index: number } | undefined
   toggleState: { worktree: boolean }
+  promptChoosing: boolean
+  specIndex: number
+  selectedChangeId?: string
   modalWidth(): number
   promptDetail(width: number): { chunks: Array<{ text: string }> }
   optionsDetail(width: number): { chunks: Array<{ text: string }> }
   pipelineDetail(width: number): { chunks: Array<{ text: string }> }
+  runSelection(pipelineName: string, initializeGit?: boolean): { prompt: string; change?: string }
 }
 
 function launchView(picker: LaunchPicker): LaunchPickerView {
@@ -1157,3 +1171,145 @@ describe("launch TUI sidebar usage meters", () => {
     }
   })
 })
+
+describe("launch TUI OpenSpec contract picker", () => {
+  const specs: OpenSpecChangeSummary[] = [
+    { id: "add-login", title: "Add Login" },
+    { id: "add-logout", title: "Add Logout" },
+  ]
+
+  test("opens the contract list instead of the editor when specs are present", async () => {
+    const launcher = await createLauncher(100, 30, 1, specs)
+    try {
+      launcher.mockInput.pressEnter()
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.mode).toBe("prompt")
+      expect(view.promptChoosing).toBe(true)
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("Manual prompt")
+      expect(frame).toContain("add-login — Add Login")
+      expect(frame).toContain("add-logout — Add Logout")
+      expect(frame).not.toContain("Add onboarding, fix bug")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("enter on a spec pins change and injects the canned prompt without opening the editor", async () => {
+    const launcher = await createLauncher(100, 30, 1, specs)
+    try {
+      launcher.mockInput.pressEnter()
+      launcher.mockInput.pressKey("j")
+      launcher.mockInput.pressEnter()
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.mode).toBe("options")
+      expect(view.selectedChangeId).toBe("add-login")
+      expect(view.prompt).toBe("Implement the attached OpenSpec change.")
+      const selection = view.runSelection("pipeline-1")
+      expect(selection.change).toBe("add-login")
+      expect(selection.prompt).toBe("Implement the attached OpenSpec change.")
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("openspec")
+      expect(frame).toContain("add-login")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("enter on Manual prompt opens the editor and does not pin a change", async () => {
+    const launcher = await createLauncher(100, 30, 1, specs)
+    try {
+      launcher.mockInput.pressEnter()
+      launcher.mockInput.pressEnter()
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.mode).toBe("prompt")
+      expect(view.promptChoosing).toBe(false)
+      expect(view.selectedChangeId).toBeUndefined()
+      expect(launcher.captureCharFrame()).toContain("Add onboarding, fix bug")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+})
+
+describe("launch TUI OpenSpec notice", () => {
+  const specs: OpenSpecChangeSummary[] = [
+    { id: "add-login", title: "Add Login" },
+    { id: "add-logout", title: "Add Logout" },
+  ]
+
+  test("picker shows the auto-resolved change that will attach without a pick", async () => {
+    const launcher = await createLauncher(100, 40, 1, specs, ["add-login"])
+    try {
+      await launcher.renderOnce()
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("add-login · bundle attaches to every step")
+      expect(frame).toContain("Add Login")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("options shows the auto-resolved change when nothing was picked", async () => {
+    const launcher = await createLauncher(100, 40, 1, specs, ["add-login"])
+    try {
+      launcher.mockInput.pressEnter() // open the contract list
+      launcher.mockInput.pressEnter() // Manual prompt -> editor
+      for (const ch of "ship it") launcher.mockInput.pressKey(ch)
+      launcher.mockInput.pressEnter() // submit -> options
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.mode).toBe("options")
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("add-login · bundle attaches to every step")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("no auto-selection says so and points at the picker", async () => {
+    const launcher = await createLauncher(110, 40, 1, specs, [])
+    try {
+      await launcher.renderOnce()
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("2 active changes · pick one when writing the prompt")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("a manual pick owns the notice instead of the auto-resolved id", async () => {
+    const launcher = await createLauncher(100, 40, 1, specs, ["add-login"])
+    try {
+      launcher.mockInput.pressEnter() // contract list
+      launcher.mockInput.pressKey("j") // index 1 (add-login)
+      launcher.mockInput.pressKey("j") // index 2 (add-logout)
+      launcher.mockInput.pressEnter() // pin add-logout -> options
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.mode).toBe("options")
+      expect(view.selectedChangeId).toBe("add-logout")
+      const frame = launcher.captureCharFrame()
+      expect(frame).toContain("add-logout · Add Logout")
+      expect(frame).not.toContain("bundle attaches to every step")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("stays quiet with no active changes at all", async () => {
+    const launcher = await createLauncher(100, 40, 1, [], [])
+    try {
+      await launcher.renderOnce()
+      const frame = launcher.captureCharFrame()
+      expect(frame).not.toContain("bundle attaches to every step")
+      expect(frame).not.toContain("active changes · pick one")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+})
+

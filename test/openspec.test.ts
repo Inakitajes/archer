@@ -10,9 +10,12 @@ import type { RunOptions } from "../src/types"
 import {
   branchIdFromBranch,
   isOpenSpecChangeId,
+  listOpenSpecChanges,
   loadOpenSpecBundle,
+  openSpecPromptFor,
   openspecDirName,
   resolveChange,
+  titleFromProposal,
   type OpenSpecChange,
 } from "../src/openspec"
 
@@ -410,5 +413,46 @@ describe("--change wiring through the reviewed run plan", () => {
 
     const plan = await runPlanFor(["--dir", repo, "-p", "review", "review this"])
     expect(plan?.openspec?.changeIds).toEqual([])
+  })
+})
+
+describe("OpenSpec listing and canned prompt", () => {
+  test("titleFromProposal prefers the first heading and skips YAML frontmatter", () => {
+    expect(titleFromProposal("# Add Login\n\nDetails.", "fallback")).toBe("Add Login")
+    expect(titleFromProposal("---\nstatus: draft\n---\n# Add Logout\n", "fallback")).toBe("Add Logout")
+    expect(titleFromProposal("No heading at all\njust prose.", "fallback")).toBe("No heading at all")
+    expect(titleFromProposal("   \n\n", "add-empty")).toBe("add-empty")
+  })
+
+  test("openSpecPromptFor is pipeline-aware and never invents a brief", () => {
+    expect(openSpecPromptFor("implement")).toBe("Implement the attached OpenSpec change.")
+    expect(openSpecPromptFor("implement-lite")).toBe("Implement the attached OpenSpec change.")
+    expect(openSpecPromptFor("review")).toBe("Review the attached OpenSpec change.")
+    expect(openSpecPromptFor("review-lite")).toBe("Review the attached OpenSpec change.")
+    expect(openSpecPromptFor("ship")).toBe("Ship the attached OpenSpec change.")
+    expect(openSpecPromptFor("hunter")).toBe("Audit the attached OpenSpec change.")
+    expect(openSpecPromptFor("custom-thing")).toBe("Implement the attached OpenSpec change.")
+  })
+
+  test("listOpenSpecChanges returns id + title and skips archive/stray files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-openspec-list-"))
+    dirs.push(dir)
+    await mkdir(join(dir, openspecDirName, "changes", "add-login"), { recursive: true })
+    await mkdir(join(dir, openspecDirName, "changes", "add-logout"), { recursive: true })
+    await mkdir(join(dir, openspecDirName, "changes", "archive"), { recursive: true })
+    await writeFile(join(dir, openspecDirName, "changes", "add-login", "proposal.md"), "# Add Login\n")
+    await writeFile(join(dir, openspecDirName, "changes", "add-logout", "proposal.md"), "Logout the user\n")
+    await writeFile(join(dir, openspecDirName, "changes", "README.md"), "# not a change\n")
+
+    expect(await listOpenSpecChanges(dir)).toEqual([
+      { id: "add-login", title: "Add Login" },
+      { id: "add-logout", title: "Logout the user" },
+    ])
+  })
+
+  test("listOpenSpecChanges returns [] when openspec/ is absent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-openspec-none-"))
+    dirs.push(dir)
+    expect(await listOpenSpecChanges(dir)).toEqual([])
   })
 })

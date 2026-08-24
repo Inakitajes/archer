@@ -40,10 +40,10 @@ describe("model shorthand", () => {
 })
 
 describe("default pipeline", () => {
-  test("matches the historical six phases", () => {
+  test("matches the historical six phases plus the closing run recap", () => {
     const pipeline = defaultPipeline()
 
-    expect(stepNames(pipeline)).toEqual(["implementer", "patterns", "security", "design", "tests", "adversarial"])
+    expect(stepNames(pipeline)).toEqual(["implementer", "patterns", "security", "design", "tests", "adversarial", "run-report"])
     expect(pipeline.steps.some((step) => step.type === "human")).toBe(false)
   })
 
@@ -126,6 +126,34 @@ describe("default pipeline", () => {
     expect(stepNames(defaultPipeline())).not.toContain("score-report")
   })
 
+  test("closes with the read-only run recap: every report, no diff, cheapest model", () => {
+    const steps = defaultPipeline()
+      .steps.filter((step): step is AgentStep => step.type === "agent")
+      .map((step) => [step.name, step] as const)
+    const byName = Object.fromEntries(steps)
+
+    const recap = byName["run-report"]
+    expect(recap).toMatchObject({
+      agentName: "run-reporter",
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      variant: "high",
+      readOnly: true,
+      inputDiff: false,
+      reportPath: "reports/run-report.md",
+    })
+    expect(recap?.advisor).toBeUndefined()
+    // The recap indexes every phase report — the adversarial verdict included.
+    expect(recap?.inputFiles).toEqual([
+      "prd.md",
+      "reports/implementer.md",
+      "reports/patterns.md",
+      "reports/security.md",
+      "reports/design.md",
+      "reports/tests.md",
+      "reports/adversarial.md",
+    ])
+  })
+
   test("keeps every implement step on its own model even when defaults.model is GPT", () => {
     const byName = Object.fromEntries(
       resolvePipeline({
@@ -206,6 +234,26 @@ describe("built-in implement-lite pipeline", () => {
     }
     expect(lite.implementer?.model).not.toBe(standard.implementer?.model)
     expect(lite.adversarial?.model).not.toBe(standard.adversarial?.model)
+  })
+
+  test("closes with the same read-only run recap as implement", () => {
+    const lite = implementLite().steps.filter((step): step is AgentStep => step.type === "agent")
+    const standard = defaultPipeline().steps.filter((step): step is AgentStep => step.type === "agent")
+    const liteRecap = lite.find((step) => step.stepName === "run-report")
+    const standardRecap = standard.find((step) => step.stepName === "run-report")
+
+    expect(liteRecap).toMatchObject({
+      agentName: "run-reporter",
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      variant: "high",
+      readOnly: true,
+      inputDiff: false,
+      reportPath: "reports/run-report.md",
+    })
+    // Identical wiring on both variants: the recap is cheap on purpose, so the
+    // low-cost pipeline has no reason to drop it.
+    expect(liteRecap?.inputFiles).toEqual(standardRecap?.inputFiles)
+    expect(liteRecap?.advisor).toBeUndefined()
   })
 })
 

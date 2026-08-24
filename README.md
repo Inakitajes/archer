@@ -15,7 +15,7 @@
   <img src="assets/screenshot.jpeg" alt="convoy running a pipeline with six parallel agents" width="920">
 </p>
 
-Convoy takes a PRD and turns it into a structured, reviewable implementation: a **pipeline** of specialized agents — implementer, pattern auditor, security auditor, design polisher, test engineer, adversarial reviewer — each step a fresh agent on the model best suited to its job, leaving one commit per phase. It is built on top of [OpenCode](https://opencode.ai), so every step can run on any model from any provider you are authenticated with, within the same run.
+Convoy takes a PRD and turns it into a structured, reviewable implementation: a **pipeline** of specialized agents — implementer, pattern auditor, security auditor, design polisher, test engineer, adversarial reviewer — each step a fresh agent on the model best suited to its job, leaving one commit per phase and closing with a one-page recap of what every phase found. It is built on top of [OpenCode](https://opencode.ai), so every step can run on any model from any provider you are authenticated with, within the same run.
 
 **Why it exists:** a single agent in a single session produces a first draft, not shippable code. The quality comes from what happens after that first pass — pattern alignment, security auditing, tests, adversarial review — and that follow-through is exactly the part nobody wants to orchestrate by hand. Convoy makes it repeatable: audits fan out in parallel across different models (a GPT and a Claude reviewing the same diff catch different things), findings are triaged adversarially before any fix lands, and named human gates go wherever you want them.
 
@@ -43,10 +43,10 @@ Convoy is written in Bun + TypeScript and uses `@opencode-ai/sdk` to control Ope
                     ┌── advisor: gpt-5.6-sol#xhigh
                     │   (consulted at decision points)
                     ▼
-PRD ──► implementer ──► patterns ──► security ──► design ──► tests ──► adversarial
+PRD ──► implementer ──► patterns ──► security ──► design ──► tests ──► adversarial ──► run-report
          │               │            │            │          │         │
          └───────────────┴────────────┴────────────┴──────────┴─────────┘
-                                          commit per phase
+                                          commit per phase           (read-only recap)
 ```
 
 | Step | Agent | Model | What it does |
@@ -57,6 +57,7 @@ PRD ──► implementer ──► patterns ──► security ──► design
 | `design` | `design-polisher` | `openrouter/x-ai/grok-4.6#high` | Polishes UI following the repo's design system, and strips generic "AI slop" styling |
 | `tests` | `test-engineer` | `openrouter/z-ai/glm-5.3#high` | Automated tests + relevant E2E/integration coverage |
 | `adversarial` | `adversarial-reviewer` | `openrouter/x-ai/grok-4.6#high` | Final adversarial review |
+| `run-report` | `run-reporter` | `openrouter/deepseek/deepseek-v4-flash-0731#high` | Distills every phase report into a one-page extractive recap at `reports/run-report.md` — what each phase concluded and what to read first; read-only, adds no findings of its own |
 
 Only the implementation phase is advised — Terra xhigh writes while Sol xhigh reviews its decisions, pairing the two GPT 5.6 variants that disagree most usefully. Every other phase runs unadvised (`advisor: false`, set explicitly so a project's `defaults.advisor` can't quietly re-advise them), so the second opinion is spent where a wrong call is most expensive to undo. See [Advisor steps](#project-configuration-convoyconfigyaml).
 
@@ -78,8 +79,8 @@ You write the plan, `implement` turns it into something functional, you shape it
 
 | Pipeline | Changes code? | What it does |
 |---|---|---|
-| `implement` | yes | **The default** (runs with no `-p`). Implement a PRD with an **advised** implementation phase — Terra xhigh writes and consults Sol xhigh at its decision points — then audit, polish, test, and adversarial review (the table above). Does not score: that is `ship`'s job. |
-| `implement-lite` | yes | `implement`'s shape on low-cost models: DeepSeek V4 Flash 0731 writes, Grok 4.6 advises the implementer and polishes design, GLM 5.3 runs the audits, and `adversarial` runs on GLM 5.3. The advisor is the last thing to go, because it is what makes a cheap implementer worth running. |
+| `implement` | yes | **The default** (runs with no `-p`). Implement a PRD with an **advised** implementation phase — Terra xhigh writes and consults Sol xhigh at its decision points — then audit, polish, test, and adversarial review (the table above), and close with a one-page extractive recap of the whole run (`reports/run-report.md`). Does not score: that is `ship`'s job. |
+| `implement-lite` | yes | `implement`'s shape on low-cost models: DeepSeek V4 Flash 0731 writes, Grok 4.6 advises the implementer and polishes design, GLM 5.3 runs the audits, and `adversarial` runs on GLM 5.3. The advisor is the last thing to go, because it is what makes a cheap implementer worth running. Ends with the same run recap — the recap is already the cheapest step in the pipeline. |
 | `ship` | yes | **The close of the cycle.** A `sync` phase merges the advanced base branch in and resolves the conflicts — real and semantic — so what gets graded is the branch as it will actually merge. Then two independent quality-scorers grade it against the rubric and a consensus step reconciles and verifies. `ship` declares `goal: 85` in its own spec, so the fix/re-score loop runs **without you passing `--goal`**: it keeps closing gaps until the score clears 85, plateaus, or hits the iteration cap. See [Quality scoring](#quality-scoring) and [Goal mode](#goal-mode). Two things it expects from your config, because both are machine-local: `permissions.allow` entries for `git merge*`, `git add*` and `git checkout --ours*`/`--theirs*` (without them those commands fall through to "ask" rather than failing), and, optionally, `hooks.pipelines.ship` to fetch the base beforehand and open the PR afterwards — Convoy never runs remote git itself. Post-hooks receive `CONVOY_GOAL_REACHED`, so the PR step can require the bar was actually met. |
 | `fixer` | yes | The follow-up to a report-only run. Give it a set of findings (as the prompt or an attachment) and it proves each one with a focused regression test **before** touching production code, applies minimal fixes only for the findings that actually went red, then independently reruns those proofs and the surrounding checks to report a final per-finding verdict (`fixed`, `already-resolved`, `not-reproducible`, `not-automatable`, `blocked`, `not-fixed`). The validation phase runs the commands itself (see [verifying steps](#project-configuration-convoyconfigyaml)) rather than taking the fix phase's word for it, and never promotes an unproven finding to fixed. |
 | `goal-fix` | yes | The goal loop's fix iteration: applies exactly the gaps the previous scoring round reported, then re-scores. Not run directly — `ship`'s goal, or an explicit `--goal`, drives it. See [Goal mode](#goal-mode). |
@@ -140,7 +141,7 @@ Verdicts map to the score: `ready` (≥90) · `ready-with-caveats` (75–89) · 
 
 **Calibrate before you trust it.** The first few scored runs will grade "differently" from your judgment. Run `review` against 2–3 PRs you already know are good or bad, compare your expectation to the score, and adjust `.convoy/quality-rubric.md` (weights, anchors, deductions) until the score matches your call. The rubric is a contract; like any contract, it is only useful once you agree with it — and since `ship` gates your pull requests on it, calibrate it before you rely on that gate.
 
-## OpenSpec-native reviews
+## OpenSpec-native runs
 
 When a repository uses [OpenSpec](https://openspec.dev/), Convoy reads the change contract from the repository instead of a `.convoy/prd-history` entry:
 
@@ -151,29 +152,26 @@ openspec/
   specs/<capability>/  spec.md
 ```
 
-The active change is resolved the same way by `/convoy` and the runtime:
+The active change is resolved:
 
-1. an explicit `--change <id>` (or `/convoy <id>`);
+1. an explicit `--change <id>` (or a spec picked in the launcher);
 2. exactly one non-archived change under `openspec/changes/`;
 3. multiple, and the branch name matches a change id (`feat/add-foo` ↔ `add-foo`);
 4. multiple, no branch match: compose the changes whose touched files appear in the diff;
 5. none: review falls back to today's behavior (default prompt + diff inference), and `implement` refuses with "no change; run /opsx:propose".
 
-When a change resolves, Convoy attaches the **spec bundle** — the current `openspec/specs/**` plus the change's proposal, design, and delta specs — in place of the oldest `.convoy/prd-history` entry (which stays untouched for non-OpenSpec repos, so nothing else changes). The `prd` (30%) and `scope` (10%) quality dimensions are graded against the change's **Requirements/Scenarios** instead of a diff-inferred brief. Convoy never writes the `openspec/` layout: `/opsx:propose` and archiving belong to OpenSpec itself.
+When a change resolves, Convoy attaches the **spec bundle** — the current `openspec/specs/**` plus the change's proposal, design, tasks, and delta specs — to **every agent step**. The `prd` (30%) and `scope` (10%) quality dimensions are graded against the change's **Requirements/Scenarios** instead of a diff-inferred brief. Convoy never writes the `openspec/` layout: `/opsx:propose` and archiving belong to OpenSpec itself.
+
+The fastest path is the launcher. After you pick a pipeline, the prompt step lists any active OpenSpec changes: pick one and the spec is the contract (no prompt to edit), or choose **Manual prompt** to type a brief yourself.
 
 ```bash
-# review the single active change on this branch
-convoy -p review
+# pick a pipeline and an active spec in the launcher
+convoy
 
-# or pin one explicitly
+# or pin one from the CLI — no prompt required
+convoy --change add-login -p implement
 convoy --change add-login -p review
-
-# install the OpenCode integration: /spin, /convoy, and the convoy-run helper
-convoy opencode install
-convoy opencode status
 ```
-
-`convoy opencode install` puts **/spin** (branch + worktree, then move this session there) and **/convoy [pipe]** (run the pipeline against the active change) next to `/opsx:propose`. They are Convoy's payload; `/opsx:propose` and archiving stay OpenSpec's, and the operator's global `/write-plan` and `/implement` stay the non-OpenSpec fallback.
 
 ## Goal mode
 
@@ -253,7 +251,7 @@ opencode models openai
 opencode models anthropic
 ```
 
-To use different providers, authenticate them in OpenCode and select models as `provider/model`. Convoy's default `implement` pipeline uses `openai/gpt-5.6-terra#xhigh` for implementation, `openrouter/z-ai/glm-5.3#high` for the audit and test phases, and `openrouter/x-ai/grok-4.6#high` for design and adversarial review. Use `--pipeline implement-lite` for the lower-cost variant that swaps the code-writing phase to `openrouter/deepseek/deepseek-v4-flash-0731#high`.
+To use different providers, authenticate them in OpenCode and select models as `provider/model`. Convoy's default `implement` pipeline uses `openai/gpt-5.6-terra#xhigh` for implementation, `openrouter/z-ai/glm-5.3#high` for the audit and test phases, `openrouter/x-ai/grok-4.6#high` for design and adversarial review, and `openrouter/deepseek/deepseek-v4-flash-0731#high` for the closing run recap. Use `--pipeline implement-lite` for the lower-cost variant that swaps the code-writing phase to `openrouter/deepseek/deepseek-v4-flash-0731#high`.
 
 ## Installation
 
@@ -626,7 +624,7 @@ The rules:
 
 - **Precedence**: CLI flag > project config > global config > built-in default. Within a config, for OpenCode models specifically: step `model` > agent `model` > `defaults.model` > the agent's built-in preference (Opus for the adversarial, triage, report, and validator agents when the step doesn't set its own model — note the `implement` pipeline's `design`/`adversarial` steps *do* set their own, so they run Grok 4.6) > `openai/gpt-5.6-terra#xhigh`. `--model` overrides OpenCode steps only; Claude Code steps keep their own CLI model and Convoy names those unaffected steps at launch.
 - **Conventions over wiring**: every agent step gets the PRD, the cumulative diff against the base branch (except the first step; opt out with `diff: false`), and the previous step's report (`reports: previous|all|none|[names]`). Its report lands at `reports/<step>.md`; writable steps commit repository changes as `convoy(<step>): …`, while read-only steps verify that the repository stayed unchanged.
-- **Aliases**: the built-in agents answer to their short names in steps — `patterns`, `security`, `design`, `tests`, `adversarial` — as well as their full names.
+- **Aliases**: the built-in agents answer to their short names in steps — `patterns`, `security`, `design`, `tests`, `adversarial`, `run-report` — as well as their full names.
 - **Read-only agents**: set `agents.<name>.readOnly: true` to enforce audit-only behavior. Convoy disables the agent's write/edit/bash tools, denies edit/bash/task permissions, saves the phase report from the assistant response if the agent cannot write it directly, and checks the clean Git baseline before finalizing. If Git-visible files, HEAD, or the active branch change during the step, Convoy fails without committing or deleting anything; the changes stay intact for the user to inspect and resolve.
 - **Verifying steps**: add `verify: true` on a **step** (not on the agent) to hand a read-only step bash back under the same policy writable agents get. Allowlisted project test/typecheck/lint scripts run silently; the hard denylist (`git push`, `sudo`, installs, …) stays deny — OpenCode rejects those before the gate, and `--yolo` cannot approve them. It exists because a validator that cannot run anything can only restate what earlier phases claimed. Built-in pipelines set it on the steps that need it: `scope` in `review` / `review-lite` / `review-cc`, `score-report` in `review` / `review-lite` / `ship` / `goal-fix`, and `validation` in `fixer`. Project pipelines that use `review-validator` or `implementation-validator` must set `verify: true` on those steps themselves. Write and edit tools stay disabled and the clean-baseline check above still runs, so a verifying step that changes the repository fails like any other read-only one. Two caveats worth knowing: bash can write through shell redirection, so "doesn't write" is enforced by the Git baseline rather than by the tool list, and anything Git ignores (build caches, coverage output) is invisible to that check. `verify` is ignored unless the agent is `readOnly`, and it is dropped for steps forced read-only by `parallel:` or `models:`, where concurrent agents would fight over one working tree. Not available on `runner: claude-code` steps, whose tool envelope excludes Bash.
 - **Human steps**: use `type: human` with optional `name` and `description` to insert an interactive gate. The old `human-review` string still works as a legacy shorthand, but named `type: human` steps are preferred for planning, QA, approval, or any other human checkpoint.
@@ -732,7 +730,8 @@ Each invocation creates `~/.convoy/runs/<run-id>/`:
 │   ├── security.md
 │   ├── design.md
 │   ├── tests.md
-│   └── adversarial.md
+│   ├── adversarial.md
+│   └── run-report.md
 ├── diffs/
 │   ├── patterns.pre.diff
 │   ├── security.pre.diff
@@ -746,6 +745,8 @@ Each invocation creates `~/.convoy/runs/<run-id>/`:
 ```
 
 `metadata.json` records the resolved pipeline the run executes plus each step's status, session ID, timing, cost, tokens, and model as the run progresses (written atomically, debounced). On `--resume`, the frozen pipeline is replayed — even if `.convoy/config.yaml` changed since — and steps that already wrote their report are restored in the dashboard with their real duration, cost, and session, which can still be opened by clicking the pipeline row.
+
+`SUMMARY.md` is the mechanical archive — every phase report concatenated — while `reports/run-report.md` (on the `implement` pipelines) is the one-page extractive distillation written for a human to read first. Read the recap, then open the full archive only where it points you.
 
 The run dir is kept after the run by default (browse it with `convoy runs`); pass `--no-keep-run-dir` to delete it on successful completion. If the run fails, it's always preserved for inspecting reports, diffs, and logs.
 

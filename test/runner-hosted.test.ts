@@ -676,6 +676,45 @@ describe("run() with a hosted progress", () => {
     }
   })
 
+  test("attaches the OpenSpec spec bundle to implement steps that have no prdHistory flag", async () => {
+    const repo = await cleanRepo()
+    const workspace = await mkdtemp(join(tmpdir(), "convoy-openspec-implement-"))
+    const phase = {
+      type: "agent" as const,
+      name: "implementer",
+      stepName: "implementer",
+      groupId: "g1",
+      agentName: "implementer",
+      description: "implement",
+      model: "openai/gpt-5.6-terra",
+      inputFiles: [],
+      inputDiff: false,
+      reportPath: "reports/implementer.md",
+    }
+    try {
+      await mkdir(join(repo, "openspec", "changes", "add-login"), { recursive: true })
+      await mkdir(join(repo, "openspec", "specs", "auth"), { recursive: true })
+      await writeFile(join(repo, "openspec", "changes", "add-login", "proposal.md"), "# Add Login\n")
+      await writeFile(join(repo, "openspec", "changes", "add-login", "design.md"), "# Design\n")
+      await writeFile(join(repo, "openspec", "changes", "add-login", "tasks.md"), "# Tasks\n")
+      await writeFile(join(repo, "openspec", "specs", "auth", "spec.md"), "# Auth spec\n")
+
+      const bundle = await loadOpenSpecBundle({ targetDir: repo })
+      const options = makeOptions(repo)
+      const plan = buildRunPlan({ ...options, openspec: bundle!, promptSource: "inline" })
+      const prepared = await preparePhaseRun({ dir: workspace, runID: "current" }, phase, { ...options, plan }, [], [])
+
+      const filenames = prepared.attachments.map((part) => part.filename)
+      expect(filenames).toContain("proposal.md")
+      expect(filenames).toContain("design.md")
+      expect(filenames).toContain("tasks.md")
+      expect(filenames).toContain("spec.md")
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
   // SC-4: A primitive thrown value (string, number, …) cannot key the WeakMap
   // the goal loop fetches the hosted teardown from. The runner wraps it in an
   // Error before storing, so the teardown survives any thrown value.
