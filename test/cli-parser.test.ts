@@ -89,4 +89,10 @@ describe("resolveRunOptions", () => {
     await expect(parseCommand(["opencode"])).rejects.toThrow("OpenCode slash-command plugin was removed")
     await expect(parseCommand(["opencode", "install"])).rejects.toThrow("--change")
   })
+
+  test("parseCommand accepts specs with no arguments and rejects extras", async () => {
+    expect(await parseCommand(["specs"])).toEqual({ type: "specs", targetDir: process.cwd() })
+    await expect(parseCommand(["specs", "--flag"])).rejects.toThrow("usage: convoy specs")
+    await expect(parseCommand(["specs", "extra"])).rejects.toThrow("usage: convoy specs")
+  })
 })

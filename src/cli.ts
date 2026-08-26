@@ -15,6 +15,7 @@ import { loadPrdHistoryPreview } from "./prd-history"
 import { loadOpenSpecBundle, openSpecPromptFor } from "./openspec"
 import { isModelGateway, modelGatewayChoices, modelGateways, type ModelGateway } from "./model-routing"
 import { browseRuns, isControlLive, isServerLive } from "./runs"
+import { browseSpecs, buildIterateSessionInput, loadSpecsView } from "./specs"
 import { deleteKeychainSecret, keychainAvailable, storeKeychainSecret } from "./secrets"
 import type { Pipeline, RunOptions, RunPlan } from "./types"
 import type { GoalLoopConfig } from "./goal-loop"
@@ -91,6 +92,7 @@ export type CliCommand =
   | { type: "help"; text: string }
   | { type: "run"; options: RunOptions }
   | { type: "runs"; runID?: string }
+  | { type: "specs"; targetDir: string }
   | { type: "config"; targetDir: string }
   | { type: "init"; options: InitOptions }
   | { type: "agents"; action: "eject"; agentName: string; options: InitOptions }
@@ -131,6 +133,10 @@ export async function parseAndRun(argv: string[]) {
   }
   if (command.type === "runs") {
     await openRunsBrowser(command.runID)
+    return
+  }
+  if (command.type === "specs") {
+    await openSpecsBrowser(command.targetDir)
     return
   }
   if (command.type === "config") {
@@ -477,12 +483,15 @@ export async function prepareWorktreeForRun(sourceDir: string, options: RunOptio
   return { ...options, targetDir: worktree.dir, branch: worktree.branch, includeDirty: false }
 }
 
-async function launchInteractiveRun(targetDir: string) {
+async function launchInteractiveRun(targetDir: string, presetChange?: string) {
   // Imported lazily so normal CLI invocations don't pull in OpenTUI until they
   // explicitly ask for the zero-argument interactive launcher.
   const { launchRunTui } = await import("./launch-tui")
   const selection = await launchRunTui({
     targetDir,
+    // A specs-viewer handoff arrives with the change already chosen: the
+    // launcher pins that spec row instead of running its auto-detect heuristics.
+    ...(presetChange ? { presetChange } : {}),
     prepareRun: (runSelection) => prepareInteractiveRun(targetDir, runSelection),
     proposeBranchName: (input) => proposeInteractiveBranchName(targetDir, input),
     checkBranchName: (name) => checkInteractiveBranchName(targetDir, name),
@@ -620,6 +629,31 @@ async function openConfigEditor(targetDir: string) {
   await editConfigTui({ targetDir })
 }
 
+/**
+ * Routes the specs browser's resolutions. apply-change hands off to the
+ * interactive launcher with the change pinned (launchInteractiveRun's preset),
+ * iterate-change opens a standalone OpenCode session rooted at this repo (the
+ * operator authors OpenSpec changes there — Convoy never writes them), and
+ * exit simply ends. Each half is thin over specs.ts, whose pieces are unit-
+ * tested; the interactive halves are covered by component tests.
+ */
+export async function openSpecsBrowser(targetDir: string): Promise<void> {
+  const resolution = await browseSpecs(targetDir)
+  if (resolution.type === "apply-change") {
+    await launchInteractiveRun(targetDir, resolution.changeID)
+    return
+  }
+  if (resolution.type === "iterate-change") {
+    const view = await loadSpecsView(targetDir)
+    const input = buildIterateSessionInput(targetDir, view, resolution.changeID)
+    const { openIterateOpencodeWindow } = await import("./opencode")
+    // The run-dir grant lets the standalone session read its own planning
+    // files without prompting; it outlives Convoy and does its own authoring.
+    await openIterateOpencodeWindow(input)
+    return
+  }
+}
+
 // The browser resumes with default flags; metadata recovers both the repo the
 // run was launched against and the pipeline it was running.
 async function resumeOptions(runID: string, targetDir?: string): Promise<RunOptions> {
@@ -737,6 +771,11 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     if (rest.length > 1) throw new Error("usage: convoy runs [run-id]")
     if (rest[0] !== undefined && !isValidRunID(rest[0])) throw new Error(`invalid run id: ${rest[0]}`)
     return { type: "runs", runID: rest[0] }
+  }
+  if (argv[0] === "specs") {
+    // No positionals or flags yet — the viewer reads the whole OpenSpec state.
+    if (argv.length > 1) throw new Error("usage: convoy specs")
+    return { type: "specs", targetDir: process.cwd() }
   }
   if (argv[0] === "config") {
     if (argv.length > 1) throw new Error("usage: convoy config")
@@ -1234,6 +1273,7 @@ Usage:
   convoy finish
   convoy update [--check]
   convoy runs [run-id]
+  convoy specs
   convoy config
   convoy auth openrouter
 
@@ -1251,6 +1291,10 @@ Commands:
                            (source checkouts are never modified)
   runs [run-id]            Browse run history: resume a run, read its summary/reports,
                            or open a subshell in its run dir (under ~/.convoy/runs)
+  specs                    Browse active OpenSpec changes and canonical specs: read a
+                           change's proposal/design/tasks/delta specs, hand it to the
+                           launcher as the contract ("apply"), or open an OpenCode
+                           session to revise its plan ("iterate")
   config                   View and edit the global (~/.convoy) and current project config in a TUI
   auth openrouter          Store an OpenRouter management key in the macOS Keychain for the
                            header credits meter (--remove deletes it; "auth status" lists sources)

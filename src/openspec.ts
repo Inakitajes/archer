@@ -256,8 +256,11 @@ async function collectMarkdownFiles(root: string): Promise<string[]> {
  * sorted. Symlinks are never followed — file links, directory links, and a
  * symlinked walk root (e.g. `openspec/specs` → somewhere outside the repo)
  * contribute nothing rather than attaching out-of-repo files to the contract.
+ *
+ * Shared with the specs viewer (`specs.ts`), which lists the same layout for
+ * humans instead of building a runner bundle.
  */
-async function collectDirRelativeMarkdown(root: string, relativeRoot: string): Promise<string[]> {
+export async function collectDirRelativeMarkdown(root: string, relativeRoot: string): Promise<string[]> {
   let dirents
   try {
     // lstat, not stat/readdir: a symlinked root is not a directory here, so the
@@ -308,7 +311,8 @@ function stripLeadingDotSlash(path: string): string {
   return path.startsWith("./") ? path.slice(2) : path
 }
 
-function stripYamlFrontmatter(body: string): string {
+/** Drops a leading YAML frontmatter block so titles and renderers see the body. */
+export function stripYamlFrontmatter(body: string): string {
   if (!body.startsWith("---")) return body
   const end = body.indexOf("\n---", 3)
   if (end === -1) return body
