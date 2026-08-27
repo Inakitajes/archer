@@ -62,7 +62,7 @@ While browsing a change, the user can invoke an **Apply this spec** action. Conv
 
 ### Requirement: Iterate on this plan opens an OpenCode session on the change
 
-While browsing a change, the user can invoke an **Iterate on this plan** action. Convoy SHALL open a standalone OpenCode session rooted at the repository directory, with the change's planning files (proposal, design, tasks, and delta specs) referenced as initial context. The session is external to Convoy and outlives the browser; any edits to the change are made by the operator through OpenSpec authoring commands inside that session, not by Convoy.
+While browsing a change, the user can invoke an **Iterate on this plan** action. Convoy SHALL open a standalone OpenCode session rooted at the repository directory, with the change's planning files (proposal, design, tasks, and delta specs) referenced as initial context. The session SHALL be pre-authorized to read the entire repository without per-file read confirmations — revising a change requires consulting the surrounding code and specs, so the repo-wide read grant is intentional; only reads are pre-granted, and writes follow the session's normal defaults. The session is external to Convoy and outlives the browser; any edits to the change are made by the operator through OpenSpec authoring commands inside that session, not by Convoy.
 
 #### Scenario: Iterate opens a repo-rooted session
 
@@ -73,6 +73,11 @@ While browsing a change, the user can invoke an **Iterate on this plan** action.
 
 - **WHEN** the user selects "Iterate on this plan" and then closes the session without running any pipeline
 - **THEN** no run starts; only the standalone session was opened
+
+#### Scenario: Iterate session is pre-authorized to read the repository
+
+- **WHEN** the user selects "Iterate on this plan"
+- **THEN** the OpenCode session starts with read access to the whole repository pre-granted (no per-file read confirmations), so the agent can consult surrounding code and specs while revising the change
 
 ### Requirement: Non-TTY invocations print a plain listing
 

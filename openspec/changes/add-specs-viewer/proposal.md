@@ -12,7 +12,7 @@ Convoy already reads the OpenSpec layout (`openspec/specs/`, `openspec/changes/<
   - The browser itself is read-only: it purely reads files, never invokes the `openspec` binary, and never writes to the repo.
 - Non-TTY invocations print a plain listing instead of launching the TUI (same rule as `convoy runs`).
 - Selecting a change offers an **"Apply this spec"** action that hands off to the standard interactive launcher with that change preselected as the contract (`--change <id>` semantics): pipeline picker, worktree/branch toggles, plan review — all unchanged.
-- Selecting a change also offers an **"Iterate on this plan"** action that opens a standalone OpenCode session rooted at the repo directory with the change's planning files (proposal, design, tasks, delta specs) seeded as context, so the operator can revise the change using the OpenSpec authoring commands inside OpenCode — the correct way to update a change.
+- Selecting a change also offers an **"Iterate on this plan"** action that opens a standalone OpenCode session rooted at the repo directory — pre-authorized to read the whole repository, since revising a change requires consulting surrounding code and specs — with the change's planning files (proposal, design, tasks, delta specs) seeded as context, so the operator can revise the change using the OpenSpec authoring commands inside OpenCode — the correct way to update a change.
 - Extend `launchRunTui` to accept a preseeded change selection so the handoff lands on a launcher that already pins the spec row.
 
 ## Capabilities

@@ -67,12 +67,15 @@ New case in `parseCommand`: `convoy specs` (no positional args beyond the keywor
 
 The Iterate action reuses `openIterateOpencodeWindow` (`src/opencode.ts`) — the same standalone-session backend the pipeline's iterate key ("I") uses — but seeds it with the change's planning files instead of run reports. A new prompt builder (sibling of `tui.ts`'s `iteratePrompt`) lists `proposal.md`, `design.md`, `tasks.md`, and each delta spec as context. Always rooted at the repository directory, where the change's `openspec/changes/<id>/` lives. Because the session is standalone and outlives Convoy, edits to the change are made by the operator via OpenSpec authoring commands inside OpenCode — keeping Convoy's read-only stance intact.
 
+The `runDir` is deliberately set to the repository directory (`targetDir`), which pre-authorizes read access (`read`/`external_directory`) to the whole repo without per-file confirmations. This is intentional and differs from the pipeline iterate, whose grant is scoped to its own run dir (`~/.convoy/runs/<id>`): there the subject under revision is run output in a Convoy-owned directory, while here the subject is in-repo source, so the authoring agent must be able to consult the surrounding code and specs. The grant is read-only, the session is operator-initiated (an explicit keypress), and writes follow the session's normal project defaults — Convoy itself never writes.
+
 ## Risks / Trade-offs
 
 - [Launch-tui internal state is intricate; seeding `selectedChangeId` could interact with auto-detection notices] → preset applied only at initialization before the first render; tests cover launcher-with-preset in isolation plus a regression test that zero-argument launch behavior is unchanged.
 - [A change dir can contain many files across nested delta capabilities] → sections cap listing noise by grouping per capability; rendering stays lazy (read on select, not upfront) so big repos stay snappy.
 - [Frontmatter/YAML or malformed markdown may render oddly] → reuse `stripYamlFrontmatter`/`titleFromProposal`; renderer failures degrade to plain text via placeholder path.
 - [Iterate hands off to an external OpenCode session; edits happen outside Convoy] → Convoy never writes; the session is standalone and documented as the operator's authoring surface, keeping Convoy's read-only stance intact.
+- [Iterate session gets a repo-wide read grant (`runDir = targetDir`)] → accepted by design: the authoring agent must read surrounding code/specs, the grant is read-only, the session is operator-initiated, and writes keep normal project defaults. Specified explicitly in the specs-viewer requirement so audits treat it as intended behavior, not a finding.
 - [Users expect archive access once active changes are browsable] → explicitly out of scope; resolution-object design leaves room for a later filter toggle.
 
 ## Migration Plan
