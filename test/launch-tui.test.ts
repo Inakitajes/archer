@@ -58,6 +58,7 @@ async function createLauncher(
   choiceCount = 1,
   specs: readonly OpenSpecChangeSummary[] = [],
   autoSpecIds: readonly string[] = [],
+  presetChange?: string,
 ) {
   const testRenderer = await createTestRenderer({ width, height })
   const picker = new LaunchPicker(
@@ -70,6 +71,7 @@ async function createLauncher(
     { enabled: true, entries: [] },
     specs,
     autoSpecIds,
+    presetChange,
   )
   return { ...testRenderer, picker }
 }
@@ -1313,3 +1315,71 @@ describe("launch TUI OpenSpec notice", () => {
   })
 })
 
+
+describe("launch TUI preset change (specs viewer handoff)", () => {
+  const specs: OpenSpecChangeSummary[] = [
+    { id: "add-login", title: "Add Login" },
+    { id: "add-logout", title: "Add Logout" },
+  ]
+
+  test("pins the preset change before the first render and skips auto-detect notice", async () => {
+    const launcher = await createLauncher(180, 40, 1, specs, ["add-login"], "add-login")
+    try {
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.selectedChangeId).toBe("add-login")
+      // The silent auto-detect notice stays quiet when a contract is pinned.
+      expect(launcher.captureCharFrame()).not.toContain("bundle attaches to every step")
+      // The flags preview already names the pinned contract.
+      const flags = view.optionsDetail(180).chunks.map((chunk) => chunk.text).join("")
+      expect(flags).toContain("--change add-login")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("the prompt step opens with the preset row highlighted and enter confirms it", async () => {
+    const launcher = await createLauncher(100, 30, 1, specs, [], "add-logout")
+    try {
+      launcher.mockInput.pressEnter() // pipelines -> prompt (contract list)
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.promptChoosing).toBe(true)
+      // specIndex 1..n maps to specs[index - 1]; add-logout is the second row.
+      expect(view.specIndex).toBe(2)
+
+      launcher.mockInput.pressEnter() // pin add-logout -> options
+      await launcher.renderOnce()
+      const accepted = launchView(launcher.picker)
+      expect(accepted.mode).toBe("options")
+      expect(accepted.selectedChangeId).toBe("add-logout")
+      expect(accepted.runSelection("pipeline-1").change).toBe("add-logout")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("an unknown preset id is ignored and normal auto-detection still applies", async () => {
+    const launcher = await createLauncher(100, 40, 1, specs, ["add-login"], "not-a-change")
+    try {
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.selectedChangeId).toBeUndefined()
+      expect(launcher.captureCharFrame()).toContain("add-login · bundle attaches to every step")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("zero-argument launch behavior is unchanged (no pin)", async () => {
+    const launcher = await createLauncher(130, 40, 1, specs, [])
+    try {
+      await launcher.renderOnce()
+      const view = launchView(launcher.picker)
+      expect(view.selectedChangeId).toBeUndefined()
+      expect(launcher.captureCharFrame()).toContain("2 active changes · pick one when writing the prompt")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+})
