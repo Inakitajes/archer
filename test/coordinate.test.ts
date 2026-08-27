@@ -130,15 +130,20 @@ describe("spawnCoordinator", () => {
   test("records the child pid so the sweep can tell live coordinators from orphans", async () => {
     const root = await scratch()
     const pending = await writePendingLaunch(launchPayload({ ...minimalOptions() } as RunOptions, undefined, undefined), root)
+    // writePendingLaunch fires a concurrent sweep that deletes pending dirs
+    // whose recorded pid is not alive. A fabricated pid races that sweep into
+    // deleting this dir between the pid write and the read below; the test
+    // process's own pid is always alive, so the sweep spares it.
+    const fakePid = process.pid
     const fakeSpawn = (() =>
       ({
-        pid: 424242,
+        pid: fakePid,
         unref: () => {},
         exited: Promise.resolve(0),
       })) as unknown as typeof Bun.spawn
     const result = await spawnCoordinator(pending, { spawn: fakeSpawn, isStandalone: () => false })
-    expect(result.pid).toBe(424242)
-    expect(await readFile(join(pending.dir, "pid"), "utf8")).toBe("424242")
+    expect(result.pid).toBe(fakePid)
+    expect(await readFile(join(pending.dir, "pid"), "utf8")).toBe(String(fakePid))
   })
 })
 
