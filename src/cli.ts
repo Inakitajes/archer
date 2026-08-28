@@ -574,13 +574,15 @@ async function proposeInteractiveBranchName(targetDir: string, input: { prompt: 
 
 /** Sanitizes a candidate branch name and reports the free name it would take, plus its worktree path. */
 async function checkInteractiveBranchName(targetDir: string, name: string): Promise<LaunchBranchCheck> {
-  const { cleanBranchName, ensureFreeBranchName, worktreeDirFor } = await import("./worktree")
+  const { cleanBranchName, ensureFreeBranchName, resolveWorktreeDir } = await import("./worktree")
   // A hand-written name keeps whatever prefix (or none) the user chose; only
   // the model's proposals are held to the conventional `type/` shape.
   const cleaned = cleanBranchName(name, { authored: true })
   if (!cleaned) return { branch: "", dir: "" }
   const free = await ensureFreeBranchName(cleaned, targetDir)
-  return { branch: free, dir: worktreeDirFor(free), ...(free === cleaned ? {} : { suffixed: true }) }
+  // The preview must resolve the same way creation does, so what the user
+  // confirms is the directory the worktree actually lands in.
+  return { branch: free, dir: await resolveWorktreeDir(free, targetDir), ...(free === cleaned ? {} : { suffixed: true }) }
 }
 
 /**
@@ -1332,7 +1334,8 @@ Flags:
   --no-human-step          Drop all human steps (alias: --no-human-review)
   --max-concurrent <n>     Max agents running at once within a parallel group (default: ${defaultMaxConcurrentAgents}); smaller groups are unaffected
   --base <ref>             Branch/base for calculating diffs (default: auto-detected — origin's default branch, else main/master/develop/trunk, else the current branch)
-  --worktree               Run on a fresh branch in its own worktree under ~/.convoy/worktrees
+  --worktree               Run on a fresh branch in its own worktree
+                           (location: repo convention, then defaults.worktreeLocation, then ~/.convoy/worktrees)
   --no-worktree            Run in the current working tree instead
                            (default: worktree on a trunk branch, current tree on any other)
   --branch <name>          Name for the worktree branch, instead of asking the naming model
@@ -1362,8 +1365,8 @@ Config files:
                            present once you eject one, and they shadow the built-in
 
 Config keys:
-  defaults:                model, baseRef, pipeline, worktree, prdHistory, autoAcceptJudgeModel,
-                           branchNameModel, commitMessageModel
+  defaults:                model, baseRef, pipeline, worktree, worktreeLocation, prdHistory,
+                           autoAcceptJudgeModel, branchNameModel, commitMessageModel
   modelRouting:            gateway and explicit per-logical-model overrides
   agents:                  project agents or built-in overrides; prompts live at agents/<name>.md
   pipelines:               named step lists mixing agents and human gates

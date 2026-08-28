@@ -110,4 +110,41 @@ describe("runFinishCommand integration with git", () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  test("--branch locates a worktree at a non-default location via git worktree list", async () => {
+    const dir = setupRepo()
+    const wtRoot = mkdtempSync(join(tmpdir(), "convoy-finish-wt-"))
+    const wt = join(wtRoot, "custom-located")
+    git(["worktree", "add", "-b", "feat/elsewhere", "--", wt, "main"], dir)
+    git(["commit", "-q", "--allow-empty", "-m", "feat: add login (1/2)", "--author=Convoy <convoy@local>"], wt)
+    git(["commit", "-q", "--allow-empty", "-m", "fix: typo (2/2)", "--author=Convoy <convoy@local>"], wt)
+    const writes: string[] = []
+    const stdout = spyOn(process.stdout, "write").mockImplementation((chunk: string) => {
+      writes.push(chunk)
+      return true
+    })
+
+    try {
+      await runFinishCommand({ targetDir: dir, branch: "feat/elsewhere", dryRun: true, baseRef: "main" }, deps)
+
+      expect(writes.join("")).toContain("--dry-run: nothing was changed")
+      expect(writes.join("")).toContain("feat: add login")
+      expect(writes.join("")).toContain("2 convoy commits")
+    } finally {
+      stdout.mockRestore()
+      await rm(dir, { recursive: true, force: true })
+      await rm(wtRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("--branch throws a clear error when no worktree holds the branch", async () => {
+    const dir = setupRepo()
+    try {
+      await expect(
+        runFinishCommand({ targetDir: dir, branch: "feat/never-created", dryRun: true, baseRef: "main" }, deps),
+      ).rejects.toThrow("no worktree for branch \"feat/never-created\"")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

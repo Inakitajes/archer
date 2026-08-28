@@ -7,7 +7,9 @@ import {
   asStepObject,
   collapseStep,
   claudeModelPickerState,
+  defaultFields,
   deleteAt,
+  describeDefault,
   dissolveParallel,
   ejectMember,
   isHumanStep,
@@ -299,6 +301,26 @@ describe("claudeModelPickerState", () => {
   test("sets index to 0 when current is empty string", () => {
     const state = claudeModelPickerState("")
     expect(state.index).toBe(0)
+  })
+})
+
+describe("defaults fields", () => {
+  test("worktreeLocation is listed as a string field with its template hint", () => {
+    const field = defaultFields.find((field) => field.key === "worktreeLocation")
+    expect(field?.type).toBe("string")
+    expect(field?.hint).toContain("{repo}/{branch}")
+  })
+
+  test("worktreeLocation renders a description naming the template and the marker override", () => {
+    const description = describeDefault("worktreeLocation")
+    expect(description).toContain("{repo}/{branch}")
+    expect(description).toContain("AGENTS.md")
+  })
+
+  test("every listed defaults field renders a description", () => {
+    for (const field of defaultFields) {
+      expect(describeDefault(field.key)).not.toBe("")
+    }
   })
 })
 

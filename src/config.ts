@@ -76,6 +76,14 @@ export type ConvoyDefaults = {
    * not "on": it decides per branch, isolating only when HEAD sits on a trunk.
    */
   worktree?: boolean
+  /**
+   * Where isolated worktrees are created, as a path template with optional
+   * `{repo}` and `{branch}` placeholders and a leading `~` for home (e.g.
+   * `~/dev/worktrees/{repo}/{branch}`). Unset means the built-in
+   * `~/.convoy/worktrees/<branch-slug>`; a convention the repo documents for
+   * itself outranks this, and an unusable location falls back to the next one.
+   */
+  worktreeLocation?: string
   /** Persist and attach the git-ignored original PRD history; defaults to true. */
   prdHistory?: boolean
   /** Advising model for every step that doesn't set its own; unset means no advisor anywhere. */
@@ -268,6 +276,7 @@ defaults:
   # branchNameModel: openrouter/deepseek/deepseek-v4-flash-0731 # optional: model that names worktree branches
   # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
   # worktree: true # optional: force a fresh branch + worktree for every run; false always runs in the current tree. Unset decides per branch: isolate on a trunk (main/master/develop/trunk or the detected base), run in place on any other branch
+  # worktreeLocation: ~/dev/worktrees/{repo}/{branch} # optional: where isolated worktrees are created ({repo}/{branch} placeholders, ~ = home; the branch slug is appended when {branch} is missing). A marker in the repo's AGENTS.md/README.md outranks this; unusable locations fall back to ~/.convoy/worktrees
   # prdHistory: true # optional: store a git-ignored copy of each run's prompt in .convoy/prd-history; false disables history writes and scope attachments
   # advisor: anthropic/claude-opus-5 # optional: reviewing model consulted at phase decision points
   # advisorMaxCalls: 1000 # optional: consultation budget per phase attempt; the default is effectively unlimited, set this to put a real cap on it
@@ -639,6 +648,7 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
     "branchNameModel",
     "commitMessageModel",
     "worktree",
+    "worktreeLocation",
     "prdHistory",
     "advisor",
     "advisorMaxCalls",
@@ -655,6 +665,7 @@ function validateDefaults(v: Validator, raw: unknown): ConvoyDefaults {
   if (record.branchNameModel !== undefined) defaults.branchNameModel = v.model(record.branchNameModel, "defaults.branchNameModel")
   if (record.commitMessageModel !== undefined) defaults.commitMessageModel = v.model(record.commitMessageModel, "defaults.commitMessageModel")
   if (record.worktree !== undefined) defaults.worktree = v.boolean(record.worktree, "defaults.worktree")
+  if (record.worktreeLocation !== undefined) defaults.worktreeLocation = v.nonEmptyString(record.worktreeLocation, "defaults.worktreeLocation")
   if (record.prdHistory !== undefined) defaults.prdHistory = v.boolean(record.prdHistory, "defaults.prdHistory")
   if (record.advisor !== undefined) defaults.advisor = v.model(record.advisor, "defaults.advisor")
   if (record.advisorMaxCalls !== undefined) defaults.advisorMaxCalls = v.positiveInt(record.advisorMaxCalls, "defaults.advisorMaxCalls")

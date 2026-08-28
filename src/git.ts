@@ -405,6 +405,34 @@ export async function removeWorktree(dir: string, cwd: string) {
   await execFile("git", ["worktree", "remove", "--", dir], { cwd })
 }
 
+/**
+ * The checkout of `<branch>` among the repo's worktrees, or undefined when no
+ * worktree has that branch checked out. With configurable worktree locations
+ * the branch name alone can't reconstruct a path, so `git worktree list` is the
+ * source of truth for lookups (`convoy finish --branch`).
+ */
+export async function findWorktreeDirForBranch(branch: string, cwd: string): Promise<string | undefined> {
+  const result = await execFile("git", ["worktree", "list", "--porcelain"], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return undefined
+  let dir: string | undefined
+  let current: string | undefined
+  const flush = () => {
+    if (current === branch && dir) return dir
+    dir = undefined
+    current = undefined
+    return undefined
+  }
+  for (const line of result.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) dir = line.slice("worktree ".length)
+    else if (line.startsWith("branch ")) current = line.slice("branch refs/heads/".length)
+    else if (line === "") {
+      const found = flush()
+      if (found) return found
+    }
+  }
+  return flush()
+}
+
 /** The checked-out branch, or undefined when HEAD is detached. */
 export async function currentBranch(cwd: string): Promise<string | undefined> {
   const result = await execFile("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd, allowFailure: true })
