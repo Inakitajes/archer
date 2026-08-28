@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { execFileSync } from "node:child_process"
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { basename, join, resolve } from "node:path"
 
@@ -222,6 +222,66 @@ describe("resolveWorktreeDir", () => {
       await rm(repo, { recursive: true, force: true })
     }
   })
+
+  test("a template without {branch} still gives each branch its own directory", async () => {
+    const repo = await tempDir("convoy-wt-loc-fixed-")
+    const wtRoot = await tempDir("convoy-wt-loc-target-")
+    try {
+      const config = configWithLocation(join(wtRoot, "wt"))
+      expect(await resolveWorktreeDir("feat/one", repo, { config })).toBe(join(wtRoot, "wt", "feat-one"))
+      expect(await resolveWorktreeDir("feat/two", repo, { config })).toBe(join(wtRoot, "wt", "feat-two"))
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(wtRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("a fixed-path marker is honored with the slug appended", async () => {
+    const repo = await tempDir("convoy-wt-loc-fixed-marker-")
+    const wtRoot = await tempDir("convoy-wt-loc-target-")
+    try {
+      await writeFile(join(repo, "AGENTS.md"), `worktree location: ${join(wtRoot, "fixed")}\n`)
+      expect(await resolveWorktreeDir("feat/x", repo)).toBe(join(wtRoot, "fixed", "feat-x"))
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(wtRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("a symlinked parent pointing into the repo is rejected on the physical path", async () => {
+    const repo = await tempDir("convoy-wt-loc-link-")
+    const outside = await tempDir("convoy-wt-loc-outside-")
+    try {
+      await symlink(repo, join(outside, "repo-link"))
+      // Lexically outside the repo, physically inside — the guard must fall back.
+      const config = configWithLocation(join(outside, "repo-link", "wt", "{branch}"))
+      expect(await resolveWorktreeDir("feat/x", repo, { config })).toBe(worktreeDirFor("feat/x"))
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("resolution is read-only until creation", () => {
+  test("resolving and collision probes create no directories", async () => {
+    const repo = await tempDir("convoy-wt-loc-readonly-")
+    const wtRoot = await tempDir("convoy-wt-loc-target-")
+    try {
+      const config = configWithLocation(join(wtRoot, "deep", "nested", "{branch}"))
+      expect(await resolveWorktreeDir("feat/x", repo, { config })).toBe(join(wtRoot, "deep", "nested", "feat-x"))
+      expect(await branchNameTaken("feat/x", repo, { config })).toBe(false)
+      // The probe must leave the declared location's parent chain untouched.
+      const parentCreated = await stat(join(wtRoot, "deep")).then(
+        () => true,
+        () => false,
+      )
+      expect(parentCreated).toBe(false)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(wtRoot, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("collision checks on the resolved location", () => {
@@ -248,6 +308,41 @@ describe("collision checks on the resolved location", () => {
       await mkdir(join(wtRoot, "feat-x"), { recursive: true })
       const free = await ensureFreeBranchName("feat/x", repo)
       expect(free).toBe("feat/x-2")
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(wtRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("suffixing separates directories at a fixed-path location", async () => {
+    const repo = await tempDir("convoy-wt-loc-fixed-suffix-")
+    const wtRoot = await tempDir("convoy-wt-loc-target-")
+    try {
+      await writeRepoConfig(repo, `defaults:\n  worktreeLocation: ${join(wtRoot, "fixed")}\n`)
+      await mkdir(join(wtRoot, "fixed", "feat-x"), { recursive: true })
+      const free = await ensureFreeBranchName("feat/x", repo)
+      expect(free).toBe("feat/x-2")
+      expect(await resolveWorktreeDir(free, repo)).toBe(join(wtRoot, "fixed", "feat-x-2"))
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(wtRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("a second worktree against a fixed-path location gets its own directory", async () => {
+    const repo = await tempDir("convoy-wt-loc-fixed-create-")
+    const wtRoot = await tempDir("convoy-wt-loc-target-")
+    try {
+      git(["init", "-q", "-b", "main"], repo)
+      git(["config", "user.email", "test@test.com"], repo)
+      git(["config", "user.name", "Tester"], repo)
+      git(["commit", "-q", "--allow-empty", "-m", "chore: initial"], repo)
+      await writeRepoConfig(repo, `defaults:\n  worktreeLocation: ${join(wtRoot, "fixed")}\n`)
+      const first = await createIsolatedWorktree({ targetDir: repo, branch: "feat/first" })
+      const second = await createIsolatedWorktree({ targetDir: repo, branch: "feat/second" })
+      expect(first.dir).toBe(join(wtRoot, "fixed", "feat-first"))
+      expect(second.dir).toBe(join(wtRoot, "fixed", "feat-second"))
+      expect(second.branch).toBe("feat/second")
     } finally {
       await rm(repo, { recursive: true, force: true })
       await rm(wtRoot, { recursive: true, force: true })

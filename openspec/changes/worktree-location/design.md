@@ -35,7 +35,9 @@ Introduce a single resolver, e.g. `resolveWorktreeDir(branch, targetDir, ctx)`, 
 ### 2 — Resolution order with a usability guard
 `resolveWorktreeDir` tries, in order: (1) the documented marker, (2) `config.defaults.worktreeLocation`, (3) the built-in default. For each, it expands the template and checks usability before accepting it; unusable candidates are skipped for the next one.
 
-**Usability check:** resolve the expanded path, ensure its parent exists (`mkdir -p` of the parent) and is a writable directory. If it cannot be made usable, try the next candidate. The built-in `~/.convoy/worktrees` is never skipped unless it is itself unusable.
+**Usability check:** resolve the expanded path and verify — without creating anything — that it is not inside the repository (compared on physical, `realpath`-resolved paths, so a symlinked parent cannot smuggle a path in) and that its nearest existing ancestor is a writable directory. The parent chain is created only by `createIsolatedWorktree` once the run is confirmed, so the launcher preview and collision probes stay read-only. If a candidate cannot be made usable, try the next one. The built-in `~/.convoy/worktrees` is never skipped unless it is itself unusable.
+
+A candidate template without `{branch}` would map every branch — and every collision suffix — onto one directory, so the resolver appends the branch slug to such templates and each branch keeps a directory of its own (`~/wt` → `~/wt/<slug>`).
 
 **Alternative considered:** trusting the marker or config blindly. Rejected — a stale `AGENTS.md` could point worktrees into an unusable location with no recovery.
 
@@ -62,7 +64,7 @@ whose captured value is a template (contains `{repo}` or `{branch}`) or a path. 
 ## Risks / Trade-offs
 
 - **Callers drift again** → the single `resolveWorktreeDir` is the only place paths are derived; tests assert creation, collision, and preview resolve identically.
-- **Template path lands inside the repo or a nested worktree** → `git worktree add` refuses such a path. Guard: if the resolved path is inside `targetDir` (or its worktrees), fall back to the next candidate.
+- **Template path lands inside the repo or a nested worktree** → `git worktree add` refuses such a path. Guard: if the resolved path (compared physically, via `realpath`, so symlinked parents can't defeat the check) is inside `targetDir` (or its worktrees), fall back to the next candidate.
 - **Writability check races with another run** → the existing suffix mechanism and a final `stat` in `branchNameTaken` still guard collisions; a failed create falls back to the next location.
 - **Two repos with the same directory name** (two `calisteniapp`) collide in a `{repo}`-based layout → the existing `-2`, `-3`… suffixing already picks a free branch/path.
 

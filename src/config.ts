@@ -276,7 +276,7 @@ defaults:
   # branchNameModel: openrouter/deepseek/deepseek-v4-flash-0731 # optional: model that names worktree branches
   # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
   # worktree: true # optional: force a fresh branch + worktree for every run; false always runs in the current tree. Unset decides per branch: isolate on a trunk (main/master/develop/trunk or the detected base), run in place on any other branch
-  # worktreeLocation: ~/dev/worktrees/{repo}/{branch} # optional: where isolated worktrees are created ({repo}/{branch} placeholders, ~ = home). A marker in the repo's AGENTS.md/README.md outranks this; unusable locations fall back to ~/.convoy/worktrees
+  # worktreeLocation: ~/dev/worktrees/{repo}/{branch} # optional: where isolated worktrees are created ({repo}/{branch} placeholders, ~ = home; the branch slug is appended when {branch} is missing). A marker in the repo's AGENTS.md/README.md outranks this; unusable locations fall back to ~/.convoy/worktrees
   # prdHistory: true # optional: store a git-ignored copy of each run's prompt in .convoy/prd-history; false disables history writes and scope attachments
   # advisor: anthropic/claude-opus-5 # optional: reviewing model consulted at phase decision points
   # advisorMaxCalls: 1000 # optional: consultation budget per phase attempt; the default is effectively unlimited, set this to put a real cap on it

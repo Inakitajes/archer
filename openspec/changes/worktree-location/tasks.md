@@ -1,7 +1,7 @@
 ## 1. Location resolver in src/worktree.ts
 
 - [x] 1.1 Add a template expansion helper (`expandLocationTemplate`) that substitutes `{repo}`, `{branch}`, and a leading `~`; verify with unit tests for `~/dev/worktrees/{repo}/{branch}`, missing placeholders, and `~` expansion.
-- [x] 1.2 Implement `resolveWorktreeDir(branch, targetDir, ctx)` applying the resolution order (documented marker → `defaults.worktreeLocation` → built-in default) with a usability guard (parent made writable via `mkdir -p`); verify unit tests cover the priority order and fallback on an unusable candidate.
+- [x] 1.2 Implement `resolveWorktreeDir(branch, targetDir, ctx)` applying the resolution order (documented marker → `defaults.worktreeLocation` → built-in default) with a usability guard (nearest existing ancestor writable, checked without creating anything); verify unit tests cover the priority order and fallback on an unusable candidate.
 - [x] 1.3 Add the recognized marker scan of repo-root `AGENTS.md` then `README.md` (regex-based) and verify tests for a matched marker, a non-matching prose-only doc, and a marker with an invalid template falling through.
 - [x] 1.4 Add a guard rejecting a resolved path that is inside `targetDir` (or its worktrees), falling back to the next candidate; verify with a unit test for a self-nested template.
 - [x] 1.5 Keep `worktreeDirFor(branch)` as a thin wrapper over the built-in default and verify existing `slugifyBranch`/`worktreeDirFor` tests still pass.
@@ -28,3 +28,10 @@
 - [x] 5.1 Add/update unit tests in `test/worktree*.test.ts` covering template expansion, marker detection, resolution order, fallback, and collision suffixing; verify `bun test` passes.
 - [x] 5.2 Add integration coverage for `finish --branch` on a non-default worktree; verify the command locates and finishes the correct worktree.
 - [x] 5.3 Run `bun run typecheck` and the full test suite; verify no regressions in existing worktree behavior.
+
+## 6. Review fixes
+
+- [x] 6.1 A location template without `{branch}` appends the branch slug, so every branch and every collision suffix keeps its own directory; verify with resolution tests and a second-run integration test at a fixed-path location.
+- [x] 6.2 The usability probe is read-only (nearest existing ancestor writable) — the launcher preview and collision checks no longer create directories; `createIsolatedWorktree` alone makes the parent chain; verify resolution leaves the filesystem untouched.
+- [x] 6.3 The inside-repo guard compares physical (`realpath`) paths and only treats a true parent traversal (`..`, `../`) as outside; verify a symlinked parent pointing into the repo falls back to the next candidate.
+- [x] 6.4 The config TUI field is covered by tests asserting it is listed with its template hint and description (the hint moved from a hard-coded key check onto the field itself); verify `test/config-tui.test.ts` passes.

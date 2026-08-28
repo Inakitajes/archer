@@ -33,6 +33,10 @@ A configured or documented worktree location SHALL support `{repo}` and `{branch
 - **WHEN** the location is `~/dev/worktrees/{repo}/{branch}`, the repository directory is `calisteniapp`, and the branch slug is `feat-new-feature`
 - **THEN** the resolved worktree directory is `~/dev/worktrees/calisteniapp/feat-new-feature`
 
+#### Scenario: Location without `{branch}` still separates branches
+- **WHEN** the configured or documented location has no `{branch}` placeholder (for example the fixed path `~/wt`)
+- **THEN** Convoy appends the branch slug so each branch resolves to its own directory (`~/wt/<branch-slug>`)
+
 ### Requirement: Repository-documented convention
 Convoy SHALL honor an explicit worktree-location convention declared in the repository's documentation (for example `AGENTS.md` or `README.md`) when that declaration is a recognized, machine-readable marker. Loose prose SHALL NOT be interpreted as a convention.
 

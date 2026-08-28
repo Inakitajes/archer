@@ -116,20 +116,25 @@ type RowMeta =
   | { t: "add-pipeline" }
   | { t: "builtin"; name: string }
 
-type DefaultField = { key: keyof ConvoyDefaults; type: "model" | "number" | "string" | "boolean" }
+type DefaultField = {
+  key: keyof ConvoyDefaults
+  type: "model" | "number" | "string" | "boolean"
+  /** Shown as the string editor's placeholder instead of the generic "text, empty to clear". */
+  hint?: string
+}
 
 type Row = {
   chunks: (selected: boolean, width: number) => TextChunk[]
   meta?: RowMeta
 }
 
-const defaultFields: DefaultField[] = [
+export const defaultFields: DefaultField[] = [
   { key: "model", type: "model" },
   { key: "autoAcceptJudgeModel", type: "model" },
   { key: "branchNameModel", type: "model" },
   { key: "commitMessageModel", type: "model" },
   { key: "worktree", type: "boolean" },
-  { key: "worktreeLocation", type: "string" },
+  { key: "worktreeLocation", type: "string", hint: "{repo}/{branch} template, empty to clear" },
   { key: "prdHistory", type: "boolean" },
   { key: "baseRef", type: "string" },
   { key: "pipeline", type: "string" },
@@ -629,7 +634,7 @@ export class ConfigEditor {
     this.openInput(
       `defaults.${field.key}`,
       current === undefined ? "" : String(current),
-      field.key === "worktreeLocation" ? "{repo}/{branch} template, empty to clear" : "text, empty to clear",
+      field.hint ?? "text, empty to clear",
       {
         commit: (value) => {
           setDefault(config.defaults, field.key, value.trim() === "" ? undefined : value.trim())
@@ -1988,7 +1993,7 @@ function optionHint(option: ModelChoice | ChooseItem): string {
   return option.hint ?? ""
 }
 
-function describeDefault(key: keyof ConvoyDefaults): string {
+export function describeDefault(key: keyof ConvoyDefaults): string {
   switch (key) {
     case "model":
       return "Default model for steps with no model of their own."

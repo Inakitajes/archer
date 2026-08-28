@@ -1,4 +1,5 @@
-import { access, constants, mkdir, readFile, stat } from "node:fs/promises"
+import type { Stats } from "node:fs"
+import { access, constants, mkdir, readFile, realpath, stat } from "node:fs/promises"
 import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 
@@ -144,8 +145,9 @@ export type WorktreeLocationContext = {
 /**
  * Substitutes `{repo}`, `{branch}`, and a leading `~` in a worktree-location
  * template. `{repo}` is the repository directory name and `{branch}` the
- * filesystem-safe branch slug. Placeholders are optional: a template without
- * them is a fixed path, and suffixing still separates branches.
+ * filesystem-safe branch slug. A template without `{branch}` expands to a
+ * fixed path; `resolveWorktreeDir` appends the branch slug to those so every
+ * branch — and every collision suffix — still gets a directory of its own.
  */
 export function expandLocationTemplate(template: string, values: { repo: string; branch: string }): string {
   const expanded = template.replaceAll("{repo}", values.repo).replaceAll("{branch}", values.branch)
@@ -203,23 +205,65 @@ export async function documentedWorktreeConvention(targetDir: string): Promise<s
 
 /**
  * Whether a candidate location can actually hold a worktree: absolute, not
- * inside the repo itself (`git worktree add` refuses that), with a parent that
- * either exists as a writable directory or can be created. Unusable candidates
- * are skipped by `resolveWorktreeDir` in favor of the next one.
+ * inside the repo itself (`git worktree add` refuses that), and creatable —
+ * its nearest existing ancestor is a writable directory. Purely
+ * observational: nothing is created here, so the launcher preview and
+ * collision probes never mutate the filesystem before a run is confirmed;
+ * `createIsolatedWorktree` makes the parent chain once the run is real.
+ * Unusable candidates are skipped by `resolveWorktreeDir` for the next one.
  */
 async function usableWorktreeLocation(dir: string, targetDir: string): Promise<boolean> {
   if (!isAbsolute(dir)) return false
-  const rel = relative(resolve(targetDir), resolve(dir))
-  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) return false
-  const parent = dirname(dir)
-  try {
-    await mkdir(parent, { recursive: true })
-    const info = await stat(parent)
-    if (!info.isDirectory()) return false
-    await access(parent, constants.W_OK)
-    return true
-  } catch {
-    return false
+  // Compare physical paths: a lexical comparison is fooled by a symlinked
+  // parent that points into (or out of) the repository.
+  const rel = relative(await physicalPath(targetDir), await physicalPath(dir))
+  // Inside the repo (or the repo dir itself) is unusable. Only a true parent
+  // traversal counts as outside, so a sibling literally named `..x` —
+  // `rel === "..x/…"` — is not mistaken for one.
+  if (rel === "" || (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel))) return false
+  // Walk up to the nearest existing ancestor: a regular file anywhere on the
+  // chain blocks it, and the missing remainder can only be created when that
+  // ancestor is a writable directory.
+  let current = dirname(dir)
+  for (;;) {
+    let info: Stats | null = null
+    try {
+      info = await stat(current)
+    } catch {
+      // Not there yet — climb toward the root.
+    }
+    if (info) {
+      if (!info.isDirectory()) return false
+      try {
+        await access(current, constants.W_OK)
+        return true
+      } catch {
+        return false
+      }
+    }
+    const parent = dirname(current)
+    if (parent === current) return false
+    current = parent
+  }
+}
+
+/**
+ * The physical form of `dir`: its deepest existing prefix is resolved with
+ * `realpath` (following symlinks) and the not-yet-existing tail is reattached
+ * as-is, so a path that does not exist yet can still be compared physically.
+ */
+async function physicalPath(dir: string): Promise<string> {
+  let current = dir
+  for (;;) {
+    try {
+      const real = await realpath(current)
+      const tail = relative(current, dir)
+      return tail ? join(real, tail) : real
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) return resolve(dir)
+      current = parent
+    }
   }
 }
 
@@ -239,7 +283,11 @@ export async function resolveWorktreeDir(branch: string, targetDir: string, ctx:
   if (documented) candidates.push(documented)
   if (config?.defaults.worktreeLocation) candidates.push(config.defaults.worktreeLocation)
   for (const template of candidates) {
-    const candidate = expandLocationTemplate(template, { repo, branch: slug })
+    const expanded = expandLocationTemplate(template, { repo, branch: slug })
+    // A template without `{branch}` would map every branch — and every
+    // collision suffix — onto one directory, so the branch slug is appended
+    // and each branch keeps a directory of its own (`~/wt` → `~/wt/<slug>`).
+    const candidate = template.includes("{branch}") ? expanded : join(expanded, slug)
     if (await usableWorktreeLocation(candidate, targetDir)) return candidate
   }
   return worktreeDirFor(branch)
