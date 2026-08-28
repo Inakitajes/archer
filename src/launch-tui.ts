@@ -90,6 +90,12 @@ export type LaunchRunTuiResult = LaunchReviewedRun | LaunchNavigationSelection |
 
 export type LaunchRunTuiOptions = {
   targetDir: string
+  /**
+   * A change id handed in pre-selected (the specs viewer's "apply this spec"
+   * handoff). Pins that spec row from the start and suppresses the silent
+   * auto-detect notice, exactly as if the operator had picked the row.
+   */
+  presetChange?: string
   /** Resolves the run without effects so Review and the runner share one frozen plan. */
   prepareRun(selection: LaunchRunSelection): Promise<LaunchRunPreparation>
   /** Asks the naming model for a branch name. Injected so the launcher stays free of the worktree/opencode modules. */
@@ -348,7 +354,7 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
           .then((bundle) => (bundle ? [...bundle.changeIds] : []))
           .catch(() => [] as string[])
       : []
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs, autoSpecIds).result
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs, autoSpecIds, options.presetChange).result
 }
 
 async function loadLaunchHistory(targetDir: string, enabled: boolean): Promise<LaunchHistoryContext> {
@@ -649,8 +655,16 @@ export class LaunchPicker {
     private readonly specs: readonly OpenSpecChangeSummary[] = [],
     /** Active change ids the run would attach without an explicit pick; see launchRunTui. */
     private readonly autoSpecIds: readonly string[] = [],
+    /** A change handed in pre-selected; applied before the first render. */
+    presetChange?: string,
   ) {
     this.toggleState.worktree = worktreeDefault.isolate
+    // The preset pins the contract before anything renders, so the prompt step
+    // opens with that row highlighted and the auto-detect notice stays quiet.
+    // An unknown id is ignored — the launcher falls back to its normal flow.
+    if (presetChange && specs.some((spec) => spec.id === presetChange)) {
+      this.selectedChangeId = presetChange
+    }
     const defaultIndex = choices.findIndex((choice) => choice.isDefault)
     this.selected = defaultIndex >= 0 ? defaultIndex : 0
     this.result = new Promise((resolve) => {
