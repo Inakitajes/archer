@@ -1,9 +1,10 @@
-import { mkdir, readFile, stat } from "node:fs/promises"
+import { access, constants, mkdir, readFile, stat } from "node:fs/promises"
 import { homedir } from "node:os"
-import { isAbsolute, join, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 
 import type { AgentConfig, Config, OpencodeClient } from "@opencode-ai/sdk/v2"
 
+import { loadMergedConvoyConfig, type ConvoyConfig } from "./config"
 import { addWorktree, branchExists } from "./git"
 import { log } from "./log"
 import { startOpencode } from "./opencode"
@@ -110,18 +111,20 @@ function namerOpencodeConfig(): Config {
 }
 
 /**
- * Creates a new git branch checked out in a dedicated worktree under
- * `~/.convoy/worktrees/<slug>`, so Convoy runs against an isolated checkout
- * instead of the user's current working tree. The branch name is decided (and
- * confirmed by the user) before this is called.
+ * Creates a new git branch checked out in a dedicated worktree, so Convoy runs
+ * against an isolated checkout instead of the user's current working tree. The
+ * branch name is decided (and confirmed by the user) before this is called.
+ * The worktree location is resolved through `resolveWorktreeDir` — repo
+ * convention, `defaults.worktreeLocation`, or the built-in default — and the
+ * branch was already collision-checked on that same resolved location.
  */
 export async function createIsolatedWorktree(input: WorktreeInput): Promise<WorktreeResult> {
   const base = input.baseRef ?? "HEAD"
   // Re-check right before creating: the name was validated in the launcher, and
   // anything could have claimed it since (a parallel convoy, a manual branch).
   const branch = await ensureFreeBranchName(input.branch, input.targetDir)
-  const dir = worktreeDirFor(branch)
-  await mkdir(join(convoyHome(), "worktrees"), { recursive: true })
+  const dir = await resolveWorktreeDir(branch, input.targetDir)
+  await mkdir(dirname(dir), { recursive: true })
   await addWorktree(dir, branch, base, input.targetDir)
   log.info(`created worktree at ${dir} on branch ${branch}`)
   return { dir, branch }
@@ -130,6 +133,116 @@ export async function createIsolatedWorktree(input: WorktreeInput): Promise<Work
 /** Where the worktree for `branch` lives; the directory slug flattens the `type/` prefix. */
 export function worktreeDirFor(branch: string): string {
   return join(convoyHome(), "worktrees", slugifyBranch(branch))
+}
+
+/** Optional context for worktree-location resolution. */
+export type WorktreeLocationContext = {
+  /** Pre-loaded merged convoy config; loaded from `targetDir` when omitted. */
+  config?: ConvoyConfig
+}
+
+/**
+ * Substitutes `{repo}`, `{branch}`, and a leading `~` in a worktree-location
+ * template. `{repo}` is the repository directory name and `{branch}` the
+ * filesystem-safe branch slug. Placeholders are optional: a template without
+ * them is a fixed path, and suffixing still separates branches.
+ */
+export function expandLocationTemplate(template: string, values: { repo: string; branch: string }): string {
+  const expanded = template.replaceAll("{repo}", values.repo).replaceAll("{branch}", values.branch)
+  if (expanded === "~") return homedir()
+  if (expanded.startsWith("~/")) return resolve(homedir(), expanded.slice(2))
+  return expanded
+}
+
+/**
+ * A repo can document where it wants its worktrees with an explicit marker
+ * line (`worktree location: ~/dev/wt/{repo}/{branch}`) in AGENTS.md, then
+ * README.md. Only the recognized, machine-readable marker counts — loose prose
+ * ("we keep worktrees elsewhere") is never interpreted. The first match wins.
+ */
+const worktreeMarkerRegex =
+  /^\s*(?:[-*+]\s+|>\s*)?(?:\*\*)?\s*(?:worktree[ _-]?location|worktrees?)\s*(?:\*\*)?\s*[:=\u2013\u2014-]\s*(.+)$/i
+
+/** A marker's captured value must be a template or a path, never a sentence. */
+function looksLikeLocationValue(value: string): boolean {
+  if (/\{(?:repo|branch)\}/.test(value)) return true
+  return value.startsWith("~") || /^(?:\/|\.\.?\/)/.test(value)
+}
+
+export async function documentedWorktreeConvention(targetDir: string): Promise<string | undefined> {
+  for (const name of ["AGENTS.md", "README.md"]) {
+    let text: string
+    try {
+      text = await readFile(join(targetDir, name), "utf8")
+    } catch {
+      continue
+    }
+    // Fenced code blocks are examples (a README showing a sample config.yaml),
+    // not conventions, so the scan never takes a marker from inside one.
+    let inFence = false
+    for (const line of text.split("\n")) {
+      if (/^\s*(?:```|~~~)/.test(line)) {
+        inFence = !inFence
+        continue
+      }
+      if (inFence) continue
+      const match = worktreeMarkerRegex.exec(line)
+      if (!match) continue
+      // Strip the trailing "# explanation" (decoration, not part of the path)
+      // before backticks so a `` `path` # comment `` marker loses both.
+      const value = match[1]!
+        .trim()
+        .replace(/\s+#.*$/, "")
+        .replace(/^`+|`+$/g, "")
+        .trim()
+      if (value && looksLikeLocationValue(value)) return value
+    }
+  }
+  return undefined
+}
+
+/**
+ * Whether a candidate location can actually hold a worktree: absolute, not
+ * inside the repo itself (`git worktree add` refuses that), with a parent that
+ * either exists as a writable directory or can be created. Unusable candidates
+ * are skipped by `resolveWorktreeDir` in favor of the next one.
+ */
+async function usableWorktreeLocation(dir: string, targetDir: string): Promise<boolean> {
+  if (!isAbsolute(dir)) return false
+  const rel = relative(resolve(targetDir), resolve(dir))
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) return false
+  const parent = dirname(dir)
+  try {
+    await mkdir(parent, { recursive: true })
+    const info = await stat(parent)
+    if (!info.isDirectory()) return false
+    await access(parent, constants.W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The single place a worktree path is derived: repo-documented convention,
+ * then `defaults.worktreeLocation`, then the built-in default. Every caller —
+ * creation, collision checks, the launcher preview, and `finish` lookups —
+ * resolves through this so they can never drift onto different paths. A
+ * declared or configured candidate that cannot be made usable is skipped.
+ */
+export async function resolveWorktreeDir(branch: string, targetDir: string, ctx: WorktreeLocationContext = {}): Promise<string> {
+  const config = ctx.config ?? (await loadMergedConvoyConfig(targetDir))
+  const repo = basename(resolve(targetDir))
+  const slug = slugifyBranch(branch)
+  const candidates: string[] = []
+  const documented = await documentedWorktreeConvention(targetDir)
+  if (documented) candidates.push(documented)
+  if (config?.defaults.worktreeLocation) candidates.push(config.defaults.worktreeLocation)
+  for (const template of candidates) {
+    const candidate = expandLocationTemplate(template, { repo, branch: slug })
+    if (await usableWorktreeLocation(candidate, targetDir)) return candidate
+  }
+  return worktreeDirFor(branch)
 }
 
 /**
@@ -552,23 +665,26 @@ export function fallbackBranchName(): string {
 /**
  * Appends `-2`, `-3`… until neither the branch nor its worktree directory is
  * taken, so re-running a similar prompt doesn't fail `git worktree add` after
- * the run has already been confirmed.
+ * the run has already been confirmed. The directory check runs on the
+ * *resolved* location, so suffixes apply to declared layouts too.
  */
 export async function ensureFreeBranchName(branch: string, targetDir: string, limit = 50): Promise<string> {
+  // Loaded once: every suffix candidate resolves against the same config.
+  const config = await loadMergedConvoyConfig(targetDir)
   for (let suffix = 1; suffix <= limit; suffix++) {
     const candidate = suffix === 1 ? branch : `${branch}-${suffix}`
-    if (!(await branchNameTaken(candidate, targetDir))) return candidate
+    if (!(await branchNameTaken(candidate, targetDir, { config }))) return candidate
   }
   return `${branch}-${randomSlug(4)}`
 }
 
-/** True when the branch exists or its worktree directory is already on disk. */
-export async function branchNameTaken(branch: string, targetDir: string): Promise<boolean> {
+/** True when the branch exists or its resolved worktree directory is already on disk. */
+export async function branchNameTaken(branch: string, targetDir: string, ctx: WorktreeLocationContext = {}): Promise<boolean> {
   if (await branchExists(branch, targetDir)) return true
   // `git worktree add` refuses a path that already exists, so an orphaned
   // directory from an earlier run counts as taken even without a branch.
   try {
-    await stat(worktreeDirFor(branch))
+    await stat(await resolveWorktreeDir(branch, targetDir, ctx))
     return true
   } catch {
     return false

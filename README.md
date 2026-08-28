@@ -533,6 +533,7 @@ defaults:
   branchNameModel: openrouter/deepseek/deepseek-v4-flash-0731  # proposes worktree branch names (may look up referenced issues); you confirm the name
   commitMessageModel: anthropic/claude-haiku-4-5     # writes the conventional commit `convoy finish` squashes a run into; you edit it before it lands
   worktree: true                   # force a new branch + worktree for every run; false always runs in the current tree. Unset decides per branch (isolate on a trunk, run in place on a branch)
+  worktreeLocation: ~/dev/worktrees/{repo}/{branch}  # where isolated worktrees are created ({repo}/{branch} placeholders, ~ = home). A marker line in the repo's AGENTS.md/README.md outranks this; default ~/.convoy/worktrees
   prdHistory: true                 # store each new run's git-ignored prompt under .convoy/prd-history; false disables writes and historical attachments
   advisor: anthropic/claude-opus-5   # optional; a stronger model consulted at every step's decision points
   advisorMaxCalls: 1000              # optional; consultations allowed per phase attempt (default 1000 — effectively unlimited; set it lower to cap advisor spend)
@@ -836,7 +837,7 @@ Every interactive manual run now displays its fully resolved plan before reposit
 
 ### Isolating a run in a worktree
 
-An isolated run gets a new branch checked out under `~/.convoy/worktrees/<branch>`, leaving your current checkout untouched — which is what makes the branch safely rewritable by [`convoy finish`](#finishing-a-run) afterwards.
+An isolated run gets a new branch checked out in a dedicated worktree, leaving your current checkout untouched — which is what makes the branch safely rewritable by [`convoy finish`](#finishing-a-run) afterwards. Where that worktree lives follows a fixed priority: a `worktree location: ~/dev/worktrees/{repo}/{branch}` marker in `AGENTS.md` or `README.md`, then `defaults.worktreeLocation` in config, then the built-in `~/.convoy/worktrees/<branch>`. `{repo}` and `{branch}` are placeholders; `~` is home. A declared location that can't be used falls through to the next one.
 
 **The default depends on where you are.** On a trunk — `main`, `master`, `develop`, `trunk`, or whatever `origin/HEAD` points at — Convoy isolates, because you almost certainly don't want a pipeline committing straight onto it. Once you're on a branch of your own, it runs in place: you already made the branch you want the work on. A detached HEAD isolates too. Force either end per run with `--worktree` / `--no-worktree`, or permanently with `defaults.worktree: true` / `false`; the launcher shows which way the default went and why, next to the toggle. `--branch <name>` pins the name instead of asking the naming model, which is what an unattended or scripted run should use.
 

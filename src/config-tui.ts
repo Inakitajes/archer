@@ -129,6 +129,7 @@ const defaultFields: DefaultField[] = [
   { key: "branchNameModel", type: "model" },
   { key: "commitMessageModel", type: "model" },
   { key: "worktree", type: "boolean" },
+  { key: "worktreeLocation", type: "string" },
   { key: "prdHistory", type: "boolean" },
   { key: "baseRef", type: "string" },
   { key: "pipeline", type: "string" },
@@ -625,12 +626,17 @@ export class ConfigEditor {
       })
       return
     }
-    this.openInput(`defaults.${field.key}`, current === undefined ? "" : String(current), "text, empty to clear", {
-      commit: (value) => {
-        setDefault(config.defaults, field.key, value.trim() === "" ? undefined : value.trim())
-        this.markDirty()
+    this.openInput(
+      `defaults.${field.key}`,
+      current === undefined ? "" : String(current),
+      field.key === "worktreeLocation" ? "{repo}/{branch} template, empty to clear" : "text, empty to clear",
+      {
+        commit: (value) => {
+          setDefault(config.defaults, field.key, value.trim() === "" ? undefined : value.trim())
+          this.markDirty()
+        },
       },
-    })
+    )
   }
 
   private editGateway() {
@@ -1994,6 +2000,8 @@ function describeDefault(key: keyof ConvoyDefaults): string {
       return "Model that writes the squashed commit message for finish (default: anthropic/claude-haiku-4-5)."
     case "worktree":
       return "Run each job on a fresh branch in its own worktree. Unset decides per branch: on for a trunk, off once you're on a branch."
+    case "worktreeLocation":
+      return "Where isolated worktrees are created ({repo}/{branch} template, ~ = home). A marker in AGENTS.md or README.md wins; unset is ~/.convoy/worktrees."
     case "prdHistory":
       return "Store git-ignored copies of prompts in .convoy/prd-history and attach the original branch PRD to opted-in steps. Unset is on."
     case "baseRef":

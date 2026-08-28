@@ -93,12 +93,17 @@ export async function runFinishCommand(options: FinishOptions, deps: FinishComma
 /** `--branch` finishes another run's worktree; otherwise the current directory is the run's checkout. */
 async function resolveFinishDir(options: FinishOptions): Promise<string> {
   if (!options.branch) return options.targetDir
+  // Worktree locations are configurable (repo convention, defaults.worktreeLocation),
+  // so the branch name alone can't reconstruct a path: the repo's worktree list is
+  // the source of truth. The built-in default is only a fallback for worktrees
+  // created before locations were configurable.
+  const { findWorktreeDirForBranch } = await import("./git")
   const { worktreeDirFor } = await import("./worktree")
-  const dir = worktreeDirFor(options.branch)
+  const dir = (await findWorktreeDirForBranch(options.branch, options.targetDir)) ?? worktreeDirFor(options.branch)
   // Without this the first git call fails on a missing cwd with a spawn error
   // that says nothing about which branch or path was meant.
   if (!(await directoryExists(dir))) {
-    throw new Error(`no convoy worktree for branch "${options.branch}" at ${dir}; run convoy finish from the checkout holding that branch instead`)
+    throw new Error(`no worktree for branch "${options.branch}" at ${dir}; run convoy finish from the checkout holding that branch instead`)
   }
   return dir
 }
