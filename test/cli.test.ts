@@ -486,8 +486,18 @@ describe("parseCommand", () => {
   })
 
   test("parses a run command with prompt", async () => {
-    const cmd = await parseCommand(["add login"])
-    expect(cmd.type).toBe("run")
+    // parseCommand defaults targetDir to this repo, whose OpenSpec contract
+    // rule (implement needs an active change) depends on main's archive
+    // state — red right after a close archives everything, green mid-feature.
+    // A bare temp dir has no openspec/, keeping this parse-level assertion
+    // hermetic against the repo's own change lifecycle.
+    const dir = await mkdtemp(join(tmpdir(), "convoy-cli-run-parse-"))
+    try {
+      const cmd = await parseCommand(["--dir", dir, "add login"])
+      expect(cmd.type).toBe("run")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 

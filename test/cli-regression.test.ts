@@ -261,10 +261,15 @@ describe("CLI semantic regression coverage", () => {
   })
 
   test("validates step filters against the resolved pipeline", async () => {
-    await expect(parseCommand(["--only", "secuirty", "prompt"])).rejects.toThrow('unknown step "secuirty"')
-    await expect(parseCommand(["--skip", "desing", "prompt"])).rejects.toThrow('unknown step "desing"')
+    // The convoy repo is itself an OpenSpec repo, so resolving against the
+    // cwd would require an active change under openspec/changes/ — a state
+    // main legitimately lacks right after a close archives everything. A bare
+    // temp dir keeps these assertions about pipeline resolution alone.
+    const dir = await tempDir("convoy-cli-regression-steps-")
+    await expect(parseCommand(["--dir", dir, "--only", "secuirty", "prompt"])).rejects.toThrow('unknown step "secuirty"')
+    await expect(parseCommand(["--dir", dir, "--skip", "desing", "prompt"])).rejects.toThrow('unknown step "desing"')
 
-    const command = await parseCommand(["--skip", "human-review", "prompt"])
+    const command = await parseCommand(["--dir", dir, "--skip", "human-review", "prompt"])
     expect(command.type).toBe("run")
   })
 })
