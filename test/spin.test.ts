@@ -81,6 +81,16 @@ describe("spin", () => {
     expect(await git(result.worktreeDir, "branch", "--show-current")).toBe("feat/add-widget")
   })
 
+  test("spin never installs the /convoy-spin command — that is `convoy opencode install`'s job", async () => {
+    await freshEnv()
+    const repo = await makeRepo()
+    await proposeUncommittedChange(repo, "add-quiet")
+
+    await runSpin({ targetDir: repo })
+
+    expect(await readdir(commandsDir)).toEqual([])
+  })
+
   test("prefix follows REMOVED-only deltas: fix/<id>", async () => {
     await freshEnv()
     const repo = await makeRepo()

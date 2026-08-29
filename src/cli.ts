@@ -96,6 +96,7 @@ export type CliCommand =
   | { type: "runs"; runID?: string }
   | { type: "specs"; targetDir: string }
   | { type: "spin"; options: SpinOptions }
+  | { type: "opencode-install" }
   | { type: "close"; options: CloseOptions }
   | { type: "config"; targetDir: string }
   | { type: "init"; options: InitOptions }
@@ -147,6 +148,11 @@ export async function parseAndRun(argv: string[]) {
     const { runSpin, printSpinHandoff } = await import("./spin")
     const result = await runSpin(command.options)
     printSpinHandoff(result)
+    return
+  }
+  if (command.type === "opencode-install") {
+    const { runOpencodeInstallCommand } = await import("./opencode-install")
+    await runOpencodeInstallCommand()
     return
   }
   if (command.type === "close") {
@@ -881,7 +887,13 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     return { type: "finish", options: parsed }
   }
   if (argv[0] === "opencode") {
-    throw new Error("the OpenCode slash-command plugin was removed; open the launcher (convoy) and pick an OpenSpec change, or pass --change <id>")
+    const rest = argv.slice(1)
+    if (rest.length === 0 || rest[0] === "--help" || rest[0] === "-h") {
+      const { opencodeInstallHelp } = await import("./opencode-install")
+      return { type: "help", text: opencodeInstallHelp() }
+    }
+    if (rest[0] !== "install" || rest.length > 1) throw new Error("usage: convoy opencode install")
+    return { type: "opencode-install" }
   }
 
   const parsed = parseArgs(argv)
@@ -1379,6 +1391,7 @@ Usage:
   convoy control
   convoy spin
   convoy close
+  convoy opencode install
   convoy config
   convoy auth openrouter
 
@@ -1404,8 +1417,11 @@ Commands:
                             an isolated worktree on a conventionally named branch (feat/…, fix/…,
                             change/…) and print the /move handoff for the current OpenCode session
   close                     Close a feature in one sequence: preflight, sync the base branch,
-                            archive via the OpenSpec CLI, squash convoy's commits, and merge
-                            into the base branch ("convoy close --help" for options)
+                             archive via the OpenSpec CLI, squash convoy's commits, and merge
+                             into the base branch ("convoy close --help" for options)
+  opencode install          Install the global /convoy-spin OpenCode command — a thin wrapper at
+                             ~/.config/opencode/commands/convoy-spin.md that runs convoy spin
+                             from a session (opt-in, idempotent; touches no other command file)
   config                   View and edit the global (~/.convoy) and current project config in a TUI
   auth openrouter          Store an OpenRouter management key in the macOS Keychain for the
                            header credits meter (--remove deletes it; "auth status" lists sources)

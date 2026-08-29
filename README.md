@@ -214,7 +214,9 @@ branch: feat/add-login
 continue the same OpenCode conversation: run /move and pick the worktree above
 ```
 
-The operator's OpenCode session relocates with `/move` (OpenCode's own command — Convoy never forks or summarizes a session). If `/move`'s picker doesn't list the fresh worktree, open a session in the printed directory instead. A tree dirty outside `openspec/` refuses to spin; a change already committed on the base branch spins with nothing moved. Spin also keeps the global `/spin` OpenCode command installed — a thin wrapper at `~/.config/opencode/commands/spin.md` that tells the agent to run `convoy spin` and relay its output, touching no other command files.
+The operator's OpenCode session relocates with `/move` (OpenCode's own command — Convoy never forks or summarizes a session). If `/move`'s picker doesn't list the fresh worktree, open a session in the printed directory instead. A tree dirty outside `openspec/` refuses to spin; a change already committed on the base branch spins with nothing moved.
+
+The global `/convoy-spin` OpenCode command is opt-in: run `convoy opencode install` once and the thin wrapper at `~/.config/opencode/commands/convoy-spin.md` tells the agent to run `convoy spin` and relay its output, touching no other command files (spin never writes into your global config).
 
 ### Closing a feature (`convoy close`)
 

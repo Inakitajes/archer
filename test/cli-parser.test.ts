@@ -85,9 +85,13 @@ describe("resolveRunOptions", () => {
     expect(parseArgs(["--change=add-bar"]).change).toBe("add-bar")
   })
 
-  test("parseCommand rejects the removed opencode plugin with a pointer to the launcher", async () => {
-    await expect(parseCommand(["opencode"])).rejects.toThrow("OpenCode slash-command plugin was removed")
-    await expect(parseCommand(["opencode", "install"])).rejects.toThrow("--change")
+  test("parseCommand routes opencode install; unknown subcommands and extras are usage errors", async () => {
+    expect(await parseCommand(["opencode", "install"])).toEqual({ type: "opencode-install" })
+    await expect(parseCommand(["opencode", "install", "--force"])).rejects.toThrow("usage: convoy opencode install")
+    await expect(parseCommand(["opencode", "uninstall"])).rejects.toThrow("usage: convoy opencode install")
+    const help = await parseCommand(["opencode", "--help"])
+    expect(help.type).toBe("help")
+    if (help.type === "help") expect(help.text).toContain("convoy opencode install")
   })
 
   test("parseCommand accepts specs with no arguments and rejects extras", async () => {

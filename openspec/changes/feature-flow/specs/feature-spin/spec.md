@@ -46,16 +46,26 @@ On success spin SHALL print the worktree path, the branch, the state of the move
 - **WHEN** spin completes
 - **THEN** the output names the worktree directory, the branch, what moved, and says to continue the same conversation by running `/move` and selecting that worktree
 
-### Requirement: Convoy installs the global /spin OpenCode command
+### Requirement: The global /convoy-spin OpenCode command is opt-in
 
-Convoy SHALL install and keep updated a single global OpenCode command file (`~/.config/opencode/commands/spin.md`) that instructs the agent to run `convoy spin` in the repository and relay its output — nothing more: no branch inference, no pipeline selection, no summaries. The installer SHALL be idempotent and overwrite only its own file, leaving any operator-authored command files untouched.
+`convoy opencode install` SHALL install and keep updated a single global OpenCode command file (`~/.config/opencode/commands/convoy-spin.md`, the `/convoy-spin` command) that instructs the agent to run `convoy spin` in the repository and relay its output — nothing more: no branch inference, no pipeline selection, no summaries. No other convoy path SHALL write into the operator's global OpenCode config: `convoy spin` and config saves SHALL NOT install or refresh the command as a side effect. The installer SHALL be idempotent, overwrite only its own file, leave any operator-authored command files (including an operator-authored `spin.md` or `convoy-spin.md` without the convoy marker) untouched, and remove a convoy-owned legacy `spin.md` left by the pre-rename install.
+
+#### Scenario: Opt-in install, no side effects
+
+- **WHEN** `convoy spin` completes without `convoy opencode install` ever having been run
+- **THEN** no file has been written into `~/.config/opencode/commands/`
 
 #### Scenario: Install then reinstall
 
 - **WHEN** the install runs twice
-- **THEN** exactly one convoy-owned `spin.md` exists with the current template, and any other command files in the directory are byte-identical to before
+- **THEN** exactly one convoy-owned `convoy-spin.md` exists with the current template, and any other command files in the directory are byte-identical to before
+
+#### Scenario: Legacy convoy-owned /spin is migrated away
+
+- **WHEN** the install runs on a machine with a convoy-owned legacy `spin.md` (pre-rename)
+- **THEN** `convoy-spin.md` is written and the legacy `spin.md` is removed; an operator-authored `spin.md` without the convoy marker is left untouched
 
 #### Scenario: The command is a thin wrapper
 
-- **WHEN** `/spin` runs in an OpenCode session
+- **WHEN** `/convoy-spin` runs in an OpenCode session
 - **THEN** the agent runs `convoy spin` via the shell and reports its output verbatim instead of performing git operations or naming branches itself

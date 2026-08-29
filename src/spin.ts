@@ -3,14 +3,12 @@ import { dirname, join, relative } from "node:path"
 import { stdout } from "node:process"
 
 import { detectBaseRef, execFile, statusPorcelain } from "./git"
-import { log } from "./log"
 import {
   collectDirRelativeMarkdown,
   isOpenSpecChangeId,
   listChangeIds,
   openspecDirName,
 } from "./openspec"
-import { installSpinCommand } from "./opencode-install"
 import { branchNameForChange, branchNameTaken, createIsolatedWorktree, detectSpinPrefixOverride, inferChangePrefix } from "./worktree"
 
 /**
@@ -104,14 +102,6 @@ export async function runSpin(options: SpinOptions): Promise<SpinResult> {
     )
   }
 
-  // The global /spin command rides along on every successful spin (task 2.4's
-  // completion wiring): best-effort, a failure never fails the spin itself.
-  try {
-    await installSpinCommand()
-  } catch (error) {
-    log.warn(`spin: couldn't install the global /spin command (${error instanceof Error ? error.message : error})`)
-  }
-
   return { changeID, branch: worktree.branch, worktreeDir: worktree.dir, movedFiles, committedOnBase, prefix }
 }
 
@@ -149,9 +139,9 @@ change files in, and print the /move handoff for the current OpenCode session.
 The prefix is inferred from the change's own delta specs: any ADDED requirement
 → feat, only MODIFIED → change, only REMOVED → fix, no delta specs yet → feat.
 A tree dirty outside openspec/ refuses to spin; a change already committed on
-the base branch spins with nothing moved. A successful spin also keeps the
-global /spin OpenCode command installed (a thin wrapper at
-~/.config/opencode/commands/spin.md).
+the base branch spins with nothing moved. The /convoy-spin OpenCode command is
+opt-in: run \`convoy opencode install\` once to install the thin wrapper that
+runs this command from a session (spin never touches your global config).
 
 Usage:
   convoy spin [--change <id>] [--prefix <type>]

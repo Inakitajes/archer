@@ -50,9 +50,9 @@ Squash merges erase ancestry, so `isAncestor` under-reports; `git cherry <base> 
 
 A run launched from a feature row points `targetDir` at the feature's existing worktree and freezes its branch, skipping both the namer and `ensureFreeBranchName` (which today mints `-2` suffixed new branches and is the reason multi-run features are currently impossible). Complementarily, when the launcher starts inside a worktree, isolation stays default-off (today's behavior) and gains an informational warning on manual enable, naming the current worktree's branch as the fork point. The spec-less isolated path keeps today's namer flow unchanged.
 
-### D8. The install owns exactly one file
+### D8. The install owns exactly one file, and the trigger is opt-in
 
-The reborn `src/opencode-install.ts` writes a single global `~/.config/opencode/commands/spin.md` whose template instructs the agent to run `convoy spin` and relay output. Idempotent, versioned template, refuses to touch anything else. No plugin, no bin shim, no per-repo artifacts — the old plugin's scope was its failure.
+The reborn `src/opencode-install.ts` runs only behind the explicit `convoy opencode install` and writes a single global `~/.config/opencode/commands/convoy-spin.md` (the `/convoy-spin` command) whose template instructs the agent to run `convoy spin` and relay output. Opt-in is deliberate: writing into the operator's global config is a decision the operator makes, not a side effect of spinning — no path through spin or config save installs it. The `convoy-` prefix keeps the command from colliding with an operator-authored `/spin`; a `convoy-spin.md` without the convoy marker is never clobbered (the opt-in requirement's "operator-authored command files untouched" clause), a convoy-owned legacy `spin.md` is removed as part of the rename, and an operator-authored `spin.md` is left alone. Idempotent, versioned template, no plugin, no bin shim, no per-repo artifacts — the old plugin's scope was its failure. *Alternative considered*: riding the install on every successful spin (self-healing distribution) — rejected: an implicit write to the user's global config is exactly the kind of unrequested scope the removal stood for.
 
 ### D9. Tabbed reading per the superseded change's design
 
@@ -64,10 +64,11 @@ The absorbed `specs-viewer-tabbed-reading` design carries over as written: tab s
 - [Branch renames orphan run linkage] → accepted: the join degrades to showing the change without runs; recovery is renaming back. Renaming a branch that carries runs is deliberate operator action.
 - [OpenSpec CLI archive output/flags drift across versions] → close shells out through a thin wrapper and treats any non-zero exit as a hard stop before squash/merge; the board's task counts already depend on the CLI and pin the same version behavior.
 - [The inferred board's cost per render (worktree scans + CLI calls)] → bounded: worktrees per repo are few; `openspec list` is called once per worktree with changes; the runs join is an in-memory filter over `~/.convoy/runs` plan files, the same data the runs browser already loads.
+- [Opt-in install means `/convoy-spin` may never be installed] → accepted: discoverability rides on `convoy --help` and the README; an implicit global write is the worse failure.
 
 ## Migration Plan
 
-Purely additive surfaces (`control` alias keeps `specs` working; spin/close are new commands). No stored state to migrate — by construction. Rollback is removing the commands; nothing else depends on them.
+Purely additive surfaces (`control` alias keeps `specs` working; spin/close and the opt-in `opencode install` are new commands). No repo state to migrate — by construction. The one global-state migration: a convoy-owned legacy `spin.md` is removed by the first `convoy opencode install`; an operator-authored `spin.md` is never touched. Rollback is removing the commands (for `/convoy-spin`, deleting the single file — or never installing it).
 
 ## Open Questions
 

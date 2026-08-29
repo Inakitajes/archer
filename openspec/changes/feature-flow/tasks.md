@@ -2,7 +2,7 @@
 
 ## 1. Spikes and foundations
 
-- [ ] 1.1 Spike: verify OpenCode 1.18.x's `/move` dialog lists a worktree created by plain `git worktree add` (create one in a scratch repo, open `opencode`, run `/move`, confirm it appears after the dialog's refresh); record the outcome in the run report — if absent, the spin output falls back to printing the path plus `opencode <dir>` per D4
+- [x] 1.1 Spike: verify OpenCode 1.18.x's `/move` dialog lists a worktree created by plain `git worktree add` (create one in a scratch repo, open `opencode`, run `/move`, confirm it appears after the dialog's refresh); record the outcome in the run report — if absent, the spin output falls back to printing the path plus `opencode <dir>` per D4 (outcome: verified on 1.18.x — the picker lists the worktree after the refresh, so the `/move` handoff stands as the primary path and the fallback stays just that)
 - [x] 1.2 Implement prefix inference in `src/worktree.ts` (or a sibling): scan a change's delta specs for `ADDED`/`MODIFIED`/`REMOVED` requirement headers → `feat`/`change`/`fix`, default `feat` when no deltas; verify with unit tests covering the three markers, the no-delta fallback, and mixed operations resolving to `feat`
 - [x] 1.3 Implement the board join as pure assembly over injected reads (worktrees, per-dir changes + task counts, run plans filtered by frozen branch, per-worktree status, ancestry/patch-equivalence checks); verify with unit tests using fixture dirs and plan files, including the rename-orphan degradation case from D1
 
@@ -11,7 +11,7 @@
 - [x] 2.1 Implement `convoy spin` in `src/spin.ts`: resolve the uncommitted change (single auto, multiple list-and-stop, `--change` override), derive `<prefix>/<change-id>`, create the worktree through `createIsolatedWorktree` on the base ref, refuse dirty-outside-openspec trees; verify with integration tests in a temp repo asserting branch name, worktree location per convention, and the refusal paths
 - [x] 2.2 Move the uncommitted `openspec/changes/<id>/` into the worktree (fs move, nothing committed on either side); committed-on-base changes skip the move and report that the base ref carries them; verify with tests covering the move, the already-committed case, and that base `git status` ends clean of the change
 - [x] 2.3 Print the handoff (worktree path, branch, what moved, `/move` instruction per the spike outcome); verify the output format with a snapshot-style test
-- [x] 2.4 Reborn `src/opencode-install.ts`: idempotent install/update of `~/.config/opencode/commands/spin.md` with the thin-run-the-CLI template, touching nothing else; verify with tests against a fake config dir including the double-run and foreign-file-untouched cases, and wire the install into `convoy spin`'s completion or config save path per implementation review
+- [x] 2.4 Reborn `src/opencode-install.ts` behind the explicit `convoy opencode install`: idempotent install/update of the single global `~/.config/opencode/commands/convoy-spin.md` with the thin-run-the-CLI template, no install side effect from `convoy spin`, removal of a convoy-owned legacy `spin.md` (operator-authored files untouched); verify with tests against a fake config dir including the double-run, foreign-file-untouched, no-side-effect-from-spin, and legacy-migration cases, plus CLI parser tests for the `opencode install` subcommand routing
 
 ## 3. Control board
 
@@ -43,5 +43,5 @@
 
 ## 7. Wrap-up
 
-- [x] 7.1 Update `README.md` and `convoy --help` for control/spin/close and the `/spin` command; verify help output contains all three surfaces and the alias
+- [x] 7.1 Update `README.md` and `convoy --help` for control/spin/close and the opt-in `/convoy-spin` command; verify help output contains all three surfaces and the alias
 - [x] 7.2 Full suite green (`npm test` or the repo's runner) with no coverage regression on the touched modules; run `openspec validate feature-flow` and fix any drift before apply
