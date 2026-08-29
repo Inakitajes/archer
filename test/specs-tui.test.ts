@@ -118,7 +118,7 @@ test("a change without artifacts still lists by its id", async () => {
   expect(frame).toContain("bare-change")
 })
 
-test("enter opens the change's artifact sections and escape returns", async () => {
+test("enter opens the change's tabbed reading pane and escape returns", async () => {
   const session = await openBrowser()
 
   session.press("return")
@@ -126,11 +126,12 @@ test("enter opens the change's artifact sections and escape returns", async () =
   await settle()
   await session.renderOnce()
   const detail = session.captureCharFrame()
-  // All artifact types present: the sections panel lists the full labeled set.
-  expect(detail).toContain("Proposal")
-  expect(detail).toContain("Design")
-  expect(detail).toContain("Tasks")
-  expect(detail).toContain("Delta Specs (cli)")
+  // All artifact types present: the tab strip lists the full labeled set and
+  // the title row names the subject.
+  expect(detail).toContain("1 Proposal")
+  expect(detail).toContain("2 Design")
+  expect(detail).toContain("3 Tasks")
+  expect(detail).toContain("4 Delta Specs")
   expect(detail).toContain("Add login")
 
   session.press("escape")
@@ -152,8 +153,8 @@ test("rendered markdown strips frontmatter noise in the detail pane", async () =
   expect(proposalFrame).toContain("Let operators sign in.")
   expect(proposalFrame).not.toContain("---\n")
 
-  // Design carries the frontmatter; move one section down and check it's gone.
-  session.press("j")
+  // Design carries the frontmatter; switch one tab right and check it's gone.
+  session.press("l")
   await session.renderOnce()
   await settle()
   await session.renderOnce()
@@ -171,8 +172,10 @@ test("an unreadable artifact degrades to a placeholder", async () => {
 
   session.press("return")
   await session.renderOnce()
-  // Jump to the last (Other) section.
-  for (let i = 0; i < 4; i++) session.press("j")
+  await settle()
+  await session.renderOnce()
+  // Jump straight to the last (Other) tab with its digit.
+  session.press("5")
   await session.renderOnce()
   await settle()
   await session.renderOnce()

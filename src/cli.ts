@@ -24,6 +24,8 @@ import { readRunMetadata } from "./metadata"
 import { preflightRunPlan } from "./preflight"
 import type { LaunchBranchCheck, LaunchBranchProposal, LaunchRunPreparation, LaunchRunSelection } from "./launch-tui"
 import type { FinishOptions } from "./finish-command"
+import type { SpinOptions } from "./spin"
+import type { CloseOptions } from "./feature-close-command"
 import { formatVersion } from "./version"
 import type { UpdateResult } from "./update"
 
@@ -93,6 +95,8 @@ export type CliCommand =
   | { type: "run"; options: RunOptions }
   | { type: "runs"; runID?: string }
   | { type: "specs"; targetDir: string }
+  | { type: "spin"; options: SpinOptions }
+  | { type: "close"; options: CloseOptions }
   | { type: "config"; targetDir: string }
   | { type: "init"; options: InitOptions }
   | { type: "agents"; action: "eject"; agentName: string; options: InitOptions }
@@ -137,6 +141,17 @@ export async function parseAndRun(argv: string[]) {
   }
   if (command.type === "specs") {
     await openSpecsBrowser(command.targetDir)
+    return
+  }
+  if (command.type === "spin") {
+    const { runSpin, printSpinHandoff } = await import("./spin")
+    const result = await runSpin(command.options)
+    printSpinHandoff(result)
+    return
+  }
+  if (command.type === "close") {
+    const { runCloseCommand } = await import("./feature-close-command")
+    await runCloseCommand(command.options)
     return
   }
   if (command.type === "config") {
@@ -483,7 +498,7 @@ export async function prepareWorktreeForRun(sourceDir: string, options: RunOptio
   return { ...options, targetDir: worktree.dir, branch: worktree.branch, includeDirty: false }
 }
 
-async function launchInteractiveRun(targetDir: string, presetChange?: string) {
+async function launchInteractiveRun(targetDir: string, presetChange?: string, presetFeature?: { worktreeDir: string; branch: string }) {
   // Imported lazily so normal CLI invocations don't pull in OpenTUI until they
   // explicitly ask for the zero-argument interactive launcher.
   const { launchRunTui } = await import("./launch-tui")
@@ -492,6 +507,9 @@ async function launchInteractiveRun(targetDir: string, presetChange?: string) {
     // A specs-viewer handoff arrives with the change already chosen: the
     // launcher pins that spec row instead of running its auto-detect heuristics.
     ...(presetChange ? { presetChange } : {}),
+    // A control-board "continue" arrives with the feature's worktree and
+    // branch already chosen: the launcher reuses them and never asks the namer.
+    ...(presetFeature ? { presetFeature: { changeID: presetChange ?? "", ...presetFeature } } : {}),
     prepareRun: (runSelection) => prepareInteractiveRun(targetDir, runSelection),
     proposeBranchName: (input) => proposeInteractiveBranchName(targetDir, input),
     checkBranchName: (name) => checkInteractiveBranchName(targetDir, name),
@@ -520,8 +538,15 @@ async function launchInteractiveRun(targetDir: string, presetChange?: string) {
   }
   // Revalidate Git only after the native Review has been accepted. In
   // particular, validate the source before a worktree can create a branch.
+  // A feature-row "continue" handoff executes inside the feature's existing
+  // worktree — its own checkout with its own dirt. The launcher's cwd (where
+  // the board was opened, e.g. main) is irrelevant to that run, so the
+  // readiness gate checks the run's home directory, not it. Otherwise a
+  // stranded uncommitted change on main (a first-class board state) would
+  // block continuing an unrelated feature (SC-5).
   const { ensureRepoReady } = await import("./git")
-  await ensureRepoReady(targetDir, {
+  const executionDir = presetFeature?.worktreeDir ?? targetDir
+  await ensureRepoReady(executionDir, {
     baseRef: options.baseRef,
     includeDirty: options.includeDirty,
     // A fresh worktree starts clean, so source changes are intentionally left
@@ -654,6 +679,33 @@ export async function openSpecsBrowser(targetDir: string): Promise<void> {
     await openIterateOpencodeWindow(input)
     return
   }
+  if (resolution.type === "spin-change") {
+    // Spin out reuses `convoy spin`'s whole flow verbatim: same refusals,
+    // same worktree conventions, same /move handoff.
+    const { runSpin, printSpinHandoff } = await import("./spin")
+    const result = await runSpin({ targetDir, changeID: resolution.changeID })
+    printSpinHandoff(result)
+    return
+  }
+  if (resolution.type === "continue-change") {
+    await launchInteractiveRun(targetDir, resolution.changeID, { worktreeDir: resolution.worktreeDir, branch: resolution.branch })
+    return
+  }
+  if (resolution.type === "close-change") {
+    const { runCloseCommand } = await import("./feature-close-command")
+    await runCloseCommand({
+      targetDir,
+      changeID: resolution.changeID,
+      worktreeDir: resolution.worktreeDir,
+      branch: resolution.branch,
+    })
+    return
+  }
+  if (resolution.type === "archive-change-main") {
+    const { runArchiveOnMain } = await import("./feature-close-command")
+    await runArchiveOnMain({ targetDir, changeID: resolution.changeID })
+    return
+  }
 }
 
 // The browser resumes with default flags; metadata recovers both the repo the
@@ -779,6 +831,25 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     if (argv.length > 1) throw new Error("usage: convoy specs")
     return { type: "specs", targetDir: process.cwd() }
   }
+  if (argv[0] === "control") {
+    if (argv.length > 1) throw new Error("usage: convoy control")
+    return { type: "specs", targetDir: process.cwd() }
+  }
+  if (argv[0] === "spin") {
+    if (argv.slice(1).some((arg) => arg === "--help" || arg === "-h")) {
+      const { spinHelp } = await import("./spin")
+      return { type: "help", text: spinHelp() }
+    }
+    return { type: "spin", options: parseSpinArgs(argv.slice(1)) }
+  }
+  if (argv[0] === "close") {
+    if (argv.slice(1).some((arg) => arg === "--help" || arg === "-h")) {
+      const { closeHelp } = await import("./feature-close-command")
+      return { type: "help", text: closeHelp() }
+    }
+    const { parseCloseArgs } = await import("./feature-close-command")
+    return { type: "close", options: parseCloseArgs(argv.slice(1)) }
+  }
   if (argv[0] === "config") {
     if (argv.length > 1) throw new Error("usage: convoy config")
     return { type: "config", targetDir: process.cwd() }
@@ -885,6 +956,36 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
 }
 
 type ParsedInitArgs = InitOptions & { help?: boolean }
+
+/** `convoy spin [--change <id>] [--prefix <type>]` — no positionals. */
+export function parseSpinArgs(argv: string[]): SpinOptions {
+  const options: SpinOptions = { targetDir: process.cwd() }
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === "--change") {
+      const value = argv[++i]
+      if (!value || value.startsWith("-")) throw new Error("--change requires a change id")
+      options.changeID = value
+      continue
+    }
+    if (arg.startsWith("--change=")) {
+      options.changeID = arg.slice("--change=".length)
+      continue
+    }
+    if (arg === "--prefix") {
+      const value = argv[++i]
+      if (!value || value.startsWith("-")) throw new Error("--prefix requires a conventional type (feat, change, fix, …)")
+      options.prefix = value
+      continue
+    }
+    if (arg.startsWith("--prefix=")) {
+      options.prefix = arg.slice("--prefix=".length)
+      continue
+    }
+    throw new Error(`usage: convoy spin [--change <id>] [--prefix <type>] (unexpected argument: ${arg})`)
+  }
+  return options
+}
 
 function parseInitArgs(argv: string[]): ParsedInitArgs {
   const parsed: ParsedInitArgs = {
@@ -1275,7 +1376,9 @@ Usage:
   convoy finish
   convoy update [--check]
   convoy runs [run-id]
-  convoy specs
+  convoy control
+  convoy spin
+  convoy close
   convoy config
   convoy auth openrouter
 
@@ -1293,10 +1396,16 @@ Commands:
                            (source checkouts are never modified)
   runs [run-id]            Browse run history: resume a run, read its summary/reports,
                            or open a subshell in its run dir (under ~/.convoy/runs)
-  specs                    Browse active OpenSpec changes and canonical specs: read a
-                           change's proposal/design/tasks/delta specs, hand it to the
-                           launcher as the contract ("apply"), or open an OpenCode
-                           session to revise its plan ("iterate")
+  control                   The feature board: every active change and canonical spec
+                            with live derived state (stage, tasks, runs, sync, merged-ness)
+                            and row actions — spin out, continue, close, archive on main
+                            ("convoy specs" is an alias)
+  spin                      Spin an uncommitted OpenSpec change out of the base checkout into
+                            an isolated worktree on a conventionally named branch (feat/…, fix/…,
+                            change/…) and print the /move handoff for the current OpenCode session
+  close                     Close a feature in one sequence: preflight, sync the base branch,
+                            archive via the OpenSpec CLI, squash convoy's commits, and merge
+                            into the base branch ("convoy close --help" for options)
   config                   View and edit the global (~/.convoy) and current project config in a TUI
   auth openrouter          Store an OpenRouter management key in the macOS Keychain for the
                            header credits meter (--remove deletes it; "auth status" lists sources)

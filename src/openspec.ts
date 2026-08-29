@@ -141,6 +141,25 @@ export function branchIdFromBranch(branch?: string): string | undefined {
   return candidate || undefined
 }
 
+/**
+ * The change-id directory names under an `openspec/changes/` root: real
+ * (non-symlink) directories that pass `isOpenSpecChangeId`, sorted. One shared
+ * rule for the launcher, the control board, the specs viewer, and spin, so the
+ * three cannot drift apart (SC-8). Returns `[]` when the directory is absent.
+ */
+export async function listChangeIds(changesDir: string): Promise<string[]> {
+  try {
+    const dirents = await readdir(changesDir, { withFileTypes: true })
+    return dirents
+      .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+      .map((entry) => entry.name)
+      .filter(isOpenSpecChangeId)
+      .sort()
+  } catch {
+    return []
+  }
+}
+
 export type ResolveChangeInput = {
   /** Rule 1: the explicit `--change <id>`; wins over every heuristic. */
   explicitId?: string

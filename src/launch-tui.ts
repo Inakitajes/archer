@@ -1,12 +1,13 @@
 import { homedir } from "node:os"
 import { basename } from "node:path"
+import { resolve } from "node:path"
 import { existsSync } from "node:fs"
 
 import { BoxRenderable, StyledText, TextRenderable, bg, bold, createCliRenderer, decodePasteBytes, fg, stripAnsiSequences, t } from "@opentui/core"
 
 import { defaultAdvisorMaxCalls } from "./advisor"
 import { buildAgentRegistry, emptyHooksConfig, loadMergedConvoyConfig } from "./config"
-import { currentBranch, resolveWorktreeDefault } from "./git"
+import { currentBranch, mainWorktreeDir, resolveWorktreeDefault } from "./git"
 import { hooksForPipeline } from "./hooks"
 import { openRouterLowBalance, startLimitsPoller } from "./limits"
 import { builtInPipelines, defaultPipelineName, hasWritableStep, resolvePipeline } from "./pipeline"
@@ -16,7 +17,7 @@ import { consensusStep } from "./quality-score"
 import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
 import { listOpenSpecChanges, loadOpenSpecBundle, openSpecPromptFor, type OpenSpecChangeSummary } from "./openspec"
 import { runReviewLines } from "./review-tui"
-import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
 
 import type { ConvoyConfig } from "./config"
@@ -96,6 +97,12 @@ export type LaunchRunTuiOptions = {
    * auto-detect notice, exactly as if the operator had picked the row.
    */
   presetChange?: string
+  /**
+   * A feature-row "continue" handoff from the control board: the change is
+   * pinned and the run reuses the feature's existing worktree and branch —
+   * no new worktree is created and the branch namer is never invoked (D7).
+   */
+  presetFeature?: { changeID: string; worktreeDir: string; branch: string }
   /** Resolves the run without effects so Review and the runner share one frozen plan. */
   prepareRun(selection: LaunchRunSelection): Promise<LaunchRunPreparation>
   /** Asks the naming model for a branch name. Injected so the launcher stays free of the worktree/opencode modules. */
@@ -354,7 +361,29 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
           .then((bundle) => (bundle ? [...bundle.changeIds] : []))
           .catch(() => [] as string[])
       : []
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs, autoSpecIds, options.presetChange).result
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs, autoSpecIds, options.presetChange, options.presetFeature, await detectInsideWorktree(options.targetDir)).result
+}
+
+/** Where the launcher is running inside a feature worktree, for the nested-isolation warning. */
+export type InsideWorktree = {
+  dir: string
+  branch?: string
+}
+
+/**
+ * The launcher runs inside a worktree when its checkout is not the repo's main
+ * one — exactly the situation where enabling isolation would fork a new
+ * worktree off this one's branch rather than off the base.
+ */
+export async function detectInsideWorktree(targetDir: string): Promise<InsideWorktree | undefined> {
+  try {
+    const main = await mainWorktreeDir(targetDir)
+    if (!main || resolve(main) === resolve(targetDir)) return undefined
+    const branch = await currentBranch(targetDir)
+    return { dir: targetDir, ...(branch ? { branch } : {}) }
+  } catch {
+    return undefined
+  }
 }
 
 async function loadLaunchHistory(targetDir: string, enabled: boolean): Promise<LaunchHistoryContext> {
@@ -657,6 +686,10 @@ export class LaunchPicker {
     private readonly autoSpecIds: readonly string[] = [],
     /** A change handed in pre-selected; applied before the first render. */
     presetChange?: string,
+    /** A feature-row continue handoff: reuses the feature's worktree and branch (D7). */
+    private readonly presetFeature?: { changeID: string; worktreeDir: string; branch: string },
+    /** Set when the launcher itself runs inside a worktree; drives the nested-isolation warning. */
+    private readonly insideWorktree?: InsideWorktree,
   ) {
     this.toggleState.worktree = worktreeDefault.isolate
     // The preset pins the contract before anything renders, so the prompt step
@@ -664,6 +697,13 @@ export class LaunchPicker {
     // An unknown id is ignored — the launcher falls back to its normal flow.
     if (presetChange && specs.some((spec) => spec.id === presetChange)) {
       this.selectedChangeId = presetChange
+    }
+    // Continue reuses the feature's existing worktree and branch: isolation of
+    // a NEW worktree is off (the run executes in the existing one), the branch
+    // is frozen without asking the namer, and the pinned change rides along.
+    if (presetFeature) {
+      this.selectedChangeId = presetFeature.changeID
+      this.toggleState.worktree = false
     }
     const defaultIndex = choices.findIndex((choice) => choice.isDefault)
     this.selected = defaultIndex >= 0 ? defaultIndex : 0
@@ -1447,8 +1487,17 @@ export class LaunchPicker {
   }
 
   private runSelection(pipelineName: string, initializeGit = false): LaunchRunSelection {
+    // A continue handoff executes inside the feature's existing worktree with
+    // its branch frozen into the plan — no namer, no `ensureFreeBranchName`,
+    // no new worktree (which is why `isolateWorktree` stays false).
+    const targetDir = this.presetFeature?.worktreeDir ?? this.targetDir
+    const frozenBranch = this.presetFeature
+      ? { branchName: this.presetFeature.branch, worktreeDir: this.presetFeature.worktreeDir }
+      : this.toggleState.worktree && this.branchName
+        ? { branchName: this.branchName, worktreeDir: this.branchDir }
+        : undefined
     return {
-      targetDir: this.targetDir,
+      targetDir,
       prompt: this.prompt,
       pipeline: pipelineName,
       humanReview: this.toggleState.humanReview,
@@ -1460,7 +1509,7 @@ export class LaunchPicker {
       gateway: this.gateway,
       ...(this.goalEnabled && this.currentChoice().scored ? { goal: this.goalTarget } : {}),
       isolateWorktree: this.toggleState.worktree,
-      ...(this.toggleState.worktree && this.branchName ? { branchName: this.branchName, worktreeDir: this.branchDir } : {}),
+      ...(frozenBranch ?? {}),
       ...(initializeGit ? { initializeGit: true } : {}),
       ...(this.selectedChangeId ? { change: this.selectedChangeId } : {}),
     }
@@ -1963,6 +2012,12 @@ this.detailBox.title = reviewing ? " review " : " run setup "
       const label = spec.title === spec.id ? spec.id : `${spec.id} · ${spec.title}`
       lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.teal)(truncate(label, Math.max(10, width - 9)))]))
     }
+    // The continue handoff shows what is being reused, so "no new worktree"
+    // is a visible fact of the options step rather than an assumption.
+    if (this.presetFeature) {
+      const label = `${this.presetFeature.branch} · ${shortPath(this.presetFeature.worktreeDir, Math.max(16, width - 36))} (existing worktree — no new branch or worktree)`
+      lines.push(new StyledText([fg(theme.faint)("feature  "), fg(theme.teal)(truncate(label, Math.max(10, width - 9)))]))
+    }
     this.pushOpenSpecNotice(lines, width)
     this.pushHistoryNotice(lines, width, "options")
     lines.push(plain(""))
@@ -2008,6 +2063,16 @@ this.detailBox.title = reviewing ? " review " : " run setup "
           : spec.description
       lines.push(new StyledText([raw("        "), fg(theme.dim)(truncate(description, Math.max(8, width - 8)))]))
       this.optionRows.push(index + 1)
+      // Nested isolation is never blocked, only named: enabling a new worktree
+      // while already inside one forks from this worktree's branch, and the
+      // operator should do that deliberately (D7).
+      if (spec.key === "worktree" && enabled && this.insideWorktree) {
+        const dir = shortPath(this.insideWorktree.dir, Math.max(24, width - 40))
+        const where = this.insideWorktree.branch ? `branch ${this.insideWorktree.branch} of worktree ${dir}` : `worktree ${dir}`
+        const warning = `you are on ${where} — the new worktree forks from this branch; isolate only if you truly mean it`
+        lines.push(new StyledText([raw("        "), fg(theme.yellow)(truncate(warning, Math.max(8, width - 8)))]))
+        this.optionRows.push(index + 1)
+      }
     }
 
     // Goal mode toggle: only for scored pipelines. Sits after the boolean

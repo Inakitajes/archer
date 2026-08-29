@@ -95,4 +95,32 @@ describe("resolveRunOptions", () => {
     await expect(parseCommand(["specs", "--flag"])).rejects.toThrow("usage: convoy specs")
     await expect(parseCommand(["specs", "extra"])).rejects.toThrow("usage: convoy specs")
   })
+
+  test("parseCommand opens the board through control, with specs kept as an alias", async () => {
+    expect(await parseCommand(["control"])).toEqual({ type: "specs", targetDir: process.cwd() })
+    await expect(parseCommand(["control", "extra"])).rejects.toThrow("usage: convoy control")
+  })
+
+  test("parseCommand parses spin flags into SpinOptions", async () => {
+    const command = await parseCommand(["spin", "--change", "add-foo", "--prefix", "fix"])
+    expect(command.type).toBe("spin")
+    const options = (command as { options: { changeID?: string; prefix?: string; targetDir: string } }).options
+    expect(options.changeID).toBe("add-foo")
+    expect(options.prefix).toBe("fix")
+    expect(options.targetDir).toBe(process.cwd())
+    expect((await parseCommand(["spin"])).type).toBe("spin")
+    expect(((await parseCommand(["spin", "--change=add-bar"])) as { options: { changeID?: string } }).options.changeID).toBe("add-bar")
+  })
+
+  test("parseCommand rejects malformed spin arguments", async () => {
+    await expect(parseCommand(["spin", "--change"])).rejects.toThrow("--change requires a change id")
+    await expect(parseCommand(["spin", "--prefix"])).rejects.toThrow("--prefix requires")
+    await expect(parseCommand(["spin", "surprise"])).rejects.toThrow("usage: convoy spin")
+  })
+
+  test("spin --help explains its usage", async () => {
+    const command = await parseCommand(["spin", "--help"])
+    expect(command.type).toBe("help")
+    if (command.type === "help") expect(command.text).toContain("convoy spin")
+  })
 })

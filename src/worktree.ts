@@ -65,6 +65,71 @@ type BranchType = (typeof branchTypes)[number]
 const defaultBranchType: BranchType = "feat"
 
 /**
+ * The branch prefixes `convoy spin` derives from a change's own delta-spec
+ * operations. `change` is deliberately not a conventional-commit type — it
+ * names a branch that only edits existing behavior, which no commit type
+ * expresses.
+ */
+export type ChangePrefix = "feat" | "change" | "fix"
+
+/**
+ * The requirement-operation markers a delta spec file may carry, as written
+ * by OpenSpec: `## ADDED Requirements`, `## MODIFIED Requirements`,
+ * `## REMOVED Requirements`. `RENAMED` counts as a modification of existing
+ * requirements, never as an addition.
+ */
+const deltaOperationPattern = /^\s{0,6}(?:[-*+]\s+|>\s*)?#{0,6}\s*(?:\*\*)?\s*(ADDED|MODIFIED|REMOVED|RENAMED)\b/
+
+/**
+ * Extracts the requirement-operation markers from one delta spec body, in
+ * order of appearance. Pure so inference is unit-testable without files.
+ */
+export function deltaOperationsIn(body: string): Array<"ADDED" | "MODIFIED" | "REMOVED"> {
+  const out: Array<"ADDED" | "MODIFIED" | "REMOVED"> = []
+  for (const line of body.split("\n")) {
+    const match = deltaOperationPattern.exec(line)
+    if (!match) continue
+    const marker = match[1]!
+    const op: "ADDED" | "MODIFIED" | "REMOVED" = marker === "RENAMED" ? "MODIFIED" : marker === "ADDED" || marker === "MODIFIED" || marker === "REMOVED" ? marker : "MODIFIED"
+    if (!out.includes(op)) out.push(op)
+  }
+  return out
+}
+
+/**
+ * The conventional branch prefix for a change, derived deterministically from
+ * its own delta specs: any `ADDED` requirement → `feat`, every requirement
+ * `MODIFIED` (or `RENAMED`) → `change`, only `REMOVED` → `fix`. Mixed
+ * operations with no addition — the ambiguous middle — resolve to `feat`,
+ * and a change with no delta specs yet (nothing written under `specs/`) also
+ * starts as `feat`. Needs no model and encodes what the author already wrote.
+ */
+export function inferChangePrefix(deltaBodies: readonly string[]): ChangePrefix {
+  const ops = new Set(deltaBodies.flatMap((body) => deltaOperationsIn(body)))
+  if (ops.has("ADDED")) return "feat"
+  if (ops.size === 1 && ops.has("REMOVED")) return "fix"
+  if (ops.size === 1 && ops.has("MODIFIED")) return "change"
+  return "feat"
+}
+
+/** The deterministic branch name for spinning out a change: `<prefix>/<change-id>`. */
+export function branchNameForChange(changeId: string, prefix: string): string {
+  return `${prefix}/${changeId}`
+}
+
+/**
+ * Validates a `--prefix` override. Accepts the change prefixes plus every
+ * conventional-commit type, so an operator can spin a docs-only change onto
+ * `docs/<id>`; anything else is refused rather than guessed.
+ */
+export function detectSpinPrefixOverride(value: string): ChangePrefix | BranchType {
+  const normalized = value.trim().toLowerCase()
+  if (normalized === "feat" || normalized === "change" || normalized === "fix") return normalized
+  if (isBranchType(normalized)) return normalized
+  throw new Error(`--prefix must be one of: change, ${branchTypes.join(", ")} (got "${value}")`)
+}
+
+/**
  * The namer is a registered read-only agent, not a bare `system` string on the
  * default agent: an extra system message leaves opencode's conversational
  * coding persona in charge, which is how a reply ending in "¿Cuál es tu

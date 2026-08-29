@@ -1,16 +1,22 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { execFile as nodeExecFile } from "node:child_process"
+import { promisify } from "node:util"
 
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
 
 import {
   browseSpecs,
   classifySpecArtifact,
+  groupChangeArtifacts,
   loadSpecsView,
   printSpecsList,
   specArtifactLabel,
+  specGroupSource,
   specsIteratePrompt,
+  type SpecGroup,
+  type SpecsChangeEntry,
 } from "../src/specs"
 
 let root: string
@@ -265,5 +271,137 @@ describe("buildIterateSessionInput", () => {
     const view = await loadSpecsView(root)
     const input = buildIterateSessionInput(root, view, "not-a-change")
     expect(input.prompt).toContain(join("openspec", "changes", "not-a-change") + "/")
+  })
+})
+
+describe("groupChangeArtifacts", () => {
+  function change(artifacts: SpecsChangeEntry["artifacts"]): SpecsChangeEntry {
+    return { kind: "change", id: "multi", title: "Multi", artifacts }
+  }
+
+  test("merges multi-capability deltas into one Delta Specs group in stable order", () => {
+    // loadSpecsView pre-sorts artifacts into canonical order before grouping,
+    // so the group order is stable regardless of filesystem read order.
+    const groups = groupChangeArtifacts(
+      change([
+        { section: "proposal", file: "/c/proposal.md" },
+        { section: "design", file: "/c/design.md" },
+        { section: "tasks", file: "/c/tasks.md" },
+        { section: "delta", capability: "cli", file: "/c/specs/cli/spec.md" },
+        { section: "delta", capability: "ui", file: "/c/specs/ui/spec.md" },
+      ]),
+    )
+    // Stable order, one merged delta group regardless of how many capabilities.
+    expect(groups.map((group) => group.label)).toEqual(["Proposal", "Design", "Tasks", "Delta Specs"])
+    expect(groups).toHaveLength(4)
+    const delta = groups.find((group) => group.delta)!
+    expect(delta.entries.map((entry) => entry.capability)).toEqual(["cli", "ui"])
+    expect(delta.entries.every((entry) => entry.file.startsWith("/c/specs/"))).toBe(true)
+    // Input order independence: the group set is identical if deltas appear first.
+    const shuffled = groupChangeArtifacts(
+      change([
+        { section: "delta", capability: "ui", file: "/c/specs/ui/spec.md" },
+        { section: "proposal", file: "/c/proposal.md" },
+        { section: "delta", capability: "cli", file: "/c/specs/cli/spec.md" },
+      ]),
+    )
+    expect(shuffled.map((group) => group.label).sort()).toEqual(["Delta Specs", "Proposal"])
+  })
+
+  test("a lone delta capability and Other land as their own groups", () => {
+    const groups = groupChangeArtifacts(
+      change([
+        { section: "delta", capability: "cli", file: "/c/specs/cli/spec.md" },
+        { section: "other", file: "/c/notes.md" },
+      ]),
+    )
+    expect(groups.map((group) => group.label)).toEqual(["Delta Specs", "Other"])
+    expect(groups[0]!.delta).toBe(true)
+    expect(groups[1]!.delta).toBe(false)
+  })
+})
+
+describe("specGroupSource", () => {
+  const bodyOf = (file: string) => `BODY of ${file}`
+
+  test("injects a capability heading before each delta entry only", () => {
+    const group: SpecGroup = {
+      label: "Delta Specs",
+      delta: true,
+      entries: [
+        { file: "specs/cli/spec.md", capability: "cli" },
+        { file: "specs/ui/spec.md", capability: "ui" },
+      ],
+    }
+    const source = specGroupSource(group, bodyOf)
+    expect(source).toBe("## cli\n\nBODY of specs/cli/spec.md\n\n## ui\n\nBODY of specs/ui/spec.md")
+  })
+
+  test("non-delta bodies pass through untouched, frontmatter included", () => {
+    const design = "---\nowner: someone\n---\n# Design\n"
+    const source = specGroupSource({ label: "Design", delta: false, entries: [{ file: "design.md" }] }, () => design)
+    expect(source).toBe(design)
+  })
+
+  test("a delta entry without a capability contributes only its body (no heading)", () => {
+    const source = specGroupSource({ label: "Delta Specs", delta: true, entries: [{ file: "specs/core.md" }] }, bodyOf)
+    expect(source).toBe("BODY of specs/core.md")
+  })
+})
+
+describe("SC-1: the board shows features spun out into worktrees", () => {
+  test("a change living in a feature worktree still appears in Active Changes from main", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "convoy-specs-sc1-"))
+    const exec = promisify(nodeExecFile)
+    const git = async (...args: string[]) => (await exec("git", args, { cwd: repo })).stdout.trim()
+    try {
+      await git("init", "-b", "main")
+      await git("config", "user.email", "operator@example.com")
+      await git("config", "user.name", "Operator")
+      await writeFile(join(repo, "README.md"), "# repo\n")
+      await git("add", ".")
+      await git("commit", "-m", "chore: init")
+
+      // An uncommitted change on main, then spin it into a worktree — exactly
+      // the move `convoy spin` performs (change files leave main and arrive
+      // untracked in the feature worktree).
+      const changeDir = join(repo, "openspec", "changes", "add-widget")
+      await mkdir(join(changeDir, "specs", "cli"), { recursive: true })
+      await writeFile(join(changeDir, "proposal.md"), "# Add widget\n")
+      await writeFile(join(changeDir, "tasks.md"), "- [x] one\n- [ ] two\n")
+      await writeFile(join(changeDir, "specs", "cli", "spec.md"), "## ADDED Requirements\n### Requirement: Widget\n")
+
+      const wt = join(repo, "wt")
+      await git("worktree", "add", "-b", "feat/add-widget", wt, "main")
+      for (const rel of ["proposal.md", "tasks.md", "specs/cli/spec.md"]) {
+        await mkdir(join(wt, "openspec", "changes", "add-widget", "specs", "cli"), { recursive: true })
+        await writeFile(join(wt, "openspec", "changes", "add-widget", rel), await readFile(join(changeDir, rel), "utf8"))
+      }
+      await rm(changeDir, { recursive: true, force: true })
+
+      const home = await mkdtemp(join(tmpdir(), "convoy-specs-sc1-home-"))
+      const prevHome = process.env.CONVOY_HOME
+      process.env.CONVOY_HOME = home
+      try {
+        const view = await loadSpecsView(repo)
+        // The spun-out change is visible even though main's openspec/changes/
+        // no longer carries it.
+        const entry = view.changes.find((change) => change.id === "add-widget")
+        expect(entry).toBeDefined()
+        expect(entry!.title).toBe("Add widget")
+        expect(entry!.artifacts.length).toBeGreaterThan(0)
+        // Artifact paths are absolute into the worktree, so the browser's
+        // readFile (run from main's cwd) can load them.
+        const file = entry!.artifacts[0]!.file
+        expect(file).toContain(wt)
+        await expect(readFile(file, "utf8")).resolves.toContain("Add widget")
+      } finally {
+        if (prevHome === undefined) delete process.env.CONVOY_HOME
+        else process.env.CONVOY_HOME = prevHome
+        await rm(home, { recursive: true, force: true })
+      }
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
   })
 })

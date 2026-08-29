@@ -78,7 +78,7 @@ export function backupRefFor(branch: string) {
  * repo convoy bootstrapped itself (whose root commit is authored by convoy)
  * from having its root swallowed.
  */
-export async function resolveSquashRange(cwd: string, baseRef: string): Promise<SquashRange> {
+export async function resolveSquashRange(cwd: string, baseRef: string, options: { extraSquashable?: (commit: CommitInfo) => boolean } = {}): Promise<SquashRange> {
   const branch = await currentBranch(cwd)
   if (!branch) {
     return { ok: false, reason: "detached", message: "HEAD is detached; check out the run's branch before finishing it" }
@@ -102,7 +102,10 @@ export async function resolveSquashRange(cwd: string, baseRef: string): Promise<
   const commits: CommitInfo[] = []
   let stoppedAt: CommitInfo | undefined
   for (const commit of history) {
-    if (commit.authorEmail !== convoyAuthorEmail) {
+    // `extraSquashable` lets a caller fold in specific user-identity commits
+    // it created itself (close's archive commit) without weakening the rule
+    // for anything the operator wrote.
+    if (commit.authorEmail !== convoyAuthorEmail && !options.extraSquashable?.(commit)) {
       stoppedAt = commit
       break
     }

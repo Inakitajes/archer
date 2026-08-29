@@ -38,7 +38,12 @@ const statusArgs = ["status", "--porcelain=v1", "--untracked-files=all"]
 // their entire git config, signature included.
 const commitArgs = ["commit", "--no-gpg-sign"]
 
-async function execFile(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
+/**
+ * Shared with the control board's reads (`openspec list --json`, `git cherry`),
+ * which need the same non-throwing `allowFailure` spawn semantics as the git
+ * helpers below.
+ */
+export async function execFile(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
   const proc = Bun.spawn([command, ...args], {
     cwd: options.cwd,
     env: { ...process.env, ...options.env },

@@ -1,10 +1,11 @@
 import { readdir, readFile } from "node:fs/promises"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { stdin, stdout } from "node:process"
 
+import type { FeatureRow, WorktreeWithoutSpec } from "./control-board"
 import {
   collectDirRelativeMarkdown,
-  isOpenSpecChangeId,
+  listChangeIds,
   openspecDirName,
   stripYamlFrontmatter,
   titleFromProposal,
@@ -46,6 +47,15 @@ export type SpecsView = {
   present: boolean
   changes: SpecsChangeEntry[]
   specs: string[]
+  /**
+   * The control board's derived rows, keyed to `changes` by id, when the board
+   * join ran (interactive use). Undefined in plain listings that never need it.
+   */
+  rows?: FeatureRow[]
+  /** Worktrees carrying runs but no OpenSpec change — a peer board section. */
+  worktreesWithoutSpec?: WorktreeWithoutSpec[]
+  /** The repo's detected base branch, for the sync/merged markers. */
+  baseBranch?: string
 }
 
 /**
@@ -56,6 +66,14 @@ export type SpecsResolution =
   | { type: "exit" }
   | { type: "apply-change"; changeID: string }
   | { type: "iterate-change"; changeID: string }
+  /** Spin out a stranded change into its own worktree (`convoy spin`'s flow). */
+  | { type: "spin-change"; changeID: string }
+  /** Continue a feature: the launcher preselects its existing worktree and branch. */
+  | { type: "continue-change"; changeID: string; worktreeDir: string; branch: string }
+  /** Run the full closing sequence (sync → archive → squash → merge) for a feature. */
+  | { type: "close-change"; changeID: string; worktreeDir: string; branch: string }
+  /** Archive a probably-merged-but-unarchived change in the main checkout. */
+  | { type: "archive-change-main"; changeID: string }
 
 /** Artifact order in the detail view: the named planning sections first, then deltas, then leftovers. */
 const sectionOrder: Record<SpecArtifactSection, number> = { proposal: 0, design: 1, tasks: 2, delta: 3, other: 4 }
@@ -102,22 +120,75 @@ export function specArtifactLabel(section: SpecArtifactSection, capability?: str
  * Loads everything the specs browser shows. Returns `{ present: false }` when
  * the repo has no `openspec/` directory — the brownfield signal the command
  * turns into a quiet "no specs found". A change dir that lost its proposal
- * still lists by id; unreadable files never throw.
+ * still lists by id; unreadable files never throw. When openspec state exists,
+ * the control board's live join (git worktrees, task counts, run plans) is
+ * assembled too so the browser renders derived state — every fact computed at
+ * load time, nothing persisted.
  */
 export async function loadSpecsView(targetDir: string): Promise<SpecsView> {
   const openspecRoot = join(targetDir, openspecDirName)
   if (!(await dirExists(openspecRoot))) return { present: false, changes: [], specs: [] }
 
   const changesDir = join(openspecRoot, "changes")
-  const ids = (await listChangeDirs(changesDir)).filter(isOpenSpecChangeId)
+  const ids = await listChangeIds(changesDir)
   const changes = await Promise.all(ids.map((id) => loadSpecsChange(changesDir, id)))
 
   // Relative to the repo root so detail views can read straight off it.
   const specs = await collectDirRelativeMarkdown(join(openspecRoot, "specs"), join(openspecDirName, "specs"))
-  return { present: true, changes, specs }
+
+  // The board join is additive: a failure (git missing, unreadable runs dir)
+  // degrades the derived state instead of failing the browser.
+  try {
+    const { assembleControlBoard, createBoardReads } = await import("./control-board")
+    const board = await assembleControlBoard(createBoardReads(targetDir))
+    // SC-1: spin moves a change's files into a feature worktree, so the board —
+    // whose rows are assembled over every `git worktree` — sees features the
+    // main checkout's `openspec/changes/` no longer carries. Those worktree
+    // changes must land in the Active Changes list too, or a feature spun out
+    // while `convoy control` runs from main appears nowhere and its row actions
+    // stay unreachable.
+    const merged = await mergeWorktreeChanges(changes, board.rows)
+    return {
+      present: true,
+      changes: merged,
+      specs,
+      rows: board.rows,
+      worktreesWithoutSpec: board.worktreesWithoutSpec,
+      ...(board.baseBranch ? { baseBranch: board.baseBranch } : {}),
+    }
+  } catch {
+    return { present: true, changes, specs }
+  }
 }
 
-async function loadSpecsChange(changesDir: string, id: string): Promise<SpecsChangeEntry> {
+/**
+ * Appends changes the board derived from feature worktrees that the current
+ * checkout does not show. Each such change's artifacts are loaded from its own
+ * worktree and their file paths are **absolute** — the browser reads them
+ * against its process cwd (the launch checkout), and a worktree path is the
+ * only one that resolves there. Main-checkout changes keep their repo-relative
+ * paths. Order stays alphabetical by id so the list reads stably.
+ */
+async function mergeWorktreeChanges(changes: SpecsChangeEntry[], rows: FeatureRow[] | undefined): Promise<SpecsChangeEntry[]> {
+  if (!rows) return changes
+  const seen = new Set(changes.map((change) => change.id))
+  const out = [...changes]
+  for (const row of rows) {
+    if (row.location !== "worktree" || seen.has(row.id)) continue
+    const worktreeChangesDir = join(row.worktreeDir ?? "", openspecDirName, "changes")
+    // A change with no artifacts still lists by its id (same as main).
+    const entry = await loadSpecsChange(worktreeChangesDir, row.id, { absolute: true })
+    out.push(entry)
+    seen.add(row.id)
+  }
+  return out.sort((a, b) => a.id.localeCompare(b.id))
+}
+
+async function loadSpecsChange(
+  changesDir: string,
+  id: string,
+  options: { absolute?: boolean } = {},
+): Promise<SpecsChangeEntry> {
   const changeRoot = join(changesDir, id)
   let title = id
   try {
@@ -127,9 +198,13 @@ async function loadSpecsChange(changesDir: string, id: string): Promise<SpecsCha
     // A change without a readable proposal still lists by its id.
   }
   const relatives = await collectDirRelativeMarkdown(changeRoot, ".")
+  const fileBase = options.absolute
+    ? // Absolute so the browser's readFile resolves regardless of its cwd.
+      resolve(changeRoot)
+    : join(openspecDirName, "changes", id)
   const artifacts = relatives.map((relative) => ({
     ...classifySpecArtifact(relative),
-    file: join(openspecDirName, "changes", id, relative),
+    file: join(fileBase, relative),
   }))
   artifacts.sort((a, b) => sectionOrder[a.section] - sectionOrder[b.section] || a.file.localeCompare(b.file))
   return { kind: "change", id, title, artifacts }
@@ -233,15 +308,55 @@ async function dirExists(dir: string): Promise<boolean> {
   }
 }
 
+// ── artifact grouping (the board's reading level) ────────────────────────
+
 /**
- * Real (non-symlink) directory entries of `openspec/changes/`, sorted. Stray
- * files are skipped here and dotfiles/archive by `isOpenSpecChangeId`.
+ * One reading-level group of a subject's artifacts. Delta specs always merge
+ * into a single "Delta Specs" group no matter how many capabilities they span
+ * — the tab strip stays short and the merged source carries per-capability
+ * headings (design D9).
  */
-async function listChangeDirs(dir: string): Promise<string[]> {
-  try {
-    const dirents = await readdir(dir, { withFileTypes: true })
-    return dirents.filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).map((entry) => entry.name).sort()
-  } catch {
-    return []
-  }
+export type SpecGroup = {
+  label: string
+  /** True when this group merges delta specs across capabilities. */
+  delta: boolean
+  entries: Array<{ file: string; capability?: string }>
 }
+
+/**
+ * Groups a change's artifacts into the reading level's stable order:
+ * Proposal, Design, Tasks, one merged Delta Specs, then Other. A change with
+ * a single group hides the tab strip entirely in the browser.
+ */
+export function groupChangeArtifacts(change: SpecsChangeEntry): SpecGroup[] {
+  const groups: SpecGroup[] = []
+  const byLabel = new Map<string, SpecGroup>()
+  for (const artifact of change.artifacts) {
+    const label = specArtifactLabel(artifact.section, artifact.section === "delta" ? undefined : artifact.capability)
+    let group = byLabel.get(label)
+    if (!group) {
+      group = { label, delta: artifact.section === "delta", entries: [] }
+      byLabel.set(label, group)
+      groups.push(group)
+    }
+    group.entries.push({ file: artifact.file, ...(artifact.capability ? { capability: artifact.capability } : {}) })
+  }
+  return groups
+}
+
+/**
+ * Builds the one source string a group's readers share — the detail pane's
+ * markdown and the copy-to-clipboard payload are the same bytes. Delta groups
+ * inject a small heading naming each capability before that capability's
+ * files, so a merged tab still says what came from where.
+ */
+export function specGroupSource(group: SpecGroup, bodyOf: (file: string) => string): string {
+  const parts: string[] = []
+  for (const entry of group.entries) {
+    const body = bodyOf(entry.file)
+    if (group.delta && entry.capability) parts.push(`## ${entry.capability}\n\n${body}`)
+    else parts.push(body)
+  }
+  return parts.join("\n\n")
+}
+

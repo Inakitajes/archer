@@ -173,6 +173,67 @@ convoy --change add-login -p implement
 convoy --change add-login -p review
 ```
 
+## The feature lifecycle: control, spin, close
+
+Everything the board shows is derived at render time from git, OpenSpec, and run plans — Convoy keeps no feature registry. If it appears, it is correct; if a worktree is deleted outside Convoy, the next open simply shows it gone.
+
+### The control board (`convoy control`)
+
+```bash
+convoy control   # "convoy specs" is kept as an alias
+```
+
+One board for every feature and spec, in three peer sections:
+
+- **Active Changes** — every active OpenSpec change with its derived state: stage (`stranded on main`, `proposing`, `implementing`, `ready to close`, `probably merged`), tasks done/total, linked runs with the live one marked, an uncommitted-proposal marker, and sync/merged-ness signals (`unsynced`, `probably merged` — patch equivalence can prove probability, never certainty).
+- **Worktrees without spec** — worktrees carrying runs but no OpenSpec change, linking the plain isolated-run flow back into the board.
+- **Canonical Specs** — the merged specs under `openspec/specs/`.
+
+Enter a change (or spec) to read it in a full-width pane under a tab strip: one tab per artifact group — Proposal, Design, Tasks, one merged Delta Specs tab (per-capability headings injected), Other when present — switched with `←`/`→` (`h`/`l`) or digits `1`–`9`, scrolled with `↑`/`↓`. A subject with a single group hides the strip. Press `v` for the fullscreen reader (title bar with `c copy` and scroll position; `v`/`esc`/`q` to close, tabs still switch inside, `c` copies the active tab's markdown through the same clipboard pipeline as the run dashboard), `a` to apply the change in the launcher, `i` to open a standalone OpenCode session on the change's planning files, `q` to quit.
+
+Row actions move a feature along:
+
+- **`s` — spin out** a change stranded on main (same as `convoy spin`, below).
+- **`c` — continue** hands the feature to the launcher reusing its existing worktree and branch: no new worktree, no branch namer, the branch frozen into the plan. (When the launcher itself runs inside a worktree, enabling isolation stays default-off and shows an informational warning naming the fork point.)
+- **`x` — close** runs the full closing sequence (below).
+- **`m` — archive on main** remediates a probably-merged-but-unarchived change: archive in the main checkout, no sync/squash/merge, because there is nothing left to merge.
+
+### Spinning a feature out (`convoy spin`)
+
+```bash
+convoy spin                     # resolve the uncommitted change (several → list and stop)
+convoy spin --change add-login  # pin the change
+convoy spin --prefix fix        # override the inferred conventional prefix
+```
+
+Given an uncommitted OpenSpec change on the base checkout, spin creates an isolated worktree on a branch named `<prefix>/<change-id>`, the prefix inferred deterministically from the change's own delta specs: any `ADDED` requirement → `feat`, every requirement `MODIFIED`/`RENAMED` → `change`, only `REMOVED` → `fix` (mixed without an addition, or no deltas yet → `feat`). The worktree location follows the repository's documented worktree convention exactly like launcher-isolated runs. The uncommitted change files move into the worktree (untracked only — committed files stay put and arrive via the base ref), nothing is committed, and the handoff names the directory, the branch, and the next step:
+
+```text
+spun out add-login → ~/.convoy/worktrees/feat-add-login
+branch: feat/add-login
+continue the same OpenCode conversation: run /move and pick the worktree above
+```
+
+The operator's OpenCode session relocates with `/move` (OpenCode's own command — Convoy never forks or summarizes a session). If `/move`'s picker doesn't list the fresh worktree, open a session in the printed directory instead. A tree dirty outside `openspec/` refuses to spin; a change already committed on the base branch spins with nothing moved. Spin also keeps the global `/spin` OpenCode command installed — a thin wrapper at `~/.config/opencode/commands/spin.md` that tells the agent to run `convoy spin` and relay its output, touching no other command files.
+
+### Closing a feature (`convoy close`)
+
+```bash
+convoy close                       # run inside the feature worktree
+convoy close --branch feat/add-login
+convoy close --resume              # continue after a stopped sequence
+```
+
+One resumable sequence, each step checked before it runs:
+
+1. **Preflight** — clean tree (commit or stash), all tasks complete (naming the missing count), no live run attached (wait for or stop it).
+2. **Sync** — merge the base branch into the feature branch inside the worktree. Conflicts stop with the conflict listed; resolve, commit, and `close --resume`.
+3. **Archive** — through the OpenSpec CLI (`openspec archive`), never by hand: the change moves to the archive layout and the result is committed on the feature branch under your identity.
+4. **Squash** — the same authorship-anchored walk `convoy finish` uses: your commits survive, convoy's collapse into one conventional commit.
+5. **Merge** — into the base branch from the main checkout (which must already sit on the base branch and be clean; Convoy never moves your checkout for you).
+
+Push, branch delete, and worktree removal are printed as follow-up commands and never run automatically.
+
 ## Goal mode
 
 Goal mode answers the "when is it enough?" question mechanically: **don't stop until the branch scores at or above a target**, or until the score stops improving.

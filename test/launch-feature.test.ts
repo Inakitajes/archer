@@ -1,0 +1,167 @@
+import { describe, expect, test } from "bun:test"
+
+import { LaunchPicker, detectInsideWorktree } from "../src/launch-tui"
+import { buildRunPlan } from "../src/run-plan"
+import { createTestRenderer } from "@opentui/core/testing"
+import { execFile as nodeExecFile } from "node:child_process"
+import { mkdtemp, realpath, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { promisify } from "node:util"
+import { afterAll } from "bun:test"
+
+const exec = promisify(nodeExecFile)
+const dirs: string[] = []
+
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  const { stdout } = await exec("git", args, { cwd })
+  return stdout.trim()
+}
+
+/** A repo with main plus one feature worktree, like the board's rows join them. */
+async function makeRepoWithWorktree(): Promise<{ mainDir: string; worktreeDir: string }> {
+  const mainDir = await mkdtemp(join(tmpdir(), "convoy-launch-wt-"))
+  dirs.push(mainDir)
+  await git(mainDir, "init", "-b", "main")
+  await git(mainDir, "config", "user.email", "o@e.com")
+  await git(mainDir, "config", "user.name", "O")
+  await Bun.write(join(mainDir, "README.md"), "# repo\n")
+  await git(mainDir, "add", ".")
+  await git(mainDir, "commit", "-m", "chore: init")
+  const worktreeDir = join(mainDir, "wt")
+  await git(mainDir, "worktree", "add", "-b", "feat/add-foo", worktreeDir)
+  return { mainDir: await realpath(mainDir), worktreeDir: await realpath(worktreeDir) }
+}
+
+afterAll(async () => {
+  await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+})
+
+type PickerView = {
+  toggleState: { worktree: boolean; [key: string]: unknown }
+  selectedChangeId?: string
+  runSelection(pipelineName: string, initializeGit?: boolean): {
+    targetDir: string
+    isolateWorktree: boolean
+    branchName?: string
+    worktreeDir?: string
+    change?: string
+  }
+  optionsDetail(width: number): { chunks: Array<{ text: string }> }
+}
+
+const feature = { changeID: "add-foo", worktreeDir: "/wt/feat-add-foo", branch: "feat/add-foo" }
+
+function launcherChoices() {
+  return [
+    {
+      name: "implement",
+      description: "A test pipeline.",
+      source: "built-in" as const,
+      isDefault: true,
+      steps: [],
+      hooks: [],
+      valid: true,
+      advisedSteps: 0,
+      scored: false,
+    },
+  ]
+}
+
+async function createPicker(options: { presetFeature?: typeof feature; insideWorktree?: { dir: string; branch?: string }; isolateDefault?: boolean }) {
+  const testRenderer = await createTestRenderer({ width: 120, height: 40 })
+  const picker = new LaunchPicker(
+    testRenderer.renderer,
+    "/repo",
+    launcherChoices(),
+    "configured",
+    { isolate: options.isolateDefault ?? true, reason: "test" },
+    {} as never,
+    { enabled: true, entries: [] },
+    [{ id: feature.changeID, title: "Add foo" }],
+    [],
+    undefined,
+    options.presetFeature,
+    options.insideWorktree,
+  )
+  return { ...testRenderer, picker }
+}
+
+async function closePicker(session: Awaited<ReturnType<typeof createPicker>>) {
+  session.mockInput.pressKey("c", { ctrl: true })
+  await session.picker.result.catch(() => {})
+}
+
+describe("the launcher's feature-row continue handoff", () => {
+  test("a preset feature disables new-worktree isolation even when the default is on", async () => {
+    const session = await createPicker({ presetFeature: feature, isolateDefault: true })
+    const view = session.picker as unknown as PickerView
+    expect(view.toggleState.worktree).toBe(false)
+    expect(view.selectedChangeId).toBe("add-foo")
+    await closePicker(session)
+  })
+
+  test("the selection targets the existing worktree with its branch frozen, and no namer runs", async () => {
+    const session = await createPicker({ presetFeature: feature })
+    const view = session.picker as unknown as PickerView
+    const selection = view.runSelection("implement")
+    expect(selection.targetDir).toBe("/wt/feat-add-foo")
+    expect(selection.isolateWorktree).toBe(false)
+    expect(selection.branchName).toBe("feat/add-foo")
+    expect(selection.worktreeDir).toBe("/wt/feat-add-foo")
+    expect(selection.change).toBe("add-foo")
+    await closePicker(session)
+  })
+
+  test("the frozen selection lands in the plan verbatim: the second run names the same branch and worktree", async () => {
+    const { worktreeDir } = await makeRepoWithWorktree()
+    const plan = buildRunPlan({
+      prompt: { source: "inline", text: "continue add-foo" },
+      targetDir: worktreeDir,
+      baseRef: "main",
+      worktree: false,
+      dirty: false,
+      branch: "feat/add-foo",
+      worktreeDir,
+      pipeline: { name: "implement", steps: [] } as never,
+      hooks: { pre: [], post: [], pipelines: {} },
+      files: [],
+      permissions: "yolo",
+    } as never)
+    expect(plan.target.branch).toBe("feat/add-foo")
+    expect(plan.target.worktreeDir).toBe(worktreeDir)
+    expect(plan.target.worktree).toBe(false)
+  })
+})
+
+describe("the nested-isolation warning", () => {
+  test("enabling isolation inside a worktree names the fork point, informationally", async () => {
+    const session = await createPicker({ insideWorktree: { dir: "/wt/feat-add-foo", branch: "feat/add-foo" } })
+    const view = session.picker as unknown as PickerView
+    view.toggleState.worktree = true
+    const chunks = view.optionsDetail(120).chunks.map((chunk) => chunk.text).join("")
+    expect(chunks).toContain("branch feat/add-foo of worktree /wt/feat-add-foo")
+    expect(chunks).toContain("the new worktree forks from this branch")
+    await closePicker(session)
+  })
+
+  test("no warning outside a worktree, and the default-off behavior is untouched", async () => {
+    const session = await createPicker({ isolateDefault: false })
+    const view = session.picker as unknown as PickerView
+    expect(view.toggleState.worktree).toBe(false)
+    view.toggleState.worktree = true
+    const chunks = view.optionsDetail(120).chunks.map((chunk) => chunk.text).join("")
+    expect(chunks).not.toContain("truly mean it")
+    await closePicker(session)
+  })
+})
+
+describe("detectInsideWorktree", () => {
+  test("the main checkout is not inside a worktree; a linked worktree is", async () => {
+    const { mainDir, worktreeDir } = await makeRepoWithWorktree()
+    expect(await detectInsideWorktree(mainDir)).toBeUndefined()
+    const inside = await detectInsideWorktree(worktreeDir)
+    expect(inside?.dir).toBe(worktreeDir)
+    expect(inside?.branch).toBe("feat/add-foo")
+  })
+})
