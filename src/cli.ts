@@ -698,6 +698,9 @@ export async function openSpecsBrowser(targetDir: string): Promise<void> {
     return
   }
   if (resolution.type === "close-change") {
+    // The board's handoff goes through the dual-mode dispatcher: a TTY gets
+    // the live checklist (progress, message confirmation, cleanup offers),
+    // a pipe gets the headless stdout summary — same event stream either way.
     const { runCloseCommand } = await import("./feature-close-command")
     await runCloseCommand({
       targetDir,

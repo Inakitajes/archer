@@ -30,6 +30,10 @@ export type CommitMessageInput = {
   prompt?: string
   /** The run's concatenated step reports (SUMMARY.md). */
   summary?: string
+  /** The change's proposal document, snapshotted before archive moved it (close). */
+  proposalExcerpt?: string
+  /** The capability names the change's delta specs touch; the enforced scope rule's input (close). */
+  scopeCandidates?: readonly string[]
   /** Subjects of the convoy commits being replaced, newest first. */
   commits: readonly string[]
   diffStat?: string
@@ -45,8 +49,8 @@ export type CommitMessageProposal = {
   error?: string
 }
 
-/** Cheap, fast model used to write the squashed commit message. */
-export const defaultCommitMessageModel = "anthropic/claude-haiku-4-5"
+/** Cheap, fast model used to write the squashed commit message (`finish` and `close` share it). */
+export const defaultCommitMessageModel = "openrouter/z-ai/glm-5.3-flash"
 
 /** Registered so the writer replaces opencode's default coding agent instead of merely appending to it. */
 const writerAgentName = "convoy-commit-writer"
@@ -189,7 +193,16 @@ export async function askForCommitMessage(client: OpencodeClient, input: CommitM
 export function commitMessagePrompt(input: CommitMessageInput): string {
   const parts: string[] = [`Branch: ${input.branch}`]
   if (input.summary?.trim()) parts.push(`What the run reported doing:\n${excerpt(input.summary.trim())}`)
+  if (input.proposalExcerpt?.trim()) parts.push(`The change's proposal document:\n${excerpt(input.proposalExcerpt.trim())}`)
   if (input.prompt?.trim()) parts.push(`What the user originally asked for:\n${excerpt(input.prompt.trim())}`)
+  if (input.scopeCandidates && input.scopeCandidates.length > 0) {
+    parts.push(`Touched capabilities: ${input.scopeCandidates.join(", ")}`)
+    if (input.scopeCandidates.length === 1) {
+      parts.push(`Use "${input.scopeCandidates[0]}" as the scope — the change touches exactly one capability.`)
+    } else {
+      parts.push("The change touches several capabilities, so omit the scope entirely.")
+    }
+  }
   if (input.commits.length > 0) parts.push(`The step commits being squashed:\n${input.commits.map((subject) => `- ${subject}`).join("\n")}`)
   if (input.diffStat?.trim()) parts.push(`Diffstat:\n${excerpt(input.diffStat.trim())}`)
   return parts.join("\n\n")
@@ -276,6 +289,84 @@ export function templateCommitMessage(input: CommitMessageInput): ConventionalMe
     .filter(Boolean)
     .slice(0, maxBodyLines)
   return { type, subject: capSubject(type, undefined, subject), body }
+}
+
+/**
+ * Enforces the close capability's scope rule on a writer's proposal (design D1):
+ * exactly one touched capability becomes the scope, zero or several remove it.
+ * The change id is injected into the body of a composed message — the subject
+ * never carries the slug. The model proposes; this decides.
+ */
+export function normalizeComposedMessage(
+  message: ConventionalMessage,
+  opts: { scopeCandidates?: readonly string[]; changeID?: string } = {},
+): ConventionalMessage {
+  const candidates = opts.scopeCandidates ?? []
+  const scope = candidates.length === 1 ? cleanScope(candidates[0]!) || undefined : undefined
+  let body = message.body
+  // Skip only when the id is named the way this rule names it ("change <id>"),
+  // not when a collapsed commit subject merely happens to contain the id.
+  if (opts.changeID && !body.some((line) => line.includes(`change ${opts.changeID}`))) {
+    body = [`change ${opts.changeID}`, ...body]
+  }
+  body = body.slice(0, maxBodyLines)
+  return {
+    type: message.type,
+    ...(scope ? { scope } : {}),
+    subject: capSubject(message.type, scope, message.subject),
+    body,
+  }
+}
+
+/**
+ * Type-appropriate imperative verbs for the deterministic close fallback
+ * (design D1); anything not listed updates.
+ */
+const closeFallbackVerbs: Record<string, string> = {
+  feat: "improve",
+  perf: "improve",
+  fix: "fix",
+  refactor: "refactor",
+  docs: "document",
+  test: "test",
+}
+
+/**
+ * The deterministic close fallback: the branch prefix as type (`change/`
+ * branches keep their spin-specific prefix, like close's own branchPrefix),
+ * the same sole-capability scope rule, an imperative verb plus the normalized
+ * proposal title, the change id first in the body, then the collapsed step
+ * commits. Used when the writer model answers nothing usable.
+ */
+export function closeFallbackCommitMessage(input: {
+  branch: string
+  proposal?: string
+  changeID?: string
+  scopeCandidates?: readonly string[]
+  commits?: readonly string[]
+}): ConventionalMessage {
+  const { type, rest } = splitCloseBranch(input.branch)
+  const verb = closeFallbackVerbs[type] ?? "update"
+  const title = cleanSubject(firstMeaningfulLine(input.proposal ?? "")).toLowerCase()
+  const slug = cleanSubject(rest.replace(/-/g, " "))
+  const subject = title ? `${verb} ${title}` : slug ? `${verb} ${slug}` : "update"
+  const body = (input.commits ?? [])
+    .map((line) => line.replace(/^convoy\([^)]*\):\s*/, "").trim())
+    .filter(Boolean)
+    .slice(0, maxBodyLines)
+  return normalizeComposedMessage({ type, subject, body }, {
+    scopeCandidates: input.scopeCandidates,
+    ...(input.changeID ? { changeID: input.changeID } : {}),
+  })
+}
+
+/** Like splitBranch, but `change` (spin's all-modified prefix) is a valid close type. */
+function splitCloseBranch(branch: string): { type: string; rest: string } {
+  const match = /^([a-z]+)\/(.+)$/i.exec(branch.trim())
+  if (!match) return { type: defaultCommitType, rest: branch.trim() }
+  const prefix = match[1]!.toLowerCase()
+  const type = (commitTypes as readonly string[]).includes(prefix) || prefix === "change" ? prefix : defaultCommitType
+  return { type, rest: match[2]! }
 }
 
 /** Renders the message as git receives it: subject line, blank line, bullet body. */

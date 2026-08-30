@@ -406,6 +406,16 @@ export async function pushBranch(branch: string, remote: string, cwd: string) {
   if (exitCode !== 0) throw new Error(`git push exited with code ${exitCode}`)
 }
 
+/**
+ * Pushes an explicit refspec (`<local>:<remote>`) without touching upstream
+ * config — the shape close uses for the base branch, whose remote mapping is
+ * resolved from its configured upstream rather than guessed.
+ */
+export async function pushRefspec(remote: string, refspec: string, cwd: string) {
+  const exitCode = await execFileInherited(["push", remote, refspec], cwd)
+  if (exitCode !== 0) throw new Error(`git push exited with code ${exitCode}`)
+}
+
 export async function removeWorktree(dir: string, cwd: string) {
   await execFile("git", ["worktree", "remove", "--", dir], { cwd })
 }
@@ -534,6 +544,13 @@ export async function isAncestor(ancestor: string, descendant: string, cwd: stri
 /** The upstream of the current branch (e.g. "origin/feat/x"), or undefined when it has none. */
 export async function upstreamRef(cwd: string): Promise<string | undefined> {
   const result = await execFile("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return undefined
+  return result.stdout.trim() || undefined
+}
+
+/** The configured upstream of any branch (e.g. "origin/main"), or undefined when it has none. */
+export async function branchUpstream(branch: string, cwd: string): Promise<string | undefined> {
+  const result = await execFile("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", `${branch}@{upstream}`], { cwd, allowFailure: true })
   if (result.exitCode !== 0) return undefined
   return result.stdout.trim() || undefined
 }

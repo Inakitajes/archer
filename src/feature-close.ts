@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises"
+import { readdir, readFile, stat } from "node:fs/promises"
 import { join } from "node:path"
 
 import {
@@ -18,6 +18,13 @@ import {
 } from "./git"
 import { branchIdFromBranch, isOpenSpecChangeId, openspecDirName } from "./openspec"
 import { applySquash, resolveSquashRange, type SquashRange } from "./finish"
+import {
+  closeFallbackCommitMessage,
+  formatCommitMessage,
+  normalizeComposedMessage,
+  proposeCommitMessage,
+  type CommitMessageProposal,
+} from "./commit-message"
 import { listRuns } from "./runs"
 
 /**
@@ -30,7 +37,34 @@ import { listRuns } from "./runs"
  * conflicting sync, a manual archive — continues from the first incomplete
  * step without redoing completed ones. Push, branch delete, and worktree
  * removal are offered separately and never happen automatically.
+ *
+ * The sequence narrates itself through one-way `CloseEvent`s (design D3) and
+ * gates the squashed commit behind a separate `resolveMessage` resolver, so
+ * the TTY checklist and the headless formatter consume the same stream.
  */
+
+export type CloseStep = "sync" | "archive" | "squash" | "merge"
+
+/** How the feature branch landed on the base branch (design D5: derived from git state, narrated). */
+export type CloseMergeShape = "fast-forward" | "merge-commit" | "already-up-to-date"
+
+export type CloseEvent =
+  | { type: "preflight"; summary: string }
+  | { type: "preflight-failed"; blockers: readonly ClosePreflightBlocker[] }
+  | { type: "step-started"; step: CloseStep }
+  | { type: "step-completed"; step: CloseStep; detail?: string }
+  | { type: "step-skipped"; step: CloseStep; reason: string }
+  | { type: "step-failed"; step: CloseStep; message: string }
+  | { type: "merge-shape"; shape: CloseMergeShape }
+  | { type: "result"; result: CloseResult }
+
+/** What the message gate hands the operator: the normalized proposal, and where it came from. */
+export type CloseMessageProposal = {
+  message: string
+  source: "model" | "fallback"
+  /** Set when the writing model failed and the message is the deterministic fallback. */
+  error?: string
+}
 
 export type CloseInput = {
   /** The repo (used to detect the base branch and reach the main checkout). */
@@ -43,8 +77,19 @@ export type CloseInput = {
   changeID?: string
   /** Continue a previously stopped sequence: completed steps are detected, not repeated. */
   resume?: boolean
-  /** Override for the squashed conventional commit's subject. */
+  /** Override for the squashed conventional commit's message; wins verbatim and bypasses composition. */
   message?: string
+  /** One-way narration of the sequence (design D3); safe to ignore for scripted calls. */
+  onEvent?: (event: CloseEvent) => void
+  /**
+   * The two-way gate before the squash lands: receives the composed message and
+   * returns the message to commit, or undefined to stop the sequence before the
+   * squash. Headless callers omit it (the proposal is accepted unchanged);
+   * `--message` never reaches it.
+   */
+  resolveMessage?: (proposal: CloseMessageProposal) => Promise<string | undefined>
+  /** Test seam: the commit writer behind composition. Defaults to `proposeCommitMessage`. */
+  writer?: (input: Parameters<typeof proposeCommitMessage>[0]) => Promise<CommitMessageProposal>
 }
 
 export type ClosePreflightBlocker = {
@@ -66,6 +111,8 @@ export type CloseResult = {
   /** The squash outcome; skipped when the branch carried no convoy commits. */
   squashed?: { sha: string; replaced: number }
   merged: boolean
+  /** How the merge landed (design D5); "already-up-to-date" when nothing moved. */
+  mergeShape: CloseMergeShape
 }
 
 export type CloseTarget = {
@@ -120,21 +167,37 @@ async function resolveSame(a: string, b: string): Promise<boolean> {
 }
 
 /**
+ * The preflight state: the blocking conditions (each with its concrete
+ * remediation) plus the one-line summary the checklist renders (design D6:
+ * `clean tree · 24/24 tasks · no live runs`).
+ */
+export type ClosePreflightState = {
+  blockers: ClosePreflightBlocker[]
+  summary: string
+}
+
+/**
  * The three blocking preflight conditions, each with its concrete remediation.
  * Returned (not thrown) so the caller can print them all at once; an empty
  * list means the sequence may start.
  */
 export async function closePreflight(input: CloseInput, target: CloseTarget): Promise<ClosePreflightBlocker[]> {
+  return (await closePreflightState(input, target)).blockers
+}
+
+export async function closePreflightState(input: CloseInput, target: CloseTarget): Promise<ClosePreflightState> {
   const blockers: ClosePreflightBlocker[] = []
 
   // Fail closed: a git status that cannot be read must not be read as "clean",
   // because the sequence that follows rewrites history (squash) and merges it
   // onto the base. If we cannot verify the tree, we refuse (SC-6).
   let porcelain: string
+  let treeVerifiable = true
   try {
     porcelain = await statusPorcelain(target.worktreeDir)
   } catch (error) {
     porcelain = ""
+    treeVerifiable = false
     blockers.push({
       check: "clean-tree",
       message: `couldn't verify the worktree at ${target.worktreeDir} is clean (${error instanceof Error ? error.message : error}) — refusing to rewrite history under an unverifiable tree`,
@@ -148,12 +211,17 @@ export async function closePreflight(input: CloseInput, target: CloseTarget): Pr
   // An already-archived change (a resumed sequence) has no task list to
   // check — its precondition was satisfied and archived away with the change.
   const changeStillPresent = await exists(join(target.worktreeDir, openspecDirName, "changes", target.changeID))
+  let taskSummary: string | undefined
   if (changeStillPresent) {
     const tasks = (await openspecTaskCounts(target.worktreeDir)).get(target.changeID)
     if (!tasks || tasks.total === 0) {
       blockers.push({ check: "tasks", message: `no task list found for change ${target.changeID}; finish the tasks before closing` })
+      taskSummary = "no task list"
     } else if (tasks.done < tasks.total) {
       blockers.push({ check: "tasks", message: `${tasks.total - tasks.done} of ${tasks.total} tasks are incomplete — finish them before closing` })
+      taskSummary = `${tasks.done}/${tasks.total} tasks`
+    } else {
+      taskSummary = `${tasks.done}/${tasks.total} tasks`
     }
   }
 
@@ -177,55 +245,77 @@ export async function closePreflight(input: CloseInput, target: CloseTarget): Pr
     blockers.push({ check: "live-run", message: `${liveCount} live run${liveCount === 1 ? " is" : "s are"} attached to ${target.branch} — wait for or stop ${liveCount === 1 ? "it" : "them"} first` })
   }
 
-  return blockers
+  const parts: string[] = [treeVerifiable ? "clean tree" : "tree unverifiable"]
+  if (taskSummary) parts.push(taskSummary)
+  parts.push(liveCount === 0 ? "no live runs" : `${liveCount} live run${liveCount === 1 ? "" : "s"}`)
+  return { blockers, summary: parts.join(" · ") }
 }
 
 /**
  * The full closing sequence. Throws `Error` on every stop (preflight
- * blockers, sync conflict, archive failure, merge conflict); the error
- * message names the step and the remediation, and `close --resume` picks up
- * from the first incomplete step.
+ * blockers, sync conflict, archive failure, declined message, merge conflict);
+ * the error message names the step and the remediation, and `close --resume`
+ * picks up from the first incomplete step. Every state change the renderers
+ * need travels through `input.onEvent` (design D3) — the TTY checklist and the
+ * headless formatter consume the same stream, so narration has one source.
  */
 export async function runClose(input: CloseInput): Promise<CloseResult> {
+  const emit = (event: CloseEvent) => input.onEvent?.(event)
   const target = await resolveCloseTarget(input)
   const baseRef = await closeBaseRef(input.targetDir)
 
   // Preflight: refuse to touch anything until the feature is ready to close.
-  const blockers = await closePreflight(input, target)
-  if (blockers.length > 0) {
-    throw new Error(`close preflight failed:\n  ${blockers.map((blocker) => blocker.message).join("\n  ")}`)
+  const preflight = await closePreflightState(input, target)
+  if (preflight.blockers.length > 0) {
+    emit({ type: "preflight-failed", blockers: preflight.blockers })
+    throw new Error(`close preflight failed:\n  ${preflight.blockers.map((blocker) => blocker.message).join("\n  ")}`)
   }
+  emit({ type: "preflight", summary: preflight.summary })
 
   // Sync: bring the base branch's tip in before archiving, so the canonical
   // specs the archive produces land against a fresh base.
   let syncMergeSha: string | undefined
-  if (!(await isAncestor(baseRef, target.branch, target.worktreeDir))) {
+  if (await isAncestor(baseRef, target.branch, target.worktreeDir)) {
+    emit({ type: "step-skipped", step: "sync", reason: `${baseRef} is already an ancestor of ${target.branch}` })
+  } else {
+    emit({ type: "step-started", step: "sync" })
     const merge = await execFile("git", ["merge", "--no-edit", baseRef], { cwd: target.worktreeDir, allowFailure: true })
     if (merge.exitCode !== 0) {
-      throw new Error(
-        `sync: merging ${baseRef} into ${target.branch} conflicted — resolve the conflicts and commit inside the worktree, then run \`convoy close --resume\`\n${merge.stderr || merge.stdout}`,
-      )
+      const message = `sync: merging ${baseRef} into ${target.branch} conflicted — resolve the conflicts and commit inside the worktree, then run \`convoy close --resume\`\n${merge.stderr || merge.stdout}`
+      emit({ type: "step-failed", step: "sync", message })
+      throw new Error(message)
     }
     // The clean sync just wrote an operator-identity merge commit. The squash
     // below must fold it (plus the convoy commits beneath it) into the one
     // conventional commit, or the raw `convoy(...)` steps leak onto the base
     // branch unchanged.
     syncMergeSha = (await resolveCommit("HEAD", target.worktreeDir)) ?? undefined
+    emit({ type: "step-completed", step: "sync", detail: `merged ${baseRef} into ${target.branch}` })
   }
+
+  // Snapshot the message inputs before the first archive mutation (design D1):
+  // the archive moves the live change, and the archive layout's naming is an
+  // implementation detail the message must never discover.
+  const archiveSubject = `chore(openspec): archive ${target.changeID}`
+  const snapshot = await snapshotCloseContext(target, baseRef, { syncMergeSha, archiveSubject })
 
   // Archive: through the OpenSpec CLI only — convoy never edits openspec/.
   const changeDir = join(target.worktreeDir, openspecDirName, "changes", target.changeID)
   if (await exists(changeDir)) {
+    emit({ type: "step-started", step: "archive" })
     const archive = await execFile("openspec", ["archive", target.changeID, "--yes"], { cwd: target.worktreeDir, allowFailure: true })
     if (archive.exitCode !== 0) {
-      throw new Error(
-        `archive: openspec archive ${target.changeID} failed — the sequence stops before any squash or merge\n${archive.stderr || archive.stdout}`,
-      )
+      const message = `archive: openspec archive ${target.changeID} failed — the sequence stops before any squash or merge\n${archive.stderr || archive.stdout}`
+      emit({ type: "step-failed", step: "archive", message })
+      throw new Error(message)
     }
     // The archive result is committed on the feature branch under the
     // operator's identity (staged explicitly; commitAsUser adds nothing).
     await execFile("git", ["add", openspecDirName], { cwd: target.worktreeDir })
-    await commitAsUser(`chore(openspec): archive ${target.changeID}`, target.worktreeDir)
+    await commitAsUser(archiveSubject, target.worktreeDir)
+    emit({ type: "step-completed", step: "archive", detail: `archived ${target.changeID}` })
+  } else {
+    emit({ type: "step-skipped", step: "archive", reason: `change ${target.changeID} is already archived` })
   }
 
   // Squash: the same authorship-anchored walk `convoy finish` uses, so the
@@ -233,35 +323,27 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
   // close's own archive commit, made under the operator identity — collapse
   // into one conventional commit. A branch with no convoy commits skips the
   // squash and merges as-is.
-  const archiveSubject = `chore(openspec): archive ${target.changeID}`
   let squashed: CloseResult["squashed"]
-  if (syncMergeSha) {
-    // A clean sync left a merge commit on the branch that resolveSquashRange's
-    // authorship-anchored walk would stop dead at (it's operator-identity and
-    // never extraSquashable), farming the merge *and* the raw convoy commits
-    // onto the base. Walk the first-parent line instead — the base side of
-    // the merge lives on the second parent and never enters it — folding the
-    // sync merge, the archive commit, and every convoy commit down to the
-    // operator's own proposal commit, which survives.
-    const range = await closeSyncSquashRange(target.worktreeDir, baseRef, { syncMergeSha, archiveSubject })
-    if (range.ok) {
-      const message = input.message ?? `${branchPrefix(target.branch)}: ${target.changeID}`
-      const result = await applySquash({ cwd: target.worktreeDir, plan: range, message })
-      squashed = { sha: result.sha, replaced: result.replaced }
-    } else if (range.reason !== "no-commits") {
-      throw new Error(`squash: ${range.message}`)
+  const range = syncMergeSha
+    ? await closeSyncSquashRange(target.worktreeDir, baseRef, { syncMergeSha, archiveSubject })
+    : await resolveSquashRange(target.worktreeDir, baseRef, { extraSquashable: (commit) => commit.subject === archiveSubject })
+  if (range.ok) {
+    emit({ type: "step-started", step: "squash" })
+    const message = await resolveSquashMessage(input, { target, snapshot, diffStat: range.diffStat })
+    if (message === undefined) {
+      const stop = "close stopped: the squashed commit message wasn't confirmed — rerun `convoy close --resume` to retry the squash"
+      emit({ type: "step-failed", step: "squash", message: stop })
+      throw new Error(stop)
     }
+    const result = await applySquash({ cwd: target.worktreeDir, plan: range, message })
+    squashed = { sha: result.sha, replaced: result.replaced }
+    emit({ type: "step-completed", step: "squash", detail: `${result.replaced} commit${result.replaced === 1 ? "" : "s"} → ${result.sha.slice(0, 8)}` })
+  } else if (range.reason === "no-commits") {
+    emit({ type: "step-skipped", step: "squash", reason: "no convoy commits to squash" })
   } else {
-    const range = await resolveSquashRange(target.worktreeDir, baseRef, {
-      extraSquashable: (commit) => commit.subject === archiveSubject,
-    })
-    if (range.ok) {
-      const message = input.message ?? `${branchPrefix(target.branch)}: ${target.changeID}`
-      const result = await applySquash({ cwd: target.worktreeDir, plan: range, message })
-      squashed = { sha: result.sha, replaced: result.replaced }
-    } else if (range.reason !== "no-commits") {
-      throw new Error(`squash: ${range.message}`)
-    }
+    const message = `squash: ${range.message}`
+    emit({ type: "step-failed", step: "squash", message })
+    throw new Error(message)
   }
 
   // Merge: into the base branch from the main checkout. The main checkout
@@ -270,25 +352,183 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
   const mainDir = (await mainWorktreeDir(input.targetDir)) ?? input.targetDir
   const mainBranch = await currentBranch(mainDir)
   if (mainBranch !== baseRef) {
-    throw new Error(`merge: the main checkout is on ${mainBranch ?? "a detached HEAD"}, not ${baseRef} — check out ${baseRef} there, then run \`convoy close --resume\``)
+    const message = `merge: the main checkout is on ${mainBranch ?? "a detached HEAD"}, not ${baseRef} — check out ${baseRef} there, then run \`convoy close --resume\``
+    emit({ type: "step-failed", step: "merge", message })
+    throw new Error(message)
   }
   const mainStatus = await statusPorcelain(mainDir).catch(() => "dirty")
   if (mainStatus.trim() !== "") {
-    throw new Error(`merge: the main checkout has uncommitted changes — commit or stash them first, then run \`convoy close --resume\``)
-  }
-  const merge = await execFile("git", ["merge", "--no-edit", target.branch], { cwd: mainDir, allowFailure: true })
-  if (merge.exitCode !== 0) {
-    throw new Error(`merge: merging ${target.branch} into ${baseRef} failed — resolve in the main checkout, then run \`convoy close --resume\`\n${merge.stderr || merge.stdout}`)
+    const message = "merge: the main checkout has uncommitted changes — commit or stash them first, then run `convoy close --resume`"
+    emit({ type: "step-failed", step: "merge", message })
+    throw new Error(message)
   }
 
-  return {
+  let mergeShape: CloseMergeShape
+  if (await isAncestor(target.branch, baseRef, mainDir)) {
+    emit({ type: "step-skipped", step: "merge", reason: `${target.branch} is already contained in ${baseRef}` })
+    mergeShape = "already-up-to-date"
+    emit({ type: "merge-shape", shape: mergeShape })
+  } else {
+    emit({ type: "step-started", step: "merge" })
+    const baseBefore = (await resolveCommit(baseRef, mainDir)) ?? ""
+    const merge = await execFile("git", ["merge", "--no-edit", target.branch], { cwd: mainDir, allowFailure: true })
+    if (merge.exitCode !== 0) {
+      const message = `merge: merging ${target.branch} into ${baseRef} failed — resolve in the main checkout, then run \`convoy close --resume\`\n${merge.stderr || merge.stdout}`
+      emit({ type: "step-failed", step: "merge", message })
+      throw new Error(message)
+    }
+    mergeShape = await deriveMergeShape(baseBefore, baseRef, mainDir)
+    emit({ type: "merge-shape", shape: mergeShape })
+    emit({ type: "step-completed", step: "merge", detail: mergeShapeDetail(mergeShape) })
+  }
+
+  const result: CloseResult = {
     changeID: target.changeID,
     branch: target.branch,
     worktreeDir: target.worktreeDir,
     baseRef,
     ...(squashed ? { squashed } : {}),
     merged: true,
+    mergeShape,
   }
+  emit({ type: "result", result })
+  return result
+}
+
+/**
+ * The message gate before `applySquash` (design D3): `--message` wins verbatim
+ * and bypasses the writer, normalization, and resolver entirely; otherwise the
+ * composed proposal goes to the resolver, whose undefined answer stops the
+ * sequence before anything lands; headless callers without a resolver accept
+ * the proposal unchanged.
+ */
+async function resolveSquashMessage(
+  input: CloseInput,
+  context: { target: CloseTarget; snapshot: CloseContextSnapshot; diffStat: string },
+): Promise<string | undefined> {
+  if (input.message) return input.message
+  const proposal = await composeCloseMessage(context, input.writer)
+  if (input.resolveMessage) return await input.resolveMessage(proposal)
+  return proposal.message
+}
+
+/**
+ * Snapshot + final diffstat → normalized message proposal (design D1). The
+ * writer's answer is a proposal, not authority: the scope rule is enforced
+ * here, and a writer that answered nothing usable degrades to the
+ * deterministic close fallback without blocking the sequence.
+ */
+async function composeCloseMessage(
+  context: { target: CloseTarget; snapshot: CloseContextSnapshot; diffStat: string },
+  writer?: CloseInput["writer"],
+): Promise<CloseMessageProposal> {
+  const writerInput = {
+    targetDir: context.target.worktreeDir,
+    branch: context.target.branch,
+    commits: context.snapshot.commitSubjects,
+    ...(context.diffStat.trim() ? { diffStat: context.diffStat } : {}),
+    ...(context.snapshot.proposalExcerpt ? { proposalExcerpt: context.snapshot.proposalExcerpt } : {}),
+    ...(context.snapshot.scopeCandidates.length > 0 ? { scopeCandidates: context.snapshot.scopeCandidates } : {}),
+  }
+  const proposal = await (writer ?? proposeCommitMessage)(writerInput)
+  if (proposal.source === "template") {
+    const message = closeFallbackCommitMessage({
+      branch: context.target.branch,
+      proposal: context.snapshot.proposalExcerpt,
+      changeID: context.target.changeID,
+      scopeCandidates: context.snapshot.scopeCandidates,
+      commits: context.snapshot.commitSubjects,
+    })
+    return { message: formatCommitMessage(message), source: "fallback", ...(proposal.error ? { error: proposal.error } : {}) }
+  }
+  const normalized = normalizeComposedMessage(proposal.message, {
+    scopeCandidates: context.snapshot.scopeCandidates,
+    changeID: context.target.changeID,
+  })
+  return { message: formatCommitMessage(normalized), source: "model" }
+}
+
+/** The message inputs, captured before archive moves the live change (task 2.1, design D1). */
+export type CloseContextSnapshot = {
+  changeID: string
+  /** The proposal document's content, read while the live path still existed. */
+  proposalExcerpt?: string
+  /** The capability names under the change's delta specs — the scope rule's candidates. */
+  scopeCandidates: string[]
+  /** The collapsible commit subjects, captured before the archive commit exists. */
+  commitSubjects: string[]
+}
+
+async function snapshotCloseContext(
+  target: CloseTarget,
+  baseRef: string,
+  opts: { syncMergeSha?: string; archiveSubject: string },
+): Promise<CloseContextSnapshot> {
+  const changeDir = join(target.worktreeDir, openspecDirName, "changes", target.changeID)
+  let proposalExcerpt: string | undefined
+  try {
+    proposalExcerpt = await readFile(join(changeDir, "proposal.md"), "utf8")
+  } catch {
+    // A change without a readable proposal still closes; the message just
+    // loses that seed.
+  }
+  return {
+    changeID: target.changeID,
+    ...(proposalExcerpt ? { proposalExcerpt } : {}),
+    scopeCandidates: await listChangeCapabilities(changeDir),
+    commitSubjects: await collapsibleCommitSubjects(target, baseRef, opts),
+  }
+}
+
+/** The capability directories of the change's delta specs, sorted. */
+async function listChangeCapabilities(changeDir: string): Promise<string[]> {
+  try {
+    const entries = await readdir(join(changeDir, "specs"), { withFileTypes: true })
+    return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()
+  } catch {
+    return []
+  }
+}
+
+/**
+ * The pre-archive walk of what will collapse. The archive commit doesn't exist
+ * yet, so the plain authorship-anchored walk already lists every convoy commit;
+ * the sync-aware first-parent walk covers a branch that just synced. A failure
+ * here only costs the message its commit summaries.
+ */
+async function collapsibleCommitSubjects(
+  target: CloseTarget,
+  baseRef: string,
+  opts: { syncMergeSha?: string; archiveSubject: string },
+): Promise<string[]> {
+  try {
+    const range = opts.syncMergeSha
+      ? await closeSyncSquashRange(target.worktreeDir, baseRef, { syncMergeSha: opts.syncMergeSha, archiveSubject: opts.archiveSubject })
+      : await resolveSquashRange(target.worktreeDir, baseRef)
+    return range.ok ? range.commits.map((commit) => commit.subject) : []
+  } catch {
+    return []
+  }
+}
+
+/** The merge shape from git state alone (design D5): SHA movement plus parent count. */
+async function deriveMergeShape(baseBefore: string, baseRef: string, cwd: string): Promise<CloseMergeShape> {
+  const baseAfter = (await resolveCommit(baseRef, cwd)) ?? ""
+  if (!baseBefore || !baseAfter || baseAfter === baseBefore) return "already-up-to-date"
+  const parents = await commitParentCount(baseAfter, cwd)
+  return parents > 1 ? "merge-commit" : "fast-forward"
+}
+
+async function commitParentCount(sha: string, cwd: string): Promise<number> {
+  const result = await execFile("git", ["rev-list", "--parents", "-n", "1", sha], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return 1
+  return Math.max(1, result.stdout.trim().split(/\s+/).length - 1)
+}
+
+function mergeShapeDetail(shape: CloseMergeShape): string {
+  if (shape === "fast-forward") return "merged (fast-forward)"
+  if (shape === "merge-commit") return "merged (merge commit)"
+  return "already up to date"
 }
 
 /**
@@ -333,13 +573,6 @@ export async function closeBaseRef(targetDir: string): Promise<string> {
   const mainDir = (await mainWorktreeDir(targetDir).catch(() => undefined)) ?? targetDir
   const detected = await detectBaseRef(mainDir).catch(() => undefined)
   return detected?.ref ?? "HEAD"
-}
-
-/** The conventional type the squash commit inherits from the branch's own prefix. */
-function branchPrefix(branch: string): string {
-  const slash = branch.indexOf("/")
-  const prefix = slash === -1 ? "" : branch.slice(0, slash)
-  return /^(feat|fix|refactor|perf|docs|test|chore|build|ci|change)$/.test(prefix) ? prefix : "feat"
 }
 
 /**

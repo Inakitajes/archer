@@ -231,10 +231,12 @@ One resumable sequence, each step checked before it runs:
 1. **Preflight** — clean tree (commit or stash), all tasks complete (naming the missing count), no live run attached (wait for or stop it).
 2. **Sync** — merge the base branch into the feature branch inside the worktree. Conflicts stop with the conflict listed; resolve, commit, and `close --resume`.
 3. **Archive** — through the OpenSpec CLI (`openspec archive`), never by hand: the change moves to the archive layout and the result is committed on the feature branch under your identity.
-4. **Squash** — the same authorship-anchored walk `convoy finish` uses: your commits survive, convoy's collapse into one conventional commit.
-5. **Merge** — into the base branch from the main checkout (which must already sit on the base branch and be clean; Convoy never moves your checkout for you).
+4. **Squash** — the same authorship-anchored walk `convoy finish` uses: your commits survive, convoy's collapse into one conventional commit. That commit's message is composed by a model-backed writer (with a deterministic fallback when no model answers): the scope is always the single touched capability, the subject is a readable imperative line, and the change id is named in the body. In a terminal you confirm or edit the message before it lands; `--message` overrides it exactly and skips composition.
+5. **Merge** — into the base branch from the main checkout (which must already sit on the base branch and be clean; Convoy never moves your checkout for you). Fast-forward when the base hasn't moved, and whichever shape ran — fast-forward or merge commit — is narrated.
 
-Push, branch delete, and worktree removal are printed as follow-up commands and never run automatically.
+In a terminal the sequence renders as a live checklist: completed, skipped (with reason), and failed steps stay visible as they happen, and a `close --resume` shows the finished steps already checked. Headless runs print the same facts as a plain stdout summary and attempt nothing interactive.
+
+Push, worktree removal, and branch deletion are separate, deliberate offers — never automatic. Push uses the base branch's configured remote with an explicit refspec, and is unavailable (with the setup step printed instead) when the base branch has no upstream. Worktree removal must succeed before branch deletion is offered, because git refuses to delete a checked-out branch. Headless runs print the equivalent commands in that same safe order.
 
 ## Goal mode
 

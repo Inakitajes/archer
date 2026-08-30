@@ -2,13 +2,17 @@ import { describe, expect, test } from "bun:test"
 import type { Config, OpencodeClient } from "@opencode-ai/sdk/v2"
 
 import {
+  closeFallbackCommitMessage,
   commitMessagePrompt,
+  defaultCommitMessageModel,
   formatCommitMessage,
+  normalizeComposedMessage,
   proposeCommitMessage,
   readCommitMessage,
   templateCommitMessage,
   type CommitMessageInput,
 } from "../src/commit-message"
+import { parseModel } from "../src/runner"
 
 type ProposalDeps = NonNullable<Parameters<typeof proposeCommitMessage>[1]>
 
@@ -89,7 +93,7 @@ describe("proposeCommitMessage", () => {
     expect(calls.prompts[0]).toMatchObject({
       sessionID: "session-1",
       directory: "/repo",
-      model: { providerID: "anthropic", modelID: "claude-haiku-4-5" },
+      model: { providerID: "openrouter", modelID: "z-ai/glm-5.3-flash" },
       agent: "convoy-commit-writer",
       tools: { read: true, list: true, glob: true, grep: true, webfetch: false, write: false, edit: false, bash: false },
     })
@@ -548,5 +552,126 @@ describe("templateCommitMessage edge cases", () => {
   test("scope is omitted when not set", () => {
     const msg = templateCommitMessage({ targetDir: "/repo", branch: "feat/feature", commits: [] })
     expect(msg.scope).toBeUndefined()
+  })
+})
+
+describe("defaultCommitMessageModel", () => {
+  // Task 1.1: the id must survive the same parsing/resolution path any run
+  // model takes, so `finish` (and close) inherit it without a special case.
+  test("the pinned writer model parses through the run model path", () => {
+    expect(defaultCommitMessageModel).toBe("openrouter/z-ai/glm-5.3-flash")
+    expect(parseModel(defaultCommitMessageModel)).toEqual({ providerID: "openrouter", modelID: "z-ai/glm-5.3-flash" })
+  })
+})
+
+describe("commitMessagePrompt scope guidance", () => {
+  const base = { targetDir: "/repo", branch: "feat/widget", commits: [] } satisfies CommitMessageInput
+
+  test("a single capability is named as the scope to use", () => {
+    const prompt = commitMessagePrompt({ ...base, scopeCandidates: ["cli"] })
+    expect(prompt).toContain("Touched capabilities: cli")
+    expect(prompt).toContain('Use "cli" as the scope')
+    expect(prompt).not.toContain("omit the scope")
+  })
+
+  test("several capabilities get the omit-scope instruction", () => {
+    const prompt = commitMessagePrompt({ ...base, scopeCandidates: ["cli", "ui"] })
+    expect(prompt).toContain("Touched capabilities: cli, ui")
+    expect(prompt).toContain("omit the scope entirely")
+  })
+
+  test("zero capabilities carry no scope section at all", () => {
+    const prompt = commitMessagePrompt({ ...base, scopeCandidates: [] })
+    expect(prompt).not.toContain("Touched capabilities")
+    expect(prompt).not.toContain("scope")
+  })
+
+  test("the proposal document is seeded into the prompt", () => {
+    const prompt = commitMessagePrompt({ ...base, proposalExcerpt: "# Add widget\n\nWhy: the board needs it." })
+    expect(prompt).toContain("The change's proposal document:")
+    expect(prompt).toContain("Add widget")
+  })
+})
+
+describe("normalizeComposedMessage", () => {
+  test("a sole touched capability replaces whatever scope the writer proposed", () => {
+    const normalized = normalizeComposedMessage({ type: "feat", scope: "everything", subject: "improve the board", body: [] }, {
+      scopeCandidates: ["control-board"],
+      changeID: "close-ux",
+    })
+    expect(normalized.scope).toBe("control-board")
+  })
+
+  test("an invalid scope candidate cannot survive cleaning into a wrong scope", () => {
+    const normalized = normalizeComposedMessage({ type: "feat", subject: "improve", body: [] }, { scopeCandidates: ["!!!"] })
+    expect(normalized.scope).toBeUndefined()
+  })
+
+  test("zero or several capabilities remove the scope", () => {
+    const none = normalizeComposedMessage({ type: "feat", scope: "x", subject: "do it", body: [] }, { scopeCandidates: [] })
+    expect(none.scope).toBeUndefined()
+    const many = normalizeComposedMessage({ type: "feat", scope: "x", subject: "do it", body: [] }, { scopeCandidates: ["a", "b"] })
+    expect(many.scope).toBeUndefined()
+  })
+
+  test("the change id is injected first in the body and never duplicated", () => {
+    const injected = normalizeComposedMessage({ type: "feat", subject: "do it", body: ["one"] }, { changeID: "close-ux" })
+    expect(injected.body[0]).toBe("change close-ux")
+    const already = normalizeComposedMessage({ type: "feat", subject: "do it", body: ["change close-ux", "one"] }, { changeID: "close-ux" })
+    expect(already.body).toEqual(["change close-ux", "one"])
+  })
+})
+
+describe("closeFallbackCommitMessage", () => {
+  test("carries the branch prefix as type, the sole capability as scope, verb + proposal title as subject, and the change id in the body", () => {
+    const message = closeFallbackCommitMessage({
+      branch: "feat/close-ux",
+      proposal: "# Close UX\n\nBetter commits and a visible close.",
+      changeID: "close-ux",
+      scopeCandidates: ["feature-close"],
+      commits: ["convoy(implementer): Implementer report"],
+    })
+    expect(message.type).toBe("feat")
+    expect(message.scope).toBe("feature-close")
+    expect(message.subject).toBe("improve close ux")
+    expect(message.body[0]).toBe("change close-ux")
+    expect(message.body).toContain("Implementer report")
+  })
+
+  test("several or zero capabilities omit the scope", () => {
+    const many = closeFallbackCommitMessage({ branch: "feat/x", proposal: "# X", changeID: "x", scopeCandidates: ["a", "b"], commits: [] })
+    expect(many.scope).toBeUndefined()
+    const none = closeFallbackCommitMessage({ branch: "feat/x", proposal: "# X", changeID: "x", commits: [] })
+    expect(none.scope).toBeUndefined()
+  })
+
+  test("a missing proposal falls back to the branch slug for the subject", () => {
+    const message = closeFallbackCommitMessage({ branch: "fix/broken-thing", changeID: "broken-thing", commits: [] })
+    expect(message.type).toBe("fix")
+    expect(message.subject).toBe("fix broken thing")
+  })
+
+  test("every verb-map branch picks its type-appropriate imperative", () => {
+    const verbOf = (branch: string, proposal: string) =>
+      closeFallbackCommitMessage({ branch, proposal, changeID: "x", commits: [] }).subject.split(" ")[0]
+    expect(verbOf("feat/x", "# X")).toBe("improve")
+    expect(verbOf("perf/x", "# X")).toBe("improve")
+    expect(verbOf("fix/x", "# X")).toBe("fix")
+    expect(verbOf("refactor/x", "# X")).toBe("refactor")
+    expect(verbOf("docs/x", "# X")).toBe("document")
+    expect(verbOf("test/x", "# X")).toBe("test")
+    expect(verbOf("chore/x", "# X")).toBe("update")
+    expect(verbOf("ci/x", "# X")).toBe("update")
+  })
+
+  test("spin's change/ prefix survives as the type", () => {
+    const message = closeFallbackCommitMessage({ branch: "change/rename-flow", proposal: "# Rename", changeID: "rename-flow", commits: [] })
+    expect(message.type).toBe("change")
+    expect(message.subject).toBe("update rename")
+  })
+
+  test("an unknown prefix defaults to feat", () => {
+    const message = closeFallbackCommitMessage({ branch: "operator/x", proposal: "# X", changeID: "x", commits: [] })
+    expect(message.type).toBe("feat")
   })
 })
