@@ -3,6 +3,7 @@ import { join, resolve } from "node:path"
 import { stdin, stdout } from "node:process"
 
 import type { FeatureRow, WorktreeWithoutSpec } from "./control-board"
+import type { TuiRoute } from "./tui-session"
 import {
   collectDirRelativeMarkdown,
   listChangeIds,
@@ -43,6 +44,8 @@ export type SpecsChangeEntry = {
 }
 
 export type SpecsView = {
+  /** Absolute normalized project directory the view was loaded from. */
+  targetDir: string
   /** False when the target repo has no `openspec/` directory at all. */
   present: boolean
   changes: SpecsChangeEntry[]
@@ -126,18 +129,24 @@ export function specArtifactLabel(section: SpecArtifactSection, capability?: str
  * load time, nothing persisted.
  */
 export async function loadSpecsView(targetDir: string): Promise<SpecsView> {
+  targetDir = resolve(targetDir)
   const openspecRoot = join(targetDir, openspecDirName)
-  if (!(await dirExists(openspecRoot))) return { present: false, changes: [], specs: [] }
+  const present = await dirExists(openspecRoot)
+  let changes: SpecsChangeEntry[] = []
+  let specs: string[] = []
+  if (present) {
+    const changesDir = join(openspecRoot, "changes")
+    const ids = await listChangeIds(changesDir)
+    changes = await Promise.all(ids.map((id) => loadSpecsChange(changesDir, id)))
 
-  const changesDir = join(openspecRoot, "changes")
-  const ids = await listChangeIds(changesDir)
-  const changes = await Promise.all(ids.map((id) => loadSpecsChange(changesDir, id)))
-
-  // Relative to the repo root so detail views can read straight off it.
-  const specs = await collectDirRelativeMarkdown(join(openspecRoot, "specs"), join(openspecDirName, "specs"))
+    // Relative to the repo root so detail views can read straight off it.
+    specs = await collectDirRelativeMarkdown(join(openspecRoot, "specs"), join(openspecDirName, "specs"))
+  }
 
   // The board join is additive: a failure (git missing, unreadable runs dir)
-  // degrades the derived state instead of failing the browser.
+  // degrades the derived state instead of failing the browser. It still runs
+  // without a main openspec directory because isolated run worktrees remain a
+  // useful board section on their own.
   try {
     const { assembleControlBoard, createBoardReads } = await import("./control-board")
     const board = await assembleControlBoard(createBoardReads(targetDir))
@@ -145,11 +154,12 @@ export async function loadSpecsView(targetDir: string): Promise<SpecsView> {
     // whose rows are assembled over every `git worktree` — sees features the
     // main checkout's `openspec/changes/` no longer carries. Those worktree
     // changes must land in the Active Changes list too, or a feature spun out
-    // while `convoy control` runs from main appears nowhere and its row actions
+    // while `convoy specs` runs from main appears nowhere and its row actions
     // stay unreachable.
     const merged = await mergeWorktreeChanges(changes, board.rows)
     return {
-      present: true,
+      targetDir,
+      present,
       changes: merged,
       specs,
       rows: board.rows,
@@ -157,7 +167,7 @@ export async function loadSpecsView(targetDir: string): Promise<SpecsView> {
       ...(board.baseBranch ? { baseBranch: board.baseBranch } : {}),
     }
   } catch {
-    return { present: true, changes, specs }
+    return { targetDir, present, changes, specs }
   }
 }
 
@@ -214,7 +224,7 @@ async function loadSpecsChange(
  * Plain-text listing for pipes and CI: active changes with their artifact
  * inventory first, canonical specs below. No colors, no control sequences.
  */
-export function printSpecsList(view: SpecsView): void {
+export function printSpecsList(view: Pick<SpecsView, "present" | "changes" | "specs">): void {
   stdout.write("\nspecs:\n")
   stdout.write("  active changes:\n")
   if (view.changes.length === 0) {
@@ -256,10 +266,15 @@ function inventory(change: SpecsChangeEntry): string[] {
  * listing instead of the TUI (the same rule as `convoy runs`). The browser
  * itself is lazy-imported so non-interactive invocations never pull in opentui.
  */
-export async function browseSpecs(targetDir: string): Promise<SpecsResolution> {
+export async function browseSpecs(targetDir: string, route?: TuiRoute): Promise<SpecsResolution> {
   const view = await loadSpecsView(targetDir)
-  if (!view.present || (view.changes.length === 0 && view.specs.length === 0)) {
-    stdout.write(`no specs found under ${join(targetDir, openspecDirName)}\n`)
+  if (view.changes.length === 0 && view.specs.length === 0 && (view.worktreesWithoutSpec?.length ?? 0) === 0) {
+    if (route) {
+      const { showNoticeTui } = await import("./notice-tui")
+      await showNoticeTui(route, { title: "specs", message: `No specs found under ${join(view.targetDir, openspecDirName)}` })
+      return { type: "exit" }
+    }
+    stdout.write(`no specs found under ${join(view.targetDir, openspecDirName)}\n`)
     return { type: "exit" }
   }
   if (!stdin.isTTY || !stdout.isTTY) {
@@ -267,7 +282,7 @@ export async function browseSpecs(targetDir: string): Promise<SpecsResolution> {
     return { type: "exit" }
   }
   const { browseSpecsTui } = await import("./specs-browser")
-  return browseSpecsTui(view)
+  return browseSpecsTui(view, route)
 }
 
 /**
@@ -359,4 +374,3 @@ export function specGroupSource(group: SpecGroup, bodyOf: (file: string) => stri
   }
   return parts.join("\n\n")
 }
-

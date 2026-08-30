@@ -100,7 +100,7 @@ describe("resolveRunOptions", () => {
     await expect(parseCommand(["specs", "extra"])).rejects.toThrow("usage: convoy specs")
   })
 
-  test("parseCommand opens the board through control, with specs kept as an alias", async () => {
+  test("parseCommand keeps control as a compatibility alias for specs", async () => {
     expect(await parseCommand(["control"])).toEqual({ type: "specs", targetDir: process.cwd() })
     await expect(parseCommand(["control", "extra"])).rejects.toThrow("usage: convoy control")
   })

@@ -2,10 +2,15 @@ import { createCliRenderer } from "@opentui/core"
 
 import { RunsBrowser } from "./runs-browser"
 import { paletteForTerminal, setTheme, terminalBackgroundHex } from "./tui-theme"
+import { sceneForRoute, type TuiRoute } from "./tui-session"
 
 import type { RunEntry, RunsResolution } from "./runs"
 
-export async function browseRunsTui(runs: RunEntry[], initialIndex: number): Promise<RunsResolution> {
+export async function browseRunsTui(runs: RunEntry[], initialIndex: number, route?: TuiRoute): Promise<RunsResolution> {
+  if (route) {
+    const scene = sceneForRoute(route, "convoy-runs-scene")!
+    return new RunsBrowser(route.session.renderer, runs, initialIndex, scene).result
+  }
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
   // No targetFps: it only applies while opentui's own loop runs, which convoy

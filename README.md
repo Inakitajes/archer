@@ -27,7 +27,7 @@ Typical uses:
 - **Turn a findings list into fixes.** `convoy -p fixer` takes a report and proves each finding with a focused regression test *before* touching production code, then reports a per-finding verdict.
 - **Encode your team's actual workflow.** Pipelines are YAML in `.convoy/config.yaml`: define your own steps, agents, and models, with named human gates anywhere, and run `convoy -p <name>`.
 
-Use it as a **CLI** or as a **TUI**, interchangeably: every run can be launched with plain flags and prompt files (`--no-tui` gives you plain logs for pipes and CI), or driven entirely from the TUI — `convoy` with no arguments opens the interactive launcher, every run gets a live dashboard, `convoy runs` browses past runs, and `convoy config` edits global and project config in place.
+Use it as a **CLI** or as a **TUI**, interchangeably: every run can be launched with plain flags and prompt files (`--no-tui` gives you plain logs for pipes and CI), or driven entirely from the TUI — `convoy` with no arguments opens a home launcher for **Pipelines**, **Specs**, **Runs**, and **Config**, and every run gets a live dashboard.
 
 **Pipelines are data, not code.** Convoy ships ten built-in pipelines (`implement` — the default — plus `implement-lite`, `ship`, `fixer`, `goal-fix`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
 
@@ -177,19 +177,19 @@ convoy --change add-login -p review
 
 Everything the board shows is derived at render time from git, OpenSpec, and run plans — Convoy keeps no feature registry. If it appears, it is correct; if a worktree is deleted outside Convoy, the next open simply shows it gone.
 
-### The control board (`convoy control`)
+### The specs board (`convoy specs`)
 
 ```bash
-convoy control   # "convoy specs" is kept as an alias
+convoy specs     # "convoy control" remains as a compatibility alias
 ```
 
-One board for every feature and spec, in three peer sections:
+One board for every feature and spec, in up to three peer sections (empty sections, including their titles, are omitted; a worktree-only board still opens):
 
 - **Active Changes** — every active OpenSpec change with its derived state: stage (`stranded on main`, `proposing`, `implementing`, `ready to close`, `probably merged`), tasks done/total, linked runs with the live one marked, an uncommitted-proposal marker, and sync/merged-ness signals (`unsynced`, `probably merged` — patch equivalence can prove probability, never certainty).
 - **Worktrees without spec** — worktrees carrying runs but no OpenSpec change, linking the plain isolated-run flow back into the board.
 - **Canonical Specs** — the merged specs under `openspec/specs/`.
 
-Enter a change (or spec) to read it in a full-width pane under a tab strip: one tab per artifact group — Proposal, Design, Tasks, one merged Delta Specs tab (per-capability headings injected), Other when present — switched with `←`/`→` (`h`/`l`) or digits `1`–`9`, scrolled with `↑`/`↓`. A subject with a single group hides the strip. Press `v` for the fullscreen reader (title bar with `c copy` and scroll position; `v`/`esc`/`q` to close, tabs still switch inside, `c` copies the active tab's markdown through the same clipboard pipeline as the run dashboard), `a` to apply the change in the launcher, `i` to open a standalone OpenCode session on the change's planning files, `q` to quit.
+The header names the normalized target project directory. Change and worktree rows retain their useful details preview; when a canonical spec is selected, that redundant preview disappears and the browse list fills the body in wide and compact layouts. Enter a change (or spec) to read it in a full-width pane under a tab strip: one tab per artifact group — Proposal, Design, Tasks, one merged Delta Specs tab (per-capability headings injected), Other when present — switched with `←`/`→` (`h`/`l`) or digits `1`–`9`, scrolled with `↑`/`↓`. Returning from a canonical reader restores the full-body root list. A subject with a single group hides the strip. Press `v` for the fullscreen reader (title bar with `c copy` and scroll position; `v`/`esc`/`q` to close, tabs still switch inside, `c` copies the active tab's markdown through the same clipboard pipeline as the run dashboard), `a` to apply the change in the launcher, `i` to open a standalone OpenCode session on the change's planning files, `q` to quit.
 
 Row actions move a feature along:
 
@@ -231,10 +231,10 @@ One resumable sequence, each step checked before it runs:
 1. **Preflight** — clean tree (commit or stash), all tasks complete (naming the missing count), no live run attached (wait for or stop it).
 2. **Sync** — merge the base branch into the feature branch inside the worktree. Conflicts stop with the conflict listed; resolve, commit, and `close --resume`.
 3. **Archive** — through the OpenSpec CLI (`openspec archive`), never by hand: the change moves to the archive layout and the result is committed on the feature branch under your identity.
-4. **Squash** — the same authorship-anchored walk `convoy finish` uses: your commits survive, convoy's collapse into one conventional commit. That commit's message is composed by a model-backed writer (with a deterministic fallback when no model answers): the scope is always the single touched capability, the subject is a readable imperative line, and the change id is named in the body. In a terminal you confirm or edit the message before it lands; `--message` overrides it exactly and skips composition.
+4. **Squash** — the same authorship-anchored walk `convoy finish` uses: your commits survive, convoy's collapse into one conventional commit. That commit's message is composed by a model-backed writer (with a deterministic fallback when no model answers): the scope is always the single touched capability, the subject is a readable imperative line, and the change id is named in the body. In a terminal you confirm, edit, or cancel the message before it lands; `--message` overrides it exactly and skips composition.
 5. **Merge** — into the base branch from the main checkout (which must already sit on the base branch and be clean; Convoy never moves your checkout for you). Fast-forward when the base hasn't moved, and whichever shape ran — fast-forward or merge commit — is narrated.
 
-In a terminal the sequence renders as a live checklist: completed, skipped (with reason), and failed steps stay visible as they happen, and a `close --resume` shows the finished steps already checked. Headless runs print the same facts as a plain stdout summary and attempt nothing interactive.
+In a terminal the whole sequence runs in a full-screen TUI: completed, skipped (with reason), and failed steps stay visible as they happen; the composed commit message is accepted, edited, or cancelled in the same interface; and push, worktree removal, and branch deletion remain explicit optional actions with their dependencies visible. The TUI stays open on a failure so its remediation can be read, and a `close --resume` shows the finished steps already checked. Headless runs print the same facts as a plain stdout summary and attempt nothing interactive.
 
 Push, worktree removal, and branch deletion are separate, deliberate offers — never automatic. Push uses the base branch's configured remote with an explicit refspec, and is unavailable (with the setup step printed instead) when the base branch has no upstream. Worktree removal must succeed before branch deletion is offered, because git refuses to delete a checked-out branch. Headless runs print the equivalent commands in that same safe order.
 
@@ -413,9 +413,14 @@ Release candidates use prerelease tags such as `v0.2.0-rc.1`. They are published
 
 From the root of the target repo, ideally on a working branch:
 
+In an interactive terminal, a truly bare `convoy` opens the home launcher. Move with `↑`/`↓` or `j`/`k`, press `Enter`, or jump directly with `p` (Pipelines), `s` (Specs), `r` (Runs), and `c` (Config); `q`, `Esc`, and `Ctrl-C` exit. The selected destination owns the rest of the session, so closing it exits Convoy rather than returning home. Any argv, including `--dir`, follows normal CLI parsing, and bare Convoy without interactive stdin/stdout keeps its existing non-TUI run semantics.
+
 ```bash
-# interactive launcher: choose a pipeline, enter the prompt, set options, name the branch, then review
+# home launcher: choose Pipelines, Specs, Runs, or Config
 convoy
+
+# Pipelines opens the run launcher: choose a pipeline, enter the prompt,
+# set options, name the branch, then review
 
 # inline prompt
 convoy "Add onboarding screen with 3 steps and local persistence of progress"

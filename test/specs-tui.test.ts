@@ -63,6 +63,7 @@ afterAll(async () => {
 function sampleView(): SpecsView {
   const cloneChange = (entry: SpecsChangeEntry): SpecsChangeEntry => ({ ...entry, artifacts: [...entry.artifacts] })
   return {
+    targetDir: root,
     present: true,
     changes: [
       cloneChange(change),
@@ -111,6 +112,7 @@ test("renders Active Changes above Canonical Specs with distinct headers", async
   expect(active).toBeGreaterThanOrEqual(0)
   expect(canonical).toBeGreaterThan(active)
   expect(frame).toContain("add-login — Add login")
+  expect(frame).not.toContain("WORKTREES WITHOUT SPEC")
 })
 
 test("a change without artifacts still lists by its id", async () => {
@@ -205,8 +207,7 @@ test("selection crosses sections: enter on a canonical spec reads it", async () 
   view.changes = [{ kind: "change", id: "only-change", title: "Only change", artifacts: [] }]
   const session = await openBrowser(view)
 
-  // Two downs land on the spec row past the Canonical Specs header.
-  session.press("down")
+  // One down skips the Canonical Specs header and lands on its first row.
   session.press("down")
   await session.renderOnce()
   session.press("return")
@@ -217,7 +218,9 @@ test("selection crosses sections: enter on a canonical spec reads it", async () 
 
   session.press("b")
   await session.renderOnce()
-  expect(session.captureCharFrame()).toContain("ACTIVE CHANGES")
+  const rootFrame = session.captureCharFrame()
+  expect(rootFrame).toContain("ACTIVE CHANGES")
+  expect(rootFrame).not.toContain("details")
 
   await close(session)
 })
@@ -230,15 +233,16 @@ test("Ctrl-C exits immediately", async () => {
   await expect(session.instance.result).resolves.toEqual({ type: "exit" })
 })
 
-test("an empty active-changes list opens with the first canonical spec row selected", async () => {
+test("an empty active-changes section is omitted and the first canonical spec is selected", async () => {
   const view = sampleView()
   view.changes = []
   const session = await openBrowser(view)
 
-  // No changes: the very first render must land on the spec row, not on the
-  // Canonical Specs header — the cursor marker sits on that row and Enter
-  // reads it immediately instead of no-oping.
+  // No changes: the title disappears entirely and the cursor lands on the
+  // first spec row rather than its dead section header.
   const frame = session.captureCharFrame()
+  expect(frame).not.toContain("ACTIVE CHANGES")
+  expect(frame).not.toContain("WORKTREES WITHOUT SPEC")
   expect(frame).toContain("CANONICAL SPECS")
   expect(frame).toContain("▸")
   session.press("return")
@@ -295,4 +299,26 @@ test("compact screens stack the list above the details panel", async () => {
   const detailsRow = lines.findIndex((line) => line.includes("details"))
   expect(listRow).toBeGreaterThanOrEqual(0)
   expect(detailsRow).toBeGreaterThan(listRow)
+})
+
+test.each([120, 84])("a selected canonical spec uses the full root body at width %d", async (width) => {
+  const view = sampleView()
+  view.changes = []
+  const session = await openBrowser(view, width, 30)
+  try {
+    const frame = session.captureCharFrame()
+    expect(frame).toContain("CANONICAL SPECS")
+    expect(frame).toContain("cli/spec.md")
+    expect(frame).not.toContain("details")
+
+    const boxes = session.instance as unknown as {
+      listBox: { width: unknown; height: unknown }
+      detailsBox: { visible: boolean }
+    }
+    expect(boxes.listBox.width).toBe(width - 2)
+    expect(boxes.listBox.height).toBe(24)
+    expect(boxes.detailsBox.visible).toBe(false)
+  } finally {
+    await close(session)
+  }
 })

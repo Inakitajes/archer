@@ -5,10 +5,29 @@ import type { Readable } from "node:stream"
 
 import { archiveChangeOnMain, runClose, type CloseEvent, type CloseInput, type CloseMessageProposal, type CloseResult, type CloseStep } from "./feature-close"
 import { stripControlBytes } from "./commit-message"
+import {
+  applyCloseEvent,
+  initialCloseChecklistState,
+  renderCloseChecklist,
+  type CloseChecklistRow,
+  type CloseChecklistRowStatus,
+  type CloseChecklistState,
+} from "./close-presentation"
 import { editMessageInEditor } from "./finish"
 import { branchUpstream, execFile, mainWorktreeDir, pushRefspec, removeWorktree } from "./git"
 import { log } from "./log"
 import { ask, isInteractiveTerminal } from "./terminal-input"
+import type { CloseFollowUpId, CloseFollowUpItem, CloseFollowUpStatus, CloseTui } from "./close-tui"
+import type { TuiRoute } from "./tui-session"
+
+export {
+  applyCloseEvent,
+  initialCloseChecklistState,
+  renderCloseChecklist,
+  type CloseChecklistRow,
+  type CloseChecklistRowStatus,
+  type CloseChecklistState,
+} from "./close-presentation"
 
 /**
  * The `convoy close` command surface. One close sequence, two renderers
@@ -34,7 +53,7 @@ export type CloseOptions = {
   help?: boolean
 }
 
-export async function runCloseCommand(options: CloseOptions): Promise<void> {
+export async function runCloseCommand(options: CloseOptions, route?: TuiRoute): Promise<void> {
   if (options.dryRun) {
     stdout.write(`close would run: preflight → sync → archive → squash → merge${options.resume ? " (resuming)" : ""}\n`)
     return
@@ -49,7 +68,7 @@ export async function runCloseCommand(options: CloseOptions): Promise<void> {
   }
   // The board's close-change handoff lands here too: a TTY gets the checklist,
   // a pipe gets the stdout summary — one dispatcher, no second call site.
-  if (closeSurface() === "tty") await runCloseInteractive(input)
+  if (closeSurface() === "tty") await runCloseInteractive(input, {}, route)
   else await runCloseHeadless(input)
 }
 
@@ -202,13 +221,35 @@ export function formatCloseFollowUps(followUps: CloseFollowUps): string[] {
 // TTY: the live checklist, the message gate, and the deliberate cleanups
 // ---------------------------------------------------------------------------
 
-export async function runCloseInteractive(input: CloseInput, io: CloseIO = {}): Promise<void> {
-  const renderer = createCloseChecklistRenderer(frameWrite(io))
+export async function runCloseInteractive(input: CloseInput, io: CloseIO = {}, route?: TuiRoute): Promise<void> {
+  // `io` remains on the signature for backwards-compatible unit seams around
+  // the plain prompt helpers below. Production interactive close owns an
+  // OpenTUI alternate screen from the first preflight event to cleanup.
+  void io
+  const { openCloseTui } = await import("./close-tui")
+  const tui = await openCloseTui(input.targetDir, undefined, route)
   try {
     const result = await runClose({
       ...input,
-      onEvent: (event) => renderer.onEvent(event),
-      resolveMessage: (proposal) => confirmCloseMessage(proposal, { renderer, ...io }),
+      onEvent: (event) => tui.onEvent(event),
+      withTerminal: (action) => tui.withTerminal(action),
+      resolveMessage: async (proposal) => {
+        let notice: string | undefined
+        for (;;) {
+          const decision = await tui.confirmMessage(proposal, notice)
+          if (decision === "accept") return proposal.message
+          if (decision === "cancel") return undefined
+
+          // $EDITOR needs the real terminal; suspend OpenTUI's alternate
+          // screen/raw input and restore the same checklist afterward.
+          const edited = await tui.withTerminal(() => editMessageInEditor(proposal.message))
+          if (!edited) {
+            notice = "Editor cancelled; review the proposal again or cancel close."
+            continue
+          }
+          return edited.body.length === 0 ? edited.subject : `${edited.subject}\n\n${edited.body.map((line) => `- ${line}`).join("\n")}`
+        }
+      },
     })
     const followUps = await resolveCloseFollowUps({
       targetDir: input.targetDir,
@@ -216,124 +257,21 @@ export async function runCloseInteractive(input: CloseInput, io: CloseIO = {}): 
       branch: result.branch,
       worktreeDir: result.worktreeDir,
     })
-    await offerCloseFollowUps({ ...followUps, baseRef: result.baseRef, branch: result.branch, worktreeDir: result.worktreeDir, targetDir: input.targetDir }, io)
+    await offerCloseFollowUpsTui(tui, {
+      ...followUps,
+      baseRef: result.baseRef,
+      branch: result.branch,
+      worktreeDir: result.worktreeDir,
+      targetDir: input.targetDir,
+    })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     process.exitCode = 1
-    // The checklist keeps its final frame (the failed step and its
-    // remediation stay visible); the full stop message goes below it.
-    renderer.break()
-    frameWrite(io)("\n")
-    log.error(message)
-  }
-}
-
-// -- checklist ----------------------------------------------------------------
-
-export type CloseChecklistRowStatus = "pending" | "running" | "completed" | "skipped" | "failed"
-
-export type CloseChecklistRow = {
-  step: CloseStep
-  status: CloseChecklistRowStatus
-  detail?: string
-}
-
-export type CloseChecklistState = {
-  preflight?: string
-  preflightFailed?: readonly string[]
-  rows: readonly CloseChecklistRow[]
-  result?: CloseResult
-}
-
-const closeSteps: readonly CloseStep[] = ["sync", "archive", "squash", "merge"]
-
-export function initialCloseChecklistState(): CloseChecklistState {
-  return { rows: closeSteps.map((step) => ({ step, status: "pending" as const })) }
-}
-
-/** The pure reducer from close events to checklist state — one source of narration. */
-export function applyCloseEvent(state: CloseChecklistState, event: CloseEvent): CloseChecklistState {
-  const withRow = (step: CloseStep, update: Partial<CloseChecklistRow>): CloseChecklistState => ({
-    ...state,
-    rows: state.rows.map((row) => (row.step === step ? { ...row, ...update, detail: update.detail ?? (update.status === "running" ? undefined : row.detail) } : row)),
-  })
-  switch (event.type) {
-    case "preflight":
-      return { ...state, preflight: event.summary }
-    case "preflight-failed":
-      return { ...state, preflightFailed: event.blockers.map((blocker) => blocker.message) }
-    case "step-started":
-      return withRow(event.step, { status: "running" })
-    case "step-completed":
-      return withRow(event.step, { status: "completed", detail: strip(event.detail) })
-    case "step-skipped":
-      return withRow(event.step, { status: "skipped", detail: strip(event.reason) })
-    case "step-failed": {
-      const line = firstLine(strip(event.message))
-      const prefix = `${event.step}: `
-      const detail = line.startsWith(prefix) ? line.slice(prefix.length) : line
-      return withRow(event.step, { status: "failed", detail })
-    }
-    case "merge-shape":
-      // The merge row's completed detail already narrates the shape.
-      return state
-    case "result":
-      return { ...state, result: event.result }
-  }
-}
-
-/** The pure frame renderer — the same lines the live driver rewrites in place. */
-export function renderCloseChecklist(state: CloseChecklistState): string[] {
-  const lines: string[] = []
-  if (state.preflightFailed) {
-    lines.push("close preflight failed:")
-    for (const message of state.preflightFailed) lines.push(`  ${message}`)
-    return lines
-  }
-  if (state.preflight) lines.push(`preflight: ${state.preflight}`)
-  for (const row of state.rows) {
-    if (row.status === "pending") {
-      lines.push(`  ○ ${row.step}`)
-    } else if (row.status === "running") {
-      lines.push(`  ▸ ${row.step}…`)
-    } else if (row.status === "completed") {
-      lines.push(`  ✓ ${row.step}${row.detail ? ` — ${row.detail}` : ""}`)
-    } else if (row.status === "skipped") {
-      lines.push(`  ⊘ ${row.step} — skipped: ${row.detail}`)
-    } else {
-      lines.push(`  ✗ ${row.step}${row.detail ? ` — ${row.detail}` : ""}`)
-    }
-  }
-  if (state.result) {
-    lines.push("")
-    lines.push(`closed ${state.result.changeID}: ${state.result.branch} → ${state.result.baseRef}`)
-  }
-  return lines
-}
-
-/**
- * The live driver: rewrites the frame in place with cursor-up + clear. A
- * `break()` releases the frame (before a prompt or an editor takes the
- * terminal); the next event prints a fresh frame below instead of rewriting.
- */
-export function createCloseChecklistRenderer(write: (text: string) => void = (text) => stdout.write(text)) {
-  let state = initialCloseChecklistState()
-  let drawn = 0
-  const redraw = () => {
-    const frame = renderCloseChecklist(state)
-    if (drawn > 0) write(`\x1b[${drawn}A\x1b[J`)
-    for (const line of frame) write(`${line}\n`)
-    drawn = frame.length
-  }
-  return {
-    onEvent(event: CloseEvent) {
-      state = applyCloseEvent(state, event)
-      redraw()
-    },
-    break() {
-      drawn = 0
-    },
-    state: () => state,
+    // Keep the failed checklist and remediation inside the TUI until the
+    // operator dismisses it; no cursor-control fragments leak into the shell.
+    await tui.showFailure(message)
+  } finally {
+    tui.destroy()
   }
 }
 
@@ -347,8 +285,6 @@ export type CloseIO = {
   }
 }
 
-const frameWrite = (io: CloseIO) => (text: string) => (io.output ?? stdout).write(text)
-
 /**
  * The TTY side of the resolver gate (design D4): show the composed message,
  * accept or edit. Edit delegates verbatim to `editMessageInEditor` — the same
@@ -358,7 +294,7 @@ const frameWrite = (io: CloseIO) => (text: string) => (io.output ?? stdout).writ
  */
 export async function confirmCloseMessage(
   proposal: CloseMessageProposal,
-  deps: { renderer?: ReturnType<typeof createCloseChecklistRenderer> } & CloseIO = {},
+  deps: { renderer?: { break(): void } } & CloseIO = {},
 ): Promise<string | undefined> {
   deps.renderer?.break()
   const out = deps.output ?? stdout
@@ -383,6 +319,122 @@ export async function confirmCloseMessage(
 // -- follow-up offers -------------------------------------------------------------
 
 type FollowUpOffers = CloseFollowUps & { baseRef: string; branch: string; worktreeDir: string; targetDir: string }
+
+type InteractiveFollowUpState = Partial<
+  Record<CloseFollowUpId, { status: Extract<CloseFollowUpStatus, "running" | "completed" | "failed">; error?: string }>
+>
+
+/**
+ * Optional cleanup in the OpenTUI surface. All three actions remain visible,
+ * including disabled prerequisites, and a failed action stays selectable for
+ * retry. Quitting is the deliberate "leave the rest for later" choice.
+ */
+async function offerCloseFollowUpsTui(tui: CloseTui, followUps: FollowUpOffers): Promise<void> {
+  const mainDir = (await mainWorktreeDir(followUps.targetDir).catch(() => undefined)) ?? followUps.targetDir
+  const state: InteractiveFollowUpState = {}
+
+  const items = async (): Promise<CloseFollowUpItem[]> => {
+    const worktreeExists = await stat(followUps.worktreeDir).then(
+      () => true,
+      () => false,
+    )
+    const cwdInside = processCwdInside(followUps.worktreeDir)
+
+    const push: CloseFollowUpItem = followUps.push
+      ? {
+          id: "push",
+          label: `Push ${followUps.baseRef}`,
+          detail: `Push to ${followUps.push.remote} with the explicit refspec ${followUps.push.refspec}.`,
+          command: followUps.push.command,
+          status: state.push?.status ?? "available",
+          ...(state.push?.error ? { error: state.push.error } : {}),
+        }
+      : {
+          id: "push",
+          label: `Push ${followUps.baseRef}`,
+          detail: followUps.pushRemediation ?? "No configured upstream is available.",
+          status: "unavailable",
+        }
+
+    let worktree: CloseFollowUpItem
+    if (state.worktree?.status === "completed") {
+      worktree = { id: "worktree", label: "Remove worktree", detail: followUps.worktreeDir, status: "completed" }
+    } else if (!followUps.worktreeRemoval || !worktreeExists) {
+      worktree = { id: "worktree", label: "Remove worktree", detail: "No separate feature worktree remains.", status: "unavailable" }
+    } else if (cwdInside) {
+      worktree = {
+        id: "worktree",
+        label: "Remove worktree",
+        detail: "Leave this worktree in your shell before removing it.",
+        command: followUps.worktreeRemoval,
+        status: "unavailable",
+      }
+    } else {
+      worktree = {
+        id: "worktree",
+        label: "Remove worktree",
+        detail: followUps.worktreeDir,
+        command: followUps.worktreeRemoval,
+        status: state.worktree?.status ?? "available",
+        ...(state.worktree?.error ? { error: state.worktree.error } : {}),
+      }
+    }
+
+    let branch: CloseFollowUpItem
+    if (state.branch?.status === "completed") {
+      branch = { id: "branch", label: `Delete ${followUps.branch}`, detail: "Feature branch deleted.", status: "completed" }
+    } else if (worktreeExists) {
+      branch = {
+        id: "branch",
+        label: `Delete ${followUps.branch}`,
+        detail: "Remove the feature worktree first; git cannot delete a checked-out branch.",
+        command: followUps.branchDelete,
+        status: "unavailable",
+      }
+    } else if (cwdInside) {
+      branch = {
+        id: "branch",
+        label: `Delete ${followUps.branch}`,
+        detail: "Leave the removed worktree path in your shell before deleting its branch.",
+        command: followUps.branchDelete,
+        status: "unavailable",
+      }
+    } else {
+      branch = {
+        id: "branch",
+        label: `Delete ${followUps.branch}`,
+        detail: "Delete the local feature branch after its worktree is gone.",
+        command: followUps.branchDelete,
+        status: state.branch?.status ?? "available",
+        ...(state.branch?.error ? { error: state.branch.error } : {}),
+      }
+    }
+    return [push, worktree, branch]
+  }
+
+  for (;;) {
+    const resolution = await tui.selectFollowUp(await items())
+    if (resolution.type === "done") return
+    const id = resolution.id
+    state[id] = { status: "running" }
+    tui.updateFollowUps(await items())
+    try {
+      if (id === "push") {
+        if (!followUps.push) continue
+        await tui.withTerminal(() => pushRefspec(followUps.push!.remote, followUps.push!.refspec, mainDir))
+      } else if (id === "worktree") {
+        if (!followUps.worktreeRemoval) continue
+        await removeWorktree(followUps.worktreeDir, mainDir)
+      } else {
+        const result = await execFile("git", ["branch", "-d", followUps.branch], { cwd: mainDir, allowFailure: true })
+        if (result.exitCode !== 0) throw new Error(result.stderr || `git branch -d ${followUps.branch} failed`)
+      }
+      state[id] = { status: "completed" }
+    } catch (error) {
+      state[id] = { status: "failed", error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+}
 
 /**
  * Cleanup follows git's dependency graph (design D7): push is independent;
@@ -500,15 +552,15 @@ into the feature branch, archive the change through the OpenSpec CLI, squash
 convoy's commits into one conventional commit (your identity, your signature),
 and merge the feature branch into the base branch from the main checkout.
 
-In a terminal the sequence renders as a live checklist — each step's
+In a terminal the sequence renders in a full-screen TUI — each step's
 completion, skip (with reason), or failure visible as it happens, and the
 merge's shape (fast-forward or merge commit) narrated. The squashed commit's
 message is composed from the change's proposal and touched capabilities, with
 a deterministic fallback when no model answers; the scope is always the single
-touched capability, and the change id is named in the body. You confirm or
-edit the message before it lands.
+touched capability, and the change id is named in the body. You confirm, edit,
+or cancel the message inside the TUI before it lands.
 
-Once merged, push, worktree removal, and branch deletion are offered as
+Once merged, push, worktree removal, and branch deletion stay in that TUI as
 separate, deliberate actions — never automatic. Push names the configured
 remote and refspec explicitly, and is unavailable (with the setup step) when
 the base branch has no upstream; branch deletion is only offered after the

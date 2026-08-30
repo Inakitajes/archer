@@ -28,6 +28,8 @@ import type { SpinOptions } from "./spin"
 import type { CloseOptions } from "./feature-close-command"
 import { formatVersion } from "./version"
 import type { UpdateResult } from "./update"
+import type { TuiRoute } from "./tui-session"
+import type { HomeDestination } from "./home-tui"
 
 /**
  * Flags as written: every scalar stays undefined until the user sets it, so
@@ -108,8 +110,8 @@ export type CliCommand =
   | { type: "coordinate"; launchPath: string }
 
 export async function parseAndRun(argv: string[]) {
-  if (argv.length === 0 && process.stdin.isTTY && process.stdout.isTTY) {
-    await launchInteractiveRun(process.cwd())
+  if (shouldLaunchHome(argv, process.stdin.isTTY, process.stdout.isTTY)) {
+    await runHomeSession(process.cwd())
     return
   }
 
@@ -232,6 +234,54 @@ export async function parseAndRun(argv: string[]) {
   await executeRun(options, plan)
 }
 
+/** Only a truly bare invocation with interactive input and output owns the home screen. */
+export function shouldLaunchHome(argv: readonly string[], stdinTTY: boolean | undefined, stdoutTTY: boolean | undefined): boolean {
+  return argv.length === 0 && stdinTTY === true && stdoutTTY === true
+}
+
+/** One alternate-screen owner routes every destination until Home itself quits. */
+async function runHomeSession(targetDir: string): Promise<void> {
+  const [{ launchHomeTui }, { createTuiSession }] = await Promise.all([import("./home-tui"), import("./tui-session")])
+  const session = await createTuiSession()
+  let interrupted = false
+  const route: TuiRoute = {
+    session,
+    onInterrupt: () => {
+      interrupted = true
+    },
+  }
+
+  try {
+    await runHomeNavigationLoop({
+      interrupted: () => interrupted,
+      openHome: (initialSelection) => launchHomeTui(targetDir, { route, initialSelection }),
+      openDestination: async (selection) => {
+        if (selection === "pipelines") await launchInteractiveRun(targetDir, undefined, undefined, route)
+        else if (selection === "specs") await openSpecsBrowser(targetDir, route)
+        else if (selection === "runs") await openRunsBrowser(undefined, route)
+        else await openConfigEditor(targetDir, route)
+      },
+    })
+  } finally {
+    session.destroy()
+  }
+}
+
+/** Pure navigation loop: destination close means back; only Home close quits. */
+export async function runHomeNavigationLoop(options: {
+  interrupted: () => boolean
+  openHome: (initialSelection?: HomeDestination) => Promise<HomeDestination | undefined>
+  openDestination: (selection: HomeDestination) => Promise<void>
+}): Promise<void> {
+  let lastSelection: HomeDestination | undefined
+  while (!options.interrupted()) {
+    const selection = await options.openHome(lastSelection)
+    if (!selection || options.interrupted()) return
+    lastSelection = selection
+    await options.openDestination(selection)
+  }
+}
+
 /** Builds the operator-reviewed plan, including a checkout-local PRD history preview. */
 async function buildReviewedPlan(input: BuildRunPlanInput): Promise<RunPlan> {
   // Lookup the launch checkout's current branch, not `input.branch` — that is the
@@ -338,13 +388,13 @@ function assertGoalMode(options: { goal?: number; goalFixPipeline?: Pipeline }, 
 }
 
 /** Runs the plan, entering the goal loop when goal mode is configured for this run. */
-async function executeRun(options: RunOptions, plan: RunPlan): Promise<void> {
+async function executeRun(options: RunOptions, plan: RunPlan, route?: TuiRoute): Promise<void> {
   // Defensive re-check: the early refusal in parseAndRun/launchInteractiveRun
   // should have already caught rejections before any side effect, but executeRun
   // is also called from paths that might bypass that check (e.g. resume).
   const decision = goalModeFor(options, plan)
   if (decision.mode === "rejected") throw goalModeRejectionError(decision, plan)
-  await spawnAndAttachRun(options, plan, goalConfigFor(decision, options))
+  await spawnAndAttachRun(options, plan, goalConfigFor(decision, options), route)
 }
 
 /** The goal-loop config to hand the coordinator, or undefined when goal mode is off. */
@@ -366,6 +416,7 @@ async function spawnAndAttachRun(
   options: RunOptions,
   plan: RunPlan,
   goal: GoalLoopConfig | undefined,
+  route?: TuiRoute,
 ): Promise<void> {
   const { CoordinatorBootTimeoutError, forwardCoordinatorLogs, launchPayload, rmPendingLaunch, spawnCoordinator, waitForCoordinatorReady, writePendingLaunch } = await import("./coordinate")
   const pending = await writePendingLaunch(launchPayload(options, plan, goal))
@@ -376,13 +427,13 @@ async function spawnAndAttachRun(
     // The coordinator is live; attach or wait, depending on the terminal.
     if (options.tui && process.stdout.isTTY) {
       const { openRunDashboard } = await import("./attach")
-      await openRunDashboard(ready.runID, { ctrlC: "abort" })
+      await openRunDashboard(ready.runID, { ctrlC: "abort" }, route)
       // The attach resolved because the user backgrounded the run; land on the
       // runs menu with it selected (the coordinator keeps running). Liveness
       // is the coordinator's, not iteration 1's OpenCode server: a goal loop
       // releases each iteration's server while the coordinator lives on.
       if (await isCoordinatorLiveFor(ready.runID)) {
-        const resumed = await openRunsBrowser(await currentCoordinatedRunID(ready.runID))
+        const resumed = await openRunsBrowser(await currentCoordinatedRunID(ready.runID), route)
         // A resume/retry ran its own coordinator inside the browser and owns
         // the exit code; a run still alive after the browser was backgrounded
         // on purpose — a successful handoff is exit 0.
@@ -504,29 +555,37 @@ export async function prepareWorktreeForRun(sourceDir: string, options: RunOptio
   return { ...options, targetDir: worktree.dir, branch: worktree.branch, includeDirty: false }
 }
 
-async function launchInteractiveRun(targetDir: string, presetChange?: string, presetFeature?: { worktreeDir: string; branch: string }) {
+async function launchInteractiveRun(
+  targetDir: string,
+  presetChange?: string,
+  presetFeature?: { worktreeDir: string; branch: string },
+  route?: TuiRoute,
+) {
   // Imported lazily so normal CLI invocations don't pull in OpenTUI until they
   // explicitly ask for the zero-argument interactive launcher.
   const { launchRunTui } = await import("./launch-tui")
-  const selection = await launchRunTui({
-    targetDir,
-    // A specs-viewer handoff arrives with the change already chosen: the
-    // launcher pins that spec row instead of running its auto-detect heuristics.
-    ...(presetChange ? { presetChange } : {}),
-    // A control-board "continue" arrives with the feature's worktree and
-    // branch already chosen: the launcher reuses them and never asks the namer.
-    ...(presetFeature ? { presetFeature: { changeID: presetChange ?? "", ...presetFeature } } : {}),
-    prepareRun: (runSelection) => prepareInteractiveRun(targetDir, runSelection),
-    proposeBranchName: (input) => proposeInteractiveBranchName(targetDir, input),
-    checkBranchName: (name) => checkInteractiveBranchName(targetDir, name),
-  })
+  const selection = await launchRunTui(
+    {
+      targetDir,
+      // A specs-viewer handoff arrives with the change already chosen: the
+      // launcher pins that spec row instead of running its auto-detect heuristics.
+      ...(presetChange ? { presetChange } : {}),
+      // A control-board "continue" arrives with the feature's worktree and
+      // branch already chosen: the launcher reuses them and never asks the namer.
+      ...(presetFeature ? { presetFeature: { changeID: presetChange ?? "", ...presetFeature } } : {}),
+      prepareRun: (runSelection) => prepareInteractiveRun(targetDir, runSelection),
+      proposeBranchName: (input) => proposeInteractiveBranchName(targetDir, input),
+      checkBranchName: (name) => checkInteractiveBranchName(targetDir, name),
+    },
+    route,
+  )
   if (!selection) return
   if (selection.action === "runs") {
-    await openRunsBrowser()
+    await openRunsBrowser(undefined, route)
     return
   }
   if (selection.action === "config") {
-    await openConfigEditor(targetDir)
+    await openConfigEditor(targetDir, route)
     return
   }
 
@@ -563,7 +622,7 @@ async function launchInteractiveRun(targetDir: string, presetChange?: string, pr
     if (!options.branch) throw new Error("worktree plan is missing its confirmed branch name")
     options = await prepareWorktreeForRun(targetDir, options)
   }
-  await executeRun(options, plan)
+  await executeRun(options, plan, route)
 }
 
 async function prepareInteractiveRun(targetDir: string, selection: LaunchRunSelection): Promise<LaunchRunPreparation> {
@@ -620,19 +679,19 @@ async function checkInteractiveBranchName(targetDir: string, name: string): Prom
  * @returns true when the browser left via a resume/retry (which started its
  *   own coordinator and owns the CLI's exit code), false when the user quit.
  */
-async function openRunsBrowser(initialRunID?: string): Promise<boolean> {
+async function openRunsBrowser(initialRunID?: string, route?: TuiRoute): Promise<boolean> {
   // The browser can open a run's dashboard and come back, so loop until the
   // user resumes (which hands off to a real run) or quits.
   let currentRunID = initialRunID
   for (;;) {
-    const resolution = await browseRuns(currentRunID)
+    const resolution = await browseRuns(currentRunID, route)
     if (resolution.type === "retry") {
       const options = await retryOptions(resolution.runID, resolution.targetDir)
       const plan = options.plan ?? (await buildReviewedPlan({ ...options, promptSource: "retry" }))
       if (!(await confirmRunPlan(plan))) return false
       await preflightRunPlan(plan)
       // A resumed/retried run is also a coordinator: same spawn + auto-attach path.
-      await executeRun(options, plan)
+      await executeRun(options, plan, route)
       return true
     }
     if (resolution.type === "resume") {
@@ -640,7 +699,7 @@ async function openRunsBrowser(initialRunID?: string): Promise<boolean> {
       const plan = options.plan ?? (await buildReviewedPlan({ ...options, promptSource: "resume" }))
       if (!(await confirmRunPlan(plan))) return false
       await preflightRunPlan(plan)
-      await executeRun(options, plan)
+      await executeRun(options, plan, route)
       return true
     }
     if (resolution.type === "open") {
@@ -648,7 +707,7 @@ async function openRunsBrowser(initialRunID?: string): Promise<boolean> {
       // A menu attach is a controller (ctrlC detaches); observer while a
       // controller is already attached.
       const { openRunDashboard } = await import("./attach")
-      await openRunDashboard(resolution.runID, { ctrlC: "detach" })
+      await openRunDashboard(resolution.runID, { ctrlC: "detach" }, route)
       currentRunID = resolution.runID
       continue
     }
@@ -656,10 +715,10 @@ async function openRunsBrowser(initialRunID?: string): Promise<boolean> {
   }
 }
 
-async function openConfigEditor(targetDir: string) {
+async function openConfigEditor(targetDir: string, route?: TuiRoute) {
   // Imported lazily so normal runs never pull in the opentui editor.
   const { editConfigTui } = await import("./config-tui")
-  await editConfigTui({ targetDir })
+  await editConfigTui({ targetDir, route })
 }
 
 /**
@@ -670,10 +729,10 @@ async function openConfigEditor(targetDir: string) {
  * exit simply ends. Each half is thin over specs.ts, whose pieces are unit-
  * tested; the interactive halves are covered by component tests.
  */
-export async function openSpecsBrowser(targetDir: string): Promise<void> {
-  const resolution = await browseSpecs(targetDir)
+export async function openSpecsBrowser(targetDir: string, route?: TuiRoute): Promise<void> {
+  const resolution = await browseSpecs(targetDir, route)
   if (resolution.type === "apply-change") {
-    await launchInteractiveRun(targetDir, resolution.changeID)
+    await launchInteractiveRun(targetDir, resolution.changeID, undefined, route)
     return
   }
   if (resolution.type === "iterate-change") {
@@ -694,7 +753,7 @@ export async function openSpecsBrowser(targetDir: string): Promise<void> {
     return
   }
   if (resolution.type === "continue-change") {
-    await launchInteractiveRun(targetDir, resolution.changeID, { worktreeDir: resolution.worktreeDir, branch: resolution.branch })
+    await launchInteractiveRun(targetDir, resolution.changeID, { worktreeDir: resolution.worktreeDir, branch: resolution.branch }, route)
     return
   }
   if (resolution.type === "close-change") {
@@ -702,12 +761,15 @@ export async function openSpecsBrowser(targetDir: string): Promise<void> {
     // the live checklist (progress, message confirmation, cleanup offers),
     // a pipe gets the headless stdout summary — same event stream either way.
     const { runCloseCommand } = await import("./feature-close-command")
-    await runCloseCommand({
-      targetDir,
-      changeID: resolution.changeID,
-      worktreeDir: resolution.worktreeDir,
-      branch: resolution.branch,
-    })
+    await runCloseCommand(
+      {
+        targetDir,
+        changeID: resolution.changeID,
+        worktreeDir: resolution.worktreeDir,
+        branch: resolution.branch,
+      },
+      route,
+    )
     return
   }
   if (resolution.type === "archive-change-main") {
@@ -1391,7 +1453,7 @@ Usage:
   convoy finish
   convoy update [--check]
   convoy runs [run-id]
-  convoy control
+  convoy specs
   convoy spin
   convoy close
   convoy opencode install
@@ -1399,8 +1461,8 @@ Usage:
   convoy auth openrouter
 
 Commands:
-  convoy                   Open an interactive TUI launcher to pick a pipeline,
-                           enter a prompt or pick an OpenSpec change, and toggle run options
+  convoy                   Open the home TUI: Pipelines, Specs, Runs, or Config
+                           (Pipelines continues to the interactive run launcher)
   init                     Create .convoy/config.yaml in the target repo
   init --global            Create ~/.convoy/config.yaml
   agents eject <agent>     Copy one built-in agent prompt to agents/<agent>.md to
@@ -1412,10 +1474,10 @@ Commands:
                            (source checkouts are never modified)
   runs [run-id]            Browse run history: resume a run, read its summary/reports,
                            or open a subshell in its run dir (under ~/.convoy/runs)
-  control                   The feature board: every active change and canonical spec
-                            with live derived state (stage, tasks, runs, sync, merged-ness)
-                            and row actions — spin out, continue, close, archive on main
-                            ("convoy specs" is an alias)
+  specs                     The feature board: every active change and canonical spec
+                             with live derived state (stage, tasks, runs, sync, merged-ness)
+                             and row actions — spin out, continue, close, archive on main
+                             ("convoy control" remains as a compatibility alias)
   spin                      Spin an uncommitted OpenSpec change out of the base checkout into
                             an isolated worktree on a conventionally named branch (feat/…, fix/…,
                             change/…) and print the /move handoff for the current OpenCode session

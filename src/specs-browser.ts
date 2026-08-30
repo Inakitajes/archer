@@ -8,7 +8,6 @@ import { parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-r
 import { stripYamlFrontmatter } from "./openspec"
 import { groupChangeArtifacts, specGroupSource, type SpecGroup, type SpecsChangeEntry, type SpecsResolution, type SpecsView } from "./specs"
 import {
-  clipChunks,
   hintsRow,
   joinLines,
   moreHintsMarker,
@@ -23,6 +22,7 @@ import {
   truncate,
 } from "./tui-theme"
 import { shortVersion } from "./version"
+import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 import type { Hint } from "./tui-theme"
@@ -31,12 +31,11 @@ import type { Hint } from "./tui-theme"
 const compactSpecsMaxWidth = 84
 
 /**
- * One row of the navigation list. The three board sections — Active Changes,
- * Worktrees without spec, Canonical Specs — are peers, separated by headers
- * so each is independently reachable while scrolling.
+ * One row of the navigation list. Non-empty board sections are peers,
+ * separated by headers so each is independently reachable while scrolling.
  */
 type ListRow =
-  | { kind: "header"; label: string; section: "changes" | "worktrees" | "specs" }
+  | { kind: "header"; label: string }
   | { kind: "change"; change: SpecsChangeEntry }
   | { kind: "worktree"; worktree: WorktreeWithoutSpec }
   | { kind: "spec"; path: string }
@@ -45,6 +44,7 @@ export class SpecsBrowser {
   readonly result: Promise<SpecsResolution>
 
   private resolveResult!: (resolution: SpecsResolution) => void
+  private finished = false
   /** "root": the three-section entity list; "detail": one subject's reading pane. */
   private level: "root" | "detail" = "root"
   /** Set while the immersive reader replaces the chrome (detail level only). */
@@ -89,6 +89,7 @@ export class SpecsBrowser {
     if ((key.ctrl && key.name === "c") || key.raw === "\u0003") {
       key.preventDefault()
       key.stopPropagation()
+      this.scene?.requestInterrupt()
       this.finish({ type: "exit" })
       return
     }
@@ -104,10 +105,12 @@ export class SpecsBrowser {
     // Clipboard deps are constructor-injected exactly like the dashboard's
     // copyReport, so tests swap the transport instead of shelling out.
     private readonly copyReport: typeof copyReportToClipboard = copyReportToClipboard,
+    private readonly scene?: TuiScene,
   ) {
     this.result = new Promise((resolve) => {
       this.resolveResult = resolve
     })
+    const mount = this.scene?.root ?? renderer.root
     // Land on the first non-header row (the first change, or the first spec
     // when there are no changes). A header is a dead row — enter/apply/iterate
     // no-op on it — so the browser must never park the cursor there.
@@ -124,14 +127,14 @@ export class SpecsBrowser {
       gap: 0,
     })
 
-    // Minimal chrome (one header content line): the live counts ride a single
-    // row; there is no static location line.
+    // Minimal chrome (one header content line): identify the normalized target
+    // directory without repeating list counts.
     const header = this.panel({
       id: "convoy-specs-header",
       height: 3,
       borderColor: theme.border,
       backgroundColor: theme.bg,
-      title: ` convoy control ${shortVersion()} `,
+      title: ` convoy specs ${shortVersion()} `,
       titleAlignment: "left",
     })
 
@@ -207,7 +210,7 @@ export class SpecsBrowser {
     shell.add(header.box)
     shell.add(body)
     shell.add(footer.box)
-    renderer.root.add(shell)
+    mount.add(shell)
 
     renderer.keyInput.on("keypress", this.handleKeyPress)
     renderer.on("theme_mode", this.handleThemeMode)
@@ -494,13 +497,26 @@ export class SpecsBrowser {
   // ── layout ──────────────────────────────────────────────────────────────
 
   private get rows(): ListRow[] {
-    const rows: ListRow[] = [{ kind: "header", label: "Active Changes", section: "changes" }]
-    for (const change of this.view.changes) rows.push({ kind: "change", change })
-    rows.push({ kind: "header", label: "Worktrees without spec", section: "worktrees" })
-    for (const worktree of this.view.worktreesWithoutSpec ?? []) rows.push({ kind: "worktree", worktree })
-    rows.push({ kind: "header", label: "Canonical Specs", section: "specs" })
-    for (const path of this.view.specs) rows.push({ kind: "spec", path })
+    const rows: ListRow[] = []
+    if (this.view.changes.length > 0) {
+      rows.push({ kind: "header", label: "Active Changes" })
+      for (const change of this.view.changes) rows.push({ kind: "change", change })
+    }
+    const worktrees = this.view.worktreesWithoutSpec ?? []
+    if (worktrees.length > 0) {
+      rows.push({ kind: "header", label: "Worktrees without spec" })
+      for (const worktree of worktrees) rows.push({ kind: "worktree", worktree })
+    }
+    if (this.view.specs.length > 0) {
+      rows.push({ kind: "header", label: "Canonical Specs" })
+      for (const path of this.view.specs) rows.push({ kind: "spec", path })
+    }
     return rows
+  }
+
+  /** Canonical specs need no root preview: their row already identifies them. */
+  private canonicalSelectedAtRoot() {
+    return this.level === "root" && this.rows[this.selectedRow]?.kind === "spec"
   }
 
   private detailsWidth() {
@@ -517,6 +533,7 @@ export class SpecsBrowser {
 
   private listHeight() {
     // Header (3) + footer (3) + list panel borders (2); compact stacks instead.
+    if (this.canonicalSelectedAtRoot()) return Math.max(3, this.bodyHeight() - 2)
     if (this.renderer.width <= compactSpecsMaxWidth) return Math.max(3, this.compactListHeight(this.bodyHeight()) - 2)
     return Math.max(3, this.renderer.height - 8)
   }
@@ -538,10 +555,11 @@ export class SpecsBrowser {
   // ── rendering ───────────────────────────────────────────────────────────
 
   private render() {
-    if (this.renderer.isDestroyed) return
+    if (this.finished || this.renderer.isDestroyed || this.scene?.isClosed) return
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const compact = this.renderer.width <= compactSpecsMaxWidth
     const detail = this.level === "detail"
+    const fullRootList = this.canonicalSelectedAtRoot()
     // The fullscreen reader replaces the header, footer, and tab chrome with
     // its title bar (the details panel's border title) plus the full-width pane.
     const reader = detail && this.fullscreen
@@ -551,15 +569,22 @@ export class SpecsBrowser {
     const listWidth = Math.max(36, this.renderer.width - detailsWidth - 7)
     const bodyHeight = this.bodyHeight()
 
-    this.bodyBox.flexDirection = !detail && compact ? "column" : "row"
+    this.bodyBox.flexDirection = !detail && compact && !fullRootList ? "column" : "row"
     if (detail) {
       // The reading pane is full width: the navigation list is hidden and the
       // details panel takes the whole body.
       this.listBox.visible = false
+      this.detailsBox.visible = true
       this.detailsBox.width = "100%"
       this.detailsBox.height = "100%"
+    } else if (fullRootList) {
+      this.listBox.visible = true
+      this.detailsBox.visible = false
+      this.listBox.width = "100%"
+      this.listBox.height = "100%"
     } else if (compact) {
       this.listBox.visible = true
+      this.detailsBox.visible = true
       const listHeight = this.compactListHeight(bodyHeight)
       this.listBox.width = "100%"
       this.listBox.height = listHeight
@@ -567,6 +592,7 @@ export class SpecsBrowser {
       this.detailsBox.height = Math.max(3, bodyHeight - listHeight)
     } else {
       this.listBox.visible = true
+      this.detailsBox.visible = true
       this.listBox.width = "auto"
       this.listBox.height = "100%"
       this.detailsBox.width = detailsWidth
@@ -575,21 +601,16 @@ export class SpecsBrowser {
 
     this.headerText.content = this.headerContent(innerWidth)
     this.listBox.title = " browse "
-    this.listText.content = detail ? "" : this.listContent(compact ? innerWidth : listWidth)
+    this.listText.content = detail ? "" : this.listContent(compact || fullRootList ? innerWidth : listWidth)
     this.detailsText.content = this.detailsContent((compact && !detail ? innerWidth : detail ? innerWidth : detailsWidth) - 4)
     this.detailsBox.title = this.detailsTitle()
     this.footerText.content = this.footerContent(innerWidth)
     this.renderer.requestRender()
   }
 
-  /** The header's only content line: the live counts, nothing static. */
+  /** The header's only content line: the normalized target project directory. */
   private headerContent(width: number) {
-    const summary: TextChunk[] = [
-      fg(theme.text)(`${this.view.changes.length} change${this.view.changes.length === 1 ? "" : "s"}`),
-      fg(theme.faint)("  ·  "),
-      fg(theme.text)(`${this.view.specs.length} spec${this.view.specs.length === 1 ? "" : "s"}`),
-    ]
-    return joinLines([new StyledText(clipChunks(summary, width))])
+    return t`${fg(theme.dim)(shortPath(this.view.targetDir, width))}`
   }
 
   /** The details panel's border title doubles as the reader's title bar. */
@@ -624,15 +645,7 @@ export class SpecsBrowser {
 
   private rowLine(row: ListRow, selected: boolean, width: number): StyledText {
     if (row.kind === "header") {
-      const left: TextChunk[] = [bold(fg(theme.accent)(` ${truncate(row.label.toUpperCase(), width)}`))]
-      const count =
-        row.section === "changes"
-          ? this.view.changes.length
-          : row.section === "worktrees"
-            ? (this.view.worktreesWithoutSpec?.length ?? 0)
-            : this.view.specs.length
-      if (count > 0) return new StyledText(left)
-      return padBetween(left, [fg(theme.dim)("none")], width)
+      return new StyledText([bold(fg(theme.accent)(` ${truncate(row.label.toUpperCase(), width)}`))])
     }
     if (row.kind === "change") {
       const change = row.change
@@ -769,7 +782,7 @@ export class SpecsBrowser {
           : []),
         { keys: "v", label: "full", priority: 3, style: "glued" },
         { keys: "esc", label: "back", priority: 4 },
-        { keys: "q", label: "uit", priority: 1, style: "glued" },
+        { keys: "q", label: this.scene ? "back" : "uit", priority: 1, style: this.scene ? undefined : "glued" },
       ]
       const position = `${this.selectedGroup + 1}/${Math.max(1, this.groups.length)}`
       return hintsRow(hints, [[fg(theme.faint)(position)]], width, { style: "spaced", overflow: moreHintsMarker })
@@ -789,7 +802,7 @@ export class SpecsBrowser {
             ...(feature?.probablyMerged ? ([{ keys: "m", label: "archive", priority: 7 }] as Hint[]) : []),
           ] as Hint[])
         : []),
-      { keys: "q", label: "uit", priority: 1, style: "glued" },
+      { keys: "q", label: this.scene ? "back" : "uit", priority: 1, style: this.scene ? undefined : "glued" },
     ]
     const selectable = this.rows.filter((row) => row.kind !== "header").length
     const ordinal = this.rows.slice(0, this.selectedRow + 1).filter((row) => row.kind !== "header").length
@@ -798,9 +811,11 @@ export class SpecsBrowser {
   }
 
   private finish(resolution: SpecsResolution) {
+    if (this.finished) return
+    this.finished = true
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
     this.renderer.off("theme_mode", this.handleThemeMode)
-    if (!this.renderer.isDestroyed) this.renderer.destroy()
+    if (!this.scene && !this.renderer.isDestroyed) this.renderer.destroy()
     this.resolveResult(resolution)
   }
 
@@ -831,7 +846,11 @@ export class SpecsBrowser {
 }
 
 /** Interactive specs browser: the control board — browse, read, apply, iterate, spin, continue, close. */
-export async function browseSpecsTui(view: SpecsView): Promise<SpecsResolution> {
+export async function browseSpecsTui(view: SpecsView, route?: TuiRoute): Promise<SpecsResolution> {
+  if (route) {
+    const scene = sceneForRoute(route, "convoy-specs-scene")!
+    return new SpecsBrowser(route.session.renderer, view, copyReportToClipboard, scene).result
+  }
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
   const renderer = await createCliRenderer({

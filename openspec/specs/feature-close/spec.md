@@ -101,17 +101,17 @@ The squashed commit's message SHALL be composed, not templated from the branch n
 
 ### Requirement: Close shows its progress as a checklist
 
-When running interactively, close SHALL render a live checklist of the sequence — preflight rendered as one line, then sync, archive, squash, and merge — with each step's completion, skip (with reason), or failure visible as it happens. The squash step SHALL present the composed message for confirmation or editing before the commit lands. A mid-sequence stop SHALL leave the checklist visible with the failed step and its remediation; resuming SHALL show previously completed steps already checked. When not running interactively, close SHALL print the same operational facts as a stdout summary without attempting any interactive offers.
+When running interactively, close SHALL render the whole sequence in a real full-screen TUI — not line-oriented terminal output redrawn with cursor-control bytes. The TUI SHALL show preflight as one line, then sync, archive, squash, and merge, with each step's completion, skip (with reason), or failure visible as it happens. The squash step SHALL present the composed message inside the TUI for confirmation, cancellation, or editing before the commit lands; launching the external editor MAY temporarily release and then restore the TUI with its checklist state intact. After a successful merge, push, worktree removal, and branch deletion SHALL remain in the same TUI as explicit optional actions, with unavailable dependencies visible and failed actions retryable. A mid-sequence stop SHALL keep the TUI open with the failed step and its remediation until the operator dismisses it; resuming SHALL show previously completed steps already checked. When not running interactively, close SHALL print the same operational facts as a stdout summary without attempting any interactive offers.
 
 #### Scenario: Checklist completes in a terminal
 
 - **WHEN** close runs to completion in a TTY
-- **THEN** each step is visible as completed or skipped-with-reason, the merge shape is narrated, and the follow-up offers appear on the completed checklist
+- **THEN** each step is visible as completed or skipped-with-reason in the full-screen TUI, the merge shape is narrated, and the follow-up actions appear in that same interface
 
 #### Scenario: The message is confirmed before landing
 
 - **WHEN** the squash step reaches the composed message in a TTY
-- **THEN** the operator can accept it as-is or edit it, and the commit lands only after that choice
+- **THEN** the TUI lets the operator accept it as-is, edit it, or cancel, and the commit lands only after acceptance
 
 #### Scenario: A stop keeps the state readable
 

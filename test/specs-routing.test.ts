@@ -22,6 +22,7 @@ const actualOpencode = await import("../src/opencode")
 // record in place, so the namespace objects above reflect the mock once
 // registered and would recurse if consulted through them.
 const realBrowseSpecs = actualSpecs.browseSpecs
+const realLoadSpecsView = actualSpecs.loadSpecsView
 const realLaunchRunTui = actualLaunchTui.launchRunTui
 const realOpenIterateWindow = actualOpencode.openIterateOpencodeWindow
 
@@ -84,6 +85,11 @@ async function makeChangeRepo(): Promise<string> {
 }
 
 describe("openSpecsBrowser routing (specs viewer handoffs)", () => {
+  test("the loaded view carries the normalized target directory", async () => {
+    const view = await realLoadSpecsView(join(root, "."))
+    expect(view.targetDir).toBe(root)
+  })
+
   test("apply-change hands the change id to the launcher as the preset", async () => {
     nextResolution = { type: "apply-change", changeID: "add-login" }
     await openSpecsBrowser(root)

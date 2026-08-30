@@ -19,6 +19,7 @@ import { listOpenSpecChanges, loadOpenSpecBundle, openSpecPromptFor, type OpenSp
 import { runReviewLines } from "./review-tui"
 import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { shortVersion } from "./version"
+import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { ConvoyConfig } from "./config"
 import type { WorktreeDefault } from "./git"
@@ -322,7 +323,7 @@ export function adjustGoalTarget(current: number, delta: number): number {
   return Math.max(1, Math.min(100, current + delta))
 }
 
-export async function launchRunTui(options: LaunchRunTuiOptions): Promise<LaunchRunTuiResult> {
+export async function launchRunTui(options: LaunchRunTuiOptions, route?: TuiRoute): Promise<LaunchRunTuiResult> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("convoy needs an interactive terminal to open the launcher")
   }
@@ -330,17 +331,6 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
   const config = await loadMergedConvoyConfig(options.targetDir)
   const choices = pipelineChoices(config, buildAgentRegistry(config))
 
-  // No backgroundColor yet: the palette is only chosen after the terminal
-  // answers the background query, so a light terminal never flashes dark.
-  // No targetFps: it only applies while opentui's own loop runs, which convoy
-  // never starts — frames come on demand, paced by the ticker below.
-  const renderer = await createCliRenderer({
-    screenMode: "alternate-screen",
-    consoleMode: "console-overlay",
-    exitOnCtrlC: false,
-  })
-  const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
-  setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
   // Unset config means "decide per branch": isolating is right on a trunk, but
   // on a branch you're already where the work should land.
   const worktree =
@@ -361,7 +351,21 @@ export async function launchRunTui(options: LaunchRunTuiOptions): Promise<Launch
           .then((bundle) => (bundle ? [...bundle.changeIds] : []))
           .catch(() => [] as string[])
       : []
-  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs, autoSpecIds, options.presetChange, options.presetFeature, await detectInsideWorktree(options.targetDir)).result
+  const insideWorktree = await detectInsideWorktree(options.targetDir)
+
+  if (route) {
+    const scene = sceneForRoute(route, "convoy-launch-scene")!
+    return new LaunchPicker(route.session.renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs, autoSpecIds, options.presetChange, options.presetFeature, insideWorktree, scene).result
+  }
+
+  // No backgroundColor yet: the palette is only chosen after the terminal
+  // answers the background query, so a light terminal never flashes dark.
+  // No targetFps: it only applies while opentui's own loop runs, which convoy
+  // never starts — frames come on demand, paced by the ticker below.
+  const renderer = await createCliRenderer({ screenMode: "alternate-screen", consoleMode: "console-overlay", exitOnCtrlC: false })
+  const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
+  setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
+  return new LaunchPicker(renderer, options.targetDir, choices, config?.modelRouting?.gateway ?? "configured", worktree, options, history, specs, autoSpecIds, options.presetChange, options.presetFeature, insideWorktree).result
 }
 
 /** Where the launcher is running inside a feature worktree, for the nested-isolation warning. */
@@ -492,6 +496,7 @@ export class LaunchPicker {
   readonly result: Promise<LaunchRunTuiResult>
 
   private resolveResult!: (selection: LaunchRunTuiResult) => void
+  private finished = false
   private mode: Mode = "pipelines"
   private selected = 0
   private scroll = 0
@@ -613,6 +618,7 @@ export class LaunchPicker {
     if ((key.ctrl && key.name === "c") || key.raw === "\u0003") {
       key.preventDefault()
       key.stopPropagation()
+      this.scene?.requestInterrupt()
       this.finish(undefined)
       return
     }
@@ -690,6 +696,7 @@ export class LaunchPicker {
     private readonly presetFeature?: { changeID: string; worktreeDir: string; branch: string },
     /** Set when the launcher itself runs inside a worktree; drives the nested-isolation warning. */
     private readonly insideWorktree?: InsideWorktree,
+    private readonly scene?: TuiScene,
   ) {
     this.toggleState.worktree = worktreeDefault.isolate
     // The preset pins the contract before anything renders, so the prompt step
@@ -710,6 +717,7 @@ export class LaunchPicker {
     this.result = new Promise((resolve) => {
       this.resolveResult = resolve
     })
+    const mount = this.scene?.root ?? renderer.root
 
     const shell = new BoxRenderable(renderer, {
       id: "convoy-launch-shell",
@@ -841,7 +849,7 @@ export class LaunchPicker {
     shell.add(header.box)
     shell.add(body)
     shell.add(footer.box)
-    renderer.root.add(shell)
+    mount.add(shell)
 
     // Modals float over the whole canvas, matching config-tui/runs-tui: an
     // absolute overlay centers a rounded accent-bordered box painted on
@@ -871,7 +879,7 @@ export class LaunchPicker {
     this.modalText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", height: "100%" })
     this.modalBox.add(this.modalText)
     this.overlay.add(this.modalBox)
-    renderer.root.add(this.overlay)
+    mount.add(this.overlay)
     this.paletteTargets.push({ box: this.modalBox, background: "overlay", border: "accent" })
 
     renderer.keyInput.on("keypress", this.handleKeyPress)
@@ -1594,12 +1602,14 @@ export class LaunchPicker {
   }
 
   private finish(selection: LaunchRunTuiResult) {
+    if (this.finished) return
+    this.finished = true
     clearInterval(this.ticker)
     this.stopLimits()
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
     this.renderer.keyInput.off("paste", this.handlePaste)
     this.renderer.off("theme_mode", this.handleThemeMode)
-    if (!this.renderer.isDestroyed) this.renderer.destroy()
+    if (!this.scene && !this.renderer.isDestroyed) this.renderer.destroy()
     this.resolveResult(selection)
   }
 
@@ -1624,7 +1634,7 @@ export class LaunchPicker {
   }
 
   private render() {
-    if (this.renderer.isDestroyed) return
+    if (this.finished || this.renderer.isDestroyed || this.scene?.isClosed) return
     this.lastRenderAt = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const reviewing = this.mode === "review"
@@ -2268,7 +2278,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
           { keys: "enter", label: "prompt", priority: 3 },
           { keys: "r", label: "runs", priority: 4 },
           { keys: "c", label: "config", priority: 5 },
-          { keys: "q", label: "quit", priority: 1 },
+          { keys: "q", label: this.scene ? "back" : "quit", priority: 1 },
         ],
         [fg(theme.faint)(`${this.selected + 1}/${this.choices.length}`)],
       )
@@ -2326,7 +2336,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
         { keys: "g", label: "gateway", priority: 5 },
         { keys: "enter", label: "review", priority: 4 },
         { keys: "p", label: "prompt", priority: 6 },
-        { keys: "q", label: "quit", priority: 1 },
+        { keys: "q", label: this.scene ? "back" : "quit", priority: 1 },
       ],
       [fg(theme.faint)(`${this.optionIndex + 1}/${this.optionCount()}`)],
     )

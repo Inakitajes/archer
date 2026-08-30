@@ -89,6 +89,12 @@ export type CloseInput = {
    * `--message` never reaches it.
    */
   resolveMessage?: (proposal: CloseMessageProposal) => Promise<string | undefined>
+  /**
+   * Releases an interactive renderer while a user-owned git command may need
+   * the terminal (commit signing, hooks, credential prompts). Headless callers
+   * omit it and execute the action directly.
+   */
+  withTerminal?: <T>(action: () => Promise<T>) => Promise<T>
   /** Test seam: the commit writer behind composition. Defaults to `proposeCommitMessage`. */
   writer?: (input: Parameters<typeof proposeCommitMessage>[0]) => Promise<CommitMessageProposal>
 }
@@ -144,7 +150,7 @@ export async function resolveCloseTarget(input: CloseInput): Promise<CloseTarget
   }
   if (!worktreeDir) {
     throw new Error(
-      "couldn't locate the feature worktree: pass --branch <name>, run inside the worktree, or continue from the control board's row action",
+      "couldn't locate the feature worktree: pass --branch <name>, run inside the worktree, or continue from the specs board's row action",
     )
   }
 
@@ -318,8 +324,19 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
     }
     // The archive result is committed on the feature branch under the
     // operator's identity (staged explicitly; commitAsUser adds nothing).
-    await execFile("git", ["add", openspecDirName], { cwd: target.worktreeDir })
-    await commitAsUser(archiveSubject, target.worktreeDir)
+    try {
+      await execFile("git", ["add", openspecDirName], { cwd: target.worktreeDir })
+      const commitArchive = () => commitAsUser(archiveSubject, target.worktreeDir)
+      if (input.withTerminal) await input.withTerminal(commitArchive)
+      else await commitArchive()
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      const message =
+        `archive: change ${target.changeID} was archived but committing the result failed — resolve the git error in the worktree, ` +
+        `commit the archive result, then run \`convoy close --resume\`\n${detail}`
+      emit({ type: "step-failed", step: "archive", message })
+      throw new Error(message)
+    }
     emit({ type: "step-completed", step: "archive", detail: `archived ${target.changeID}` })
   } else {
     emit({ type: "step-skipped", step: "archive", reason: `change ${target.changeID} is already archived` })
@@ -343,7 +360,8 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
       throw new Error(stop)
     }
     try {
-      const result = await applySquash({ cwd: target.worktreeDir, plan: range, message })
+      const squash = () => applySquash({ cwd: target.worktreeDir, plan: range, message })
+      const result = input.withTerminal ? await input.withTerminal(squash) : await squash()
       squashed = { sha: result.sha, replaced: result.replaced }
       emit({ type: "step-completed", step: "squash", detail: `${result.replaced} commit${result.replaced === 1 ? "" : "s"} → ${result.sha.slice(0, 8)}` })
     } catch (error) {
@@ -557,7 +575,7 @@ export async function archiveChangeOnMain(input: { targetDir: string; changeID: 
   const { changeID } = input
   // Archive always lands on the base branch's checkout — the repo's main
   // worktree, not whatever directory the board happened to be launched from.
-  // Opening `convoy control` inside a feature worktree (a supported scenario)
+  // Opening `convoy specs` inside a feature worktree (a supported scenario)
   // must not archive and commit on that feature branch instead (SC-4).
   const targetDir = (await mainWorktreeDir(input.targetDir).catch(() => undefined)) ?? input.targetDir
 

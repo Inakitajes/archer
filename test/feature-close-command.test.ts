@@ -9,7 +9,6 @@ import {
   closeHelp,
   closeSurface,
   confirmCloseMessage,
-  createCloseChecklistRenderer,
   formatCloseEvents,
   formatCloseFollowUps,
   initialCloseChecklistState,
@@ -91,8 +90,8 @@ describe("closeHelp", () => {
   const help = closeHelp()
 
   test("documents the interactive and headless contracts", () => {
-    expect(help).toContain("live checklist")
-    expect(help).toContain("confirm or")
+    expect(help).toContain("full-screen TUI")
+    expect(help).toContain("confirm, edit")
     expect(help).toContain("fast-forward")
     expect(help).toContain("upstream")
     expect(help).toContain("Headless")
@@ -163,27 +162,6 @@ describe("renderCloseChecklist", () => {
     const blockers: ClosePreflightBlocker[] = [{ check: "tasks", message: "2 of 3 tasks are incomplete — finish them before closing" }]
     const frame = renderCloseChecklist(stateThrough([{ type: "preflight-failed", blockers }]))
     expect(frame).toEqual(["close preflight failed:", "  2 of 3 tasks are incomplete — finish them before closing"])
-  })
-})
-
-describe("createCloseChecklistRenderer", () => {
-  test("redraws in place with cursor-up, and break() makes the next event print fresh", () => {
-    const chunks: string[] = []
-    const renderer = createCloseChecklistRenderer((text) => chunks.push(text))
-    renderer.onEvent({ type: "preflight", summary: "clean tree" })
-    const firstFrame = chunks.join("")
-    expect(firstFrame).toContain("preflight: clean tree")
-    expect(firstFrame).not.toContain("\x1b[")
-
-    const afterFirstFrame = chunks.length
-    renderer.onEvent({ type: "step-started", step: "sync" })
-    const redraw = chunks.slice(afterFirstFrame).join("")
-    expect(redraw.startsWith("\x1b[5A\x1b[J")).toBe(true)
-
-    renderer.break()
-    const afterSecondFrame = chunks.length
-    renderer.onEvent({ type: "step-completed", step: "sync", detail: "done" })
-    expect(chunks.slice(afterSecondFrame).join("")).not.toContain("\x1b[")
   })
 })
 

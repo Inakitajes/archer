@@ -52,16 +52,23 @@ import {
 } from "./tui-theme"
 import { shortVersion } from "./version"
 import { convoyRoot, globalConfigPath } from "./workspace"
+import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 import type { Hint, PaletteColor } from "./tui-theme"
 import type { HookSpec } from "./types"
 
-export async function editConfigTui(options: { targetDir: string }): Promise<void> {
+export async function editConfigTui(options: { targetDir: string; route?: TuiRoute }): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("convoy config needs an interactive terminal")
   }
   const [globalConfig, projectConfig] = await Promise.all([loadGlobalConvoyConfig(), loadConvoyConfig(options.targetDir)])
+
+  if (options.route) {
+    const scene = sceneForRoute(options.route, "convoy-config-scene")!
+    await new ConfigEditor(options.route.session.renderer, options.targetDir, globalConfig, projectConfig, scene).result
+    return
+  }
 
   const renderer = await createCliRenderer({
     screenMode: "alternate-screen",
@@ -166,6 +173,7 @@ export function claudeModelPickerState(current: string | undefined): { options: 
 export class ConfigEditor {
   readonly result: Promise<void>
   private resolveResult!: () => void
+  private finished = false
 
   private readonly tabs: [Tab, Tab]
   private active = 0
@@ -200,7 +208,7 @@ export class ConfigEditor {
     if ((key.ctrl && key.name === "c") || key.raw === "") {
       key.preventDefault()
       key.stopPropagation()
-      this.tryQuit()
+      this.tryQuit("interrupt")
       return
     }
     key.preventDefault()
@@ -214,6 +222,7 @@ export class ConfigEditor {
     targetDir: string,
     globalConfig: ConvoyConfig | undefined,
     projectConfig: ConvoyConfig | undefined,
+    private readonly scene?: TuiScene,
   ) {
     this.tabs = [
       { title: "Global", path: globalConfigPath(), validateDir: convoyRoot(), config: globalConfig, dirty: false },
@@ -222,6 +231,7 @@ export class ConfigEditor {
     this.result = new Promise((resolve) => {
       this.resolveResult = resolve
     })
+    const mount = this.scene?.root ?? renderer.root
 
     const shell = new BoxRenderable(renderer, {
       id: "convoy-config-shell",
@@ -273,7 +283,7 @@ export class ConfigEditor {
     shell.add(header.box)
     shell.add(body)
     shell.add(footer.box)
-    renderer.root.add(shell)
+    mount.add(shell)
 
     this.overlay = new BoxRenderable(renderer, {
       id: "convoy-config-overlay",
@@ -301,7 +311,7 @@ export class ConfigEditor {
     this.modalText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", height: "100%" })
     this.modalBox.add(this.modalText)
     this.overlay.add(this.modalBox)
-    renderer.root.add(this.overlay)
+    mount.add(this.overlay)
     this.paletteTargets.push({ box: this.modalBox, background: "overlay", border: "accent" })
 
     renderer.keyInput.on("keypress", this.handleKeyPress)
@@ -358,7 +368,7 @@ export class ConfigEditor {
         return
       case "q":
       case "escape":
-        this.tryQuit()
+        this.tryQuit("back")
         return
       case "t":
         this.editTemperature()
@@ -1178,18 +1188,18 @@ export class ConfigEditor {
     }
   }
 
-  private tryQuit() {
+  private tryQuit(cause: "back" | "interrupt") {
     if (this.tabs.some((tab) => tab.dirty)) {
       this.modal = {
         kind: "confirm",
         title: "Unsaved changes",
         message: "Discard unsaved changes and quit? [y/n]",
-        onYes: () => this.finish(),
+        onYes: () => this.finish(cause),
       }
       this.render()
       return
     }
-    this.finish()
+    this.finish(cause)
   }
 
   // ---- modal openers ------------------------------------------------------
@@ -1264,11 +1274,14 @@ export class ConfigEditor {
     this.render()
   }
 
-  private finish() {
+  private finish(cause: "back" | "interrupt") {
+    if (this.finished) return
+    this.finished = true
     clearInterval(this.ticker)
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
     this.renderer.off("theme_mode", this.handleThemeMode)
-    if (!this.renderer.isDestroyed) this.renderer.destroy()
+    if (cause === "interrupt") this.scene?.requestInterrupt()
+    if (!this.scene && !this.renderer.isDestroyed) this.renderer.destroy()
     this.resolveResult()
   }
 
@@ -1394,7 +1407,7 @@ export class ConfigEditor {
   }
 
   private render() {
-    if (this.renderer.isDestroyed) return
+    if (this.finished || this.renderer.isDestroyed || this.scene?.isClosed) return
     this.lastRenderAt = Date.now()
     this.rows = this.buildRows()
     if (this.selected >= this.rows.length) this.selected = this.firstSelectable()
@@ -1551,7 +1564,7 @@ export class ConfigEditor {
       { keys: "enter", label: "edit", priority: 3 },
       { keys: "s", label: "ave", priority: 2, style: "glued" },
       { keys: "tab", label: "switch", priority: 5 },
-      { keys: "q", label: "uit", priority: 1, style: "glued" },
+      { keys: "q", label: this.scene ? "back" : "uit", priority: 1, style: this.scene ? undefined : "glued" },
     ]
     const dirty = this.tab().dirty ? fg(theme.yellow)("● unsaved") : fg(theme.faint)("saved")
     return hintsRow(hints, [[dirty]], width, { style: "spaced", overflow: moreHintsMarker })

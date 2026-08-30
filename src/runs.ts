@@ -8,6 +8,7 @@ import type { PendingSnapshot } from "./control-server"
 import { readRunMetadata, type PhaseMetadataStatus, type RunMetadata } from "./metadata"
 import { isValidRunID, runsRoot } from "./workspace"
 import { readAdvisorSplit } from "./advisor-report"
+import type { TuiRoute } from "./tui-session"
 
 export type RunStatusKind = "completed" | "failed" | "incomplete" | "empty" | "unknown"
 
@@ -63,9 +64,14 @@ export async function listRuns(root = runsRoot()): Promise<RunEntry[]> {
 }
 
 /** Interactive run-history browser: pick a run, then resume it, read its reports, or open a subshell in its dir. */
-export async function browseRuns(initialRunID?: string): Promise<RunsResolution> {
+export async function browseRuns(initialRunID?: string, route?: TuiRoute): Promise<RunsResolution> {
   const runs = await listRuns()
   if (runs.length === 0) {
+    if (route) {
+      const { showNoticeTui } = await import("./notice-tui")
+      await showNoticeTui(route, { title: "runs", message: `No runs found in ${runsRoot()}` })
+      return { type: "exit" }
+    }
     stdout.write(`no runs found in ${runsRoot()}\n`)
     return { type: "exit" }
   }
@@ -85,7 +91,7 @@ export async function browseRuns(initialRunID?: string): Promise<RunsResolution>
   // Dynamic import keeps opentui out of non-interactive invocations (same
   // reason progress.ts lazy-loads the run TUI).
   const { browseRunsTui } = await import("./runs-tui")
-  return browseRunsTui(runs, initialIndex)
+  return browseRunsTui(runs, initialIndex, route)
 }
 
 /** SUMMARY.md when the run finished; otherwise whatever phase reports landed before it died. */

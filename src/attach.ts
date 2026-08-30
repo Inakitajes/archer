@@ -12,6 +12,7 @@ import { progressPhases } from "./runner"
 import { stepRunnerFor } from "./step-runners"
 import { createTuiProgress } from "./tui"
 import { runsRoot } from "./workspace"
+import type { TuiRoute } from "./tui-session"
 
 /**
  * Claims the controller slot for an attach session. A 409 (slot taken) is
@@ -66,7 +67,7 @@ type AttachView = {
  * - a **stopped run** is reconstructed from metadata + on-disk reports and
  *   shown as the browsable finish screen.
  */
-export async function openRunDashboard(runID: string, options: AttachOptions = {}): Promise<void> {
+export async function openRunDashboard(runID: string, options: AttachOptions = {}, route?: TuiRoute): Promise<void> {
   const dir = join(runsRoot(), runID)
   const metaPath = join(dir, "metadata.json")
   const metadata = await readRunMetadata(metaPath)
@@ -141,6 +142,7 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
       observer: !controller,
       mode: live ? "live" : "historical",
       ctrlC: options.ctrlC ?? "detach",
+      route,
       // [f] is gated on `finished`, so wiring the seam on a live attach is
       // inert until the finish hold lands. Skipping it here used to leave a
       // coordinated finish screen without Finalize.

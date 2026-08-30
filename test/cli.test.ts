@@ -5,12 +5,66 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { goalModeFor, goalModeRejectionError, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
+import { goalModeFor, goalModeRejectionError, parseArgs, parseCommand, resolveRunOptions, runHomeNavigationLoop, shouldLaunchHome } from "../src/cli"
 import { modelGateways } from "../src/model-routing"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import type { Pipeline, RunPlan } from "../src/types"
 
 const validRunID = "20240101-120000-abcd"
+
+describe("home launcher gate", () => {
+  test("opens only for truly empty argv with interactive stdin and stdout", () => {
+    expect(shouldLaunchHome([], true, true)).toBeTrue()
+    expect(shouldLaunchHome([], false, true)).toBeFalse()
+    expect(shouldLaunchHome([], true, false)).toBeFalse()
+    expect(shouldLaunchHome([], undefined, true)).toBeFalse()
+  })
+
+  test("does not consume arguments such as --dir", () => {
+    expect(shouldLaunchHome(["--dir", "/some/repo"], true, true)).toBeFalse()
+    expect(shouldLaunchHome(["--help"], true, true)).toBeFalse()
+  })
+})
+
+describe("home navigation loop", () => {
+  test("a destination close returns to Home with that destination still selected", async () => {
+    const initials: Array<string | undefined> = []
+    const destinations: string[] = []
+    let opens = 0
+
+    await runHomeNavigationLoop({
+      interrupted: () => false,
+      openHome: async (initial) => {
+        initials.push(initial)
+        return opens++ === 0 ? "specs" : undefined
+      },
+      openDestination: async (selection) => {
+        destinations.push(selection)
+      },
+    })
+
+    expect(initials).toEqual([undefined, "specs"])
+    expect(destinations).toEqual(["specs"])
+  })
+
+  test("an interrupt inside a destination exits without reopening Home", async () => {
+    let interrupted = false
+    let homeOpens = 0
+
+    await runHomeNavigationLoop({
+      interrupted: () => interrupted,
+      openHome: async () => {
+        homeOpens += 1
+        return "runs"
+      },
+      openDestination: async () => {
+        interrupted = true
+      },
+    })
+
+    expect(homeOpens).toBe(1)
+  })
+})
 
 describe("parseArgs", () => {
   test("parses a positional prompt", () => {
@@ -291,6 +345,7 @@ describe("parseCommand", () => {
       expect(cmd.text).toContain("convoy [prompt]")
       expect(cmd.text).toContain("Commands:")
       expect(cmd.text).toContain("Flags:")
+      expect(cmd.text).toContain("Pipelines, Specs, Runs, or Config")
       expect(cmd.text).toContain(`--gateway <${modelGateways.join("|")}>`)
     }
   })

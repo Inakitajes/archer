@@ -1,13 +1,13 @@
 # control-board Specification
 
 ## Purpose
-One inferred surface — `convoy control` — where every feature's stage is derived live from git, OpenSpec, and run plans, with the actions that move it along; no persisted registry, one shared change resolver.
+One inferred surface — `convoy specs` — where every feature's stage is derived live from git, OpenSpec, and run plans, with the actions that move it along; no persisted registry, one shared change resolver.
 
 ## Requirements
 
 ### Requirement: Control command is the single inferred board
 
-`convoy control` SHALL present the board (with `convoy specs` retained as an alias) and derive every displayed fact at render time from the filesystem: worktrees and branches from git, task completion from the OpenSpec CLI, run linkage from run plans' frozen branch field, and change identity from the same resolver the launcher and runs use for branch↔change matching. Convoy SHALL NOT persist any feature registry — a row's existence in the world is its existence on the board.
+`convoy specs` SHALL present the board (with `convoy control` retained only as a compatibility alias) and derive every displayed fact at render time from the filesystem: worktrees and branches from git, task completion from the OpenSpec CLI, run linkage from run plans' frozen branch field, and change identity from the same resolver the launcher and runs use for branch↔change matching. Convoy SHALL NOT persist any feature registry — a row's existence in the world is its existence on the board.
 
 #### Scenario: Deleting the worktree updates the board
 
@@ -35,12 +35,17 @@ Each active change row SHALL show its derived stage and signals: tasks completed
 
 ### Requirement: Worktrees without spec get their own section
 
-The board SHALL include a section listing worktrees that carry runs but no OpenSpec change, each linking to the runs browser for that branch. The section SHALL be a peer of the active-changes and canonical-specs sections, not a footnote.
+The board SHALL include a section listing worktrees that carry runs but no OpenSpec change, each linking to the runs browser for that branch. The section SHALL be a peer of the active-changes and canonical-specs sections, not a footnote. Empty peer sections SHALL be omitted entirely, including their titles. A non-empty worktrees-without-spec section SHALL make the interactive board non-empty even when no active changes or canonical specs exist.
 
 #### Scenario: Plain isolated run appears
 
 - **WHEN** an isolated run's worktree exists with no change directory
 - **THEN** it is listed in the worktrees-without-spec section with its branch and run count
+
+#### Scenario: Worktree-only board remains interactive
+
+- **WHEN** worktrees carrying runs exist but there are no active changes or canonical specs
+- **THEN** the interactive board opens with only Worktrees without spec, omitting the Active Changes and Canonical Specs titles
 
 ### Requirement: Continue reuses the feature's worktree and branch
 

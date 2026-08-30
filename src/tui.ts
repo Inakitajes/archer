@@ -56,6 +56,7 @@ import {
   wrapLines,
 } from "./tui-theme"
 import { shortVersion } from "./version"
+import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { BoxOptions, CliRenderer, KeyEvent, Selection, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
@@ -339,8 +340,30 @@ export async function createTuiProgress(
     mode?: TuiDashboardMode
     /** Ctrl+C behavior on this dashboard: abort (first auto-attach) or detach (menu attach). */
     ctrlC?: "abort" | "detach"
+    /** Shared renderer/session when reached from the zero-argument home UI. */
+    route?: TuiRoute
   } & ProgressHostControls,
 ): Promise<ProgressUI> {
+  if (options?.route) {
+    const scene = sceneForRoute(options.route, "convoy-dashboard-scene")!
+    return new TuiProgress(
+      options.route.session.renderer,
+      phases,
+      onAbort,
+      autoAccept,
+      options.offlineSessions ?? false,
+      options.observer ?? false,
+      initialContentTab(options.mode ?? "live"),
+      copyReportToClipboard,
+      options.onPauseToggle,
+      options.onKeepAwakeToggle,
+      options.onBackground,
+      options.onCycleAutoAccept,
+      options.ctrlC,
+      options.finish,
+      scene,
+    )
+  }
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
   // No targetFps: opentui only honours it while its own loop runs (start() /
@@ -372,6 +395,7 @@ export async function createTuiProgress(
 }
 
 export class TuiProgress implements ProgressUI {
+  private stopped = false
   private runID = ""
   private targetDir = ""
   private serverUrl = ""
@@ -587,6 +611,7 @@ export class TuiProgress implements ProgressUI {
     if ((key.ctrl && key.name === "c") || key.raw === "\u0003") {
       key.preventDefault()
       key.stopPropagation()
+      this.scene?.requestInterrupt()
       // After the run ended Ctrl+C just dismisses the finish screen; aborting
       // a finished run would only race the cleanup it already triggers.
       if (this.finished) {
@@ -927,6 +952,7 @@ export class TuiProgress implements ProgressUI {
     onCycleAutoAccept?: (mode: AutoAcceptMode) => void,
     private readonly ctrlC: "abort" | "detach" = "abort",
     finishSeam?: FinishSeam,
+    private readonly scene?: TuiScene,
   ) {
     this.contentTab = initialTab
     this.hostControls = {
@@ -936,6 +962,7 @@ export class TuiProgress implements ProgressUI {
       ...(onCycleAutoAccept ? { onCycleAutoAccept } : {}),
       finish: finishSeam,
     }
+    const mount = this.scene?.root ?? renderer.root
     this.phases = pendingPhases(phases)
 
     const shell = new BoxRenderable(renderer, {
@@ -1120,7 +1147,7 @@ export class TuiProgress implements ProgressUI {
     shell.add(header.box)
     shell.add(body)
     shell.add(footer.box)
-    renderer.root.add(shell)
+    mount.add(shell)
 
     this.overlay = new BoxRenderable(renderer, {
       id: "convoy-permission-overlay",
@@ -1150,7 +1177,7 @@ export class TuiProgress implements ProgressUI {
     this.modalText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", height: "100%" })
     this.modal.add(this.modalText)
     this.overlay.add(this.modal)
-    renderer.root.add(this.overlay)
+    mount.add(this.overlay)
     this.paletteTargets.push({ box: this.modal, background: "overlay", border: "yellow" })
 
     this.reportOverlay = new BoxRenderable(renderer, {
@@ -1189,7 +1216,7 @@ export class TuiProgress implements ProgressUI {
       },
     })
     this.reportOverlay.add(this.fullscreenScrollbar)
-    renderer.root.add(this.reportOverlay)
+    mount.add(this.reportOverlay)
     this.paletteTargets.push({ box: this.reportOverlay, background: "overlay", border: "accent" })
 
     // The full-screen reader owns the wheel just as the inline content panel
@@ -1783,6 +1810,8 @@ export class TuiProgress implements ProgressUI {
   }
 
   stop() {
+    if (this.stopped) return
+    this.stopped = true
     clearInterval(this.ticker)
     this.renderer.removeFrameCallback(this.flushRender)
     this.stopLimits()
@@ -1798,8 +1827,7 @@ export class TuiProgress implements ProgressUI {
       pending.explainAbort?.abort()
       pending.resolve("reject")
     }
-    if (this.renderer.isDestroyed) return
-    this.renderer.destroy()
+    if (!this.scene && !this.renderer.isDestroyed) this.renderer.destroy()
   }
 
   private applyPalette() {
@@ -2683,7 +2711,7 @@ export class TuiProgress implements ProgressUI {
   // extends it to every data event. Input handlers still call render() directly
   // for zero-latency feedback.
   private scheduleRender() {
-    if (this.renderer.isDestroyed) return
+    if (this.stopped || this.renderer.isDestroyed || this.scene?.isClosed) return
     this.dirty = true
     this.renderer.requestRender()
   }
@@ -2691,7 +2719,7 @@ export class TuiProgress implements ProgressUI {
   // Runs once per opentui frame, before the native paint (see CliRenderer.loop).
   // Rebuilds the screen only when a data event marked it dirty.
   private readonly flushRender = async () => {
-    if (this.dirty) this.render()
+    if (!this.stopped && this.dirty) this.render()
   }
 
   // The animation clock. Data events repaint through the frame callback above;
@@ -2703,7 +2731,7 @@ export class TuiProgress implements ProgressUI {
   // nothing to animate, so an idle dashboard falls back to a 1 Hz clock tick and
   // a finished one stops repainting altogether.
   private readonly animationTick = () => {
-    if (this.renderer.isDestroyed) return
+    if (this.stopped || this.renderer.isDestroyed || this.scene?.isClosed) return
     if (this.dirty || this.isAnimating()) {
       this.render()
       return
@@ -2725,7 +2753,7 @@ export class TuiProgress implements ProgressUI {
     // This repaint (frame flush, ticker, or immediate input render) satisfies any
     // pending schedule.
     this.dirty = false
-    if (this.renderer.isDestroyed) return
+    if (this.stopped || this.renderer.isDestroyed || this.scene?.isClosed) return
     this.lastRenderAt = Date.now()
     // The reader's opaque overlay hides the dashboard completely. Rebuilding
     // it would waste a full layout pass and, for reports, a second markdown

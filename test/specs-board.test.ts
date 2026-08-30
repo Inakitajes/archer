@@ -42,6 +42,7 @@ function change(id: string, title = id): SpecsChangeEntry {
 
 function viewWith(rows: FeatureRow[], worktreesWithoutSpec: WorktreeWithoutSpec[] = []): SpecsView {
   return {
+    targetDir: "/repo",
     present: true,
     changes: rows.map((row) => change(row.id, `Title of ${row.id}`)),
     specs: [],
@@ -83,7 +84,7 @@ async function selectFirstChange(session: Awaited<ReturnType<typeof openBoard>>)
 }
 
 describe("board rows derive their lifecycle state", () => {
-  test("a stranded change on main shows its stage and the worktrees-without-spec section stays a peer", async () => {
+  test("a stranded change on main shows its stage and the non-empty worktree section stays a peer", async () => {
     const frame = await frameOf(
       viewWith([featureRow({ id: "add-foo", stage: "stranded" })], [{ dir: "/wt/iso", branch: "feat/quick-fix", runCount: 2 }]),
     )
@@ -91,14 +92,13 @@ describe("board rows derive their lifecycle state", () => {
     expect(frame).toContain("WORKTREES WITHOUT SPEC")
     expect(frame).toContain("feat/quick-fix")
     expect(frame).toContain("2 runs")
-    // Sections render in order: changes above worktrees above specs.
+    // Non-empty sections render in order; the empty canonical section has no title.
     const lines = frame.split("\n")
     const changes = lines.findIndex((line) => line.includes("ACTIVE CHANGES"))
     const worktrees = lines.findIndex((line) => line.includes("WORKTREES WITHOUT SPEC"))
-    const specs = lines.findIndex((line) => line.includes("CANONICAL SPECS"))
     expect(changes).toBeGreaterThanOrEqual(0)
     expect(worktrees).toBeGreaterThan(changes)
-    expect(specs).toBeGreaterThan(worktrees)
+    expect(frame).not.toContain("CANONICAL SPECS")
   })
 
   test("an implementing feature marks the live run and its task counts", async () => {
@@ -124,6 +124,9 @@ describe("board rows derive their lifecycle state", () => {
     expect(frame).toContain("runs: 2 (1 live)")
     expect(frame).toContain("uncommitted")
     expect(frame).toContain("unsynced")
+    expect(frame).toContain("details")
+    expect(frame).not.toContain("WORKTREES WITHOUT SPEC")
+    expect(frame).not.toContain("CANONICAL SPECS")
   })
 
   test("a completed-unarchived change reads ready to close; probably-merged reads honestly", async () => {
@@ -132,6 +135,17 @@ describe("board rows derive their lifecycle state", () => {
 
     const merged = await frameOf(viewWith([featureRow({ id: "old-one", stage: "probably-merged", probablyMerged: true })]))
     expect(merged).toContain("probably merged")
+  })
+
+  test("a worktree-only board remains useful and omits both empty section titles", async () => {
+    const frame = await frameOf(viewWith([], [{ dir: "/wt/iso", branch: "feat/quick-fix", runCount: 2 }]))
+    expect(frame).toContain("WORKTREES WITHOUT SPEC")
+    expect(frame).toContain("feat/quick-fix")
+    expect(frame).toContain("2 runs")
+    expect(frame).toContain("no OpenSpec change")
+    expect(frame).toContain("details")
+    expect(frame).not.toContain("ACTIVE CHANGES")
+    expect(frame).not.toContain("CANONICAL SPECS")
   })
 })
 
@@ -189,7 +203,7 @@ describe("the fullscreen reader stays at the detail level", () => {
     session.press("v")
     await session.renderOnce()
     // The header is still visible: the reader never opened.
-    expect(session.captureCharFrame()).toContain("convoy control")
+    expect(session.captureCharFrame()).toContain("convoy specs")
     session.press("c", { ctrl: true })
     await expect(session.instance.result).resolves.toEqual({ type: "exit" })
   })

@@ -62,7 +62,7 @@ function sampleChange(): SpecsChangeEntry {
 }
 
 function sampleView(): SpecsView {
-  return { present: true, changes: [sampleChange()], specs: [] }
+  return { targetDir: root, present: true, changes: [sampleChange()], specs: [] }
 }
 
 /** A fake clipboard transport capturing what would be copied. */
@@ -107,7 +107,7 @@ describe("the fullscreen reader", () => {
   test("replaces the chrome with one title bar naming the subject and tab", async () => {
     const session = await openReader()
     const frame = session.captureCharFrame()
-    expect(frame).not.toContain("convoy control")
+    expect(frame).not.toContain("convoy specs")
     expect(frame).not.toContain("quit")
     // The title bar names the subject, the tab, the copy and close hints, and no scroll hints.
     expect(frame).toContain("add-login")
@@ -233,15 +233,14 @@ describe("tabbed detail level", () => {
 })
 
 describe("minimal chrome", () => {
-  test("the header's only content line is the live counts", async () => {
+  test("the header's only content line is the normalized target directory", async () => {
     const session = await openReader({ view: sampleView() })
     session.press("v")
     await session.renderOnce()
     const frame = session.captureCharFrame()
-    expect(frame).toContain("1 change")
-    expect(frame).toContain("0 specs")
-    // No static location line anywhere.
-    expect(frame).not.toContain("openspec/changes · openspec/specs")
+    expect(frame).toContain(root)
+    expect(frame).not.toContain("1 change")
+    expect(frame).not.toContain("0 specs")
     await closeSession(session)
   })
 

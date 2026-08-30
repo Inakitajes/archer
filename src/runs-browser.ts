@@ -21,6 +21,7 @@ import {
   truncate,
 } from "./tui-theme"
 import { shortVersion } from "./version"
+import type { TuiScene } from "./tui-session"
 import { runsRoot } from "./workspace"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
@@ -45,6 +46,7 @@ export class RunsBrowser {
   readonly result: Promise<RunsResolution>
 
   private resolveResult!: (resolution: RunsResolution) => void
+  private finished = false
   private selected: number
   private scroll = 0
   private summary?: { runID: string; lines: string[]; scroll: number }
@@ -83,6 +85,7 @@ export class RunsBrowser {
     if ((key.ctrl && key.name === "c") || key.raw === "\u0003") {
       key.preventDefault()
       key.stopPropagation()
+      this.scene?.requestInterrupt()
       this.finish({ type: "exit" })
       return
     }
@@ -98,11 +101,13 @@ export class RunsBrowser {
     private readonly renderer: CliRenderer,
     private readonly runs: RunEntry[],
     initialIndex: number,
+    private readonly scene?: TuiScene,
   ) {
     this.selected = initialIndex
     this.result = new Promise((resolve) => {
       this.resolveResult = resolve
     })
+    const mount = this.scene?.root ?? renderer.root
 
     const shell = new BoxRenderable(renderer, {
       id: "convoy-runs-shell",
@@ -204,7 +209,7 @@ export class RunsBrowser {
     shell.add(header.box)
     shell.add(body)
     shell.add(footer.box)
-    renderer.root.add(shell)
+    mount.add(shell)
 
     this.overlay = new BoxRenderable(renderer, {
       id: "convoy-runs-summary-overlay",
@@ -232,7 +237,7 @@ export class RunsBrowser {
     this.modalText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", height: "100%" })
     this.modal.add(this.modalText)
     this.overlay.add(this.modal)
-    renderer.root.add(this.overlay)
+    mount.add(this.overlay)
     this.paletteTargets.push({ box: this.modal, background: "overlay", border: "accent" })
 
     // While the summary is up its full-screen overlay owns the wheel.
@@ -261,6 +266,7 @@ export class RunsBrowser {
   // A live run can park on a permission or review gate at any moment; the
   // details line should say so without waiting for a browser reopen.
   private refreshWaiting() {
+    if (this.finished) return
     const run = this.selectedRun()
     if (!run.live || this.inSubshell) return
     void refreshRunWaiting(run)
@@ -435,11 +441,13 @@ export class RunsBrowser {
   }
 
   private finish(resolution: RunsResolution) {
+    if (this.finished) return
+    this.finished = true
     clearInterval(this.ticker)
     clearInterval(this.waitingTicker)
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
     this.renderer.off("theme_mode", this.handleThemeMode)
-    if (!this.renderer.isDestroyed) this.renderer.destroy()
+    if (!this.scene && !this.renderer.isDestroyed) this.renderer.destroy()
     this.resolveResult(resolution)
   }
 
@@ -510,7 +518,7 @@ export class RunsBrowser {
   }
 
   private render() {
-    if (this.renderer.isDestroyed) return
+    if (this.finished || this.renderer.isDestroyed || this.scene?.isClosed) return
     const now = Date.now()
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const compact = this.renderer.width <= compactRunsMaxWidth
@@ -671,7 +679,7 @@ export class RunsBrowser {
       { keys: "R", label: "resume", priority: 5 },
       { keys: "s", label: "ummary", priority: 6, style: "glued" },
       { keys: "d", label: "ir", priority: 7, style: "glued" },
-      { keys: "q", label: "uit", priority: 1, style: "glued" },
+      { keys: "q", label: this.scene ? "back" : "uit", priority: 1, style: this.scene ? undefined : "glued" },
     ]
     const right: TextChunk[] = [fg(theme.faint)(`${this.selected + 1}/${this.runs.length}`)]
     return hintsRow(hints, [right], width, { style: "spaced", overflow: moreHintsMarker })

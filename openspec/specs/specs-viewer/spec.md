@@ -18,25 +18,49 @@ Convoy SHALL expose a `convoy specs` subcommand that reads only the `openspec/` 
 #### Scenario: Repo with openspec directory but no active changes
 
 - **WHEN** `convoy specs` runs in a repository whose `openspec/changes/` contains only `archive`
-- **THEN** the Active Changes section is reported or shown empty, and canonical specs (if any) remain browsable
+- **THEN** the interactive root omits the Active Changes section and its title entirely, and canonical specs (if any) remain browsable
 
-### Requirement: Root view separates active changes from canonical specs
+### Requirement: Root view shows only non-empty sections
 
-In the interactive browser, the root navigation list SHALL present two visually distinct sections: **Active Changes** first, then **Canonical Specs**, separated so each is independently reachable while scrolling. A change entry without a readable `proposal.md` SHALL still be listed by its id.
+In the interactive browser, the root navigation list SHALL present each non-empty board section in this order: **Active Changes**, **Worktrees without spec**, then **Canonical Specs**. The sections SHALL have visually distinct headers and remain independently reachable while scrolling. A section with no entries SHALL be omitted entirely, including its header. A change entry without a readable `proposal.md` SHALL still be listed by its id.
 
 #### Scenario: Sections appear in order
 
-- **WHEN** the browser opens with at least one active change and at least one canonical spec
-- **THEN** the Active Changes section is listed above the Canonical Specs section with visually distinct headers
+- **WHEN** the browser opens with entries in all three sections
+- **THEN** Active Changes is listed above Worktrees without spec, which is listed above Canonical Specs, with visually distinct headers
+
+#### Scenario: Empty root sections disappear
+
+- **WHEN** any root section has no entries
+- **THEN** neither that section's rows nor its title are rendered
 
 #### Scenario: Change missing its proposal
 
 - **WHEN** an active change directory has no `proposal.md`
 - **THEN** the change still appears in the list, titled by its directory id
 
+### Requirement: Canonical selection keeps the root list full-size
+
+While a canonical spec is selected at the root, the redundant details panel SHALL be hidden and the browse list SHALL use the full body in both wide and compact layouts. Pressing Enter SHALL still open that spec in the full-width reading level. Returning to the root SHALL restore the list-only full-body layout for the still-selected canonical spec. Active-change and worktree selections SHALL retain their useful root details panel.
+
+#### Scenario: Canonical spec selected at root
+
+- **WHEN** the root selection lands on a canonical spec in either a wide or compact terminal
+- **THEN** the details panel is absent and the browse list fills the body
+
+#### Scenario: Return from a canonical reader
+
+- **WHEN** the user presses Enter on a canonical spec and then returns from its reader
+- **THEN** that spec remains selected at the root and the redundant details panel is hidden again
+
+#### Scenario: Change and worktree previews remain
+
+- **WHEN** the root selection lands on an active change or a worktree without spec
+- **THEN** the details panel remains visible with the selected row's useful lifecycle or worktree information
+
 ### Requirement: Change detail groups artifacts by type
 
-Selecting an active change or a canonical spec SHALL show one full-width reading pane under a horizontal tab strip, with one tab per artifact group — Proposal, Design, Tasks, Delta Specs, and Other when present. All delta spec files SHALL share a single Delta Specs tab regardless of how many capabilities they span, concatenated with a small heading naming each capability before that capability's files. The tab strip SHALL be omitted when the subject has a single group (a canonical spec, or a change with one artifact group), leaving only a title row identifying the subject. Tabs SHALL switch with left/right keys (or `h`/`l`) and digit keys `1`–`9`; up/down keys SHALL scroll the active tab's content line by line. Each tab's content renders as markdown with YAML frontmatter stripped; delta spec content MAY style its requirement-operation headers (`ADDED`, `MODIFIED`, `REMOVED`) distinctly. Files that cannot be read render as a placeholder instead of failing the browser.
+Entering an active change or a canonical spec SHALL show one full-width reading pane under a horizontal tab strip, with one tab per artifact group — Proposal, Design, Tasks, Delta Specs, and Other when present. All delta spec files SHALL share a single Delta Specs tab regardless of how many capabilities they span, concatenated with a small heading naming each capability before that capability's files. The tab strip SHALL be omitted when the subject has a single group (a canonical spec, or a change with one artifact group), leaving only a title row identifying the subject. Tabs SHALL switch with left/right keys (or `h`/`l`) and digit keys `1`–`9`; up/down keys SHALL scroll the active tab's content line by line. Each tab's content renders as markdown with YAML frontmatter stripped; delta spec content MAY style its requirement-operation headers (`ADDED`, `MODIFIED`, `REMOVED`) distinctly. Files that cannot be read render as a placeholder instead of failing the browser.
 
 #### Scenario: All artifact types present
 
@@ -150,12 +174,12 @@ Inside the fullscreen reader, pressing `c` SHALL copy the active tab's markdown 
 
 ### Requirement: Minimal chrome
 
-The board's chrome SHALL stay lean. The header SHALL show exactly one content line — the live change and spec counts — with no static location line. The footer SHALL advertise only actions that are not universal navigation conventions: hints for arrow-key selection, paging, or scrolling MUST NOT appear in the footer at any level, nor in the fullscreen reader's title bar. The footer's hint-overflow behavior (truncation with a more-actions marker) is retained.
+The board's chrome SHALL stay lean. The header SHALL show exactly one content line containing the normalized target project directory supplied by the loaded specs view; the browser SHALL NOT substitute its process working directory. Live change and spec counts SHALL NOT appear there. The footer SHALL advertise only actions that are not universal navigation conventions: hints for arrow-key selection, paging, or scrolling MUST NOT appear in the footer at any level, nor in the fullscreen reader's title bar. The footer's hint-overflow behavior (truncation with a more-actions marker) is retained.
 
-#### Scenario: Header carries no static location line
+#### Scenario: Header identifies the loaded project
 
-- **WHEN** the board renders at any level
-- **THEN** the header's only content line shows the live counts, and no line naming the `openspec/changes` / `openspec/specs` directories appears
+- **WHEN** the board renders at any non-fullscreen level for a normalized target directory
+- **THEN** the header's only content line shows that directory and does not show live change/spec counts or the browser process's working directory
 
 #### Scenario: Footer drops obvious navigation hints
 
