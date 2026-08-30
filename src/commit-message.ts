@@ -306,7 +306,7 @@ export function normalizeComposedMessage(
   let body = message.body
   // Skip only when the id is named the way this rule names it ("change <id>"),
   // not when a collapsed commit subject merely happens to contain the id.
-  if (opts.changeID && !body.some((line) => line.includes(`change ${opts.changeID}`))) {
+  if (opts.changeID && !body.some((line) => line === `change ${opts.changeID}`)) {
     body = [`change ${opts.changeID}`, ...body]
   }
   body = body.slice(0, maxBodyLines)
@@ -375,6 +375,20 @@ export function formatCommitMessage(message: ConventionalMessage): string {
   const subject = `${message.type}${scope}: ${message.subject}`
   if (message.body.length === 0) return subject
   return `${subject}\n\n${message.body.map((line) => `- ${line}`).join("\n")}`
+}
+
+/**
+ * Strips terminal-injection bytes from model- and git-derived text at the
+ * render and commit-composition boundaries (SC-4). Removes full ANSI CSI
+ * sequences (`\x1b[…m` and friends, so git-stderr color codes don't leave
+ * `[31m` garbage) plus the remaining C0 bytes except tab/newline/CR and DEL —
+ * escape bytes that could otherwise paint arbitrary terminal sequences.
+ * Newlines survive so multi-line bodies and error blocks stay readable.
+ */
+export function stripControlBytes(value: string): string {
+  return value
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
 }
 
 function splitBranch(branch: string): { type: string; rest: string } {

@@ -23,6 +23,7 @@ import {
   formatCommitMessage,
   normalizeComposedMessage,
   proposeCommitMessage,
+  stripControlBytes,
   type CommitMessageProposal,
 } from "./commit-message"
 import { listRuns } from "./runs"
@@ -277,6 +278,12 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
   let syncMergeSha: string | undefined
   if (await isAncestor(baseRef, target.branch, target.worktreeDir)) {
     emit({ type: "step-skipped", step: "sync", reason: `${baseRef} is already an ancestor of ${target.branch}` })
+    // A resume arrives here after the sync merge already landed, so this step
+    // is detected as done rather than redone. That merge is an operator-identity
+    // commit the squash below must fold (design D5); it isn't persisted, so
+    // re-discover it — without it the plain walk would leave the sync merge and
+    // the raw convoy commits to leak onto the base branch (SC-1).
+    if (input.resume) syncMergeSha = await detectPendingSyncMerge(target.worktreeDir)
   } else {
     emit({ type: "step-started", step: "sync" })
     const merge = await execFile("git", ["merge", "--no-edit", baseRef], { cwd: target.worktreeDir, allowFailure: true })
@@ -335,9 +342,17 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
       emit({ type: "step-failed", step: "squash", message: stop })
       throw new Error(stop)
     }
-    const result = await applySquash({ cwd: target.worktreeDir, plan: range, message })
-    squashed = { sha: result.sha, replaced: result.replaced }
-    emit({ type: "step-completed", step: "squash", detail: `${result.replaced} commit${result.replaced === 1 ? "" : "s"} → ${result.sha.slice(0, 8)}` })
+    try {
+      const result = await applySquash({ cwd: target.worktreeDir, plan: range, message })
+      squashed = { sha: result.sha, replaced: result.replaced }
+      emit({ type: "step-completed", step: "squash", detail: `${result.replaced} commit${result.replaced === 1 ? "" : "s"} → ${result.sha.slice(0, 8)}` })
+    } catch (error) {
+      // A failed rewrite (declined signature, rejected hook) must still mark
+      // the squash row failed; the failed event carries the remediation (SC-5).
+      const detail = error instanceof Error ? error.message : String(error)
+      emit({ type: "step-failed", step: "squash", message: `squash: ${detail}` })
+      throw error
+    }
   } else if (range.reason === "no-commits") {
     emit({ type: "step-skipped", step: "squash", reason: "no convoy commits to squash" })
   } else {
@@ -406,7 +421,9 @@ async function resolveSquashMessage(
   input: CloseInput,
   context: { target: CloseTarget; snapshot: CloseContextSnapshot; diffStat: string },
 ): Promise<string | undefined> {
-  if (input.message) return input.message
+  // `--message ""` is still an explicit override and must win verbatim, so
+  // presence is `!== undefined`, never truthiness (SC-8).
+  if (input.message !== undefined) return input.message
   const proposal = await composeCloseMessage(context, input.writer)
   if (input.resolveMessage) return await input.resolveMessage(proposal)
   return proposal.message
@@ -439,13 +456,13 @@ async function composeCloseMessage(
       scopeCandidates: context.snapshot.scopeCandidates,
       commits: context.snapshot.commitSubjects,
     })
-    return { message: formatCommitMessage(message), source: "fallback", ...(proposal.error ? { error: proposal.error } : {}) }
+    return { message: stripControlBytes(formatCommitMessage(message)), source: "fallback", ...(proposal.error ? { error: proposal.error } : {}) }
   }
   const normalized = normalizeComposedMessage(proposal.message, {
     scopeCandidates: context.snapshot.scopeCandidates,
     changeID: context.target.changeID,
   })
-  return { message: formatCommitMessage(normalized), source: "model" }
+  return { message: stripControlBytes(formatCommitMessage(normalized)), source: "model" }
 }
 
 /** The message inputs, captured before archive moves the live change (task 2.1, design D1). */
@@ -644,6 +661,27 @@ async function firstParentLog(head: string, cwd: string): Promise<CommitInfo[]> 
       return { sha, authorEmail, subject: rest.join("\x1f") }
     })
     .filter((commit) => commit.sha !== "")
+}
+
+/**
+ * Re-discovers close's sync merge after a resume (SC-1). The sync step creates
+ * exactly one operator-identity merge commit; nothing close added above it
+ * (the archive commit) is a merge, so the newest first-parent merge is that
+ * merge. The branch's own first-parent line descends into the base's history,
+ * so a merge there — which the squash never reaches (the walk anchors below
+ * the operator's surviving commit) — wouldn't fold anyway; returning one is
+ * harmless. Returns undefined when no first-parent merge exists at all.
+ */
+async function detectPendingSyncMerge(cwd: string): Promise<string | undefined> {
+  const head = (await resolveCommit("HEAD", cwd)) ?? ""
+  if (!head) return undefined
+  const result = await execFile("git", ["log", "--first-parent", "--format=%H %P", head], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return undefined
+  for (const line of result.stdout.split("\n")) {
+    const [sha = "", ...parents] = line.trim().split(/\s+/)
+    if (sha && parents.length > 1) return sha
+  }
+  return undefined
 }
 
 async function exists(path: string): Promise<boolean> {

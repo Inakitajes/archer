@@ -1,5 +1,4 @@
-import { createInterface } from "node:readline/promises"
-import { stdin, stdout } from "node:process"
+import { stdout } from "node:process"
 import { resolve } from "node:path"
 
 import { formatCommitMessage } from "./commit-message"
@@ -7,6 +6,7 @@ import { loadMergedConvoyConfig } from "./config"
 import { applySquash, canOpenPullRequest, defaultRemote, describeSquashPlan, openPullRequest, prepareFinish, resolveFinishBase } from "./finish"
 import { mainWorktreeDir, pushBranch, removeWorktree } from "./git"
 import { log } from "./log"
+import { ask, isInteractiveTerminal } from "./terminal-input"
 
 export type FinishOptions = {
   /** Repo or worktree holding the run's branch. */
@@ -64,7 +64,7 @@ export async function runFinishCommand(options: FinishOptions, deps: FinishComma
     return
   }
 
-  if (!options.yes && !interactive()) {
+  if (!options.yes && !isInteractiveTerminal()) {
     // Rewriting history is not something to do because nobody was there to say no.
     stdout.write("not an interactive terminal; re-run with --yes to squash without confirmation\n")
     return
@@ -133,7 +133,7 @@ async function offerFollowUps(input: FollowUpInput) {
   // --yes covers the squash only. Pushing and opening a PR are outward-facing,
   // so they always ask — and where there is nobody to ask, they simply don't
   // happen and the commands are printed instead.
-  if (input.yes || !interactive()) {
+  if (input.yes || !isInteractiveTerminal()) {
     stdout.write(`\nnext: git push -u ${defaultRemote} ${input.branch}\n`)
     await describeWorktreeRemoval(input)
     return
@@ -208,39 +208,9 @@ async function worktreeRemoval(input: FollowUpInput): Promise<{ mainDir: string;
   }
 }
 
-/**
- * Single-key confirmation in the style of confirmRunPlan, including its raw-mode
- * SIGINT handling. Every question opens its own readline interface, so a stdin
- * that reaches EOF (a pipe, a closed terminal) must resolve rather than leave
- * the promise pending forever and let the process exit mid-flow.
- */
-async function ask(question: string): Promise<string> {
-  const prompt = createInterface({ input: stdin, output: stdout })
-  const controller = new AbortController()
-  let interrupted = false
-  prompt.on("SIGINT", () => {
-    interrupted = true
-    controller.abort()
-  })
-  const closed = new Promise<string>((resolve) => prompt.once("close", () => resolve("")))
-  try {
-    const answer = await Promise.race([prompt.question(question, { signal: controller.signal }), closed])
-    return answer.trim().toLowerCase()
-  } catch (error) {
-    if (interrupted && error instanceof Error && error.name === "AbortError") {
-      stdout.write("\n")
-      return ""
-    }
-    throw error
-  } finally {
-    prompt.close()
-  }
-}
-
-/** Whether convoy can still ask the user anything, or should only print what it would have offered. */
-function interactive(): boolean {
-  return Boolean(stdin.isTTY && stdout.isTTY)
-}
+// Single-key confirmation (`ask`) and the interactive-terminal check live in
+// `terminal-input.ts`, shared with `close` so their SIGINT/EOF semantics stay
+// identical (SC-3).
 
 function indent(value: string) {
   return value

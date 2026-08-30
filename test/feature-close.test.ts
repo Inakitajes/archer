@@ -461,6 +461,60 @@ describe("runClose", () => {
     expect(subject).toBe("feat(cli): exact override")
   })
 
+  test("an empty --message still bypasses composition (SC-8)", async () => {
+    const fixture = await makeFixture()
+    // Presence, not truthiness: `--message ""` must not fall through to the
+    // writer. (git rejects an empty message, which is the failure here — but
+    // neither the writer nor the resolver may even be reached.)
+    let writerRan = false
+    let resolverRan = false
+    await expect(
+      runTestClose(fixture, {
+        message: "",
+        writer: async () => {
+          writerRan = true
+          return { message: templateCommitMessage({ targetDir: "", branch: "", commits: [] }), source: "template", error: "n/a" }
+        },
+        resolveMessage: async () => {
+          resolverRan = true
+          return ""
+        },
+      }),
+    ).rejects.toThrow()
+    expect(writerRan).toBe(false)
+    expect(resolverRan).toBe(false)
+  })
+
+  test("control bytes from a model message are stripped before the commit lands (SC-4)", async () => {
+    const fixture = await makeFixture()
+    await runTestClose(fixture, {
+      writer: async () => ({
+        message: { type: "feat", scope: "hack", subject: "improve \u001b[31mred\u001b[0m", body: ["a line\u001b[K"] },
+        source: "model",
+      }),
+    })
+    const subject = await git(fixture.mainDir, undefined, "log", "--format=%s", "-n", "1", "main")
+    // The sole capability still wins the scope; the escape sequences are gone.
+    expect(subject).toBe("feat(cli): improve red")
+    const body = await git(fixture.mainDir, undefined, "log", "--format=%B", "-n", "1", "main")
+    expect(body).not.toContain("\u001b")
+  })
+
+  test("an applySquash failure emits a step-failed squash event (SC-5)", async () => {
+    const fixture = await makeFixture()
+    const finish = await import("../src/finish")
+    const spy = spyOn(finish, "applySquash")
+    spy.mockRejectedValue(new Error("signature declined"))
+    try {
+      const events: CloseEvent[] = []
+      await expect(runTestClose(fixture, { onEvent: (event) => events.push(event) })).rejects.toThrow(/signature declined/)
+      expect(events[events.length - 1]).toMatchObject({ type: "step-failed", step: "squash" })
+      expect(events.some((event) => event.type === "result")).toBe(false)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   test("a declined message stops before the squash and nothing lands", async () => {
     const fixture = await makeFixture()
     const branchBefore = await git(fixture.worktreeDir, undefined, "rev-parse", "HEAD")
@@ -471,6 +525,35 @@ describe("runClose", () => {
     expect(branchAfter).not.toBe(branchBefore)
     const mainLog = await git(fixture.mainDir, undefined, "log", "--format=%s", "main")
     expect(mainLog).not.toContain("improve add widget")
+  })
+
+  test("a resumed close after a declined message on a synced branch leaks no raw convoy commit onto the base (SC-1)", async () => {
+    const fixture = await makeFixture()
+    // Advance main so the first attempt's sync step creates an
+    // operator-identity merge commit the resumed squash must fold.
+    await writeFile(join(fixture.mainDir, "main-advance.txt"), "advance\n")
+    await git(fixture.mainDir, undefined, "add", ".")
+    await git(fixture.mainDir, undefined, "commit", "-m", "chore: advance main in parallel")
+
+    // First attempt: sync runs, archive runs, the message is declined at the
+    // squash gate — the sequence stops with the sync merge and archive commit
+    // already on the feature branch.
+    await expect(runTestClose(fixture, { resolveMessage: async () => undefined })).rejects.toThrow(/wasn't confirmed[\s\S]*--resume/)
+
+    // Resume accepts. The resumed squash must re-discover the sync merge and
+    // fold it (plus the archive and convoy commits) instead of leaking them.
+    const result = await runTestClose(fixture, {
+      resume: true,
+      resolveMessage: async (proposal) => proposal.message,
+    })
+    expect(result.merged).toBe(true)
+    expect(result.mergeShape).toBe("merge-commit")
+
+    const log = await git(fixture.mainDir, undefined, "log", "--format=%s", "main")
+    expect(log).not.toContain("convoy(implement): implement add-widget")
+    expect(log).not.toContain("chore(openspec): archive add-widget")
+    // The operator's proposal commit survives the walk.
+    expect(log).toContain("feat(openspec): propose add-widget")
   })
 
   // -- task 2.4: merge shapes --------------------------------------------------

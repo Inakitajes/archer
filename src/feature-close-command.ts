@@ -1,13 +1,14 @@
-import { createInterface } from "node:readline/promises"
-import { stdin, stdout } from "node:process"
+import { stdout } from "node:process"
 import { stat } from "node:fs/promises"
 import { resolve } from "node:path"
 import type { Readable } from "node:stream"
 
 import { archiveChangeOnMain, runClose, type CloseEvent, type CloseInput, type CloseMessageProposal, type CloseResult, type CloseStep } from "./feature-close"
+import { stripControlBytes } from "./commit-message"
 import { editMessageInEditor } from "./finish"
 import { branchUpstream, execFile, mainWorktreeDir, pushRefspec, removeWorktree } from "./git"
 import { log } from "./log"
+import { ask, isInteractiveTerminal } from "./terminal-input"
 
 /**
  * The `convoy close` command surface. One close sequence, two renderers
@@ -44,7 +45,7 @@ export async function runCloseCommand(options: CloseOptions): Promise<void> {
     ...(options.branch ? { branch: options.branch } : {}),
     ...(options.changeID ? { changeID: options.changeID } : {}),
     ...(options.resume ? { resume: true } : {}),
-    ...(options.message ? { message: options.message } : {}),
+    ...(options.message !== undefined ? { message: options.message } : {}),
   }
   // The board's close-change handoff lands here too: a TTY gets the checklist,
   // a pipe gets the stdout summary — one dispatcher, no second call site.
@@ -53,12 +54,8 @@ export async function runCloseCommand(options: CloseOptions): Promise<void> {
 }
 
 /** Which renderer the command surface uses; a seam so mode selection stays testable. */
-export function closeSurface(interactive: boolean = interactiveTerminal()): "tty" | "headless" {
+export function closeSurface(interactive: boolean = isInteractiveTerminal()): "tty" | "headless" {
   return interactive ? "tty" : "headless"
-}
-
-function interactiveTerminal(): boolean {
-  return Boolean(stdin.isTTY && stdout.isTTY)
 }
 
 // ---------------------------------------------------------------------------
@@ -112,13 +109,13 @@ export function formatCloseEvents(events: readonly CloseEvent[], extra: { follow
       case "step-started":
         break
       case "step-completed":
-        stepState.set(event.step, event.detail ? `${event.step}: ${event.detail}` : `${event.step}: completed`)
+        stepState.set(event.step, event.detail ? `${event.step}: ${strip(event.detail)}` : `${event.step}: completed`)
         break
       case "step-skipped":
-        stepState.set(event.step, `${event.step}: skipped — ${event.reason}`)
+        stepState.set(event.step, `${event.step}: skipped — ${strip(event.reason)}`)
         break
       case "step-failed":
-        stepState.set(event.step, `${event.step}: failed — ${firstLine(event.message)}`)
+        stepState.set(event.step, `${event.step}: failed — ${strip(firstLine(event.message))}`)
         break
       case "merge-shape":
         break
@@ -159,6 +156,10 @@ export async function resolveCloseFollowUps(args: {
   worktreeDir: string
 }): Promise<CloseFollowUps> {
   const mainDir = (await mainWorktreeDir(args.targetDir).catch(() => undefined)) ?? args.targetDir
+  // Every printed command is prefixed `git -C <mainDir>` and quotes only the
+  // path tokens, so it is executable from inside the feature worktree (the
+  // natural close cwd) and survives paths with spaces (SC-2).
+  const gitC = `git -C ${shq(mainDir)}`
 
   let push: CloseFollowUps["push"]
   let pushRemediation: string | undefined
@@ -166,9 +167,9 @@ export async function resolveCloseFollowUps(args: {
   const [remote, ...remoteRest] = (upstream ?? "").split("/")
   const remoteBranch = remoteRest.join("/")
   if (remote && remoteBranch) {
-    push = { remote, refspec: `${args.baseRef}:${remoteBranch}`, command: `git push ${remote} ${args.baseRef}:${remoteBranch}` }
+    push = { remote, refspec: `${args.baseRef}:${remoteBranch}`, command: `${gitC} push ${remote} ${args.baseRef}:${remoteBranch}` }
   } else {
-    pushRemediation = `${args.baseRef} has no configured upstream — set one first: git branch --set-upstream-to=<remote>/<branch> ${args.baseRef}`
+    pushRemediation = `${args.baseRef} has no configured upstream — set one first: ${gitC} branch --set-upstream-to=<remote>/<branch> ${args.baseRef}`
   }
 
   let worktreeRemoval: string | undefined
@@ -177,13 +178,13 @@ export async function resolveCloseFollowUps(args: {
     () => true,
     () => false,
   )
-  if (!isMainCheckout && worktreeExists) worktreeRemoval = `git worktree remove ${args.worktreeDir}`
+  if (!isMainCheckout && worktreeExists) worktreeRemoval = `${gitC} worktree remove ${shq(args.worktreeDir)}`
 
   return {
     ...(push ? { push } : {}),
     ...(pushRemediation ? { pushRemediation } : {}),
     ...(worktreeRemoval ? { worktreeRemoval } : {}),
-    branchDelete: `git branch -d ${args.branch}`,
+    branchDelete: `${gitC} branch -d ${args.branch}`,
   }
 }
 
@@ -241,8 +242,6 @@ export type CloseChecklistState = {
   preflight?: string
   preflightFailed?: readonly string[]
   rows: readonly CloseChecklistRow[]
-  /** The failed step's stop message; the failed row already carries its first line. */
-  failed?: string
   result?: CloseResult
 }
 
@@ -266,14 +265,14 @@ export function applyCloseEvent(state: CloseChecklistState, event: CloseEvent): 
     case "step-started":
       return withRow(event.step, { status: "running" })
     case "step-completed":
-      return withRow(event.step, { status: "completed", detail: event.detail })
+      return withRow(event.step, { status: "completed", detail: strip(event.detail) })
     case "step-skipped":
-      return withRow(event.step, { status: "skipped", detail: event.reason })
+      return withRow(event.step, { status: "skipped", detail: strip(event.reason) })
     case "step-failed": {
-      const line = firstLine(event.message)
+      const line = firstLine(strip(event.message))
       const prefix = `${event.step}: `
       const detail = line.startsWith(prefix) ? line.slice(prefix.length) : line
-      return { ...withRow(event.step, { status: "failed", detail }), failed: event.message }
+      return withRow(event.step, { status: "failed", detail })
     }
     case "merge-shape":
       // The merge row's completed detail already narrates the shape.
@@ -366,7 +365,7 @@ export async function confirmCloseMessage(
   for (;;) {
     out.write("\n")
     if (proposal.error) out.write("(the writing model failed, so this message is derived from the proposal and the step commits)\n")
-    out.write(`${indent(proposal.message)}\n\n`)
+    out.write(`${indent(strip(proposal.message))}\n\n`)
     const answer = await ask("Commit with this message? [y/e/N] ", deps)
     if (answer === "y") return proposal.message
     if (answer === "e") {
@@ -425,7 +424,13 @@ export async function offerCloseFollowUps(followUps: FollowUpOffers, io: CloseIO
   }
 
   // git refuses to delete a branch that is checked out in a worktree, so the
-  // offer only exists once that dependency cleared.
+  // offer only exists once that dependency cleared. The worktree may be gone
+  // already (removed between runs or by hand) — then the branch is deletable
+  // now and the immediate command is printed, not a wait (SC-9).
+  const worktreeStillExists = await stat(followUps.worktreeDir).then(
+    () => true,
+    () => false,
+  )
   if (worktreeRemoved) {
     const deleted = await offerAction(
       "branch deletion",
@@ -438,7 +443,9 @@ export async function offerCloseFollowUps(followUps: FollowUpOffers, io: CloseIO
     )
     if (deleted) out.write(`branch ${followUps.branch} deleted\n`)
     else out.write(`next: ${followUps.branchDelete}\n`)
-  } else if (!processCwdInside(followUps.worktreeDir)) {
+  } else if (!worktreeStillExists && !processCwdInside(followUps.worktreeDir)) {
+    out.write(`next: ${followUps.branchDelete}\n`)
+  } else if (worktreeStillExists && !processCwdInside(followUps.worktreeDir)) {
     out.write(`next (after the worktree is removed): ${followUps.branchDelete}\n`)
   }
 }
@@ -463,35 +470,9 @@ function processCwdInside(dir: string): boolean {
   return cwd === target || cwd.startsWith(`${target}/`)
 }
 
-/**
- * Single-key confirmation in the style of `finish`'s prompt, including its
- * raw-mode SIGINT handling and its EOF-must-resolve rule: a stdin that closes
- * (a pipe, a closed terminal) resolves rather than leaving the close hanging.
- */
-async function ask(question: string, io: CloseIO = {}): Promise<string> {
-  // Bun's readline types only accept the exact process streams; the injectable
-  // I/O is structurally compatible, so the cast stays at this one boundary.
-  const prompt = createInterface({ input: (io.input ?? stdin) as typeof stdin, output: (io.output ?? stdout) as typeof stdout })
-  const controller = new AbortController()
-  let interrupted = false
-  prompt.on("SIGINT", () => {
-    interrupted = true
-    controller.abort()
-  })
-  const closed = new Promise<string>((resolvePromise) => prompt.once("close", () => resolvePromise("")))
-  try {
-    const answer = await Promise.race([prompt.question(question, { signal: controller.signal }), closed])
-    return answer.trim().toLowerCase()
-  } catch (error) {
-    if (interrupted && error instanceof Error && error.name === "AbortError") {
-      ;(io.output ?? stdout).write("\n")
-      return ""
-    }
-    throw error
-  } finally {
-    prompt.close()
-  }
-}
+// The single-key `ask` confirmation and the interactive-terminal check live in
+// `terminal-input.ts`, shared with `finish` so their SIGINT/EOF semantics stay
+// identical (SC-3).
 
 // ---------------------------------------------------------------------------
 
@@ -578,6 +559,16 @@ export function parseCloseArgs(argv: string[]): CloseOptions {
 
 function firstLine(value: string): string {
   return value.split("\n")[0]?.trim() ?? value
+}
+
+/** The display/commit boundary sanitizer for model- and git-derived text (SC-4). */
+function strip(value: string | undefined): string {
+  return stripControlBytes(value ?? "")
+}
+
+/** Quotes a token for the shell only when it would otherwise break out of a bare word. */
+function shq(value: string): string {
+  return /^[A-Za-z0-9_./:=@-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`
 }
 
 function indent(value: string): string {

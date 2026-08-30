@@ -620,6 +620,15 @@ describe("normalizeComposedMessage", () => {
     const already = normalizeComposedMessage({ type: "feat", subject: "do it", body: ["change close-ux", "one"] }, { changeID: "close-ux" })
     expect(already.body).toEqual(["change close-ux", "one"])
   })
+
+  test("a collapsed subject merely containing the id does not suppress the required body line (SC-7)", () => {
+    // A collapsed commit subject like "convoy(openspec): change close-ux plan"
+    // contains the substring but is not the rule's own body line; the required
+    // `change close-ux` line must still be injected.
+    const normalized = normalizeComposedMessage({ type: "feat", subject: "improve", body: ["change close-ux plan gets archived"] }, { changeID: "close-ux" })
+    expect(normalized.body[0]).toBe("change close-ux")
+    expect(normalized.body).toContain("change close-ux plan gets archived")
+  })
 })
 
 describe("closeFallbackCommitMessage", () => {

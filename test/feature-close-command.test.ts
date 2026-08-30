@@ -23,6 +23,12 @@ import type { CloseEvent, ClosePreflightBlocker } from "../src/feature-close"
 
 const dirs: string[] = []
 
+/** git reports repo paths in the kernel's canonical form (/private/var on macOS). */
+async function realPath(path: string): Promise<string> {
+  const { realpath } = await import("node:fs/promises")
+  return realpath(path)
+}
+
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" })
   const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
@@ -258,10 +264,13 @@ describe("resolveCloseFollowUps", () => {
     await git(fixture.mainDir, "config", "branch.main.merge", "refs/heads/main")
     await git(fixture.mainDir, "update-ref", "refs/remotes/origin/main", "HEAD")
     const followUps = await resolveCloseFollowUps({ targetDir: fixture.mainDir, baseRef: "main", branch: "feat/add-widget", worktreeDir: fixture.worktreeDir })
-    expect(followUps.push).toEqual({ remote: "origin", refspec: "main:main", command: "git push origin main:main" })
+    // The printed commands carry git -C <main-repo> and only quote unsafe paths,
+    // so they stay executable from inside the feature worktree (SC-2).
+    const main = await realPath(fixture.mainDir)
+    expect(followUps.push).toEqual({ remote: "origin", refspec: "main:main", command: `git -C ${main} push origin main:main` })
     expect(followUps.pushRemediation).toBeUndefined()
-    expect(followUps.worktreeRemoval).toBe(`git worktree remove ${fixture.worktreeDir}`)
-    expect(followUps.branchDelete).toBe("git branch -d feat/add-widget")
+    expect(followUps.worktreeRemoval).toBe(`git -C ${main} worktree remove ${fixture.worktreeDir}`)
+    expect(followUps.branchDelete).toBe(`git -C ${main} branch -d feat/add-widget`)
   })
 
   test("a missing upstream yields the remediation and no push", async () => {
@@ -269,7 +278,7 @@ describe("resolveCloseFollowUps", () => {
     const followUps = await resolveCloseFollowUps({ targetDir: fixture.mainDir, baseRef: "main", branch: "feat/add-widget", worktreeDir: fixture.worktreeDir })
     expect(followUps.push).toBeUndefined()
     expect(followUps.pushRemediation).toContain("no configured upstream")
-    expect(followUps.pushRemediation).toContain("git branch --set-upstream-to=")
+    expect(followUps.pushRemediation).toContain("branch --set-upstream-to=")
   })
 
   test("a worktree that is the main checkout offers no removal", async () => {
@@ -406,6 +415,29 @@ describe("offerCloseFollowUps", () => {
     expect(cleaned(io.chunks)).toContain("branch feat/add-widget deleted")
     await expect(stat(fixture.worktreeDir)).rejects.toThrow()
     await expect(git(fixture.mainDir, "rev-parse", "--verify", "feat/add-widget")).rejects.toThrow()
+  })
+
+  test("an already-removed worktree makes branch deletion immediately available (SC-9)", async () => {
+    const fixture = await makeFixture()
+    // Remove the worktree out from under close (by hand / a prior run), so
+    // resolveCloseFollowUps returns no removal command.
+    await git(fixture.mainDir, "worktree", "remove", fixture.worktreeDir)
+    await expect(stat(fixture.worktreeDir)).rejects.toThrow()
+    const io = createIO([])
+    await offerCloseFollowUps(
+      {
+        branchDelete: "git branch -d feat/add-widget",
+        baseRef: "main",
+        branch: "feat/add-widget",
+        worktreeDir: fixture.worktreeDir,
+        targetDir: fixture.mainDir,
+      },
+      io,
+    )
+    const text = cleaned(io.chunks)
+    // The branch is deletable now — the immediate command, not a wait.
+    expect(text).toContain("next: git branch -d feat/add-widget")
+    expect(text).not.toContain("after the worktree is removed")
   })
 })
 
