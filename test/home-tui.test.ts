@@ -284,8 +284,10 @@ test("image selection and resize delete the old placement before drawing the nex
     const resized = writes.join("")
     expect(resized.indexOf("\x1b_Ga=d,d=i,i=101")).toBeGreaterThanOrEqual(0)
     expect(resized.indexOf("\x1b_Ga=p,i=101")).toBeGreaterThan(resized.indexOf("\x1b_Ga=d,d=i,i=101"))
-    expect(resized).toContain("\x1b[5;2H")
-    expect(resized).toMatch(/\x1b_Ga=p,i=101[^;]*c=78,r=13/)
+    // The shortened masthead build line lets the block wordmark fit at 80
+    // columns too, so the image keeps its row and only loses one row of height.
+    expect(resized).toContain("\x1b[6;2H")
+    expect(resized).toMatch(/\x1b_Ga=p,i=101[^;]*c=78,r=12/)
   } finally {
     session.press("q")
     await session.home.result
