@@ -1,10 +1,15 @@
-// Home hero: four floating sculptures, one per destination. The camera scale
-// is computed once per canvas size and per kind, from that sculpture's
-// worst-case bounds over a full yaw sweep — so nothing resizes while it spins;
-// it stays centered with constant padding. Selection morphs the particle
-// cloud; once settled, each destination draws its own geometry. Depth decides
-// brightness: near marks keep their color, far ones fall to dim/faint, which
-// is what makes the volumes read as 3D.
+// Home hero: four floating sculptures, one per destination, drawn entirely in
+// fine points — middle dots for volume, bullets only where light lands. The
+// camera scale is computed once per canvas size and per kind, from that
+// sculpture's worst-case bounds over a full yaw sweep — so nothing resizes
+// while it spins; it stays centered with constant padding, deliberately
+// undersized so the figure sits quietly instead of dominating the screen.
+// Selecting a destination swaps the sculpture directly — no morph, no burst:
+// the figure you asked for is the figure you get. Depth decides brightness:
+// near marks keep their color, far ones fall to dim/faint, which is what
+// makes the volumes read as 3D. Motion is contemplative: a slow orbit,
+// brightness pulses — never glyph flips, flashes, or bursts. The wordmark is
+// the single heavy element: square, bold, with a drop extrusion.
 
 import { StyledText, bold, fg } from "@opentui/core"
 
@@ -16,8 +21,7 @@ export type HomeArtKind = "pipelines" | "specs" | "runs" | "config"
 
 export type Vec3 = { x: number; y: number; z: number }
 
-export const homeArtTickMs = 50
-export const homeArtMorphFrames = 10
+export const homeArtTickMs = 80
 /** The art region never asks for more rows than this, even on huge terminals. */
 export const homeArtMaxHeight = 24
 
@@ -25,8 +29,8 @@ const CHAR_ASPECT = 0.5
 const CAM_DIST = 4.2
 const FOCAL = 3.35
 const TILT = 0.5
-const SPIN = 0.03
-const PAD = 0.12
+const SPIN = 0.012
+const PAD = 0.18
 
 const LATS = [-0.82, -0.5, -0.18, 0, 0.18, 0.5, 0.82]
 
@@ -65,59 +69,149 @@ export function formCloud(kind: HomeArtKind, n: number, tick: number): Vec3[] {
 
 export function renderHomeArt(options: {
   kind: HomeArtKind
-  previous?: HomeArtKind
-  from?: readonly Vec3[]
-  morph: number
   tick: number
   width: number
   height: number
-}): { content: StyledText; cloud: Vec3[] } {
+  wordmark?: boolean
+}): { content: StyledText } {
   const width = Math.max(1, Math.floor(options.width))
   const height = Math.max(1, Math.floor(options.height))
-  const morph = clamp(options.morph, 0, 1)
   const tick = options.tick
+  // The wordmark owns a fixed band at the top of the canvas (glyphs, its
+  // shadow extrusion, and one row of air); the sculpture view shrinks and
+  // centers into what remains below it, so the mark never collides with the
+  // art.
+  const mark = options.wordmark === false ? undefined : pickWordmark(width, height)
+  const band = mark ? TITLE_ROW + mark.length + MARK_SHADOW.dy + 1 : 0
+  const artHeight = mark ? height - band : height
+  const artOffset = band
   const count = homeArtCount(width, height)
-  const target = formPoints(options.kind, count, tick)
-  const origin = resample(options.from ?? target, count)
-  const eased = smoothstep(morph)
-  const burst = 1 + 0.3 * Math.sin(morph * Math.PI)
-  const cloud: Vec3[] = target.map((point, index) => {
-    const prior = origin[index] ?? point
-    return {
-      x: (prior.x + (point.x - prior.x) * eased) * burst,
-      y: (prior.y + (point.y - prior.y) * eased) * burst,
-      z: (prior.z + (point.z - prior.z) * eased) * burst,
-    }
-  })
 
   // Pipelines never spins: its camera is the fixed isometric (a steeper
   // tilt than the orbiting kinds) the tetromino choreography needs.
-  // Everything else orbits slowly. During a morph the camera eases from one
-  // pose to the other alongside the flying cloud.
+  // Everything else orbits slowly.
   const spinFor = (kind: HomeArtKind) => (kind === "pipelines" ? ISO_YAW : KIND_YAW[kind] + tick * SPIN)
-  const yaw = lerp(spinFor(options.previous ?? options.kind), spinFor(options.kind), eased)
-  const baseTilt = options.kind === "pipelines" ? ISO_TILT : TILT
-  // The camera's idle nod is periodic over the tetris cycle so that loop (and
-  // every other frame) closes seamlessly.
-  const tilt = baseTilt + 0.03 * Math.sin((tick / TETRIS_TOTAL) * Math.PI * 4)
+  const yaw = spinFor(options.kind)
+  const tilt = options.kind === "pipelines" ? ISO_TILT : TILT
   const cells = new Array<Cell | undefined>(width * height)
-  const view = stableView(width, height, options.kind)
+  const view = stableView(width, artHeight, options.kind, artOffset)
   const project = (point: Vec3) => projectPoint(point, yaw, tilt, view)
 
-  if (morph < 0.97) {
-    for (const [index, point] of cloud.entries()) {
-      const role = target[index]?.role ?? "form"
-      plotParticle(cells, width, height, project(point), roleGlyph(role), roleColor(role), role === "live" ? 4 : 2, role === "live")
-    }
-  } else {
-    paintSettled(cells, width, height, options.kind, tick, project)
+  if (mark) {
+    paintWordmark(cells, width, height, mark)
   }
+  paintSettled(cells, width, height, options.kind, tick, project)
 
-  return { content: cellsToStyled(cells, width, height), cloud }
+  return { content: cellsToStyled(cells, width, height) }
 }
 
 export function homeArtPlain(content: StyledText) {
   return content.chunks.map((chunk) => chunk.text).join("")
+}
+
+// ── wordmark ───────────────────────────────────────────────────────────────
+
+// "CONVOY" as a heavy 5-row block font — square proportions, 3-cell strokes —
+// pinned to the top of the canvas. The sculpture owns the body; the wordmark
+// owns the empty band above it that every kind leaves anyway. Each face cell
+// extrudes a dim block two columns right and one row down: a drop shadow at
+// terminal aspect (~2:1) reads as a 45° depth edge. Narrow canvases fall back
+// to the old 5-row mark so the name always fits.
+const TITLE_ROW = 1
+const MARK_SHADOW = { dx: 2, dy: 1 }
+
+const MARK_LETTERS: Readonly<Record<string, readonly string[]>> = {
+  C: [
+    " ███████ ",
+    "█████████",
+    "███      ",
+    "███      ",
+    " ███████ ",
+  ],
+  N: [
+    "███   ███",
+    "████  ███",
+    "███ █ ███",
+    "███  ████",
+    "███   ███",
+  ],
+  O: [
+    " ███████ ",
+    "█████████",
+    "███   ███",
+    "███   ███",
+    " ███████ ",
+  ],
+  V: [
+    "███   ███",
+    "███   ███",
+    "███   ███",
+    " ███████ ",
+    "  █████  ",
+  ],
+  Y: [
+    "███   ███",
+    " ███████ ",
+    "   ███   ",
+    "   ███   ",
+    "   ███   ",
+  ],
+}
+
+const WORDMARK: readonly string[] = Array.from({ length: 5 }, (_, row) =>
+  [..."CONVOY"].map((letter) => MARK_LETTERS[letter]![row]!).join(" "),
+)
+
+const WORDMARK_SMALL: readonly string[] = [
+  " ###   ###  #   # #   #  ###  #   #",
+  "#   # #   # ##  # #   # #   # #   #",
+  "#     #   # # # #  # #  #   #  # # ",
+  "#   # #   # #  ##  # #  #   #    #  ",
+  " ###   ###  #   #   #    ###     #  ",
+]
+
+/** The wordmark this canvas can host — large when it fits, small when not. */
+function pickWordmark(width: number, height: number): readonly string[] | undefined {
+  // Every mark needs its band: TITLE_ROW + glyphs + shadow + 1 air, plus
+  // room below for the sculpture to breathe (6 rows, as before).
+  if (height < TITLE_ROW + WORDMARK.length + MARK_SHADOW.dy + 1 + 6) return undefined
+  return width >= WORDMARK[0]!.length + 4 ? WORDMARK : WORDMARK_SMALL
+}
+
+function paintWordmark(
+  cells: Array<Cell | undefined>,
+  width: number,
+  height: number,
+  rows: readonly string[],
+) {
+  const markWidth = Math.max(...rows.map((row) => row.length)) + MARK_SHADOW.dx
+  const x0 = Math.max(0, Math.floor((width - markWidth) / 2))
+  for (let y = 0; y < rows.length; y++) {
+    const row = rows[y]!
+    for (let x = 0; x < row.length; x++) {
+      const mark = row[x]
+      // The large font encodes cells as █, the small fallback as #.
+      if (mark !== "█" && mark !== "#") continue
+      const col = x0 + x
+      const rowFace = TITLE_ROW + y
+      if (col >= width || rowFace >= height) continue
+      // The extrusion goes down first (rank 4) so the face (rank 5) wins any
+      // overlap: the shadow only survives at the mark's lower-right rim.
+      plotCell(
+        cells,
+        width,
+        height,
+        { col: col + MARK_SHADOW.dx, row: rowFace + MARK_SHADOW.dy, depth: 0, facing: 1 },
+        "█",
+        theme.dim,
+        4,
+        false,
+      )
+      // Static accent, uniformly bold: the name is the one heavy element on
+      // an otherwise fine-point canvas.
+      plotCell(cells, width, height, { col, row: rowFace, depth: 0, facing: 1 }, "█", theme.accent, 5, true)
+    }
+  }
 }
 
 // ── sculpture geometry ───────────────────────────────────────────────────
@@ -198,13 +292,9 @@ function tetrisCubeState(index: number, tick: number): TetrisCube {
   const phase = ((tick % TETRIS_TOTAL) + TETRIS_TOTAL) % TETRIS_TOTAL
   const beat = Math.floor(phase / TETRIS_BEAT)
   const within = (phase % TETRIS_BEAT) / TETRIS_BEAT
-  // Idle bob, phased per block but periodic over the whole cycle so the loop
-  // closes seamlessly.
-  const bob = Math.sin((phase / TETRIS_TOTAL) * Math.PI * 6 + index * 1.7) * 0.08
   const restY = TETRIS_FLOOR + TETRIS_SIZE / 2
   const depart = index * 0.05
   const duration = 0.26
-  const landT = depart + duration
   const flight = clamp((within - depart) / duration, 0, 1)
   const eased = easeOutCubic(flight)
   const lift = Math.sin(flight * Math.PI) * 0.34
@@ -220,20 +310,15 @@ function tetrisCubeState(index: number, tick: number): TetrisCube {
     from = { x: prev.x, y: beat === 0 ? tetrisHomes[index]!.y : restY, z: prev.z }
     to = { x: shape.x, y: restY, z: shape.z }
   }
-  let y = lerp(from.y, to.y, eased) + lift + bob
-  // Landing bounce: a quick dip past the rest height and back — the thunk.
-  if (flight >= 1 && within < landT + 0.14) {
-    y -= Math.sin(((within - landT) / 0.14) * Math.PI) * 0.045
+  // No idle bob and no landing bounce: the blocks travel a clean arc and
+  // settle. The assembly itself carries the motion; everything else is noise.
+  return {
+    pos: { x: lerp(from.x, to.x, eased), y: lerp(from.y, to.y, eased) + lift, z: lerp(from.z, to.z, eased) },
+    from,
+    to,
+    flight,
+    restY,
   }
-  return { pos: { x: lerp(from.x, to.x, eased), y, z: lerp(from.z, to.z, eased) }, from, to, flight, restY }
-}
-
-function tetrisLocked(tick: number): boolean {
-  const phase = ((tick % TETRIS_TOTAL) + TETRIS_TOTAL) % TETRIS_TOTAL
-  const beat = Math.floor(phase / TETRIS_BEAT)
-  if (beat >= TETRIS_SCATTER_BEATS) return false
-  const within = (phase % TETRIS_BEAT) / TETRIS_BEAT
-  return within > 0.54 && within < 0.7
 }
 
 function pipelinePoints(n: number, tick: number): FormPoint[] {
@@ -363,7 +448,6 @@ function paintPipeline(
 ) {
   const phase = ((tick % TETRIS_TOTAL) + TETRIS_TOTAL) % TETRIS_TOTAL
   const beat = Math.floor(phase / TETRIS_BEAT)
-  const within = (phase % TETRIS_BEAT) / TETRIS_BEAT
   const cubes = [0, 1, 2, 3].map((index) => tetrisCubeState(index, tick))
 
   // Blueprint floor: a wide, shallow dotted grid. No ring — a circle under
@@ -373,17 +457,6 @@ function paintPipeline(
     for (const gz of [-0.74, 0, 0.74]) {
       plotParticle(cells, width, height, project({ x: gx, y: TETRIS_FLOOR, z: gz }), "·", theme.faint, 0, false)
     }
-  }
-
-  // Lock shockwave: a ring races out from the piece's center across the
-  // floor while the tetromino is locked — the landing's money shot.
-  if (tetrisLocked(tick)) {
-    const shockT = (within - 0.54) / 0.16
-    const shape = tetrominoes[beat]!
-    const cx = shape.reduce((sum, slot) => sum + slot.x, 0) / shape.length
-    const cz = shape.reduce((sum, slot) => sum + slot.z, 0) / shape.length
-    const radius = lerp(0.25, 1.65, easeOutCubic(shockT))
-    plotFloorRing(cells, width, height, project, cx, cz, radius, shockT < 0.55 ? theme.yellow : theme.dim, 2)
   }
 
   for (const [index, cube] of cubes.entries()) {
@@ -396,70 +469,13 @@ function paintPipeline(
     // climbs — the single cue that sells height under a solid block.
     const h = clamp((cube.pos.y - cube.restY) / 0.5, 0, 1)
     plotShadow(cells, width, height, project, cube.pos.x, cube.pos.z, TETRIS_SIZE * (0.58 - 0.16 * h), h > 0.55 ? theme.faint : theme.dim)
-    // Two fading ghost dots trail the flight path; anything more is noise.
-    if (airborne) {
-      for (let k = 1; k <= 2; k++) {
-        const fk = clamp(cube.flight - 0.1 * k, 0, 1)
-        const ek = easeOutCubic(fk)
-        const ghost = {
-          x: lerp(cube.from.x, cube.to.x, ek),
-          y: lerp(cube.from.y, cube.to.y, ek) + Math.sin(fk * Math.PI) * 0.34,
-          z: lerp(cube.from.z, cube.to.z, ek),
-        }
-        plotParticle(cells, width, height, project(ghost), "·", theme.faint, 1, false)
-      }
-    }
-    // Landing dust: six sparks race outward along the floor from the slot.
-    const landT = index * 0.05 + 0.26
-    if (cube.flight >= 1 && within > landT && within < landT + 0.13) {
-      const dt = (within - landT) / 0.13
-      const spread = 0.12 + 0.5 * dt
-      for (let d = 0; d < 6; d++) {
-        const a = (d / 6) * Math.PI * 2 + index * 0.7
-        plotParticle(
-          cells,
-          width,
-          height,
-          project({ x: cube.to.x + Math.cos(a) * spread * 0.85, y: TETRIS_FLOOR + 0.02, z: cube.to.z + Math.sin(a) * spread * 0.55 }),
-          "·",
-          dt < 0.5 ? theme.dim : theme.faint,
-          1,
-          false,
-        )
-      }
-    }
   }
 
-  const locked = tetrisLocked(tick)
+  // No lock flash, no shockwave, no dust, no ghost trails: the blocks arc in,
+  // snap, and the scene holds. The assembly is the story.
   const colors = [theme.accent, theme.teal, theme.magenta, theme.cyan]
   for (const [index, cube] of cubes.entries()) {
-    plotIsoCube(cells, width, height, project, cube.pos, TETRIS_SIZE, colors[index]!, locked)
-  }
-}
-
-/** A dashed circle lying on the blueprint floor. */
-function plotFloorRing(
-  cells: Array<Cell | undefined>,
-  width: number,
-  height: number,
-  project: (point: Vec3) => Projected | undefined,
-  cx: number,
-  cz: number,
-  radius: number,
-  color: string,
-  rank: number,
-) {
-  const steps = 22
-  let prev: Vec3 | undefined
-  for (let i = 0; i <= steps; i++) {
-    if (i % 3 === 2) {
-      prev = undefined
-      continue
-    }
-    const a = (i / steps) * Math.PI * 2
-    const point = { x: cx + Math.cos(a) * radius, y: TETRIS_FLOOR, z: cz + Math.sin(a) * radius }
-    if (prev) plotLine(cells, width, height, project(prev), project(point), color, rank, "·")
-    prev = point
+    plotIsoCube(cells, width, height, project, cube.pos, TETRIS_SIZE, colors[index]!)
   }
 }
 
@@ -480,7 +496,7 @@ function plotShadow(
       const dx = (i / n) * 2 - 1
       const dz = (j / n) * 2 - 1
       if (dx * dx + dz * dz > 1) continue
-      plotParticle(cells, width, height, project({ x: cx + dx * radius, y: TETRIS_FLOOR, z: cz + dz * radius * 0.8 }), "░", color, 1, false)
+      plotParticle(cells, width, height, project({ x: cx + dx * radius, y: TETRIS_FLOOR, z: cz + dz * radius * 0.8 }), "·", color, 1, false)
     }
   }
 }
@@ -502,12 +518,10 @@ function plotFootprint(
   }
 }
 
-// The shared density ramp: solid glyph per orientation, so every sculpture
-// reads its 3D the same way pipelines' blocks do. Tints stay on the palette.
-function faceShade(facing: number): "▓" | "▒" | "░" {
-  if (facing > 0.28) return "▓"
-  if (facing > 0) return "▒"
-  return "░"
+// The shared density ramp: a bullet where light lands, a middle dot on the
+// rest — depth does the remaining work through color. Tints stay on the palette.
+function faceShade(facing: number): "•" | "·" {
+  return facing > 0.28 ? "•" : "·"
 }
 
 function plotSolidNode(
@@ -549,8 +563,8 @@ function paintSpecs(
   tick: number,
   project: (point: Vec3) => Projected | undefined,
 ) {
-  // Rings: solid bands whose density ramps ▓▒░ with the face — the same
-  // shading language the tetris blocks speak, carried on a wire sculpture.
+  // Rings: solid bands whose density rides the shared ·/• ramp — the same
+  // shading language every sculpture speaks, carried on a wire sculpture.
   for (const ring of specsRings) {
     const steps = 120
     for (let i = 0; i < steps; i++) {
@@ -564,12 +578,13 @@ function paintSpecs(
     const t = (((tick * ring.speed + ring.phase) % 1) + 1) % 1
     const electron = ringPoint(t * Math.PI * 2, ring)
     const tail = project(ringPoint((((t - 0.03) % 1) + 1) % 1 * Math.PI * 2, ring))
-    if (tail) plotParticle(cells, width, height, tail, "•", theme[ring.hue], 3, false)
-    plotSolidNode(cells, width, height, project, electron, theme[ring.hue], "●")
+    if (tail) plotParticle(cells, width, height, tail, "·", theme[ring.hue], 3, false)
+    plotSolidNode(cells, width, height, project, electron, theme[ring.hue], "•")
   }
-  // Nucleus: a small solid core pulsing at the atom's heart.
-  const beat = Math.sin(tick * 0.2) > 0 ? "◆" : "●"
-  plotSolidNode(cells, width, height, project, { x: 0, y: ATOM_CY, z: 0 }, theme.cyan, beat)
+  // Nucleus: a small core at the atom's heart, pulsing in brightness only —
+  // the glyph never changes shape.
+  const lit = Math.sin(tick * 0.2) > 0
+  plotSolidNode(cells, width, height, project, { x: 0, y: ATOM_CY, z: 0 }, lit ? theme.cyan : theme.dim, "•")
 }
 
 function paintRuns(
@@ -579,8 +594,9 @@ function paintRuns(
   tick: number,
   project: (point: Vec3) => Projected | undefined,
 ) {
-  // Main strand solid and shaded by face; the twin stays a dotted echo —
-  // history behind the story — and rungs drop to faint ░ steps.
+  // Main strand dotted and shaded by face; the twin stays a sparse echo —
+  // history behind the story — and rungs drop to faint · steps. No head
+  // spark: the helix turns, that is all the theater it needs.
   for (let i = 0; i < HELIX_STEPS; i++) {
     const t = i / (HELIX_STEPS - 1)
     const front = project(helixStrand(t, 0))
@@ -592,17 +608,15 @@ function paintRuns(
     if (i % RUNG_EVERY === 7) {
       const a = project(helixStrand(t, 0))
       const b = project(helixStrand(t, Math.PI))
-      if (a && b && a.facing > 0 && b.facing > 0) plotLine(cells, width, height, a, b, theme.faint, 1, "░")
+      if (a && b && a.facing > 0 && b.facing > 0) plotLine(cells, width, height, a, b, theme.faint, 1, "·")
     }
   }
   for (const [index, t] of runBeats.entries()) {
     if (index === liveBeat) continue
-    plotSolidNode(cells, width, height, project, helixStrand(t, 0), theme.teal, "●")
+    plotSolidNode(cells, width, height, project, helixStrand(t, 0), theme.teal, "•")
   }
-  const pulse = Math.sin(tick * 0.25) > 0 ? "◆" : "●"
-  plotSolidNode(cells, width, height, project, helixStrand(runBeats[liveBeat]!, 0), theme.accent, pulse)
-  const head = helixStrand(((tick * 0.01) % 1 + 1) % 1, 0)
-  plotParticle(cells, width, height, project({ x: head.x, y: head.y + 0.14, z: head.z }), "✦", theme.yellow, 5, true)
+  const lit = Math.sin(tick * 0.25) > 0
+  plotSolidNode(cells, width, height, project, helixStrand(runBeats[liveBeat]!, 0), lit ? theme.accent : theme.dim, "•")
 }
 
 function paintConfig(
@@ -612,8 +626,9 @@ function paintConfig(
   tick: number,
   project: (point: Vec3) => Projected | undefined,
 ) {
-  // Outer shell: solid patches shaded by orientation — parallels in ▓,
-  // meridians in ▒, dusk in ░ — so the orb reads as a volume, not a wire.
+  // Outer shell: dotted patches shaded by orientation — the lit equator
+  // carries bullets, the dusk bands fall to middle dots, the back hemisphere
+  // to faint dots — so the orb reads as a volume, not a wire.
   for (const v of LATS) {
     const r = ORB_R * Math.sqrt(Math.max(0, 1 - v * v))
     const steps = 88
@@ -622,7 +637,7 @@ function paintConfig(
       const hit = project({ x: Math.cos(a) * r, y: ORB_CY + v * ORB_R, z: Math.sin(a) * r })
       if (!hit) continue
       const front = hit.facing > 0.02
-      const ch = front ? (Math.abs(v) < 0.45 ? "▓" : "░") : "░"
+      const ch = front && Math.abs(v) < 0.45 ? "•" : "·"
       const color = front ? (Math.abs(v) < 0.45 ? theme.teal : theme.cyan) : theme.faint
       plotParticle(cells, width, height, hit, ch, color, 2, false)
     }
@@ -638,12 +653,11 @@ function paintConfig(
       })
       if (!hit) continue
       const front = hit.facing > 0.02
-      const ch = front ? "▒" : "░"
-      plotParticle(cells, width, height, hit, ch, front ? theme.cyan : theme.faint, 2, false)
+      plotParticle(cells, width, height, hit, "·", front ? theme.cyan : theme.faint, 2, false)
     }
   }
   // Inner shell: the settings core, a smaller accent wire inside the orb —
-  // kept solid on its front arcs so it never dissolves into the shell.
+  // kept brighter on its front arcs so it never dissolves into the shell.
   const inner = 0.45
   for (const v of [-0.5, 0, 0.5]) {
     const r = inner * Math.sqrt(Math.max(0, 1 - v * v))
@@ -652,7 +666,7 @@ function paintConfig(
       const a = (i / steps) * Math.PI * 2
       const hit = project({ x: Math.cos(a) * r, y: ORB_CY + v * inner, z: Math.sin(a) * r })
       if (!hit) continue
-      plotParticle(cells, width, height, hit, hit.facing > 0 ? "▒" : "░", hit.facing > 0 ? theme.accent : theme.dim, 3, false)
+      plotParticle(cells, width, height, hit, "·", hit.facing > 0 ? theme.accent : theme.dim, 3, false)
     }
   }
   for (const phi of [0, Math.PI / 2]) {
@@ -665,20 +679,21 @@ function paintConfig(
         z: inner * Math.sin(theta) * Math.sin(phi),
       })
       if (!hit) continue
-      plotParticle(cells, width, height, hit, hit.facing > 0 ? "▒" : "░", hit.facing > 0 ? theme.accent : theme.dim, 3, false)
+      plotParticle(cells, width, height, hit, "·", hit.facing > 0 ? theme.accent : theme.dim, 3, false)
     }
   }
-  const pulse = Math.sin(tick * 0.15) > 0 ? "◆" : "●"
   // The core outranks the shell (rank 6 over 3): it must read as the bright
-  // center of the orb, never as a dot lost behind its own wires.
-  plotParticle(cells, width, height, project({ x: 0, y: ORB_CY, z: 0 }), pulse, theme.accent, 6, true)
+  // center of the orb, never as a dot lost behind its own wires. It pulses
+  // in brightness only — the glyph is a steady bullet.
+  const lit = Math.sin(tick * 0.15) > 0
+  plotParticle(cells, width, height, project({ x: 0, y: ORB_CY, z: 0 }), "•", lit ? theme.accent : theme.dim, 6, true)
 }
 
 // ── drawing primitives ───────────────────────────────────────────────────
 
 type Projected = { col: number; row: number; depth: number; facing: number }
 type CameraHit = { px: number; py: number; depth: number; facing: number }
-type View = { scale: number; midX: number; midY: number; width: number; height: number }
+type View = { scale: number; midX: number; midY: number; width: number; height: number; offsetY: number }
 
 function cameraPoint(point: Vec3, yaw: number, tilt: number): CameraHit | undefined {
   const spun = rotX(rotY(point, yaw), tilt)
@@ -697,6 +712,15 @@ function cameraPoint(point: Vec3, yaw: number, tilt: number): CameraHit | undefi
 // its size at every yaw instead of breathing with the frame's bounding box.
 const viewCache = new Map<string, View>()
 const sampleCache = new Map<HomeArtKind, readonly Vec3[]>()
+const centerCache = new Map<HomeArtKind, readonly Vec3[]>()
+
+// Everything pipelines paints under the blocks — the blueprint grid, contact
+// shadows, slot footprints, landing dust — lives on the floor plane inside
+// this rect. The isometric tilt throws the plane's front edge far below the
+// cube bottoms, so the fit has to see it or the scene crowds the bottom edge.
+const tetrisFloorSamples: readonly Vec3[] = [-1.5, -0.75, 0, 0.75, 1.5].flatMap((x) =>
+  [-1, -0.5, 0, 0.5, 1].map((z) => ({ x, y: TETRIS_FLOOR, z })),
+)
 
 function boundSamples(kind: HomeArtKind): readonly Vec3[] {
   const cached = sampleCache.get(kind)
@@ -704,24 +728,50 @@ function boundSamples(kind: HomeArtKind): readonly Vec3[] {
   let samples: readonly Vec3[]
   if (kind === "pipelines") {
     // The tetromino choreography moves the blocks all over the playfield;
-    // sweep the whole cycle so the fit never clips a flying block.
-    const poses: Vec3[] = []
-    for (let tick = 0; tick < TETRIS_TOTAL; tick += 8) poses.push(...formCloud(kind, 16, tick))
+    // sweep every renderable tick (plus the floor they play over) so the fit
+    // never clips a flying block — the flight lift peaks sharply, and a
+    // coarser stride misses the apex between samples. n = 96 keeps every
+    // sampled cube corner: smaller counts make takeN decimate the cloud.
+    const poses: Vec3[] = [...tetrisFloorSamples]
+    for (let tick = 0; tick < TETRIS_TOTAL; tick++) poses.push(...formCloud(kind, 96, tick))
     samples = poses
   } else {
-    const cloud = formCloud(kind, 72, 0)
-    // The coil's climbing spark rides above the helix; give it headroom.
-    samples = kind === "runs" ? [...cloud, ...cloud.map((point) => ({ x: point.x, y: point.y + 0.16, z: point.z }))] : cloud
+    samples = formCloud(kind, 72, 0)
   }
   sampleCache.set(kind, samples)
   return samples
 }
 
-function stableView(width: number, height: number, kind: HomeArtKind): View {
-  const key = `${width}x${height}:${kind}`
+// What the camera centers on. For the spinning kinds this is the same
+// worst-case set the scale comes from. Pipelines is the exception: its sweep
+// reserves headroom for blocks in flight, so centering on the sweep's
+// midpoint hangs the resting tetromino — the pose the scene dwells in —
+// several rows below center. Center on the settled scene (locked blocks plus
+// the floor under them) and let flight borrow the reserved headroom instead.
+function centerSamples(kind: HomeArtKind): readonly Vec3[] {
+  const cached = centerCache.get(kind)
+  if (cached) return cached
+  let samples: readonly Vec3[]
+  if (kind === "pipelines") {
+    const poses: Vec3[] = [...tetrisFloorSamples]
+    // The hold phase of every build beat: all four blocks locked on the floor.
+    for (let beat = 0; beat < TETRIS_SCATTER_BEATS; beat++) {
+      poses.push(...formCloud(kind, 96, Math.floor((beat + 0.8) * TETRIS_BEAT)))
+    }
+    samples = poses
+  } else {
+    samples = boundSamples(kind)
+  }
+  centerCache.set(kind, samples)
+  return samples
+}
+
+function stableView(width: number, height: number, kind: HomeArtKind, offsetY = 0): View {
+  const key = `${width}x${height}:${kind}:${offsetY}`
   const cached = viewCache.get(key)
   if (cached) return cached
   const samples = boundSamples(kind)
+  const centers = centerSamples(kind)
   let maxAbsX = 0
   let minY = Infinity
   let maxY = -Infinity
@@ -739,15 +789,31 @@ function stableView(width: number, height: number, kind: HomeArtKind): View {
       if (hit.py > maxY) maxY = hit.py
     }
   }
+  let centerMinY = minY
+  let centerMaxY = maxY
+  if (centers !== samples) {
+    centerMinY = Infinity
+    centerMaxY = -Infinity
+    for (let i = 0; i < yawSteps; i++) {
+      const yaw = kind === "pipelines" ? ISO_YAW : (i / 48) * Math.PI * 2
+      for (const point of centers) {
+        const hit = cameraPoint(point, yaw, tilt)
+        if (!hit) continue
+        if (hit.py < centerMinY) centerMinY = hit.py
+        if (hit.py > centerMaxY) centerMaxY = hit.py
+      }
+    }
+  }
   const spanX = Math.max(0.2, 2 * maxAbsX)
   const spanY = Math.max(0.2, maxY - minY)
   const scale = Math.min((width * (1 - 2 * PAD)) / spanX, (height * (1 - 2 * PAD)) / spanY)
   const view: View = {
     scale: Number.isFinite(scale) && scale > 0 ? scale : Math.min(width, height) * 0.4,
     midX: 0,
-    midY: Number.isFinite(minY) ? (minY + maxY) / 2 : 0,
+    midY: Number.isFinite(centerMinY) ? (centerMinY + centerMaxY) / 2 : 0,
     width,
     height,
+    offsetY,
   }
   viewCache.set(key, view)
   return view
@@ -757,17 +823,15 @@ function projectPoint(point: Vec3, yaw: number, tilt: number, view: View): Proje
   const hit = cameraPoint(point, yaw, tilt)
   if (!hit) return undefined
   const col = (view.width - 1) / 2 + (hit.px - view.midX) * view.scale
-  const row = (view.height - 1) / 2 + (hit.py - view.midY) * view.scale
+  const row = view.offsetY + (view.height - 1) / 2 + (hit.py - view.midY) * view.scale
   return { col, row, depth: hit.depth, facing: hit.facing }
 }
 
-// An isometric solid block: three visible faces filled edge-to-edge with
-// block-density glyphs in the cube's own color — █ on the lit top, ▓ on the
-// lighter side, ▒ on the darker side. The terminal's background supplies the
-// dark, so a single hue reads as three tones of one material. No outlines:
-// stroked edges at this scale decay into diagonal noise, while solid faces
-// plus the depth buffer keep even touching blocks crisp. During the lock
-// flash the top face burns yellow.
+// An isometric solid block: three visible faces dotted edge-to-edge — bullets
+// on the lit top, middle dots on the sides — in the cube's own color. The
+// terminal's background supplies the dark, so a single hue reads as three
+// tones of one material. Equal-rank faces let the depth buffer decide
+// overlaps, so neighbouring blocks z-sort correctly.
 function plotIsoCube(
   cells: Array<Cell | undefined>,
   width: number,
@@ -776,7 +840,6 @@ function plotIsoCube(
   center: Vec3,
   size: number,
   color: string,
-  flash: boolean,
 ) {
   const s = size / 2
   const at = (dx: number, dy: number, dz: number): Vec3 => ({ x: center.x + dx * s, y: center.y + dy * s, z: center.z + dz * s })
@@ -787,9 +850,9 @@ function plotIsoCube(
   const bB = at(-1, -1, 1)
   const bC = at(1, -1, 1)
   const bD = at(1, -1, -1)
-  fillFace(cells, width, height, project, tD, tC, bC, bD, "▒", color, 4, false)
-  fillFace(cells, width, height, project, tB, bB, bC, tC, "▓", color, 4, false)
-  fillFace(cells, width, height, project, tA, tB, tC, tD, "█", flash ? theme.yellow : color, flash ? 6 : 5, flash)
+  fillFace(cells, width, height, project, tD, tC, bC, bD, "·", color, 4, false)
+  fillFace(cells, width, height, project, tB, bB, bC, tC, "·", color, 4, false)
+  fillFace(cells, width, height, project, tA, tB, tC, tD, "•", color, 5, true)
 }
 
 // Fills a 3D quad with a dense bilinear point grid, sampled finely enough for
@@ -928,20 +991,6 @@ function cellsToStyled(cells: Array<Cell | undefined>, width: number, height: nu
 
 // ── small helpers ────────────────────────────────────────────────────────
 
-function roleGlyph(role: Role) {
-  if (role === "live") return "◆"
-  if (role === "inner") return "•"
-  if (role === "path") return "•"
-  return "·"
-}
-
-function roleColor(role: Role) {
-  if (role === "live") return theme.accent
-  if (role === "inner") return theme.cyan
-  if (role === "path") return theme.teal
-  return theme.dim
-}
-
 function cubePoints(cx: number, cy: number, cz: number, size: number, n: number, role: Role): FormPoint[] {
   const h = size / 2
   const corners: Vec3[] = []
@@ -981,27 +1030,6 @@ function easeOutCubic(t: number) {
   return 1 - Math.pow(1 - t, 3)
 }
 
-function resample(points: readonly Vec3[], n: number): Vec3[] {
-  if (points.length === n) return points.map((point) => ({ x: point.x, y: point.y, z: point.z }))
-  if (points.length === 0) return Array.from({ length: n }, () => ({ x: 0, y: 0, z: 0 }))
-  if (points.length > n) {
-    return Array.from({ length: n }, (_, i) => {
-      const point = points[Math.floor((i * points.length) / n)]!
-      return { x: point.x, y: point.y, z: point.z }
-    })
-  }
-  return Array.from({ length: n }, (_, i) => {
-    const t = (i * points.length) / n
-    const a = Math.floor(t) % points.length
-    const b = (a + 1) % points.length
-    return {
-      x: lerp(points[a]!.x, points[b]!.x, t - Math.floor(t)),
-      y: lerp(points[a]!.y, points[b]!.y, t - Math.floor(t)),
-      z: lerp(points[a]!.z, points[b]!.z, t - Math.floor(t)),
-    }
-  })
-}
-
 function rotY(point: Vec3, angle: number): Vec3 {
   const c = Math.cos(angle)
   const s = Math.sin(angle)
@@ -1020,11 +1048,6 @@ function lerp(a: number, b: number, t: number) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
-}
-
-function smoothstep(t: number) {
-  const x = clamp(t, 0, 1)
-  return x * x * (3 - 2 * x)
 }
 
 function takeN(points: FormPoint[], n: number): FormPoint[] {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { compareSemVer, parseSemVer } from "../src/update"
-import { formatVersion, shortVersion, versionInfo } from "../src/version"
+import { formatVersion, majorMinorVersion, shortVersion, versionInfo } from "../src/version"
 
 const released = { version: "0.1.1", commit: "a".repeat(40), platform: "darwin-arm64", release: true }
 
@@ -12,6 +12,12 @@ describe("version formatting", () => {
     // `bun src/main.ts` sets no npm_package_version, so the triple falls all
     // the way through: "v0.0.0-development-dev" would be noise, not a version.
     expect(shortVersion({ ...released, version: "0.0.0-development", release: false })).toBe("dev")
+  })
+
+  test("Home condenses a semantic version to its major-minor release line", () => {
+    expect(majorMinorVersion(released)).toBe("v0.1")
+    expect(majorMinorVersion({ ...released, version: "12.34.56-local+abcdef0", release: false })).toBe("v12.34")
+    expect(majorMinorVersion({ ...released, version: "0.0.0-development", release: false })).toBe("dev")
   })
 
   // install.sh and the self-updater both parse this line to confirm a staged

@@ -41,3 +41,15 @@ export function shortVersion(info: VersionInfo = versionInfo) {
   if (info.release) return `v${info.version}`
   return info.version === developmentVersion ? "dev" : `v${info.version}-dev`
 }
+
+/** Home only needs the release line; detailed patch/build identity appears elsewhere. */
+export function majorMinorVersion(info: VersionInfo = versionInfo) {
+  const version = shortVersion(info)
+  const match = /^v(\d+)\.(\d+)/.exec(version)
+  return match ? `v${match[1]}.${match[2]}` : version
+}
+
+/** The full build line (version + commit + platform), brand prefix dropped. */
+export function versionDetails(info: VersionInfo = versionInfo) {
+  return formatVersion(info).replace(/^convoy\s+/, "")
+}

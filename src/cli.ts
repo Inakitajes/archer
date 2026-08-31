@@ -241,6 +241,11 @@ export function shouldLaunchHome(argv: readonly string[], stdinTTY: boolean | un
 
 /** One alternate-screen owner routes every destination until Home itself quits. */
 async function runHomeSession(targetDir: string): Promise<void> {
+  // Probe the Kitty graphics protocol before the session renderer takes
+  // stdin; over SSH the client's environment doesn't travel, so the terminal
+  // itself has to answer.
+  const { probeKittyGraphics } = await import("./kitty-graphics")
+  const kittyGraphics = await probeKittyGraphics()
   const [{ launchHomeTui }, { createTuiSession }] = await Promise.all([import("./home-tui"), import("./tui-session")])
   const session = await createTuiSession()
   let interrupted = false
@@ -254,7 +259,7 @@ async function runHomeSession(targetDir: string): Promise<void> {
   try {
     await runHomeNavigationLoop({
       interrupted: () => interrupted,
-      openHome: (initialSelection) => launchHomeTui(targetDir, { route, initialSelection }),
+      openHome: (initialSelection) => launchHomeTui(targetDir, { route, initialSelection, kittyGraphics }),
       openDestination: async (selection) => {
         if (selection === "pipelines") await launchInteractiveRun(targetDir, undefined, undefined, route)
         else if (selection === "specs") await openSpecsBrowser(targetDir, route)
