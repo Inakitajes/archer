@@ -23,9 +23,9 @@ import {
   formatCommitMessage,
   normalizeComposedMessage,
   proposeCommitMessage,
-  stripControlBytes,
   type CommitMessageProposal,
 } from "./commit-message"
+import { stripControlBytes } from "./commit-text"
 import { listRuns } from "./runs"
 
 /**

@@ -326,7 +326,61 @@ export async function listChangedFiles(baseRef: string, cwd: string): Promise<st
     .filter(Boolean)
 }
 
-export async function addAllAndCommit(message: string, cwd: string) {
+/**
+ * Evidence about the exact staged change set, parsed from NUL-delimited
+ * `git diff --cached --name-status -z` after `git add -A` (design D5). Renames
+ * contribute their new path; a failed probe yields empty evidence so message
+ * composition degrades to an honest fallback instead of blocking the commit.
+ */
+export type StagedChangeEvidence = {
+  /** Staged paths, in name-status order (rename targets for R/C entries). */
+  paths: string[]
+  /** One status code per path (`A`, `M`, `D`, `R100`, …). */
+  statuses: string[]
+}
+
+export async function stagedChangeEvidence(cwd: string): Promise<StagedChangeEvidence> {
+  const nameStatus = await execFile("git", ["diff", "--cached", "--name-status", "-z"], { cwd, allowFailure: true })
+  if (nameStatus.exitCode !== 0) return { paths: [], statuses: [] }
+  return parseStagedEvidence(nameStatus.stdout)
+}
+
+/**
+ * Parses `--name-status -z` output: NUL-separated records of `<status>` then
+ * one path — two for renames/copies, where git emits the original path first
+ * and the new path second (verified empirically). A trailing NUL yields an
+ * empty field that terminates the loop.
+ */
+export function parseStagedEvidence(zOutput: string): StagedChangeEvidence {
+  const fields = zOutput.split("\0")
+  const paths: string[] = []
+  const statuses: string[] = []
+  for (let index = 0; index < fields.length; index++) {
+    const status = fields[index]!
+    if (!status) continue
+    const first = fields[++index] ?? ""
+    if (!first) continue
+    if (/^[RC]/.test(status)) {
+      const renamed = fields[++index] ?? ""
+      if (!renamed) continue
+      statuses.push(status)
+      paths.push(renamed)
+      continue
+    }
+    statuses.push(status)
+    paths.push(first)
+  }
+  return { paths, statuses }
+}
+
+/**
+ * The commit message: either a fixed string or an asynchronous factory invoked
+ * only after staging and secret scanning, so it can describe the exact staged
+ * change set (design D5) and never runs when there is nothing to commit.
+ */
+export type CommitMessageInput = string | ((evidence: StagedChangeEvidence) => Promise<string>)
+
+export async function addAllAndCommit(message: CommitMessageInput, cwd: string) {
   await execFile("git", ["add", "-A"], { cwd })
 
   const status = await execFile("git", statusArgs, { cwd })
@@ -343,7 +397,8 @@ export async function addAllAndCommit(message: string, cwd: string) {
     )
   }
 
-  await execFile("git", [...commitArgs, "-m", message], {
+  const resolved = typeof message === "function" ? await message(await stagedChangeEvidence(cwd)) : message
+  await execFile("git", [...commitArgs, "-m", resolved], {
     cwd,
     env: convoyGitEnv,
   })

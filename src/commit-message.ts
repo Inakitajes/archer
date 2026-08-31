@@ -1,5 +1,6 @@
 import type { AgentConfig, Config, OpencodeClient } from "@opencode-ai/sdk/v2"
 
+import { capSubjectWithin, firstMeaningfulLine, maxCommitSubjectLength } from "./commit-text"
 import { log } from "./log"
 import { startOpencode } from "./opencode"
 import { splitModelVariant } from "./pipeline"
@@ -57,7 +58,7 @@ const writerAgentName = "convoy-commit-writer"
 
 const commitMessageTimeoutMs = 60_000
 /** Conventional commits recommend keeping the whole subject line inside ~72 columns. */
-const maxSubjectLength = 72
+const maxSubjectLength = maxCommitSubjectLength
 const maxBodyLines = 6
 
 const commitTypes = ["feat", "fix", "refactor", "perf", "docs", "test", "chore", "build", "ci"] as const
@@ -377,20 +378,6 @@ export function formatCommitMessage(message: ConventionalMessage): string {
   return `${subject}\n\n${message.body.map((line) => `- ${line}`).join("\n")}`
 }
 
-/**
- * Strips terminal-injection bytes from model- and git-derived text at the
- * render and commit-composition boundaries (SC-4). Removes full ANSI CSI
- * sequences (`\x1b[…m` and friends, so git-stderr color codes don't leave
- * `[31m` garbage) plus the remaining C0 bytes except tab/newline/CR and DEL —
- * escape bytes that could otherwise paint arbitrary terminal sequences.
- * Newlines survive so multi-line bodies and error blocks stay readable.
- */
-export function stripControlBytes(value: string): string {
-  return value
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
-}
-
 function splitBranch(branch: string): { type: string; rest: string } {
   const match = /^([a-z]+)\/(.+)$/i.exec(branch.trim())
   if (!match) return { type: defaultCommitType, rest: branch.trim() }
@@ -423,20 +410,7 @@ function cleanSubject(value: string): string {
 }
 
 function capSubject(type: string, scope: string | undefined, subject: string): string {
-  const prefix = `${type}${scope ? `(${scope})` : ""}: `
-  const room = maxSubjectLength - prefix.length
-  if (room <= 0 || subject.length <= room) return subject
-  const cut = subject.slice(0, room)
-  const boundary = cut.lastIndexOf(" ")
-  return (boundary > room / 2 ? cut.slice(0, boundary) : cut).trim()
-}
-
-function firstMeaningfulLine(value: string): string {
-  for (const line of value.split("\n")) {
-    const trimmed = line.trim().replace(/^#+\s*/, "")
-    if (trimmed) return trimmed
-  }
-  return ""
+  return capSubjectWithin(`${type}${scope ? `(${scope})` : ""}: `, subject)
 }
 
 function collectText(parts: ReadonlyArray<{ type: string; text?: string }>): string {

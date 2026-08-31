@@ -50,6 +50,7 @@ import type { Workspace } from "../src/workspace"
 import { LoopGuard, LoopGuardError, resolveLoopGuard } from "../src/loop-guard"
 import { createReportRuntime, type ReportPhaseHandle } from "../src/report-runtime"
 import { startReportBridge } from "../src/report-bridge"
+import { writeCommitSidecar } from "../src/step-commit"
 import { qualityDimensionWeights } from "../src/quality-score"
 
 const recoveryDirs: string[] = []
@@ -97,6 +98,14 @@ async function cleanRepo(): Promise<string> {
   await git(["add", "-A"], dir)
   await git(["commit", "-qm", "base"], dir)
   return dir
+}
+
+async function workspaceWithReports(reports: string[]): Promise<Workspace> {
+  const dir = await mkdtemp(join(tmpdir(), "convoy-recover-ws-"))
+  recoveryDirs.push(dir)
+  await mkdir(join(dir, "reports"), { recursive: true })
+  for (const name of reports) await writeFile(join(dir, "reports", `${name}.md`), `# ${name}`)
+  return { dir, runID: "20260101-000000-test" }
 }
 
 function agentStep(name: string): AgentStep {
@@ -1933,14 +1942,6 @@ describe("dirty-tree recovery", () => {
   const fakeMetadata = (statuses: Record<string, ProgressPhaseSnapshot | undefined>): RunMetadataStore =>
     ({ snapshot: (name: string) => statuses[name] }) as unknown as RunMetadataStore
 
-  async function workspaceWithReports(reports: string[]): Promise<Workspace> {
-    const dir = await mkdtemp(join(tmpdir(), "convoy-recover-ws-"))
-    recoveryDirs.push(dir)
-    await mkdir(join(dir, "reports"), { recursive: true })
-    for (const name of reports) await writeFile(join(dir, "reports", `${name}.md`), `# ${name}`)
-    return { dir, runID: "20260101-000000-test" }
-  }
-
   test("selects the first agent phase a resume would re-run, skipping human gates", async () => {
     // implementer done, patterns failed (stale report), tests never ran.
     const ws = await workspaceWithReports(["implementer", "patterns"])
@@ -2000,7 +2001,118 @@ describe("dirty-tree recovery", () => {
     await commitRecoveredPhase(ws, metadata, agent("implementer"), repo)
 
     expect(await readFile(join(ws.dir, "reports", "implementer.md"), "utf8")).toBe("# implementer")
-    expect(await git(["log", "-1", "--pretty=%s"], repo)).toContain("convoy(implementer): implementer")
+    // The report's only line is the bare phase name — a generic label — so the
+    // commit describes the exact staged change instead (`step-commit-messages`).
+    expect(await git(["log", "-1", "--pretty=%s"], repo)).toContain("convoy(implementer): update feature.txt")
+    expect(await git(["log", "-1", "--pretty=%B"], repo)).toContain("Convoy-Run: 20260101-000000-test")
+  })
+
+  test("reuses a hash-matched sidecar description when recovery follows an interrupted write_report", async () => {
+    const repo = await dirtyRepo()
+    const ws = await workspaceWithReports(["implementer"])
+    const metadata = await openRunMetadata(ws, repo, pipeline)
+
+    // The interrupted phase wrote a report plus a structured commit description;
+    // the sidecar hashes the persisted report so recovery can trust it.
+    const reportAbs = join(ws.dir, "reports", "implementer.md")
+    await writeFile(reportAbs, "preserve report sessions across human gates\n")
+    await writeCommitSidecar(reportAbs, {
+      subject: "preserve report sessions across human gates",
+      details: ["Keep report and advisor handles alive during manual iteration"],
+    })
+
+    await commitRecoveredPhase(ws, metadata, agent("implementer"), repo)
+
+    const body = await git(["log", "-1", "--pretty=%B"], repo)
+    expect(body).toContain("convoy(implementer): preserve report sessions across human gates")
+    expect(body).toContain("- Keep report and advisor handles alive during manual iteration")
+    expect(body).toContain("Convoy-Run: 20260101-000000-test")
+  })
+
+  test("ignores a stale sidecar whose report hash no longer matches", async () => {
+    const repo = await dirtyRepo()
+    const ws = await workspaceWithReports(["implementer"])
+    const metadata = await openRunMetadata(ws, repo, pipeline)
+
+    // The sidecar was written for different report content than what is
+    // persisted now: recovery must degrade to the staged evidence, not pair
+    // the stale description with this commit.
+    const reportAbs = join(ws.dir, "reports", "implementer.md")
+    await writeCommitSidecar(reportAbs, { subject: "stale description" })
+    await writeFile(reportAbs, "the report changed after the sidecar was written\n")
+
+    await commitRecoveredPhase(ws, metadata, agent("implementer"), repo)
+
+    // The stale description is ignored; the revised report's own heading is a
+    // useful subject, so that becomes the summary (not the recovery fallback).
+    expect(await git(["log", "-1", "--pretty=%s"], repo)).toContain(
+      "convoy(implementer): the report changed after the sidecar was written",
+    )
+    expect(await git(["log", "-1", "--pretty=%B"], repo)).not.toContain("stale description")
+  })
+})
+
+describe("writable phase finalization", () => {
+  // Uses the recovery fixtures: each repo starts with a base commit and the
+  // workspace carries runID `20260101-000000-test`.
+
+  test("a normal writable phase commits a run-linked semantic message", async () => {
+    const repo = await dirtyRepo()
+    const ws = await workspaceWithReports(["implementer"])
+    // The phase wrote its report and a structured description through
+    // write_report before finalization: the sidecar hashes the report so the
+    // composer can trust the description pair.
+    const reportAbs = join(ws.dir, "reports", "implementer.md")
+    await writeFile(reportAbs, "preserve report sessions across human gates\n")
+    await writeCommitSidecar(reportAbs, {
+      subject: "preserve report sessions across human gates",
+      details: ["Keep report and advisor handles alive during manual iteration"],
+    })
+
+    await finalizePhaseRepository(agentStep("implementer"), reportAbs, repo, undefined, undefined, ws)
+
+    const body = await git(["log", "-1", "--pretty=%B"], repo)
+    expect(body).toContain("convoy(implementer): preserve report sessions across human gates")
+    expect(body).toContain("- Keep report and advisor handles alive during manual iteration")
+    expect(body).toContain("Convoy-Run: 20260101-000000-test")
+    expect(body.match(/^Convoy-Run:/gm)).toHaveLength(1)
+    expect((await git(["status", "--porcelain"], repo)).trim()).toBe("")
+  })
+
+  test("without structured metadata a useful report heading becomes the subject and staged paths the details", async () => {
+    const repo = await dirtyRepo()
+    const ws = await workspaceWithReports(["implementer"])
+    const reportAbs = join(ws.dir, "reports", "implementer.md")
+    await writeFile(reportAbs, "preserve report sessions across human gates\n")
+
+    await finalizePhaseRepository(agentStep("implementer"), reportAbs, repo, undefined, undefined, ws)
+
+    const body = await git(["log", "-1", "--pretty=%B"], repo)
+    expect(body).toContain("convoy(implementer): preserve report sessions across human gates")
+    expect(body).toContain("- A feature.txt")
+    expect(body).toContain("Convoy-Run: 20260101-000000-test")
+  })
+
+  test("a clean writable phase creates no empty commit", async () => {
+    const repo = await cleanRepo()
+    const ws = await workspaceWithReports(["implementer"])
+    const reportAbs = join(ws.dir, "reports", "implementer.md")
+
+    await finalizePhaseRepository(agentStep("implementer"), reportAbs, repo, undefined, undefined, ws)
+
+    expect((await git(["rev-list", "--count", "HEAD"], repo)).trim()).toBe("1")
+    expect((await git(["status", "--porcelain"], repo)).trim()).toBe("")
+  })
+
+  test("a writable phase without a workspace is refused: provenance is never invented", async () => {
+    const repo = await dirtyRepo()
+    const ws = await workspaceWithReports(["implementer"])
+    const reportAbs = join(ws.dir, "reports", "implementer.md")
+    await writeFile(reportAbs, "preserve report sessions\n")
+
+    await expect(
+      finalizePhaseRepository(agentStep("implementer"), reportAbs, repo, undefined, undefined, undefined),
+    ).rejects.toThrow("without run provenance")
   })
 })
 
