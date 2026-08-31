@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { compareSemVer, parseSemVer } from "../src/update"
-import { formatVersion, majorMinorVersion, shortVersion, versionInfo } from "../src/version"
+import { formatVersion, majorMinorVersion, shortVersion, versionDetails, versionInfo } from "../src/version"
 
 const released = { version: "0.1.1", commit: "a".repeat(40), platform: "darwin-arm64", release: true }
 
@@ -53,6 +53,24 @@ describe("version formatting", () => {
     // A numeric-only short hash with a leading zero stays valid as build
     // metadata (it would be invalid as a prerelease identifier).
     expect(parseSemVer("0.1.1-local+0123456")).toBeDefined()
+  })
+
+  // The masthead shows a glanceable short fragment, not the diagnostic hash:
+  // git's short-hash convention, matching what scripts/build.ts embeds as
+  // local build metadata. A suffix fragment can't be fed to git tooling.
+  describe("versionDetails", () => {
+    test("the masthead build line keeps a short commit fragment, not the full hash", () => {
+      expect(versionDetails(released)).toBe("0.1.1 (aaaaaaa, darwin-arm64)")
+    })
+
+    test("an unknown commit renders the unknown fragment", () => {
+      expect(versionDetails({ ...released, commit: "unknown" })).toBe("0.1.1 (unknown, darwin-arm64)")
+    })
+
+    test("no masthead rendering carries the commit label or a long hash", () => {
+      expect(versionDetails(released)).not.toContain("commit")
+      expect(versionDetails(released)).not.toMatch(/[0-9a-f]{8,}/)
+    })
   })
 
   test("a source checkout still reports a usable version triple", () => {
