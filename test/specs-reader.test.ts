@@ -107,7 +107,8 @@ describe("the fullscreen reader", () => {
   test("replaces the chrome with one title bar naming the subject and tab", async () => {
     const session = await openReader()
     const frame = session.captureCharFrame()
-    expect(frame).not.toContain("convoy specs")
+    // The labeled header row is gone with the rest of the chrome.
+    expect(frame).not.toContain("project  ")
     expect(frame).not.toContain("quit")
     // The title bar names the subject, the tab, the copy and close hints, and no scroll hints.
     expect(frame).toContain("add-login")
@@ -233,12 +234,12 @@ describe("tabbed detail level", () => {
 })
 
 describe("minimal chrome", () => {
-  test("the header's only content line is the normalized target directory", async () => {
+  test("the header's only content line is the project label plus the normalized target directory", async () => {
     const session = await openReader({ view: sampleView() })
     session.press("v")
     await session.renderOnce()
     const frame = session.captureCharFrame()
-    expect(frame).toContain(root)
+    expect(frame).toContain(`project  ${root}`)
     expect(frame).not.toContain("1 change")
     expect(frame).not.toContain("0 specs")
     await closeSession(session)

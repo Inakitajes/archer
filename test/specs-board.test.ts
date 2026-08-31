@@ -203,8 +203,33 @@ describe("the fullscreen reader stays at the detail level", () => {
     session.press("v")
     await session.renderOnce()
     // The header is still visible: the reader never opened.
-    expect(session.captureCharFrame()).toContain("convoy specs")
+    expect(session.captureCharFrame()).toContain("project  /repo")
     session.press("c", { ctrl: true })
     await expect(session.instance.result).resolves.toEqual({ type: "exit" })
+  })
+})
+
+describe("compact stacking", () => {
+  test("stacked panels sit flush and every bottom border stays visible", async () => {
+    const testRenderer = await createTestRenderer({ width: 84, height: 55 })
+    const instance = new SpecsBrowser(testRenderer.renderer, viewWith([featureRow({ id: "add-foo" })]), async () => "copied-native")
+    try {
+      await testRenderer.renderOnce()
+      const frame = testRenderer.captureCharFrame()
+      // The bare header row rides above the panels.
+      expect(frame).toContain("project  /repo")
+      const lines = frame.split("\n")
+      const tops = lines.flatMap((line, index) => (line.trimStart().startsWith("╭") ? [index] : []))
+      const bottoms = lines.flatMap((line, index) => (line.trimStart().startsWith("╰") ? [index] : []))
+      // Browse, details, footer: all three bordered panels fully drawn, with
+      // the details panel's bottom border above the footer's top border.
+      expect(tops).toHaveLength(3)
+      expect(bottoms).toHaveLength(3)
+      // Flush stacking: no blank separator row between stacked panels.
+      for (let index = 1; index < tops.length; index++) expect(tops[index]).toBe(bottoms[index - 1]! + 1)
+    } finally {
+      testRenderer.renderer.keyInput.emit("keypress", keyEvent("c", { ctrl: true }))
+      await instance.result.catch(() => {})
+    }
   })
 })

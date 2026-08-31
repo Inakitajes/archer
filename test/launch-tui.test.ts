@@ -237,8 +237,8 @@ describe("launch TUI compact layout", () => {
   })
 
   test("pageup and pagedown page by the compact pipeline window, not the wide list height", async () => {
-    // At 80×24 the compact pipeline panel shows 3 rows (compactPipelineHeight 5
-    // minus its 2-row chrome), so paging moves the selection by 3 — not the 15
+    // At 80×24 the compact pipeline panel shows 4 rows (compactPipelineHeight 6
+    // minus its 2-row chrome), so paging moves the selection by 4 — not the 18
     // rows the wide layout would move. Pressing the escape sequences directly
     // because the mock-keys helper has no PageUp/PageDown entry in its KeyCodes.
     const launcher = await createLauncher(80, 24, 10)
@@ -248,13 +248,13 @@ describe("launch TUI compact layout", () => {
 
       launcher.mockInput.pressKey("\x1B[6~")
       await launcher.renderOnce()
-      expect(launcher.captureCharFrame()).toContain("● pipeline-4")
+      expect(launcher.captureCharFrame()).toContain("● pipeline-5")
       expect(launcher.captureCharFrame()).not.toContain("● pipeline-1")
 
       launcher.mockInput.pressKey("\x1B[5~")
       await launcher.renderOnce()
       expect(launcher.captureCharFrame()).toContain("● pipeline-1")
-      expect(launcher.captureCharFrame()).not.toContain("● pipeline-4")
+      expect(launcher.captureCharFrame()).not.toContain("● pipeline-5")
     } finally {
       await closeLauncher(launcher)
     }

@@ -181,10 +181,14 @@ test("wide screens keep the run list and details side by side", async () => {
   try {
     await Bun.sleep(260)
     const lines = testRenderer.captureCharFrame().split("\n")
-    // The header carries convoy+version on its border, not a meter row.
-    // shortVersion() is "dev" in a bare checkout and "vX.Y.Z-dev" when
-    // npm_package_version is set (CI), so the assertion has to follow it.
-    expect(lines.join("\n")).toContain(`convoy ${shortVersion()}`)
+    // The header is one bare row: the runs label plus the history stats, with
+    // no version tag, no "run history" caption, and no runs-root path.
+    expect(lines.join("\n")).toContain("runs  3 runs")
+    expect(lines.join("\n")).toContain("✓ 1")
+    expect(lines.join("\n")).toContain("✗ 1")
+    expect(lines.join("\n")).toContain("$0.28")
+    expect(lines.join("\n")).not.toContain("run history")
+    expect(lines.join("\n")).not.toContain(shortVersion())
     expect(lines.join("\n")).not.toContain("OpenRouter")
     expect(lines.join("\n")).not.toContain("OpenAI")
     // Side by side: both panel titles share the same horizontal band.
@@ -208,6 +212,28 @@ test("compact screens stack the run list above the details panel", async () => {
     // Stacked: the details panel's title sits below the runs panel's.
     expect(runsTitle).toBeGreaterThanOrEqual(0)
     expect(detailsTitle).toBeGreaterThan(runsTitle)
+  } finally {
+    testRenderer.mockInput.pressKey("c", { ctrl: true })
+  }
+})
+
+test("compact stacking keeps the panels flush and fully bordered", async () => {
+  const testRenderer = await createTestRenderer({ width: 84, height: 40 })
+  const instance = new RunsBrowser(testRenderer.renderer, sampleRuns(), 0)
+  try {
+    await Bun.sleep(260)
+    const frame = testRenderer.captureCharFrame()
+    // The bare header row rides above the panels.
+    expect(frame).toContain("runs  3 runs")
+    const lines = frame.split("\n")
+    const tops = lines.flatMap((line, index) => (line.trimStart().startsWith("╭") ? [index] : []))
+    const bottoms = lines.flatMap((line, index) => (line.trimStart().startsWith("╰") ? [index] : []))
+    // Runs, details, footer: all three bordered panels fully drawn, with the
+    // details panel's bottom border above the footer's top border, and no
+    // blank separator row between stacked panels.
+    expect(tops).toHaveLength(3)
+    expect(bottoms).toHaveLength(3)
+    for (let index = 1; index < tops.length; index++) expect(tops[index]).toBe(bottoms[index - 1]! + 1)
   } finally {
     testRenderer.mockInput.pressKey("c", { ctrl: true })
   }

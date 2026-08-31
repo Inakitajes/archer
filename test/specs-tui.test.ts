@@ -316,7 +316,9 @@ test.each([120, 84])("a selected canonical spec uses the full root body at width
       detailsBox: { visible: boolean }
     }
     expect(boxes.listBox.width).toBe(width - 2)
-    expect(boxes.listBox.height).toBe(24)
+    // Full root body: header (1) + footer (3) of the shell, minus the list
+    // panel's own borders (2).
+    expect(boxes.listBox.height).toBe(26)
     expect(boxes.detailsBox.visible).toBe(false)
   } finally {
     await close(session)

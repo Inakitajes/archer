@@ -21,7 +21,6 @@ import {
   theme,
   truncate,
 } from "./tui-theme"
-import { shortVersion } from "./version"
 import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
@@ -127,16 +126,15 @@ export class SpecsBrowser {
       gap: 0,
     })
 
-    // Minimal chrome (one header content line): identify the normalized target
-    // directory without repeating list counts.
-    const header = this.panel({
+    // Minimal chrome (one bare header row, like home): a context label plus the
+    // normalized target directory, no border box and no version title.
+    const header = new BoxRenderable(renderer, {
       id: "convoy-specs-header",
-      height: 3,
-      borderColor: theme.border,
+      height: 1,
       backgroundColor: theme.bg,
-      title: ` convoy specs ${shortVersion()} `,
-      titleAlignment: "left",
     })
+    const headerText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", wrapMode: "none" })
+    header.add(headerText)
 
     const body = new BoxRenderable(renderer, {
       id: "convoy-specs-body",
@@ -187,8 +185,8 @@ export class SpecsBrowser {
       backgroundColor: theme.bg,
     })
 
-    this.headerText = header.text
-    this.headerBox = header.box
+    this.headerText = headerText
+    this.headerBox = header
     this.bodyBox = body
     this.listText = list.text
     this.listBox = list.box
@@ -199,7 +197,7 @@ export class SpecsBrowser {
 
     this.paletteTargets.push(
       { box: shell, background: "bg" },
-      { box: header.box, background: "bg", border: "border" },
+      { box: header, background: "bg" },
       { box: list.box, background: "bg", border: "borderDim" },
       { box: details.box, background: "bg", border: "borderDim" },
       { box: footer.box, background: "bg", border: "borderDim" },
@@ -207,7 +205,7 @@ export class SpecsBrowser {
 
     body.add(list.box)
     body.add(details.box)
-    shell.add(header.box)
+    shell.add(header)
     shell.add(body)
     shell.add(footer.box)
     mount.add(shell)
@@ -524,7 +522,8 @@ export class SpecsBrowser {
   }
 
   private bodyHeight() {
-    return Math.max(8, this.renderer.height - 6)
+    // Header (1) + footer (3).
+    return Math.max(8, this.renderer.height - 4)
   }
 
   private compactListHeight(bodyHeight: number) {
@@ -532,10 +531,10 @@ export class SpecsBrowser {
   }
 
   private listHeight() {
-    // Header (3) + footer (3) + list panel borders (2); compact stacks instead.
+    // Header (1) + footer (3) + list panel borders (2); compact stacks instead.
     if (this.canonicalSelectedAtRoot()) return Math.max(3, this.bodyHeight() - 2)
     if (this.renderer.width <= compactSpecsMaxWidth) return Math.max(3, this.compactListHeight(this.bodyHeight()) - 2)
-    return Math.max(3, this.renderer.height - 8)
+    return Math.max(3, this.renderer.height - 6)
   }
 
   private detailsHeight() {
@@ -570,6 +569,10 @@ export class SpecsBrowser {
     const bodyHeight = this.bodyHeight()
 
     this.bodyBox.flexDirection = !detail && compact && !fullRootList ? "column" : "row"
+    // Stacked panels sit flush (the shell's own chrome has no gaps either);
+    // keeping the row layout's 1-column gap here would overflow the body by
+    // the separator row and push the details' bottom border under the footer.
+    this.bodyBox.gap = !detail && compact && !fullRootList ? 0 : 1
     if (detail) {
       // The reading pane is full width: the navigation list is hidden and the
       // details panel takes the whole body.
@@ -608,9 +611,10 @@ export class SpecsBrowser {
     this.renderer.requestRender()
   }
 
-  /** The header's only content line: the normalized target project directory. */
+  /** The header's only content line: home's `project` label plus the normalized target directory. */
   private headerContent(width: number) {
-    return t`${fg(theme.dim)(shortPath(this.view.targetDir, width))}`
+    const pathWidth = Math.max(1, width - 9)
+    return new StyledText([fg(theme.faint)("project  "), fg(theme.text)(shortPath(this.view.targetDir, pathWidth))])
   }
 
   /** The details panel's border title doubles as the reader's title bar. */

@@ -18,7 +18,6 @@ import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdH
 import { listOpenSpecChanges, loadOpenSpecBundle, openSpecPromptFor, type OpenSpecChangeSummary } from "./openspec"
 import { runReviewLines } from "./review-tui"
 import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
-import { shortVersion } from "./version"
 import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { ConvoyConfig } from "./config"
@@ -728,16 +727,15 @@ export class LaunchPicker {
       paddingX: 1,
     })
 
-    // The version rides the border instead of a content row: it never changes
-    // while the launcher is open, so it costs nothing to draw it once as chrome.
-    const header = this.panel({
+    // Minimal chrome (one bare header row, like home): the project label and
+    // the target project anchor the launcher; no version rides the header.
+    const header = new BoxRenderable(renderer, {
       id: "convoy-launch-header",
-      height: 3,
-      borderColor: theme.border,
+      height: 1,
       backgroundColor: theme.bg,
-      title: ` convoy ${shortVersion()} `,
-      titleAlignment: "left",
     })
+    const headerText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", wrapMode: "none" })
+    header.add(headerText)
     const body = new BoxRenderable(renderer, { id: "convoy-launch-body", width: "100%", flexGrow: 1, flexDirection: "row", gap: 1 })
 
     const selectFromList = (event: { y: number; preventDefault(): void; stopPropagation(): void }) => {
@@ -822,7 +820,7 @@ export class LaunchPicker {
     detail.text.onMouseScroll = scrollReview
     const footer = this.panel({ id: "convoy-launch-footer", height: 3, borderColor: theme.borderDim, backgroundColor: theme.bg })
 
-    this.headerText = header.text
+    this.headerText = headerText
     this.bodyBox = body
     this.leftBox = left
     this.pipelineText = pipeline.text
@@ -835,7 +833,7 @@ export class LaunchPicker {
 
     this.paletteTargets.push(
       { box: shell, background: "bg" },
-      { box: header.box, background: "bg", border: "border" },
+      { box: header, background: "bg" },
       { box: pipeline.box, background: "bg", border: "borderDim" },
       { box: usage.box, background: "bg", border: "borderDim" },
       { box: detail.box, background: "bg", border: "borderDim" },
@@ -846,7 +844,7 @@ export class LaunchPicker {
     left.add(usage.box)
     body.add(left)
     body.add(detail.box)
-    shell.add(header.box)
+    shell.add(header)
     shell.add(body)
     shell.add(footer.box)
     mount.add(shell)
@@ -1648,11 +1646,11 @@ export class LaunchPicker {
     // screens retain the sidebar, but measure the detail panel from the actual
     // inner width rather than a fixed 40-column floor that could overflow.
     const detailWidth = reviewing || compact ? innerWidth : Math.max(34, innerWidth - pipelineWidth - 1)
-    // The left column runs from the header's bottom border to the footer's top,
-    // so its height is the full shell less those two (3 rows each). The usage
+    // The left column runs from the header's bottom edge to the footer's top,
+    // so its height is the full shell less those two (1 row + 3 rows). The usage
     // panel pins to its bottom edge and the pipeline list fills the rest,
     // leaving no dead stripe under the meters.
-    const bodyHeight = Math.max(8, this.renderer.height - 6)
+    const bodyHeight = Math.max(8, this.renderer.height - 4)
     const usageHeight = 4
     const usageVisible = !compact && !reviewing && this.limits !== undefined && bodyHeight - usageHeight >= 6
     this.usageVisible = usageVisible
@@ -1741,13 +1739,12 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     return clamp(this.renderer.width - 8, 34, 80)
   }
 
-  // No "◆ convoy" branding here: the launcher is convoy's own front door, so
-  // the target project is the header's anchor and the meter row stays clean.
-  // The version still shows, but as the header box's border title so neither
-  // content row has to give up space for it.
+  // No version branding here: the launcher is convoy's own front door, so the
+  // target project is the header's anchor, labeled like home and specs, with
+  // the stage breadcrumb as the screen-local right segment.
   private headerContent(width: number) {
     const project = basename(this.targetDir) || this.targetDir
-    const title: TextChunk[] = [fg(theme.faint)("target "), bold(fg(theme.text)(truncate(project, Math.max(12, width - 32))))]
+    const title: TextChunk[] = [fg(theme.faint)("project  "), bold(fg(theme.text)(truncate(project, Math.max(12, width - 34))))]
     // The branch step only exists for worktree runs, so the stage row grows and
     // shrinks with the toggle instead of showing a step that can't be reached.
     const steps: Array<{ label: string; mode: Mode }> = [
@@ -2361,8 +2358,8 @@ this.detailBox.title = reviewing ? " review " : " run setup "
   }
 
   private compactBodyHeight() {
-    // Header (3), footer (3), and the detail panel's top/bottom borders (2).
-    return Math.max(8, this.renderer.height - 8)
+    // Header (1), footer (3), and the detail panel's top/bottom borders (2).
+    return Math.max(8, this.renderer.height - 6)
   }
 
   private pipelineVisibleRows() {
@@ -2370,7 +2367,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     // Wide: the sidebar shares its column with the usage meters when they're
     // on, so the list's visible rows shrink to match the box laid out in
     // render() — keeping pagination and click targets in sync with the panel.
-    const bodyHeight = Math.max(8, this.renderer.height - 6)
+    const bodyHeight = Math.max(8, this.renderer.height - 4)
     const rows = bodyHeight - (this.usageVisible ? 4 : 0) - 2
     return Math.max(3, rows)
   }
@@ -2389,8 +2386,8 @@ this.detailBox.title = reviewing ? " review " : " run setup "
   }
 
   private listHeight() {
-    // Header (3) + footer (3) + list panel borders (2).
-    return Math.max(3, this.renderer.height - 8)
+    // Header (1) + footer (3) + list panel borders (2).
+    return Math.max(3, this.renderer.height - 6)
   }
 }
 

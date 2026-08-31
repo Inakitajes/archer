@@ -5,6 +5,7 @@ import { BoxRenderable, StyledText, TextRenderable, bold, fg, t } from "@opentui
 import { parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
 import { loadRunSummary, refreshRunWaiting } from "./runs"
 import {
+  clipChunks,
   formatElapsed,
   formatMoney,
   hintsRow,
@@ -20,9 +21,7 @@ import {
   theme,
   truncate,
 } from "./tui-theme"
-import { shortVersion } from "./version"
 import type { TuiScene } from "./tui-session"
-import { runsRoot } from "./workspace"
 
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 import type { RunEntry, RunStatusKind, RunsResolution } from "./runs"
@@ -119,14 +118,15 @@ export class RunsBrowser {
       gap: 0,
     })
 
-    const header = this.panel({
+    // Minimal chrome (one bare header row, like home): the runs label plus the
+    // history stats, no border box and no version title.
+    const header = new BoxRenderable(renderer, {
       id: "convoy-runs-header",
-      height: 4,
-      borderColor: theme.border,
+      height: 1,
       backgroundColor: theme.bg,
-      title: ` convoy ${shortVersion()} `,
-      titleAlignment: "left",
     })
+    const headerText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", wrapMode: "none" })
+    header.add(headerText)
 
     const body = new BoxRenderable(renderer, {
       id: "convoy-runs-body",
@@ -188,7 +188,7 @@ export class RunsBrowser {
       backgroundColor: theme.bg,
     })
 
-    this.headerText = header.text
+    this.headerText = headerText
     this.bodyBox = body
     this.listText = list.text
     this.listBox = list.box
@@ -198,7 +198,7 @@ export class RunsBrowser {
 
     this.paletteTargets.push(
       { box: shell, background: "bg" },
-      { box: header.box, background: "bg", border: "border" },
+      { box: header, background: "bg" },
       { box: list.box, background: "bg", border: "borderDim" },
       { box: details.box, background: "bg", border: "borderDim" },
       { box: footer.box, background: "bg", border: "borderDim" },
@@ -206,7 +206,7 @@ export class RunsBrowser {
 
     body.add(list.box)
     body.add(details.box)
-    shell.add(header.box)
+    shell.add(header)
     shell.add(body)
     shell.add(footer.box)
     mount.add(shell)
@@ -481,9 +481,9 @@ export class RunsBrowser {
     return Math.max(30, Math.min(46, this.renderer.width - 64))
   }
 
-  // Header (4) + footer (3). The body holds the stacked or side-by-side panels.
+  // Header (1) + footer (3). The body holds the stacked or side-by-side panels.
   private bodyHeight() {
-    return Math.max(8, this.renderer.height - 7)
+    return Math.max(8, this.renderer.height - 4)
   }
 
   private compactListHeight(bodyHeight: number) {
@@ -491,9 +491,9 @@ export class RunsBrowser {
   }
 
   private listHeight() {
-    // Header (4) + footer (3) + list panel borders (2); compact stacks instead.
+    // Header (1) + footer (3) + list panel borders (2); compact stacks instead.
     if (this.renderer.width <= compactRunsMaxWidth) return Math.max(3, this.compactListHeight(this.bodyHeight()) - 2)
-    return Math.max(3, this.renderer.height - 9)
+    return Math.max(3, this.renderer.height - 6)
   }
 
   private summaryHeight() {
@@ -527,8 +527,11 @@ export class RunsBrowser {
     const bodyHeight = this.bodyHeight()
 
     // Narrow terminals stack the panels: the list keeps its rows and the
-    // details pane gets whatever the body has left.
+    // details pane gets whatever the body has left. Panels sit flush — the
+    // 1-column gap of the side-by-side layout would overflow the stacked body
+    // by the separator row and push the details' bottom border under the footer.
     this.bodyBox.flexDirection = compact ? "column" : "row"
+    this.bodyBox.gap = compact ? 0 : 1
     if (compact) {
       const listHeight = this.compactListHeight(bodyHeight)
       this.listBox.width = "100%"
@@ -550,13 +553,13 @@ export class RunsBrowser {
     this.renderer.requestRender()
   }
 
+  /** One bare header line: the runs label followed by the history stats (no data-root path). */
   private headerContent(width: number) {
     const completed = this.runs.filter((run) => run.statusKind === "completed").length
     const failed = this.runs.filter((run) => run.statusKind === "failed").length
     const cost = this.runs.reduce((sum, run) => sum + (run.cost ?? 0), 0)
-
-    const title: TextChunk[] = [fg(theme.text)("run history")]
-    const totals: TextChunk[] = [
+    const chunks: TextChunk[] = [
+      fg(theme.faint)("runs  "),
       fg(theme.text)(`${this.runs.length} run${this.runs.length === 1 ? "" : "s"}`),
       fg(theme.faint)("  ·  "),
       fg(theme.green)(`✓ ${completed}`),
@@ -565,9 +568,7 @@ export class RunsBrowser {
       fg(theme.faint)("  ·  "),
       fg(theme.green)(formatMoney(cost)),
     ]
-    const line1 = padBetween(title, totals, width)
-    const line2 = t`${fg(theme.dim)(truncate(runsRoot(), width))}`
-    return joinLines([line1, line2])
+    return new StyledText(clipChunks(chunks, width))
   }
 
   private listContent(width: number) {

@@ -35,6 +35,7 @@ import {
 import { gatewayHint, gatewayLabel, modelGateways, type ModelGateway } from "./model-routing"
 import { claudeCodeModelAliases, normalizeStepRunnerModel, stepRunnerFor } from "./step-runners"
 import {
+  chunksLength,
   displayWidth,
   hintsRow,
   joinLines,
@@ -50,7 +51,6 @@ import {
   theme,
   truncate,
 } from "./tui-theme"
-import { shortVersion } from "./version"
 import { convoyRoot, globalConfigPath } from "./workspace"
 import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
@@ -242,7 +242,15 @@ export class ConfigEditor {
       paddingX: 1,
     })
 
-    const header = this.panel({ id: "convoy-config-header", height: 4, borderColor: theme.border, backgroundColor: theme.bg })
+    // Minimal chrome (one bare header row, like home): the config label plus
+    // the active tab's file path, with the tab strip right-aligned.
+    const header = new BoxRenderable(renderer, {
+      id: "convoy-config-header",
+      height: 1,
+      backgroundColor: theme.bg,
+    })
+    const headerText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", wrapMode: "none" })
+    header.add(headerText)
     const body = new BoxRenderable(renderer, { id: "convoy-config-body", width: "100%", flexGrow: 1, flexDirection: "row", gap: 1 })
     const list = this.panel({
       id: "convoy-config-list",
@@ -264,7 +272,7 @@ export class ConfigEditor {
     })
     const footer = this.panel({ id: "convoy-config-footer", height: 3, borderColor: theme.borderDim, backgroundColor: theme.bg })
 
-    this.headerText = header.text
+    this.headerText = headerText
     this.listText = list.text
     this.detailText = detail.text
     this.detailBox = detail.box
@@ -272,7 +280,7 @@ export class ConfigEditor {
 
     this.paletteTargets.push(
       { box: shell, background: "bg" },
-      { box: header.box, background: "bg", border: "border" },
+      { box: header, background: "bg" },
       { box: list.box, background: "bg", border: "borderDim" },
       { box: detail.box, background: "bg", border: "borderDim" },
       { box: footer.box, background: "bg", border: "borderDim" },
@@ -280,7 +288,7 @@ export class ConfigEditor {
 
     body.add(list.box)
     body.add(detail.box)
-    shell.add(header.box)
+    shell.add(header)
     shell.add(body)
     shell.add(footer.box)
     mount.add(shell)
@@ -1403,7 +1411,8 @@ export class ConfigEditor {
   }
 
   private listHeight() {
-    return Math.max(3, this.renderer.height - 9)
+    // Header (1) + footer (3) + list panel borders (2).
+    return Math.max(3, this.renderer.height - 6)
   }
 
   private render() {
@@ -1426,6 +1435,7 @@ export class ConfigEditor {
     this.renderer.requestRender()
   }
 
+  /** One bare header line: `config  <active tab path>` with the tab strip right-aligned. */
   private headerContent(width: number) {
     const tabs: TextChunk[] = []
     this.tabs.forEach((tab, index) => {
@@ -1433,10 +1443,11 @@ export class ConfigEditor {
       const label = `${tab.title}${tab.dirty ? " ●" : ""}`
       tabs.push(index === this.active ? bold(fg(theme.accent)(`▸ ${label}`)) : fg(theme.dim)(`  ${label}`))
     })
-    const title: TextChunk[] = [bold(fg(theme.accent)("◆ convoy")), fg(theme.faint)(` ${shortVersion()}`), fg(theme.faint)("  ·  "), fg(theme.text)("config")]
-    const line1 = padBetween(title, tabs, width)
-    const line2 = new StyledText([fg(theme.dim)(truncate(shortenPath(this.tab().path), width))])
-    return joinLines([line1, line2])
+    // The path yields before the tabs: clip it here so padBetween never has to
+    // cut into the interactive tab strip on narrow terminals.
+    const pathWidth = Math.max(8, width - 9 - chunksLength(tabs))
+    const left: TextChunk[] = [fg(theme.faint)("config  "), fg(theme.text)(truncate(shortenPath(this.tab().path), pathWidth))]
+    return padBetween(left, tabs, width)
   }
 
   private listContent(width: number) {
