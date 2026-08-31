@@ -89,7 +89,7 @@ test("wide home puts destinations on one row followed by the selected descriptio
   }
 })
 
-test("a tall no-graphics home centers navigation between masthead and footer", async () => {
+test("a tall no-graphics home centers navigation in the available body", async () => {
   const session = await openHome(100, 42)
   try {
     const frame = session.captureCharFrame()

@@ -489,12 +489,6 @@ export function shortUrl(value: string) {
   return value.replace(/^https?:\/\//, "")
 }
 
-export function projectName(dir: string) {
-  if (!dir) return "…"
-  const parts = dir.split("/").filter(Boolean)
-  return parts[parts.length - 1] ?? dir
-}
-
 /** Full path with the home prefix as ~, truncated from the left so the deepest segments stay readable. */
 export function shortPath(dir: string, max: number) {
   if (!dir) return "…"

@@ -4,7 +4,6 @@ import { existsSync, readFileSync } from "node:fs"
 
 import { BoxRenderable, StyledText, TextRenderable, bold, createCliRenderer, fg } from "@opentui/core"
 
-import type { HomeArtKind } from "./home-art"
 import {
   coverSourceRect,
   deleteKittyImages,
@@ -37,7 +36,8 @@ import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 import type { CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 import type { PaletteColor } from "./tui-theme"
 
-export type HomeDestination = HomeArtKind
+/** One of the four home destinations; doubles as the key for its photo asset. */
+export type HomeDestination = "pipelines" | "specs" | "runs" | "config"
 export type HomeSelection = HomeDestination | undefined
 
 type HomeItem = {

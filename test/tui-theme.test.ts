@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import type { CliRenderer } from "@opentui/core"
-import { displayWidth, formatAgo, formatCount, formatElapsed, formatMoney, formatTime, fmtCountdown, hintsRow, moreHintsMarker, padBetween, paletteForMode, paletteForTerminal, projectName, raw, shortID, shortPath, shortUrl, spinnerFrame, terminalBackgroundHex, truncate, wrapLines, type Hint, type OverflowHint } from "../src/tui-theme"
+import { displayWidth, formatAgo, formatCount, formatElapsed, formatMoney, formatTime, fmtCountdown, hintsRow, moreHintsMarker, padBetween, paletteForMode, paletteForTerminal, raw, shortID, shortPath, shortUrl, spinnerFrame, terminalBackgroundHex, truncate, wrapLines, type Hint, type OverflowHint } from "../src/tui-theme"
 
 // terminalBackgroundHex reaches into opentui internals; the adapter must read a
 // real reply but degrade to undefined (→ static palettes) on any shape change.
@@ -394,16 +394,6 @@ describe("shortID", () => {
 describe("shortUrl", () => {
   test("strips protocol prefix", () => {
     expect(shortUrl("https://example.com/path")).toBe("example.com/path")
-  })
-})
-
-describe("projectName", () => {
-  test("returns last path segment", () => {
-    expect(projectName("/home/user/project")).toBe("project")
-  })
-
-  test("returns ellipsis for empty string", () => {
-    expect(projectName("")).toBe("…")
   })
 })
 
