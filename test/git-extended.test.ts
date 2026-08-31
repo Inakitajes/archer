@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
+  addAllAndCommit,
   commitsBetween,
   convoyAuthorEmail,
   createCleanRepoSnapshot,
@@ -532,5 +533,99 @@ describe("git-repo functions", () => {
       // After removal the directory should be gone.
       expect(Bun.spawnSync(["ls", wtDir]).exitCode).not.toBe(0)
     })
+  })
+})
+
+describe("addAllAndCommit message factory", () => {
+  const dirs: string[] = []
+
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  async function gitOut(args: string[], cwd: string): Promise<string> {
+    const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "convoy-test",
+        GIT_AUTHOR_EMAIL: "convoy-test@example.invalid",
+        GIT_COMMITTER_NAME: "convoy-test",
+        GIT_COMMITTER_EMAIL: "convoy-test@example.invalid",
+      },
+    })
+    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
+    const exitCode = await proc.exited
+    if (exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${stderr}`)
+    return stdout.trim()
+  }
+
+  async function createRepo(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-commit-seam-"))
+    dirs.push(dir)
+    await gitOut(["init", "-q", "-b", "main"], dir)
+    await writeFile(join(dir, "base.txt"), "base\n")
+    await gitOut(["add", "-A"], dir)
+    await gitOut(["commit", "-qm", "base"], dir)
+    return dir
+  }
+
+  test("a fixed string behaves exactly as before", async () => {
+    const dir = await createRepo()
+    await writeFile(join(dir, "one.txt"), "1\n")
+    expect(await addAllAndCommit("convoy(step): fixed", dir)).toBe(true)
+    expect(await gitOut(["log", "-1", "--pretty=%s"], dir)).toBe("convoy(step): fixed")
+  })
+
+  test("the factory runs after staging and sees the exact staged change set", async () => {
+    const dir = await createRepo()
+    await mkdir(join(dir, "src"), { recursive: true })
+    await writeFile(join(dir, "src/a.ts"), "a\n")
+    await writeFile(join(dir, "src/b.ts"), "b\n")
+
+    const seen: { paths: string[]; statuses: string[] }[] = []
+    const committed = await addAllAndCommit(async (evidence) => {
+      seen.push(evidence)
+      return `convoy(step): update ${evidence.paths.length} files\n\nConvoy-Run: 20260101-000000-test`
+    }, dir)
+
+    expect(committed).toBe(true)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]!.paths.sort()).toEqual(["src/a.ts", "src/b.ts"])
+    expect(await gitOut(["log", "-1", "--pretty=%B"], dir)).toContain("Convoy-Run: 20260101-000000-test")
+  })
+
+  test("the factory is never invoked when there is nothing to commit", async () => {
+    const dir = await createRepo()
+    let calls = 0
+    const committed = await addAllAndCommit(async () => {
+      calls++
+      return "should not happen"
+    }, dir)
+    expect(committed).toBe(false)
+    expect(calls).toBe(0)
+  })
+
+  test("suspicious staged files abort before the factory runs and reset staging", async () => {
+    const dir = await createRepo()
+    await writeFile(join(dir, ".env"), "SECRET=1\n")
+    let calls = 0
+    await expect(
+      addAllAndCommit(async () => {
+        calls++
+        return "nope"
+      }, dir),
+    ).rejects.toThrow("refusing to commit files that look like secrets")
+    expect(calls).toBe(0)
+    expect(await gitOut(["status", "--porcelain"], dir)).toContain(".env")
+  })
+
+  test("commits stay authored by convoy@local and unsigned, whatever the factory returns", async () => {
+    const dir = await createRepo()
+    await writeFile(join(dir, "x.txt"), "x\n")
+    await addAllAndCommit("convoy(step): x", dir)
+    expect(await gitOut(["log", "-1", "--pretty=%an <%ae> %G?"], dir)).toBe("convoy <convoy@local> N")
   })
 })

@@ -31,6 +31,7 @@ import { agentsForPipeline, deliverableContractForPhase, splitModelVariant, vali
 import { pickPrdHistory, prdHistoryFile, readPrdHistoryIndex, writePrdHistory } from "./prd-history"
 import { installWriteReportTool, startReportBridge, type ReportBridge } from "./report-bridge"
 import { createReportRuntime, type ReportPhaseHandle, type ReportRuntime } from "./report-runtime"
+import { stepCommitMessageFactory } from "./step-commit"
 import { throughputRoutedModels } from "./run-plan"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
@@ -1149,8 +1150,11 @@ export async function commitRecoveredPhase(
     await writeFile(reportAbs, recoveryReport(phase.name))
   }
 
-  const committed = await addAllAndCommit(`convoy(${phase.name}): ${await summaryFromReport(reportAbs)}`, targetDir)
-  if (committed) log.info(`[${phase.name}] recovered uncommitted changes into a commit; continuing from the next phase`)
+  const committed = await addAllAndCommit(
+    stepCommitMessageFactory({ workspace, step: phase.name, mode: "recovery", phaseName: phase.agentName, reportPath: reportAbs }),
+    targetDir,
+  )
+  if (committed) log.info(`[${phase.name}] recovered uncommitted changes into a run-linked commit; continuing from the next phase`)
   else log.warn(`[${phase.name}] nothing to commit during recovery`)
 
   await metadata.phaseEnded(phase.name, "completed").catch((error) => log.warn(`couldn't persist phase-ended metadata: ${String(error)}`))
@@ -1216,7 +1220,7 @@ async function runPhase(
       const candidate = await runPhaseUntilResolved(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors, reports, rubricWeights)
       return persistPhaseReport(workspace, phase, candidate, contract, rubricWeights)
     })
-    await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline))
+    await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline, undefined, workspace))
     progress.phaseCompleted(phase.name, "report saved and commit checked")
   } catch (error) {
     progress.phaseFailed(phase.name, formatSdkError(error))
@@ -1986,13 +1990,16 @@ async function persistInvalidPhaseReport(workspace: Workspace, phase: AgentStep,
   await writeFile(`${reportAbs}.attempt-${suffix}.raw.md`, candidate)
 }
 
-async function commitPhase(phase: AgentStep, reportAbs: string, targetDir: string) {
-  const message = `convoy(${phase.name}): ${await summaryFromReport(reportAbs)}`
-  const committed = await addAllAndCommit(message, targetDir)
+async function commitPhase(phase: AgentStep, reportAbs: string, targetDir: string, workspace: Workspace) {
+  // The message is composed inside the commit seam, after staging, so it can
+  // describe the exact staged change set (design D5). Convoy owns the
+  // `Convoy-Run` trailer; the phase only contributes the report and sidecar.
+  const messageFactory = stepCommitMessageFactory({ workspace, step: phase.name, mode: "phase", phaseName: phase.agentName, reportPath: reportAbs })
+  const committed = await addAllAndCommit(messageFactory, targetDir)
   if (!committed) {
     log.info(`[${phase.name}] no changes - no commit`)
   } else {
-    log.info(`[${phase.name}] commit: ${message}`)
+    log.info(`[${phase.name}] committed run-linked step changes (${workspace.runID})`)
   }
 }
 
@@ -2002,9 +2009,11 @@ export async function finalizePhaseRepository(
   targetDir: string,
   baseline: RepoSnapshot | undefined,
   originalError?: unknown,
+  workspace?: Workspace,
 ): Promise<void> {
   if (!phase.readOnly) {
-    await commitPhase(phase, reportAbs, targetDir)
+    if (!workspace) throw new Error(`[${phase.name}] cannot commit a writable phase without run provenance (workspace run ID)`)
+    await commitPhase(phase, reportAbs, targetDir, workspace)
     return
   }
   if (!baseline) throw new Error(`[${phase.name}] read-only step has no clean repository baseline`)
@@ -3128,6 +3137,14 @@ function buildPhasePrompt(workspace: Workspace, phase: AgentStep) {
       : phase.readOnly
         ? `- Report: Convoy saves your report itself as ${phase.reportPath}; you do not (and cannot) write it.`
         : `- Write your final report to: ${join(workspace.dir, phase.reportPath)}`,
+    // Structured commit metadata (capability step-commit-messages): Convoy
+    // renders the phase's step commit from it, so ask for an outcome-oriented
+    // subject instead of leaving the subject to first-heading inference.
+    ...(usesWriteReport && !phase.readOnly
+      ? [
+          "- Commit: Convoy commits this phase's repository changes as `convoy(<step>): <subject>` with a `Convoy-Run` trailer. In the same `write_report` call, include an optional `commit` object: { \"subject\": \"...\", \"details\": [\"...\"] }. The `subject` is an imperative English line describing the repository outcome — never the report, the phase, the agent, or the process. `details` holds at most three concrete statements about what changed. Convoy falls back to your report or the staged changes when you omit it.",
+        ]
+      : []),
     "- Working directory: the directory where `convoy` was invoked (root of the target repo).",
     "",
     "## Access mode",
@@ -3304,21 +3321,6 @@ export function extractAssistantText(parts: readonly Part[]) {
     .map((part) => part.text.trim())
     .filter(Boolean)
     .join("\n\n")
-}
-
-async function summaryFromReport(path: string) {
-  try {
-    const content = await readFile(path, "utf8")
-    for (const raw of content.split("\n")) {
-      let line = raw.trim().replace(/^#+\s*/, "")
-      if (!line) continue
-      if (line.length > 72) line = line.slice(0, 72)
-      return line
-    }
-  } catch {
-    return "no summary"
-  }
-  return "no summary"
 }
 
 async function writeAttemptLog(workspace: Workspace, phase: AgentStep, attempt: number, payload: unknown) {

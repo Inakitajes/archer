@@ -6,6 +6,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 
 import { createReportRuntime } from "../src/report-runtime"
 import { isScoringAgent, maxReportMarkdownChars } from "../src/report"
+import { loadCommitSidecar, sidecarPathFor } from "../src/step-commit"
 import { qualityDimensionWeights } from "../src/quality-score"
 import type { AgentStep, DeliverableContract } from "../src/types"
 
@@ -128,6 +129,72 @@ describe("report runtime", () => {
     expect(await handle.write({ markdown: "score", dimensions, score: 100, verdict: "ready" })).toEqual({
       error: "write_report does not accept score or verdict; Convoy derives both from dimensions",
     })
+  })
+})
+
+describe("report runtime commit metadata", () => {
+  test("a writable phase's valid commit description persists into a report-bound sidecar", async () => {
+    const dir = await workspace()
+    const reports = createReportRuntime(dir)
+    const handle = reports.begin("ses_1", phase(), markdown, qualityDimensionWeights)
+
+    const result = await handle.write({
+      markdown: "# Findings\n\nDone.",
+      commit: { subject: "preserve report sessions across human gates", details: ["Keep handles alive", "Cover reopened sessions"] },
+    })
+    expect("error" in result).toBe(false)
+    expect(await loadCommitSidecar(join(dir, phase().reportPath))).toEqual({
+      subject: "preserve report sessions across human gates",
+      details: ["Keep handles alive", "Cover reopened sessions"],
+    })
+  })
+
+  test("a corrected write without commit metadata clears the previous description", async () => {
+    const dir = await workspace()
+    const reports = createReportRuntime(dir)
+    const handle = reports.begin("ses_1", phase(), markdown, qualityDimensionWeights)
+    const reportPath = join(dir, phase().reportPath)
+
+    await handle.write({ markdown: "# First", commit: { subject: "first subject" } })
+    expect(await loadCommitSidecar(reportPath)).toBeDefined()
+
+    await handle.write({ markdown: "# Second" })
+    expect(await loadCommitSidecar(reportPath)).toBeUndefined()
+    expect(await readFile(reportPath, "utf8")).toBe("# Second")
+  })
+
+  test("malformed commit data is rejected without replacing the last valid report candidate", async () => {
+    const dir = await workspace()
+    const handle = createReportRuntime(dir).begin("ses_1", phase(), markdown, qualityDimensionWeights)
+    const reportPath = join(dir, phase().reportPath)
+
+    await handle.write({ markdown: "# Good", commit: { subject: "good subject" } })
+    expect(await handle.write({ markdown: "# Bad", commit: { subject: "two\nlines" } })).toEqual({
+      error: "commit.subject must be a single line",
+    })
+    expect(await handle.write({ markdown: "# Bad", commit: { subject: "s", details: ["1", "2", "3", "4"] } })).toEqual({
+      error: "commit.details must contain at most 3 entries",
+    })
+    // The report and sidecar from the last valid write are untouched.
+    expect(await readFile(reportPath, "utf8")).toBe("# Good")
+    expect((await loadCommitSidecar(reportPath))?.subject).toBe("good subject")
+  })
+
+  test("read-only phases cannot supply commit metadata", async () => {
+    const dir = await workspace()
+    const handle = createReportRuntime(dir).begin("ses_1", phase({ readOnly: true }), markdown, qualityDimensionWeights)
+    expect(await handle.write({ markdown: "# Findings", commit: { subject: "nope" } })).toEqual({
+      error: "read-only phases cannot supply commit metadata: they never create a step commit",
+    })
+    expect(await loadCommitSidecar(join(dir, phase().reportPath))).toBeUndefined()
+  })
+
+  test("the sidecar sits beside the report inside the run directory only", async () => {
+    const dir = await workspace()
+    const handle = createReportRuntime(dir).begin("ses_1", phase(), markdown, qualityDimensionWeights)
+    await handle.write({ markdown: "# Findings", commit: { subject: "s" } })
+    const entries = await readdir(join(dir, "reports"))
+    expect(entries.sort()).toEqual(["review.md", "review.md.commit.json"])
   })
 })
 

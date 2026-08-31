@@ -85,6 +85,37 @@ describe("runHumanReviewGate", () => {
     await expect(readFile(join(workspace.dir, "reports", "human-review.md"), "utf8")).resolves.toContain("- Result: approved")
   })
 
+  test("an iteration's committed changes carry the run trailer and describe the staged paths", async () => {
+    const { workspace, options } = await fixture()
+    // A human iteration leaves an uncommitted change behind; the "continue"
+    // commit must describe it and link the active run instead of using the
+    // fixed `apply manual iteration` summary.
+    const changed = join(options.targetDir, "manual-fix.md")
+    await writeFile(changed, "manual iteration result\n")
+
+    const { progress } = progressWithActions(["iterate", "continue"])
+    await runHumanReviewGate(
+      workspace,
+      options,
+      "http://127.0.0.1:1234",
+      progress,
+      undefined,
+      "human-review",
+      {
+        openInteractiveOpencodeWindow: async () => "terminal",
+        runInteractiveOpencode: async () => {
+          await writeFile(changed, "manual iteration result, revised\n")
+        },
+      },
+    )
+
+    const proc = Bun.spawn(["git", "log", "-1", "--pretty=%B"], { cwd: options.targetDir, stdout: "pipe" })
+    const message = await new Response(proc.stdout).text()
+    expect(message).toContain("convoy(human-review): update manual-fix.md")
+    expect(message).toContain("Convoy-Run: 20260708-120000-test")
+    expect(message).not.toContain("apply manual iteration")
+  })
+
   test("pauses the permission gate while an external TUI iteration is active", async () => {
     const { workspace, options } = await fixture()
     let paused = false

@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 
 import { renderQualityScoreReport, type QualityDimension } from "./quality-score"
 import { isScoringAgent, validateWriteReportPayload, type ValidatedWriteReportPayload } from "./report"
+import { writeCommitSidecar } from "./step-commit"
 import type { AgentStep, DeliverableContract } from "./types"
 
 export type ReportPhaseHandle = {
@@ -46,7 +47,9 @@ export function createReportRuntime(workspaceDir: string): ReportRuntime {
       return state.candidate
     },
     write: (payload) => {
-      const validated = validateWriteReportPayload(payload, isScoringAgent(state.phase.agentName))
+      // Read-only phases cannot create a step commit, so commit metadata is
+      // rejected for them at the same boundary that validates the report.
+      const validated = validateWriteReportPayload(payload, isScoringAgent(state.phase.agentName), !state.phase.readOnly)
       if ("error" in validated) return Promise.resolve(validated)
       return enqueueWrite(state, validated)
     },
@@ -70,6 +73,11 @@ export function createReportRuntime(workspaceDir: string): ReportRuntime {
         await writeFile(tmpPath, markdown, { mode: 0o600 })
         await rename(tmpPath, state.reportPath)
         state.candidate = markdown
+        // The report-bound sidecar records the envelope on every successful
+        // write — even without commit metadata — so an older description can
+        // never survive a later report revision (design D3). Its failure fails
+        // the tool call, keeping "every accepted write has an envelope" true.
+        await writeCommitSidecar(state.reportPath, payload.commit)
         result = { markdown }
       } catch (error) {
         result = { error: `could not save report: ${error instanceof Error ? error.message : String(error)}` }

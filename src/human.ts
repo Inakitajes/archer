@@ -7,6 +7,7 @@ import { log } from "./log"
 import { openInteractiveOpencodeWindow } from "./opencode"
 import { noopProgress, type HumanReviewAction, type ProgressUI } from "./progress"
 import type { PermissionGate } from "./permissions"
+import { stepCommitMessageFactory } from "./step-commit"
 import { createTerminalInput, type TerminalInput, TerminalInterrupt } from "./terminal-input"
 import type { RunOptions } from "./types"
 import type { Workspace } from "./workspace"
@@ -65,7 +66,7 @@ export async function runHumanReviewGate(
 
     for (;;) {
       if (action === "continue") {
-        await commitHumanChanges(options, stepName)
+        await commitHumanChanges(workspace, options, stepName)
         await writeHumanReviewReport(workspace, "approved", iterations, stepName)
         progress.phaseCompleted(stepName, "approved")
         return
@@ -90,10 +91,10 @@ export async function runHumanReviewGate(
           }
 
           await runSuspendedInteractiveIteration(options, opencodeUrl, progress, stepName, permissions, deps.runInteractiveOpencode)
-          await commitHumanChanges(options, stepName)
+          await commitHumanChanges(workspace, options, stepName)
         } else {
           await runInteractiveIteration(options, opencodeUrl, stepName, permissions, deps.runInteractiveOpencode)
-          await commitHumanChanges(options, stepName)
+          await commitHumanChanges(workspace, options, stepName)
         }
         action = await askAction()
         continue
@@ -287,9 +288,18 @@ async function runInteractiveOpencode(options: RunOptions, opencodeUrl: string, 
   if (code !== 0) throw new Error(`[${stepName}] interactive OpenCode exited with code ${code}`)
 }
 
-async function commitHumanChanges(options: RunOptions, stepName: string) {
-  const committed = await addAllAndCommit(`convoy(${stepName}): apply manual iteration`, options.targetDir)
-  if (committed) log.info(`[${stepName}] committed manual changes`)
+/**
+ * Commits one human OpenCode iteration as the step's intermediate commit. The
+ * message is composed inside the commit seam from the exact staged paths —
+ * never the fixed `apply manual iteration` — and carries the active run's
+ * `Convoy-Run` trailer (capability `step-commit-messages`).
+ */
+async function commitHumanChanges(workspace: Workspace, options: RunOptions, stepName: string) {
+  const committed = await addAllAndCommit(
+    stepCommitMessageFactory({ workspace, step: stepName, mode: "human" }),
+    options.targetDir,
+  )
+  if (committed) log.info(`[${stepName}] committed manual changes (${workspace.runID})`)
 }
 
 async function writeHumanReviewReport(workspace: Workspace, result: "approved" | "aborted", iterations: number, stepName: string) {

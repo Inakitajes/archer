@@ -1,4 +1,4 @@
-import { stripControlBytes } from "./commit-message"
+import { stripControlBytes } from "./commit-text"
 import type { CloseEvent, CloseResult, CloseStep } from "./feature-close"
 
 /** Renderer-neutral state shared by the interactive close TUI and pure tests. */

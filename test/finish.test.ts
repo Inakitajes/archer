@@ -5,6 +5,7 @@ import { join } from "node:path"
 
 import { applySquash, backupRefFor, describeSquashPlan, parseMessage, resolveSquashRange } from "../src/finish"
 import { addAllAndCommit } from "../src/git"
+import { renderStepCommitMessage } from "../src/step-commit"
 
 const dirs: string[] = []
 afterAll(async () => {
@@ -245,6 +246,74 @@ describe("applySquash", () => {
     expect(await git(["rev-parse", "HEAD"], dir)).toBe(before)
     expect(await subjects(dir)).toEqual(["convoy(patterns): Pattern audit", "convoy(implementer): Implementer report", "chore: base"])
     expect(await git(["status", "--porcelain"], dir)).toBe("")
+  })
+})
+
+describe("finish with run-linked multiline step commits", () => {
+  /** Creates a step commit shaped exactly like the runner's: subject, details, and the run trailer. */
+  async function runLinkedCommit(dir: string, file: string, step: string, subject: string) {
+    await writeFile(join(dir, file), `${subject}\n`)
+    await addAllAndCommit(
+      renderStepCommitMessage({
+        runID: "20260101-000000-test",
+        step,
+        description: { subject, details: [`change ${file} concretely`] },
+      }),
+      dir,
+    )
+  }
+
+  test("authorship-bounded selection ignores multiline bodies and trailers", async () => {
+    const dir = await repoWithBranch()
+    await runLinkedCommit(dir, "a.txt", "implementer", "preserve report sessions across human gates")
+    await runLinkedCommit(dir, "b.txt", "patterns", "audit the bridge patterns")
+
+    const range = await resolveSquashRange(dir, "main")
+    if (!range.ok) throw new Error(`expected a squashable range, got ${range.reason}: ${range.message}`)
+
+    // The authorship walk reads subjects only; the same commits it would pick
+    // for legacy one-line messages are picked here, in the same order.
+    expect(range.commits.map((commit) => commit.subject)).toEqual([
+      "convoy(patterns): audit the bridge patterns",
+      "convoy(implementer): preserve report sessions across human gates",
+    ])
+    expect(range.stoppedAt).toBeUndefined()
+  })
+
+  test("the user-authored squash replaces the trailers instead of copying them", async () => {
+    const dir = await repoWithBranch()
+    await runLinkedCommit(dir, "a.txt", "implementer", "preserve report sessions across human gates")
+    await runLinkedCommit(dir, "b.txt", "tests", "cover reopened sessions")
+
+    const range = await resolveSquashRange(dir, "main")
+    if (!range.ok) throw new Error("expected a squashable range")
+    const { ok: _ok, ...plan } = range
+    const result = await applySquash({ cwd: dir, plan, message: "feat(thing): add the thing", noVerify: true })
+
+    expect(await subjects(dir)).toEqual(["feat(thing): add the thing", "chore: base"])
+    const finalBody = await git(["log", "-1", "--format=%B"], dir)
+    expect(finalBody).not.toContain("Convoy-Run:")
+    expect(finalBody).not.toContain("change a.txt concretely")
+    expect((await git(["ls-tree", "-r", "--name-only", "HEAD"], dir)).split("\n").sort()).toEqual(["README.md", "a.txt", "b.txt"])
+    expect(result.replaced).toBe(2)
+  })
+
+  test("rollback on a failed user commit still restores the run-linked history", async () => {
+    const dir = await repoWithBranch()
+    await runLinkedCommit(dir, "a.txt", "implementer", "preserve report sessions across human gates")
+    const before = await git(["rev-parse", "HEAD"], dir)
+
+    const range = await resolveSquashRange(dir, "main")
+    if (!range.ok) throw new Error("expected a squashable range")
+    const { ok: _ok, ...plan } = range
+    await git(["config", "commit.gpgsign", "true"], dir)
+    await git(["config", "gpg.format", "ssh"], dir)
+    await git(["config", "gpg.ssh.program", "/usr/bin/false"], dir)
+    await git(["config", "user.signingkey", "/dev/null"], dir)
+
+    await expect(applySquash({ cwd: dir, plan, message: "feat: squashed", noVerify: true })).rejects.toThrow(/git commit exited/)
+    expect(await git(["rev-parse", "HEAD"], dir)).toBe(before)
+    expect(await git(["log", "-1", "--format=%B"], dir)).toContain("Convoy-Run: 20260101-000000-test")
   })
 })
 

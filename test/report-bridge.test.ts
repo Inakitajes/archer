@@ -6,6 +6,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 
 import { installWriteReportTool, startReportBridge } from "../src/report-bridge"
 import { createReportRuntime } from "../src/report-runtime"
+import { loadCommitSidecar } from "../src/step-commit"
 import { qualityDimensionWeights } from "../src/quality-score"
 import type { AgentStep } from "../src/types"
 
@@ -95,6 +96,27 @@ describe("report bridge", () => {
       const invalid = await post(bridge.url, bridge.token, { sessionID: "ses_1", payload: { markdown: "   " } })
       expect(invalid.status).toBe(400)
       expect(await invalid.json()).toMatchObject({ error: "markdown must be a non-empty string" })
+
+      // Structured commit metadata rides the same payload and is validated at
+      // the same boundary: valid data lands in the sidecar, malformed data is
+      // rejected in-turn without saving the report.
+      const valid = await post(bridge.url, bridge.token, {
+        sessionID: "ses_1",
+        payload: { markdown: "# Findings", commit: { subject: "preserve report sessions", details: ["one detail"] } },
+      })
+      expect(valid.status).toBe(200)
+      expect(await loadCommitSidecar(join(dir, phase.reportPath))).toEqual({
+        subject: "preserve report sessions",
+        details: ["one detail"],
+      })
+
+      const malformed = await post(bridge.url, bridge.token, {
+        sessionID: "ses_1",
+        payload: { markdown: "# Rewritten", commit: { subject: "" } },
+      })
+      expect(malformed.status).toBe(400)
+      expect((await malformed.json()).error).toContain("commit.subject")
+      expect(await readFile(join(dir, phase.reportPath), "utf8")).toBe("# Findings")
     } finally {
       bridge.close()
     }
@@ -102,6 +124,14 @@ describe("report bridge", () => {
 })
 
 describe("write_report tool file", () => {
+  test("exposes the optional commit argument to writable phases", async () => {
+    const dir = await scratch()
+    const path = await installWriteReportTool({ dir, url: "http://127.0.0.1:1234/report", token: "t" })
+    const source = await readFile(path, "utf8")
+    expect(source).toContain('commit: tool.schema.object({ subject: tool.schema.string(), details: tool.schema.array(tool.schema.string()).optional() }).optional()')
+    expect(source).toContain("imperative English subject")
+  })
+
   test("has the fixed-path schema and restrictive permissions", async () => {
     const dir = await scratch()
     const path = await installWriteReportTool({ dir, url: "http://127.0.0.1:1234/report", token: "bridge-token" })
