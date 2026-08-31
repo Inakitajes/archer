@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { compareSemVer, parseSemVer } from "../src/update"
-import { formatVersion, majorMinorVersion, shortVersion, versionInfo } from "../src/version"
+import { formatVersion, majorMinorVersion, shortVersion, versionDetails, versionInfo } from "../src/version"
 
 const released = { version: "0.1.1", commit: "a".repeat(40), platform: "darwin-arm64", release: true }
 
@@ -53,6 +53,19 @@ describe("version formatting", () => {
     // A numeric-only short hash with a leading zero stays valid as build
     // metadata (it would be invalid as a prerelease identifier).
     expect(parseSemVer("0.1.1-local+0123456")).toBeDefined()
+  })
+
+  describe("versionDetails", () => {
+    test("the masthead shows only the release version", () => {
+      expect(versionDetails(released)).toBe("0.1.1")
+    })
+
+    test("a local masthead keeps its embedded build hash without repeating build details", () => {
+      const local = { ...released, version: "0.1.1-local+aaaaaaa" }
+      expect(versionDetails(local)).toBe("0.1.1-local+aaaaaaa")
+      expect(versionDetails(local)).not.toContain("(")
+      expect(versionDetails(local)).not.toContain(local.platform)
+    })
   })
 
   test("a source checkout still reports a usable version triple", () => {

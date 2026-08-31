@@ -49,7 +49,7 @@ export function majorMinorVersion(info: VersionInfo = versionInfo) {
   return match ? `v${match[1]}.${match[2]}` : version
 }
 
-/** The full build line (version + commit + platform), brand prefix dropped. */
+/** The masthead version, including any local-build metadata already embedded in it. */
 export function versionDetails(info: VersionInfo = versionInfo) {
-  return formatVersion(info).replace(/^convoy\s+/, "")
+  return info.version
 }
