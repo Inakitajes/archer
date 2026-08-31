@@ -55,21 +55,16 @@ describe("version formatting", () => {
     expect(parseSemVer("0.1.1-local+0123456")).toBeDefined()
   })
 
-  // The masthead shows a glanceable short fragment, not the diagnostic hash:
-  // git's short-hash convention, matching what scripts/build.ts embeds as
-  // local build metadata. A suffix fragment can't be fed to git tooling.
   describe("versionDetails", () => {
-    test("the masthead build line keeps a short commit fragment, not the full hash", () => {
-      expect(versionDetails(released)).toBe("0.1.1 (aaaaaaa, darwin-arm64)")
+    test("the masthead shows only the release version", () => {
+      expect(versionDetails(released)).toBe("0.1.1")
     })
 
-    test("an unknown commit renders the unknown fragment", () => {
-      expect(versionDetails({ ...released, commit: "unknown" })).toBe("0.1.1 (unknown, darwin-arm64)")
-    })
-
-    test("no masthead rendering carries the commit label or a long hash", () => {
-      expect(versionDetails(released)).not.toContain("commit")
-      expect(versionDetails(released)).not.toMatch(/[0-9a-f]{8,}/)
+    test("a local masthead keeps its embedded build hash without repeating build details", () => {
+      const local = { ...released, version: "0.1.1-local+aaaaaaa" }
+      expect(versionDetails(local)).toBe("0.1.1-local+aaaaaaa")
+      expect(versionDetails(local)).not.toContain("(")
+      expect(versionDetails(local)).not.toContain(local.platform)
     })
   })
 

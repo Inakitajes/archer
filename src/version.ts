@@ -49,15 +49,7 @@ export function majorMinorVersion(info: VersionInfo = versionInfo) {
   return match ? `v${match[1]}.${match[2]}` : version
 }
 
-// The masthead has room for a tag, not a build line: git's short-hash
-// convention (`git log --oneline`, `scripts/build.ts`'s local build metadata)
-// is what stays glanceable while remaining feedable to git tooling. A suffix
-// fragment would defeat that, so the fragment is the SHA's leading characters.
-function shortCommit(commit: string) {
-  return commit.slice(0, 7)
-}
-
-/** The masthead build line (version + short commit + platform), brand prefix dropped. */
+/** The masthead version, including any local-build metadata already embedded in it. */
 export function versionDetails(info: VersionInfo = versionInfo) {
-  return `${info.version} (${shortCommit(info.commit)}, ${info.platform})`
+  return info.version
 }
