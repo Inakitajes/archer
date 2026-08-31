@@ -2,7 +2,6 @@ import { BoxRenderable, StyledText, TextRenderable, bold, fg } from "@opentui/co
 
 import { hintsRow, paletteForTerminal, setTheme, terminalBackgroundHex, theme } from "./tui-theme"
 import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
-import { shortVersion } from "./version"
 
 import type { CliRenderer, KeyEvent } from "@opentui/core"
 
@@ -59,7 +58,10 @@ class NoticeTui {
       borderStyle: "rounded",
       borderColor: theme.border,
       backgroundColor: theme.bg,
-      title: ` convoy ${options.title} ${shortVersion()} `,
+      // No version branding: these notices are the empty states of home-session
+      // destination screens, whose headers must stay free of convoy-plus-version
+      // tags (tui-header spec).
+      title: ` convoy ${options.title} `,
       titleAlignment: "left",
       paddingX: 2,
       paddingY: 1,
