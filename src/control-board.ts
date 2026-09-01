@@ -91,6 +91,8 @@ export type BoardReads = {
   worktrees(): Promise<BoardWorktree[]>
   openspecPresent(dir: string): Promise<boolean>
   changeIds(dir: string): Promise<string[]>
+  /** Whether `openspec/changes/<id>/` holds any markdown file; a husk holds none. */
+  changeHasMarkdown(dir: string, id: string): Promise<boolean>
   changeTitle(dir: string, id: string): Promise<string | undefined>
   taskCounts(dir: string): Promise<ReadonlyMap<string, BoardTasks>>
   runs(): Promise<BoardRun[]>
@@ -149,7 +151,11 @@ export async function assembleControlBoard(reads: BoardReads): Promise<ControlBo
   const specless: WorktreeWithoutSpec[] = []
 
   // Feature worktrees first: their rows outrank a same-id row stranded on main.
+  // Pass 1 collects every worktree listing each change id — a merge or leftover
+  // tooling state can list one id in several worktrees. Pass 2 resolves which
+  // checkout supplies the row (precedence, not first-listed-wins).
   const features = worktrees.filter((worktree) => !worktree.main)
+  const candidates = new Map<string, BoardWorktree[]>()
   for (const worktree of features) {
     const changePresent = (await reads.openspecPresent(worktree.dir)) && (await reads.changeIds(worktree.dir)).length > 0
     if (!changePresent) {
@@ -160,10 +166,16 @@ export async function assembleControlBoard(reads: BoardReads): Promise<ControlBo
       continue
     }
     for (const id of await reads.changeIds(worktree.dir)) {
-      if (seen.has(id)) continue
-      seen.add(id)
-      rows.push(await buildRow(reads, { id, dir: worktree.dir, worktree, baseBranch, runs }))
+      const list = candidates.get(id)
+      if (list) list.push(worktree)
+      else candidates.set(id, [worktree])
     }
+  }
+
+  for (const [id, list] of candidates) {
+    const winner = await resolveClaim(reads, id, list)
+    seen.add(id)
+    rows.push(await buildRow(reads, { id, dir: winner.dir, worktree: winner, baseBranch, runs }))
   }
 
   // Whatever is left lives stranded on the base checkout.
@@ -182,6 +194,27 @@ export async function assembleControlBoard(reads: BoardReads): Promise<ControlBo
 function worktreeRunsFor(worktree: BoardWorktree, runs: BoardRun[]): BoardRun[] {
   if (!worktree.branch) return []
   return runs.filter((run) => run.branch === worktree.branch)
+}
+
+/**
+ * Which checkout supplies a change's row when several worktrees list the id:
+ * the worktree whose branch matches the change id (the same resolver rule
+ * `branchForChange` applies) outranks every other copy; among the rest, a copy
+ * carrying change markdown outranks a husk directory with none; remaining ties
+ * keep stable `git worktree list` order. Resolution never drops a row — when
+ * no candidate bears markdown and no branch matches, the first-listed
+ * candidate wins and the row degrades exactly as before (design D3).
+ */
+async function resolveClaim(reads: BoardReads, id: string, list: BoardWorktree[]): Promise<BoardWorktree> {
+  const branchMatch = list.find((worktree) => branchForChange(id, worktree.branch) !== undefined)
+  if (branchMatch) return branchMatch
+  // A lone candidate wins on list order regardless of artifacts, so the
+  // markdown read is spent only where it can change the outcome.
+  if (list.length === 1) return list[0]!
+  for (const worktree of list) {
+    if (await reads.changeHasMarkdown(worktree.dir, id)) return worktree
+  }
+  return list[0]!
 }
 
 async function buildRow(
@@ -260,6 +293,7 @@ export function createBoardReads(targetDir: string): BoardReads {
   let worktreesCache: Promise<BoardWorktree[]> | undefined
   const taskCountsCache = new Map<string, Promise<ReadonlyMap<string, BoardTasks>>>()
   const statusCache = new Map<string, Promise<string>>()
+  const markdownCache = new Map<string, Promise<boolean>>()
   return {
     async worktrees() {
       worktreesCache ??= (async () => {
@@ -295,6 +329,19 @@ export function createBoardReads(targetDir: string): BoardReads {
 
     async changeIds(dir) {
       return listChangeIds(join(dir, openspecDirName, "changes"))
+    },
+
+    async changeHasMarkdown(dir, id) {
+      const root = join(dir, openspecDirName, "changes", id)
+      let cached = markdownCache.get(root)
+      if (!cached) {
+        // collectDirRelativeMarkdown's traversal stance (hidden entries and
+        // symlinks skipped, errors answer empty) with a boolean collapse:
+        // true when any `.md` file exists, false on error or an empty husk.
+        cached = collectDirRelativeMarkdown(root, ".").then((files) => files.length > 0)
+        markdownCache.set(root, cached)
+      }
+      return cached
     },
 
     async changeTitle(dir, id) {
