@@ -374,6 +374,8 @@ describe("runClose", () => {
       "step-started:archive",
       "step-completed:archive",
       "step-started:squash",
+      "squash-phase",
+      "squash-phase",
       "step-completed:squash",
       "step-started:merge",
       "merge-shape",
@@ -482,6 +484,31 @@ describe("runClose", () => {
     expect(body).toContain("change add-widget")
   })
 
+  test("close never consults $EDITOR: only the resolver's accepted value reaches applySquash (design D4)", async () => {
+    const fixture = await makeFixture()
+    // Point every external-editor resolution at a writer that would poison
+    // the commit; close must never run it.
+    const binDir = join(tmpdir(), `convoy-close-editor-${Math.random().toString(36).slice(2)}`)
+    dirs.push(binDir)
+    await mkdir(binDir, { recursive: true })
+    const editor = join(binDir, "poison-editor")
+    await writeFile(editor, "#!/bin/sh\nprintf 'EDITOR WROTE THIS' > \"$1\"\n")
+    await chmod(editor, 0o755)
+    const saved = process.env.GIT_EDITOR
+    process.env.GIT_EDITOR = editor
+    try {
+      await runTestClose(fixture, {
+        resolveMessage: async (proposal) => proposal.message.replace("improve", "hand edited"),
+      })
+      const subject = await git(fixture.mainDir, undefined, "log", "--format=%s", "-n", "1", "main")
+      expect(subject).not.toContain("EDITOR WROTE THIS")
+      expect(subject).toContain("hand edited")
+    } finally {
+      if (saved === undefined) delete process.env.GIT_EDITOR
+      else process.env.GIT_EDITOR = saved
+    }
+  })
+
   test("an explicit --message wins verbatim and bypasses writer and resolver entirely", async () => {
     const fixture = await makeFixture()
     await runTestClose(fixture, {
@@ -549,6 +576,66 @@ describe("runClose", () => {
     } finally {
       spy.mockRestore()
     }
+  })
+
+  test("squash phases arrive in order for a model proposal accepted by the resolver", async () => {
+    const fixture = await makeFixture()
+    const events: CloseEvent[] = []
+    await runTestClose(fixture, {
+      writer: async () => ({
+        message: { type: "feat", scope: "cli", subject: "improve the close flow", body: [] },
+        source: "model",
+      }),
+      resolveMessage: async (proposal) => proposal.message,
+      onEvent: (event) => events.push(event),
+    })
+    // The typed sub-phases bracket the real awaits: composition, then the
+    // review gate, then the commit mutation (design D1).
+    expect(events.map((event) => (event.type === "squash-phase" ? `squash:${event.phase}` : event.type))).toEqual(
+      expect.arrayContaining(["step-started", "squash:composing-message", "squash:awaiting-message-review", "squash:creating-commit", "step-completed"]),
+    )
+    const squashStart = events.findIndex((event) => event.type === "step-started" && "step" in event && event.step === "squash")
+    const squashEnd = events.findIndex((event) => event.type === "step-completed" && "step" in event && event.step === "squash")
+    const squashSlice = events.slice(squashStart + 1, squashEnd + 1)
+    expect(squashSlice.map((event) => (event.type === "squash-phase" ? event.phase : event.type))).toEqual([
+      "composing-message",
+      "awaiting-message-review",
+      "creating-commit",
+      "step-completed",
+    ])
+  })
+
+  test("squash phases arrive in order for the deterministic fallback too", async () => {
+    const fixture = await makeFixture()
+    const events: CloseEvent[] = []
+    await runTestClose(fixture, { resolveMessage: async (proposal) => proposal.message, onEvent: (event) => events.push(event) })
+    const phases = events.filter((event) => event.type === "squash-phase")
+    expect(phases.map((event) => (event.type === "squash-phase" ? event.phase : null))).toEqual([
+      "composing-message",
+      "awaiting-message-review",
+      "creating-commit",
+    ])
+  })
+
+  test("a declined message emits no creating-commit phase and marks the squash failed", async () => {
+    const fixture = await makeFixture()
+    const events: CloseEvent[] = []
+    await expect(runTestClose(fixture, { resolveMessage: async () => undefined, onEvent: (event) => events.push(event) })).rejects.toThrow(
+      /wasn't confirmed/,
+    )
+    expect(events.some((event) => event.type === "squash-phase" && event.phase === "creating-commit")).toBe(false)
+    expect(events[events.length - 1]).toMatchObject({ type: "step-failed", step: "squash" })
+  })
+
+  test("an explicit --message skips composition and review but still names commit creation", async () => {
+    const fixture = await makeFixture()
+    const events: CloseEvent[] = []
+    await runTestClose(fixture, {
+      message: "feat(cli): exact override",
+      onEvent: (event) => events.push(event),
+    })
+    const phases = events.filter((event) => event.type === "squash-phase")
+    expect(phases.map((event) => (event.type === "squash-phase" ? event.phase : null))).toEqual(["creating-commit"])
   })
 
   test("a declined message stops before the squash and nothing lands", async () => {

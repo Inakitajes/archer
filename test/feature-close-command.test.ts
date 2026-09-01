@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream"
 
 import {
   applyCloseEvent,
+  buildCloseFollowUpsView,
   closeHelp,
   closeSurface,
   confirmCloseMessage,
@@ -13,10 +14,13 @@ import {
   formatCloseFollowUps,
   initialCloseChecklistState,
   offerCloseFollowUps,
+  parseCloseArgs,
   renderCloseChecklist,
   resolveCloseFollowUps,
   type CloseChecklistState,
   type CloseIO,
+  type CloseInteractiveFollowUpState,
+  type FollowUpOffers,
 } from "../src/feature-close-command"
 import type { CloseEvent, ClosePreflightBlocker } from "../src/feature-close"
 
@@ -91,12 +95,65 @@ describe("closeHelp", () => {
 
   test("documents the interactive and headless contracts", () => {
     expect(help).toContain("full-screen TUI")
-    expect(help).toContain("confirm, edit")
+    expect(help).toContain("inline multiline editor")
+    expect(help).toContain("Ctrl+S")
+    expect(help).toContain("deferred cleanup")
     expect(help).toContain("fast-forward")
     expect(help).toContain("upstream")
     expect(help).toContain("Headless")
     expect(help).toContain("--resume")
     expect(help).toContain("--message")
+  })
+})
+
+// -- task 4.1: the close argument surface ---------------------------------------
+
+describe("parseCloseArgs", () => {
+  test("empty argv targets the current directory with no options", () => {
+    expect(parseCloseArgs([])).toEqual({ targetDir: process.cwd() })
+  })
+
+  test("--branch accepts both space and = forms", () => {
+    expect(parseCloseArgs(["--branch", "feat/x"])).toMatchObject({ branch: "feat/x" })
+    expect(parseCloseArgs(["--branch=feat/y"])).toMatchObject({ branch: "feat/y" })
+  })
+
+  test("--change accepts both space and = forms", () => {
+    expect(parseCloseArgs(["--change", "add-widget"])).toMatchObject({ changeID: "add-widget" })
+    expect(parseCloseArgs(["--change=add-gadget"])).toMatchObject({ changeID: "add-gadget" })
+  })
+
+  test("--message carries through verbatim, including an empty override (SC-8)", () => {
+    expect(parseCloseArgs(["--message", "feat(cli): exact"])).toMatchObject({ message: "feat(cli): exact" })
+    expect(parseCloseArgs(["--message=feat(cli): equals"])).toMatchObject({ message: "feat(cli): equals" })
+    // Presence, not truthiness: an empty --message= still reaches runClose as an
+    // explicit override and never falls through to the writer (SC-8).
+    expect(parseCloseArgs(["--message="])).toMatchObject({ message: "" })
+    // The space form treats an empty value as missing — a deliberate CLI
+    // convention predating this change (git rejects an empty message anyway).
+    expect(() => parseCloseArgs(["--message", ""])).toThrow(/requires a value/)
+  })
+
+  test("--resume, --dry-run, and --worktree-dir parse", () => {
+    expect(parseCloseArgs(["--resume"])).toMatchObject({ resume: true })
+    expect(parseCloseArgs(["--resume", "--dry-run"])).toMatchObject({ resume: true, dryRun: true })
+    expect(parseCloseArgs(["--worktree-dir", "/wt"])).toMatchObject({ worktreeDir: "/wt" })
+  })
+
+  test("combined flags keep every option", () => {
+    expect(parseCloseArgs(["--branch", "feat/close-ui", "--change", "close-ui", "--resume", "--message", "feat(cli): done"])).toEqual({
+      targetDir: process.cwd(),
+      branch: "feat/close-ui",
+      changeID: "close-ui",
+      resume: true,
+      message: "feat(cli): done",
+    })
+  })
+
+  test("an unknown argument and a missing value both throw the usage error", () => {
+    expect(() => parseCloseArgs(["--bogus"])).toThrow(/usage: convoy close/)
+    expect(() => parseCloseArgs(["--branch"])).toThrow(/requires a value/)
+    expect(() => parseCloseArgs(["--message"])).toThrow(/requires a value/)
   })
 })
 
@@ -163,6 +220,27 @@ describe("renderCloseChecklist", () => {
     const frame = renderCloseChecklist(stateThrough([{ type: "preflight-failed", blockers }]))
     expect(frame).toEqual(["close preflight failed:", "  2 of 3 tasks are incomplete — finish them before closing"])
   })
+
+  test("a squash phase names the sub-phase on a running squash row", () => {
+    const frame = renderCloseChecklist(stateThrough([preflight, { type: "step-started", step: "squash" }, { type: "squash-phase", phase: "composing-message" }]))
+    expect(frame).toContain("  ▸ squash — composing the commit message")
+    const review = renderCloseChecklist(stateThrough([{ type: "step-started", step: "squash" }, { type: "squash-phase", phase: "awaiting-message-review" }]))
+    expect(review).toContain("  ▸ squash — awaiting message review")
+    const creating = renderCloseChecklist(stateThrough([{ type: "step-started", step: "squash" }, { type: "squash-phase", phase: "creating-commit" }]))
+    expect(creating).toContain("  ▸ squash — creating the squashed commit")
+  })
+
+  test("a step-failed squash replaces the phase detail with the remediation", () => {
+    const frame = renderCloseChecklist(
+      stateThrough([
+        { type: "step-started", step: "squash" },
+        { type: "squash-phase", phase: "awaiting-message-review" },
+        { type: "step-failed", step: "squash", message: "squash: signature declined" },
+      ]),
+    )
+    expect(frame).toContain("  ✗ squash — signature declined")
+    expect(frame.some((line) => line.includes("awaiting message review"))).toBe(false)
+  })
 })
 
 // -- task 3.1: the headless formatter ---------------------------------------------
@@ -227,6 +305,20 @@ describe("formatCloseEvents", () => {
     expect(text).not.toContain("closed ")
     expect(text).not.toContain("optional follow-ups")
   })
+
+  test("intermediate squash phases never reach the stdout summary", () => {
+    const text = formatCloseEvents([
+      { type: "preflight", summary: "clean tree" },
+      { type: "step-started", step: "squash" },
+      { type: "squash-phase", phase: "composing-message" },
+      { type: "squash-phase", phase: "awaiting-message-review" },
+      { type: "squash-phase", phase: "creating-commit" },
+      { type: "step-completed", step: "squash", detail: "2 commits → abcd1234" },
+    ])
+    expect(text).toContain("squash: 2 commits → abcd1234")
+    expect(text).not.toContain("composing")
+    expect(text).not.toContain("awaiting message review")
+  })
 })
 
 // -- task 3.4: upstream-aware follow-ups -------------------------------------------
@@ -290,38 +382,25 @@ describe("confirmCloseMessage", () => {
     expect(cleaned(io.chunks)).toContain("feat(cli): improve the close flow")
   })
 
-  test("edit-then-accept lands the edited message", async () => {
-    const binDir = await mkdtemp(join(tmpdir(), "convoy-close-editor-"))
-    dirs.push(binDir)
-    const editor = join(binDir, "replace-editor")
-    await writeFile(editor, "#!/bin/sh\nprintf 'edited subject\\n\\n- edited body\\n' > \"$1\"\n")
-    await chmod(editor, 0o755)
-    const saved = process.env.GIT_EDITOR
-    process.env.GIT_EDITOR = editor
-    try {
-      const io = createIO(["e"])
-      const result = await confirmCloseMessage(proposal, { ...io })
-      expect(result).toBe("edited subject\n\n- edited body")
-    } finally {
-      if (saved === undefined) delete process.env.GIT_EDITOR
-      else process.env.GIT_EDITOR = saved
-    }
+  test("a declined prompt returns undefined", async () => {
+    const io = createIO(["N"])
+    const result = await confirmCloseMessage(proposal, { ...io })
+    expect(result).toBeUndefined()
   })
 
-  test("an editor cancellation re-asks; a declined prompt returns undefined", async () => {
+  test("no external editor participates: an 'e' answer declines without launching $EDITOR (design D4)", async () => {
     const binDir = await mkdtemp(join(tmpdir(), "convoy-close-editor-"))
     dirs.push(binDir)
-    const editor = join(binDir, "failing-editor")
-    await writeFile(editor, "#!/bin/sh\nexit 1\n")
+    const editor = join(binDir, "would-run-editor")
+    await writeFile(editor, "#!/bin/sh\nprintf 'editor must never run for close' > \"$1\"\nexit 0\n")
     await chmod(editor, 0o755)
     const saved = process.env.GIT_EDITOR
     process.env.GIT_EDITOR = editor
     try {
-      // e → editor dies → re-ask → EOF resolves as "" → declined.
+      // The prompt is accept-or-decline now; editing lives in the Close TUI.
       const io = createIO(["e"])
       const result = await confirmCloseMessage(proposal, { ...io })
       expect(result).toBeUndefined()
-      expect(cleaned(io.chunks)).toContain("editor cancelled — nothing has landed")
     } finally {
       if (saved === undefined) delete process.env.GIT_EDITOR
       else process.env.GIT_EDITOR = saved
@@ -330,6 +409,75 @@ describe("confirmCloseMessage", () => {
 })
 
 // -- task 3.4: the cleanup dependency graph ------------------------------------------
+
+// -- task 3.1: actions, same-session dependencies, and deferred cleanup ------------
+
+describe("buildCloseFollowUpsView", () => {
+  const offersFor = (fixture: { mainDir: string; worktreeDir: string }): FollowUpOffers => ({
+    push: { remote: "origin", refspec: "main:main", command: `git -C ${fixture.mainDir} push origin main:main` },
+    worktreeRemoval: `git -C ${fixture.mainDir} worktree remove '${fixture.worktreeDir}'`,
+    branchDelete: `git -C ${fixture.mainDir} branch -d feat/add-widget`,
+    baseRef: "main",
+    branch: "feat/add-widget",
+    worktreeDir: fixture.worktreeDir,
+    targetDir: fixture.mainDir,
+  })
+
+  test("launched outside the worktree: push and removal are actions, branch deletion is blocked (same-session dependency)", async () => {
+    const fixture = await makeFixture()
+    const view = await buildCloseFollowUpsView({ followUps: offersFor(fixture), cwdInside: false })
+    expect(view.deferred).toBeUndefined()
+    expect(view.actions.map((action) => `${action.id}:${action.status}`)).toEqual([
+      "push:available",
+      "worktree:available",
+      "branch:blocked",
+    ])
+    // The blocked row keeps its explicit command for later use.
+    expect(view.actions[2]!.command).toContain("branch -d feat/add-widget")
+  })
+
+  test("launched inside the worktree: only push is an action; cleanup is ordered deferred guidance naming the shell location", async () => {
+    const fixture = await makeFixture()
+    const view = await buildCloseFollowUpsView({ followUps: offersFor(fixture), cwdInside: true })
+    expect(view.actions.map((action) => action.id)).toEqual(["push"])
+    expect(view.deferred).toBeDefined()
+    expect(view.deferred!.reason).toContain("launched from inside")
+    expect(view.deferred!.steps.map((step) => step.command)).toEqual([
+      `git -C ${fixture.mainDir} worktree remove '${fixture.worktreeDir}'`,
+      `git -C ${fixture.mainDir} branch -d feat/add-widget`,
+    ])
+  })
+
+  test("a missing upstream becomes a notice with the setup step, never a push action", async () => {
+    const fixture = await makeFixture()
+    const offers = { ...offersFor(fixture), push: undefined, pushRemediation: "main has no configured upstream — set one first: git branch --set-upstream-to=<remote>/<branch> main" }
+    const view = await buildCloseFollowUpsView({ followUps: offers, cwdInside: false })
+    expect(view.actions.find((action) => action.id === "push")).toBeUndefined()
+    expect(view.notice).toContain("no configured upstream")
+  })
+
+  test("a failed removal keeps the worktree action retryable; branch deletion stays blocked", async () => {
+    const fixture = await makeFixture()
+    const failed: CloseInteractiveFollowUpState = { worktree: { status: "failed", error: "worktree remove: permission denied" } }
+    const view = await buildCloseFollowUpsView({ followUps: offersFor(fixture), cwdInside: false, state: failed })
+    const worktree = view.actions.find((action) => action.id === "worktree")!
+    expect(worktree.status).toBe("failed")
+    expect(worktree.error).toContain("permission denied")
+    expect(view.actions.find((action) => action.id === "branch")!.status).toBe("blocked")
+  })
+
+  test("branch deletion unlocks once the worktree is gone, with the removal action omitted", async () => {
+    const fixture = await makeFixture()
+    const gone = { ...fixture, worktreeDir: join(fixture.mainDir, "no-such-wt") }
+    const view = await buildCloseFollowUpsView({
+      followUps: { ...offersFor(gone), worktreeRemoval: undefined },
+      cwdInside: false,
+      state: { worktree: { status: "completed" } },
+    })
+    expect(view.actions.find((action) => action.id === "worktree")!.status).toBe("completed")
+    expect(view.actions.find((action) => action.id === "branch")!.status).toBe("available")
+  })
+})
 
 describe("offerCloseFollowUps", () => {
   test("declined worktree removal keeps branch deletion unavailable and prints both commands", async () => {

@@ -1,5 +1,5 @@
 import { stripControlBytes } from "./commit-text"
-import type { CloseEvent, CloseResult, CloseStep } from "./feature-close"
+import type { CloseEvent, CloseResult, CloseStep, CloseSquashPhase } from "./feature-close"
 
 /** Renderer-neutral state shared by the interactive close TUI and pure tests. */
 export type CloseChecklistRowStatus = "pending" | "running" | "completed" | "skipped" | "failed"
@@ -50,6 +50,10 @@ export function applyCloseEvent(state: CloseChecklistState, event: CloseEvent): 
       const detail = line.startsWith(prefix) ? line.slice(prefix.length) : line
       return withRow(event.step, { status: "failed", detail })
     }
+    case "squash-phase":
+      // A running squash names its sub-phase (design D1); the copy lives here
+      // so every renderer narrates the same state from the same identifiers.
+      return withRow("squash", { status: "running", detail: squashPhaseDetail(event.phase) })
     case "merge-shape":
       // The merge row's completed detail already narrates the shape.
       return state
@@ -71,7 +75,9 @@ export function renderCloseChecklist(state: CloseChecklistState): string[] {
     if (row.status === "pending") {
       lines.push(`  ○ ${row.step}`)
     } else if (row.status === "running") {
-      lines.push(`  ▸ ${row.step}…`)
+      // A running row may carry sub-phase detail (the squash phases, design
+      // D1); with a named sub-phase the bare ellipsis would be redundant.
+      lines.push(`  ▸ ${row.step}${row.detail ? ` — ${row.detail}` : "…"}`)
     } else if (row.status === "completed") {
       lines.push(`  ✓ ${row.step}${row.detail ? ` — ${row.detail}` : ""}`)
     } else if (row.status === "skipped") {
@@ -89,6 +95,13 @@ export function renderCloseChecklist(state: CloseChecklistState): string[] {
 
 function firstLine(value: string): string {
   return value.split("\n")[0]?.trim() ?? value
+}
+
+/** The human-readable row detail for each typed squash phase (design D1). */
+function squashPhaseDetail(phase: CloseSquashPhase): string {
+  if (phase === "composing-message") return "composing the commit message"
+  if (phase === "awaiting-message-review") return "awaiting message review"
+  return "creating the squashed commit"
 }
 
 function strip(value: string | undefined): string {

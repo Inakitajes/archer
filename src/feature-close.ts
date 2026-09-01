@@ -46,6 +46,13 @@ import { listRuns } from "./runs"
 
 export type CloseStep = "sync" | "archive" | "squash" | "merge"
 
+/**
+ * The squash step's typed sub-phases (design D1): stable identifiers the
+ * renderers map to their own copy, so semantic operation state stays in the
+ * orchestrator instead of being inferred from which renderer is waiting.
+ */
+export type CloseSquashPhase = "composing-message" | "awaiting-message-review" | "creating-commit"
+
 /** How the feature branch landed on the base branch (design D5: derived from git state, narrated). */
 export type CloseMergeShape = "fast-forward" | "merge-commit" | "already-up-to-date"
 
@@ -56,6 +63,7 @@ export type CloseEvent =
   | { type: "step-completed"; step: CloseStep; detail?: string }
   | { type: "step-skipped"; step: CloseStep; reason: string }
   | { type: "step-failed"; step: CloseStep; message: string }
+  | { type: "squash-phase"; phase: CloseSquashPhase }
   | { type: "merge-shape"; shape: CloseMergeShape }
   | { type: "result"; result: CloseResult }
 
@@ -353,14 +361,34 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
     : await resolveSquashRange(target.worktreeDir, baseRef, { extraSquashable: (commit) => commit.subject === archiveSubject })
   if (range.ok) {
     emit({ type: "step-started", step: "squash" })
-    const message = await resolveSquashMessage(input, { target, snapshot, diffStat: range.diffStat })
+    // `--message ""` is still an explicit override and must win verbatim, so
+    // presence is `!== undefined`, never truthiness (SC-8). The override
+    // bypasses composition, normalization, and the review gate entirely.
+    let message: string | undefined
+    if (input.message !== undefined) {
+      message = input.message
+    } else {
+      // The composition await is real work the renderer must see as such
+      // (design D1): a slow model produces no intermediate event of its own.
+      emit({ type: "squash-phase", phase: "composing-message" })
+      const proposal = await composeCloseMessage({ target, snapshot, diffStat: range.diffStat }, input.writer)
+      if (input.resolveMessage) {
+        emit({ type: "squash-phase", phase: "awaiting-message-review" })
+        message = await input.resolveMessage(proposal)
+      } else {
+        // Headless: the proposal is accepted unchanged.
+        message = proposal.message
+      }
+    }
     if (message === undefined) {
       const stop = "close stopped: the squashed commit message wasn't confirmed — rerun `convoy close --resume` to retry the squash"
       emit({ type: "step-failed", step: "squash", message: stop })
       throw new Error(stop)
     }
+    const confirmedMessage = message
+    emit({ type: "squash-phase", phase: "creating-commit" })
     try {
-      const squash = () => applySquash({ cwd: target.worktreeDir, plan: range, message })
+      const squash = () => applySquash({ cwd: target.worktreeDir, plan: range, message: confirmedMessage })
       const result = input.withTerminal ? await input.withTerminal(squash) : await squash()
       squashed = { sha: result.sha, replaced: result.replaced }
       emit({ type: "step-completed", step: "squash", detail: `${result.replaced} commit${result.replaced === 1 ? "" : "s"} → ${result.sha.slice(0, 8)}` })
@@ -426,25 +454,6 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
   }
   emit({ type: "result", result })
   return result
-}
-
-/**
- * The message gate before `applySquash` (design D3): `--message` wins verbatim
- * and bypasses the writer, normalization, and resolver entirely; otherwise the
- * composed proposal goes to the resolver, whose undefined answer stops the
- * sequence before anything lands; headless callers without a resolver accept
- * the proposal unchanged.
- */
-async function resolveSquashMessage(
-  input: CloseInput,
-  context: { target: CloseTarget; snapshot: CloseContextSnapshot; diffStat: string },
-): Promise<string | undefined> {
-  // `--message ""` is still an explicit override and must win verbatim, so
-  // presence is `!== undefined`, never truthiness (SC-8).
-  if (input.message !== undefined) return input.message
-  const proposal = await composeCloseMessage(context, input.writer)
-  if (input.resolveMessage) return await input.resolveMessage(proposal)
-  return proposal.message
 }
 
 /**
