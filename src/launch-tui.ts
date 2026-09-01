@@ -363,43 +363,6 @@ export async function defaultDirtyStatus(dir: string): Promise<string> {
   }
 }
 
-/** One launcher read of the execution tree's dirt, interpreted against the run's shape. */
-export type DirtReading = {
-  /** Number of dirty porcelain entries in the execution tree. */
-  files: number
-  /** Whether that dirt can affect this run at all: a fresh isolated worktree starts clean, so source dirt is irrelevant. */
-  matters: boolean
-  /** Whether the run would refuse to start: dirt matters, exists, and was not explicitly included. */
-  blocked: boolean
-}
-
-/**
- * The single predicate the launcher's dirt surfaces share — options notice,
- * toggle count, review warning, and the accept-time choice all derive from
- * this one function, so none of them can drift from what the post-review
- * `ensureRepoReady` gate would refuse: `matters` mirrors the gate's
- * `allowDirty` (a continue handoff executes inside the feature's own
- * worktree, so its dirt matters; a fresh isolated worktree starts clean), and
- * `blocked` mirrors its refusal rule exactly.
- */
-export function dirtReading(
-  porcelain: string,
-  options: { presetFeature?: { worktreeDir: string } | undefined; worktree: boolean; includeDirty: boolean },
-): DirtReading {
-  const files = porcelain.split("\n").filter((line) => line.trim() !== "").length
-  const matters = options.presetFeature ? true : !options.worktree
-  return { files, matters, blocked: matters && files > 0 && !options.includeDirty }
-}
-
-/** The injected reader's default: the gate's own git call, resolving to "" when git can't answer. */
-export async function defaultDirtyStatus(dir: string): Promise<string> {
-  try {
-    return await statusPorcelain(dir)
-  } catch {
-    return ""
-  }
-}
-
 /** The terminal width at or below which the launcher stacks its two panels. */
 export const compactLaunchMaxWidth = 84
 
