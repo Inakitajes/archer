@@ -571,6 +571,29 @@ Before each commit Convoy scans the staged files for common secret names (`.env*
 
 Convoy's commits are always unsigned (`--no-gpg-sign`) and authored by `convoy <convoy@local>`. They are machine commits: with a global `commit.gpgsign = true`, an unattended run would otherwise stall on an interactive signing prompt (1Password, gpg-agent) until it times out and takes the whole pipeline down — and the signature would not verify against that identity anyway. Committing is Convoy's job, so agents are denied `git commit` alongside `git push`. Turn them into one signed commit of your own with [`convoy finish`](#finishing-a-run) when the run is done.
 
+### Step commit messages
+
+Every intermediate commit Convoy creates — a writable phase's clean finish, a recovered interrupted phase, and each committed human iteration — carries the run that produced it:
+
+```text
+convoy(<step>): <semantic subject>
+
+- <concrete detail>
+- <concrete detail>
+
+Convoy-Run: <complete run ID>
+```
+
+- **The trailer.** Convoy, never agent content, writes exactly one `Convoy-Run` trailer with the run's complete ID, so history answers "which run made this commit?" mechanically:
+
+  ```bash
+  git log --grep '^Convoy-Run: 20260101-120000-abcd' --format='%h %s'
+  ```
+
+- **The subject.** Writable phases can supply an imperative, outcome-oriented subject through an optional `commit: { subject, details }` field on their `write_report` call — one subject, up to three single-line details. Without it, Convoy falls back to the report's first meaningful line (rejecting generic labels like `Implementer report`), then to the exact staged change set (`update src/foo.ts`, a common directory, or a file count), and finally to an honest summary. The complete subject stays within 72 characters; every detail within 120. Recovery reuses a description the phase already submitted.
+- **The squash.** None of this changes what `convoy finish` and `convoy close` replace: they still select Convoy's commits by the `convoy@local` authorship alone, and the `Convoy-Run` trailers are not required to survive into your own squashed commit.
+- **No empty commits.** A step that leaves no repository changes still commits nothing; the trailer records work, not presence.
+
 ### Finishing a run
 
 A finished run leaves a stack of `convoy(<step>): …` commits: accurate, but not a story, and none of them yours. **`convoy finish`** — or **`f`** on the dashboard's finish screen — collapses them into a single conventional commit created with your own git identity, so your normal config applies and an SSH/GPG signature happens exactly as it would for a commit you typed yourself.
@@ -586,7 +609,7 @@ convoy finish --dry-run            # print what would happen and exit
 - **Undo.** The pre-squash tip is kept at `refs/convoy/finish/<branch>`, so `git reset --hard refs/convoy/finish/<branch>` restores the original history. A commit that fails — declined signature, rejected hook — restores the branch instead of leaving it half-reset.
 - **After the commit.** Pushing, opening a PR with `gh`, and removing the worktree are each offered separately and never happen on their own; declining leaves you with the commit and nothing else done.
 
-During a human step, Convoy waits indefinitely for an explicit action: `c` continues the pipeline (committing any manual changes), `o` opens an OpenCode window attached to the run's server (resuming its latest session, so the iteration keeps the run's context), and `a` aborts the run.
+During a human step, Convoy waits indefinitely for an explicit action: `c` continues the pipeline (committing any manual changes), `o` opens an OpenCode window attached to the run's server (resuming its latest session, so the iteration keeps the run's context), and `a` aborts the run. A committed iteration is an intermediate commit like any other: it describes the staged paths (or the changed-file count) instead of a fixed label, and it carries the run's `Convoy-Run` trailer.
 
 ## Project configuration (`.convoy/config.yaml`)
 
@@ -707,7 +730,7 @@ The rules:
 - **Default and suggested prompts**: a pipeline can define `defaultPrompt` — text prefilled in the launcher's prompt field and used by `convoy -p <pipeline>` when no prompt is given — plus `suggestedPrompts`, a list the launcher Tab-cycles through while the field is still clean (empty or holding a default). Editing the field makes it yours: it survives pipeline switches and stops Tab from overwriting it. Built-ins that exist to run one concrete action (`review`, `review-lite`, `review-cc`, `hunter`, `hunter-max`, `ship`) ship with a `defaultPrompt`; pipelines where the prompt IS the description (`implement`, `fixer`, ...) leave the prompt mandatory.
 - **`--no-human-step` / `--no-human-review`** (and non-TTY runs) drop every human gate from the pipeline.
 - **Resume is frozen**: the resolved pipeline is persisted in the run's `metadata.json`; `--resume` replays it even if the config changed since.
-- **Dirty-tree recovery**: a writable phase interrupted before its commit (Ctrl+C, a failed commit step, a killed process) leaves uncommitted work in the tree, which normally blocks `--resume`. In an interactive terminal, resume offers to commit that work as the interrupted phase (`convoy(<phase>): …`), mark it done, and continue with the following phases. Read-only phases are never recoverable as agent output: preserved changes must be resolved manually, and resume also verifies their recorded HEAD/branch baseline. Decline (or a non-TTY resume) keeps the old "commit/stash first" behavior.
+- **Dirty-tree recovery**: a writable phase interrupted before its commit (Ctrl+C, a failed commit step, a killed process) leaves uncommitted work in the tree, which normally blocks `--resume`. In an interactive terminal, resume offers to commit that work as the interrupted phase (`convoy(<phase>): …` with the resumed run's `Convoy-Run` trailer), mark it done, and continue with the following phases. If the interrupted phase had already accepted a structured commit description through `write_report`, recovery reuses it; otherwise the message describes the staged paths or says plainly what happened. Read-only phases are never recoverable as agent output: preserved changes must be resolved manually, and resume also verifies their recorded HEAD/branch baseline. Decline (or a non-TTY resume) keeps the old "commit/stash first" behavior.
 - **Permissions are additive**: `permissions.deny` extends the hard denylist, `permissions.allow` extends the allowlist, deny always wins, and there is deliberately no way for a repo to grant itself `--yolo`.
 - **Hooks are trusted local shell commands**: `hooks.pre` runs after the run workspace/dashboard is initialized and before the pipeline starts (pre-hooks are skipped on `--resume`); `hooks.post` runs at the end according to `when`. Top-level hooks apply to every pipeline, and `hooks.pipelines.<name>` entries are appended for that pipeline. Hooks run via `$SHELL -lc` from the target repo by default, receive `CONVOY_RUN_ID`, `CONVOY_RUN_DIR`, `CONVOY_TARGET_DIR`, `CONVOY_PIPELINE`, `CONVOY_PROMPT_FILE`, and post-hooks also receive `CONVOY_RUN_STATUS`, plus `CONVOY_RUN_SCORE` on a scored pipeline and `CONVOY_GOAL_REACHED`/`CONVOY_GOAL_SCORE`/`CONVOY_GOAL_TARGET` when a [goal loop](#goal-mode) ran (in which case post-hooks run once, after the loop, not once per iteration). A failing hook fails the run unless `continueOnError: true` is set. Each hook is also a row in the dashboard pipeline — pre-hooks ahead of the steps, post-hooks after — with live running/✓/✗/skipped status, and the tail of its output lands in that row's `logs` tab; the rows are recorded in the run metadata, so re-opened runs show them too.
 
@@ -854,6 +877,7 @@ convoy/
 │   ├── finish.ts        # squashing a run's convoy commits into one commit of the user's own
 │   ├── finish-command.ts # convoy finish: confirmation, then the push/PR/worktree offers
 │   ├── commit-message.ts # writes the conventional commit message finish proposes
+│   ├── step-commit.ts    # intermediate convoy(<step>) messages with a Convoy-Run trailer
 │   ├── workspace.ts     # run dir, ~/.convoy home (CONVOY_HOME), global config/agents paths
 │   ├── runs.ts          # interactive run-history browser (convoy runs)
 │   ├── runs-tui.ts      # OpenTUI run-history browser rendering

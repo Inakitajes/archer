@@ -3,7 +3,7 @@ import { createTestRenderer } from "@opentui/core/testing"
 
 import { HomeLauncher, compactHomeMaxWidth, type HomeSelection } from "../src/home-tui"
 import { displayWidth } from "../src/tui-theme"
-import { versionDetails } from "../src/version"
+import { versionDetails, versionInfo } from "../src/version"
 
 import type { KeyEvent } from "@opentui/core"
 
@@ -57,7 +57,9 @@ test("wide home puts destinations on one row followed by the selected descriptio
     const strip = lines.findIndex((line) => line.includes("PIPELINES") && line.includes("SPECS"))
 
     expect(lines[0]!.trim()).toBe("")
-    expect(lines[1]).toContain(versionDetails())
+    expect(lines[1]!.trimEnd()).toEndWith(versionDetails())
+    expect(lines[1]).not.toContain("(")
+    expect(lines[1]).not.toContain(versionInfo.platform)
     expect(lines[1].trimStart()).toStartWith("████")
     expect(lines[2]).toContain("██")
     expect(lines[2]).toContain("/work/acme/convoy")
@@ -160,6 +162,9 @@ test("narrow home stacks destinations with balanced spacing and one description"
     expect(lines[2]).toContain("project  /work/acme/convoy")
     expect(lines[0]!.trim()).toBe("")
     expect(lines[1]).toContain("CONVOY")
+    expect(lines[1]!.trimEnd()).toEndWith(versionDetails())
+    expect(lines[1]).not.toContain("(")
+    expect(lines[1]).not.toContain(versionInfo.platform)
     expect(p).toBeGreaterThanOrEqual(0)
     expect(r).toBeGreaterThan(p)
     expect(r - p).toBeLessThan(4)
@@ -284,7 +289,7 @@ test("image selection and resize delete the old placement before drawing the nex
     const resized = writes.join("")
     expect(resized.indexOf("\x1b_Ga=d,d=i,i=101")).toBeGreaterThanOrEqual(0)
     expect(resized.indexOf("\x1b_Ga=p,i=101")).toBeGreaterThan(resized.indexOf("\x1b_Ga=d,d=i,i=101"))
-    // The shortened masthead build line lets the block wordmark fit at 80
+    // The version-only masthead line lets the block wordmark fit at 80
     // columns too, so the image keeps its row and only loses one row of height.
     expect(resized).toContain("\x1b[6;2H")
     expect(resized).toMatch(/\x1b_Ga=p,i=101[^;]*c=78,r=12/)

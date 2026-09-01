@@ -4,7 +4,7 @@ import { resolve } from "node:path"
 import type { Readable } from "node:stream"
 
 import { archiveChangeOnMain, runClose, type CloseEvent, type CloseInput, type CloseMessageProposal, type CloseResult, type CloseStep } from "./feature-close"
-import { stripControlBytes } from "./commit-message"
+import { stripControlBytes } from "./commit-text"
 import {
   applyCloseEvent,
   initialCloseChecklistState,

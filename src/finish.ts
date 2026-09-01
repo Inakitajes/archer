@@ -69,10 +69,12 @@ export function backupRefFor(branch: string) {
  * The range is anchored on authorship rather than on state persisted at run
  * time: agents are denied `git commit` outright (see bash-policy), so every
  * commit convoy is responsible for carries the convoy@local identity, including
- * the "apply manual iteration" commits from human review gates. Walking back
- * from HEAD while that holds therefore captures exactly this run's work, and
- * stops dead at the first commit the user wrote themselves — their history is
- * never rewritten.
+ * the run-linked commits from human review gates. Multiline bodies and
+ * `Convoy-Run` trailers do not participate in the walk — it reads subjects
+ * only — so run-linked step commits select exactly like legacy one-liners.
+ * Walking back from HEAD while that holds therefore captures exactly this
+ * run's work, and stops dead at the first commit the user wrote themselves —
+ * their history is never rewritten.
  *
  * The merge-base with the run's base ref floors the walk, which is what keeps a
  * repo convoy bootstrapped itself (whose root commit is authored by convoy)

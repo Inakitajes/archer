@@ -5,6 +5,8 @@ import { join } from "node:path"
 
 import { archiveChangeOnMain, closePreflight, resolveCloseTarget, runClose, type CloseEvent, type CloseInput } from "../src/feature-close"
 import { templateCommitMessage, type CommitMessageProposal } from "../src/commit-message"
+import { addAllAndCommit } from "../src/git"
+import { renderStepCommitMessage } from "../src/step-commit"
 
 const dirs: string[] = []
 
@@ -241,6 +243,35 @@ describe("runClose", () => {
     expect(body).toContain("change add-widget")
     // The worktree still exists until the operator accepts its removal.
     expect((await stat(fixture.worktreeDir)).isDirectory()).toBe(true)
+  })
+
+  test("run-linked multiline step commits squash exactly like legacy one-line commits", async () => {
+    const fixture = await makeFixture()
+    // An additional intermediate commit shaped like the runner's: semantic
+    // subject, detail bullets, and a `Convoy-Run` trailer authored by
+    // convoy@local. The authorship-anchored walk must fold it in unchanged.
+    await writeFile(join(fixture.worktreeDir, "extra.ts"), "export const extra = 2\n")
+    await addAllAndCommit(
+      renderStepCommitMessage({
+        runID: "20260101-000000-test",
+        step: "implementer",
+        description: { subject: "preserve report sessions across human gates", details: ["Keep handles alive during manual iteration"] },
+      }),
+      fixture.worktreeDir,
+    )
+
+    const result = await runTestClose(fixture)
+    expect(result.merged).toBe(true)
+    // Operator proposal + one-line convoy commit + run-linked commit + archive commit.
+    expect(result.squashed?.replaced).toBe(3)
+
+    const log = await git(fixture.mainDir, undefined, "log", "--format=%s", "main")
+    expect(log).toContain(fallbackSubject)
+    expect(log).toContain("feat(openspec): propose add-widget")
+    expect(log).not.toContain("convoy(implementer): preserve report sessions across human gates")
+    // The intermediate trailer is not copied into the user-authored commit.
+    const bodies = await git(fixture.mainDir, undefined, "log", "--format=%B", "main")
+    expect(bodies).not.toContain("Convoy-Run:")
   })
 
   test("the sequence is resumable: completed steps are not redone", async () => {
