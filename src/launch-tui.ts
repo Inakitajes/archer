@@ -24,7 +24,7 @@ import type { ConvoyConfig } from "./config"
 import type { WorktreeDefault } from "./git"
 import type { BoxOptions, CliRenderer, KeyEvent, PasteEvent, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
-import type { AgentSpec, AgentStep, HookSet, HookSpec, RunOptions, RunPlan, Step } from "./types"
+import type { AgentSpec, AgentStep, HookSet, HookSpec, ResolvedGoalPlan, RunOptions, RunPlan, Step } from "./types"
 import type { Hint, PaletteColor } from "./tui-theme"
 
 export type LaunchRunSelection = {
@@ -157,6 +157,22 @@ type HookNode = {
   when?: "failure" | "always"
 }
 
+// The goal cycle a scored pipeline will run, flattened for the preview the
+// way the review screen summarizes it: the stopping policy plus the improve
+// and measure fragments as step trees, so the launcher shows the loop's full
+// mutation/cost envelope before the operator ever leaves the pipeline list.
+export type GoalPreview = {
+  target: number
+  maxIterations: number
+  plateau: number
+  /** The improve step that alone receives the sanitized score brief. */
+  briefRecipient: string
+  /** The measure step whose deliverable contract is the authoritative machine-readable score. */
+  scoreProducer: string
+  improve: StepNode[]
+  measure: StepNode[]
+}
+
 export type PipelineChoice = {
   name: string
   description: string
@@ -166,8 +182,8 @@ export type PipelineChoice = {
   hooks: HookNode[]
   valid: boolean
   advisedSteps: number
-  /** True when the pipeline declares a valid terminal goal step: the only way a pipeline enters goal execution. */
-  scored: boolean
+  /** Present when the pipeline declares a valid terminal goal step: the goal cycle the preview and review both summarize. */
+  goal?: GoalPreview
   error?: string
   /** Prompt text to prefill when launching this pipeline without a prompt; undefined when the prompt stays mandatory. */
   defaultPrompt?: string
@@ -477,9 +493,10 @@ export function pipelineChoices(config: ConvoyConfig | undefined, agents: readon
         hooks,
         valid: true,
         advisedSteps: pipeline.steps.filter((step) => step.type === "agent" && Boolean(step.resolvedAdvisor ?? step.advisor)).length,
-        // Pipelines are classified directly by the presence of a valid terminal
-        // goal step: the resolver already validated its structure and roles.
-        scored: Boolean(pipeline.goalPlan),
+        // The goal cycle rides along when the pipeline declares a valid
+        // terminal goal step — the resolver already validated its structure
+        // and roles — so the preview can show the loop, not just the prefix.
+        ...(pipeline.goalPlan ? { goal: goalPreview(pipeline.goalPlan) } : {}),
         defaultPrompt: pipeline.defaultPrompt,
         suggestedPrompts: pipeline.suggestedPrompts,
         attachesPrdHistory: pipeline.steps.some((step) => step.type === "agent" && step.prdHistory),
@@ -494,7 +511,6 @@ export function pipelineChoices(config: ConvoyConfig | undefined, agents: readon
         hooks,
         valid: false,
         advisedSteps: 0,
-        scored: false,
         error: error instanceof Error ? error.message : String(error),
       }
     }
@@ -520,6 +536,19 @@ function stepNode(step: Step): StepNode {
     kind: "agent",
     modelLabel: launcherStepModelLabel(step),
     advisorLabel: advisor ? `${shortModelLabel(advisor)} advisor ×${cap}` : "",
+  }
+}
+
+/** Flattens a resolved goal plan into the preview shape: policy plus both fragments' step trees. */
+function goalPreview(plan: ResolvedGoalPlan): GoalPreview {
+  return {
+    target: plan.target,
+    maxIterations: plan.maxIterations,
+    plateau: plan.plateau,
+    briefRecipient: plan.briefRecipient,
+    scoreProducer: plan.scoreProducer,
+    improve: plan.improve.steps.map(stepNode),
+    measure: plan.measure.steps.map(stepNode),
   }
 }
 
@@ -1714,7 +1743,7 @@ export class LaunchPicker {
     this.render()
   }
 
-  /** Number of selectable rows in the options step: the gateway selector, the built-in toggles, and the goal row when the pipeline is scored. */
+  /** Number of selectable rows in the options step: the gateway selector and the built-in toggles. */
   private optionCount(): number {
     return 1 + toggles.length
   }
@@ -2001,6 +2030,13 @@ this.detailBox.title = reviewing ? " review " : " run setup "
       for (const line of stepTree(choice.steps, width)) lines.push(line)
       const agentSteps = choice.steps.filter((step) => step.kind === "agent").length
       lines.push(plain(""), t`${fg(theme.teal)(`Advisors: ${choice.advisedSteps}/${agentSteps} steps advised`)}`)
+      // The pipeline preview continues where the prefix ends: a scored
+      // pipeline's remaining shape is the goal loop, and this is the only
+      // launcher surface that shows it before Review.
+      if (choice.goal) {
+        lines.push(plain(""))
+        for (const line of goalLines(choice.goal, width)) lines.push(line)
+      }
     }
     this.pushHistoryNotice(lines, width, "picker")
     this.pushOpenSpecNotice(lines, width)
@@ -2917,6 +2953,35 @@ export function hookLines(hooks: readonly HookNode[], width: number): StyledText
     lines.push(new StyledText(chunks))
   }
   return lines
+}
+
+// Previews the selected scored pipeline's goal cycle the way the review
+// screen summarizes it: the stopping policy, then the measure and improve
+// fragments as indented step trees — measurement zero runs first, improve
+// rounds follow — so the loop's models and roles are visible before the
+// operator ever reaches Review. Exported pure, like stepTree and hookLines
+// beside it, for direct unit tests.
+export function goalLines(goal: GoalPreview, width: number): StyledText[] {
+  const indent = "  "
+  const measurements = 1 + goal.maxIterations
+  const policy = `target ${goal.target}/100 · up to ${counted(measurements, "measurement")} · plateau ${goal.plateau}`
+  const lines: StyledText[] = [
+    new StyledText([fg(theme.faint)("goal cycle"), fg(theme.faint)("  · "), fg(theme.dim)(truncate(policy, Math.max(6, width - 14)))]),
+  ]
+  const branch = (label: string, detail: string, steps: readonly StepNode[]) => {
+    const used = indent.length + label.length + 4
+    lines.push(new StyledText([fg(theme.faint)(`${indent}${label}`), fg(theme.faint)("  · "), fg(theme.dim)(truncate(detail, Math.max(6, width - used)))]))
+    // The fragment tree renders against the narrower inner width so the
+    // branch indent keeps every row inside the panel.
+    for (const line of stepTree(steps, width - indent.length)) lines.push(new StyledText([raw(indent), ...line.chunks]))
+  }
+  branch("measure", `${counted(goal.measure.length, "step")} · score from ${goal.scoreProducer}`, goal.measure)
+  branch("improve", `${counted(goal.improve.length, "step")} · brief goes to ${goal.briefRecipient}`, goal.improve)
+  return lines
+}
+
+function counted(n: number, noun: string) {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`
 }
 
 function fitNameWithModel(stepName: string, model: string, width: number) {
