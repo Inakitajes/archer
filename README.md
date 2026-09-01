@@ -29,7 +29,7 @@ Typical uses:
 
 Use it as a **CLI** or as a **TUI**, interchangeably: every run can be launched with plain flags and prompt files (`--no-tui` gives you plain logs for pipes and CI), or driven entirely from the TUI — `convoy` with no arguments opens a home launcher for **Pipelines**, **Specs**, **Runs**, and **Config**, and every run gets a live dashboard.
 
-**Pipelines are data, not code.** Convoy ships ten built-in pipelines (`implement` — the default — plus `implement-lite`, `ship`, `fixer`, `goal-fix`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere — in `.convoy/config.yaml`.
+**Pipelines are data, not code.** Convoy ships nine built-in pipelines (`implement` — the default — plus `implement-lite`, `ship`, `fixer`, and the report-only `review`, `review-lite`, `review-cc`, `hunter`, and `hunter-max`; see [Built-in pipelines](#built-in-pipelines)), and a project can define its own — any number of steps, its own agents, its own models, with named human gates anywhere, and an embedded terminal `goal` step for quality-loop pipelines — in `.convoy/config.yaml`.
 
 Beyond sequencing agents, Convoy owns the operational layer around OpenCode: repo context attachment, runtime guard rails, a live permission gate, commit safety, phase reports, diff tracking, and a TUI that shows cost, tokens, and provider limits while the run is live.
 
@@ -81,9 +81,8 @@ You write the plan, `implement` turns it into something functional, you shape it
 |---|---|---|
 | `implement` | yes | **The default** (runs with no `-p`). Implement a PRD with an **advised** implementation phase — Terra xhigh writes and consults Sol xhigh at its decision points — then audit, polish, test, and adversarial review (the table above), and close with a one-page extractive recap of the whole run (`reports/run-report.md`). Does not score: that is `ship`'s job. |
 | `implement-lite` | yes | `implement`'s shape on low-cost models: DeepSeek V4 Flash 0731 writes, Grok 4.6 advises the implementer and polishes design, GLM 5.3 runs the audits, and `adversarial` runs on GLM 5.3. The advisor is the last thing to go, because it is what makes a cheap implementer worth running. Ends with the same run recap — the recap is already the cheapest step in the pipeline. |
-| `ship` | yes | **The close of the cycle.** A `sync` phase merges the advanced base branch in and resolves the conflicts — real and semantic — so what gets graded is the branch as it will actually merge. Then two independent quality-scorers grade it against the rubric and a consensus step reconciles and verifies. `ship` declares `goal: 85` in its own spec, so the fix/re-score loop runs **without you passing `--goal`**: it keeps closing gaps until the score clears 85, plateaus, or hits the iteration cap. See [Quality scoring](#quality-scoring) and [Goal mode](#goal-mode). Two things it expects from your config, because both are machine-local: `permissions.allow` entries for `git merge*`, `git add*` and `git checkout --ours*`/`--theirs*` (without them those commands fall through to "ask" rather than failing), and, optionally, `hooks.pipelines.ship` to fetch the base beforehand and open the PR afterwards — Convoy never runs remote git itself. Post-hooks receive `CONVOY_GOAL_REACHED`, so the PR step can require the bar was actually met. |
+| `ship` | yes | **The close of the cycle.** A `sync` phase merges the advanced base branch in and resolves the conflicts — real and semantic — so what gets graded is the branch as it will actually merge. Then two independent quality-scorers grade it against the rubric and a consensus step reconciles and verifies. `ship` ends in a terminal `goal` step that declares `target: 85` and embeds its own improve/measure fragments, so the improve/re-score loop runs **without any flag**: it keeps closing gaps until the score clears 85, plateaus, or hits the iteration cap. See [Quality scoring](#quality-scoring) and [Goal mode](#goal-mode). Two things it expects from your config, because both are machine-local: `permissions.allow` entries for `git merge*`, `git add*` and `git checkout --ours*`/`--theirs*` (without them those commands fall through to "ask" rather than failing), and, optionally, `hooks.pipelines.ship` to fetch the base beforehand and open the PR afterwards — Convoy never runs remote git itself. Post-hooks receive `CONVOY_GOAL_REACHED`, so the PR step can require the bar was actually met. |
 | `fixer` | yes | The follow-up to a report-only run. Give it a set of findings (as the prompt or an attachment) and it proves each one with a focused regression test **before** touching production code, applies minimal fixes only for the findings that actually went red, then independently reruns those proofs and the surrounding checks to report a final per-finding verdict (`fixed`, `already-resolved`, `not-reproducible`, `not-automatable`, `blocked`, `not-fixed`). The validation phase runs the commands itself (see [verifying steps](#project-configuration-convoyconfigyaml)) rather than taking the fix phase's word for it, and never promotes an unproven finding to fixed. |
-| `goal-fix` | yes | The goal loop's fix iteration: applies exactly the gaps the previous scoring round reported, then re-scores. Not run directly — `ship`'s goal, or an explicit `--goal`, drives it. See [Goal mode](#goal-mode). |
 | `review` | **no — report only** | Scope the diff (attaching the branch's original PRD when Convoy has one), run the bug / clean-code(+patterns) / security audits **in parallel across two models each**, synthesize one prioritized findings report, then **measure**: two independent quality-scorers grade the same diff against the rubric and a consensus step reconciles and verifies. The deliverables are `reports/report.md` and the machine-readable score in `reports/score-report.md`. Makes no changes. |
 | `review-lite` | **no — report only** | Same shape as `review`, but nothing runs on Opus: `openrouter/z-ai/glm-5.3#high` scopes and reconciles the score, DeepSeek V4 Flash 0731 writes the report, and the audit and scorer fan-outs pair GLM 5.3 with `openrouter/x-ai/grok-4.6#high`. The cheap way to get a full review and a number. |
 | `review-cc` | **no — report only** | `review`'s audits, but each is paired with a second run on the locally installed [`claude` CLI](https://code.claude.com) (`runner: claude-code`) instead of a second API model — cross-vendor diversity billed to a Claude subscription rather than per token. Ends at the findings report rather than a score: its point is a second opinion from a different vendor, not a measurement. Requires `claude` on `PATH`. |
@@ -242,33 +241,72 @@ Push, worktree removal, and branch deletion are separate, deliberate offers — 
 
 Goal mode answers the "when is it enough?" question mechanically: **don't stop until the branch scores at or above a target**, or until the score stops improving.
 
-`ship` declares `goal: 85` in its own spec, so this is simply what `ship` does — no flag required:
+A pipeline enters goal execution if and only if its definition contains one terminal `goal` step — the pipeline's last step. There are no goal CLI flags, no launcher toggle, and no separate `goal-fix` pipeline: the policy belongs to the pipeline, where it is reviewed and preflighted as part of the plan you confirm. The step owns its target, its stopping policy, and the two subflows that do the fixing and the measuring:
+
+```yaml
+pipelines:
+  ship:
+    steps:
+      - agent: sync-with-base
+        name: sync
+        reports: none
+
+      - goal:
+          target: 85          # required, 1–100
+          maxIterations: 3    # default 3: improvement rounds after iteration zero
+          plateau: 3          # default 3: stop when an improvement adds fewer points
+
+          improve:            # writable directed-fix subflow
+            briefStep: fix    # exactly one step; it alone receives the score brief
+            steps:
+              - agent: goal-fixer
+                name: fix
+                reports: none
+                diff: true
+                prdHistory: true
+
+          measure:            # read-only scoring subflow
+            steps:
+              - parallel:
+                  - agent: quality-scorer
+                    name: score
+                    models: [openrouter/x-ai/grok-4.6#high, openrouter/z-ai/glm-5.3#high]
+                    reports: none
+                    prdHistory: true
+              - agent: quality-score-report
+                name: score-report
+                reports: [score]
+                verify: true
+                prdHistory: true
+```
+
+This is the whole embedded shape of the built-in `ship`, so with `ship` this is simply what happens — no flag required:
 
 ```bash
-convoy -p ship "what this branch does"          # loops to 85
-convoy -p ship "..." --goal 92                  # the flag overrides the pipeline's target
+convoy -p ship "what this branch does"          # measure, improve, re-measure until 85
 ```
 
-Each iteration is a full run in the same worktree, so the diff accumulates:
+Execution is measure-first and bounded:
 
 ```
-Iteration 0:  sync → SCORERS → consensus                                 score 71
-Iteration 1:  goal-fix (exactly the reported gaps) → SCORERS → consensus  score 86  ✅
+Iteration 0:  sync → SCORERS → consensus                                  score 71
+Iteration 1:  improve (exactly the reported gaps) → SCORERS → consensus   score 86  ✅
 ```
 
-- The **goal-fixer** receives only the previous scoring round's work order — the score, the per-dimension gaps, and the must-fix findings — as a per-step phase brief. Its job is to close exactly those gaps and nothing else: no new scope, no speculative improvements, no restructuring.
-- The re-scorers are **blind to the previous score**: the brief goes to the goal-fixer step only, so a re-score cannot anchor on the number it is supposed to measure.
+- **Fragments are internal.** `improve` and `measure` are fragments of the owning pipeline's plan, not selectable pipelines: they never appear in the launcher, `--only`/`--skip` cannot target them, and they are not retryable or resumable as standalone pipelines. Validation reads declared structure and deliverable contracts — never reserved names — so a custom goal can name its repair step and its consensus step anything, as long as the improve fragment can edit the repository and the measure fragment is read-only and ends in exactly one machine-readable quality-score deliverable (set `deliverable: quality-score` on an arbitrarily named consensus step).
+- The **brief recipient** receives only the previous measurement's work order — the score, the per-dimension gaps, and the must-fix findings, sanitized and capped — as a per-step brief. Its job is to close exactly those gaps and nothing else: no new scope, no speculative improvements, no restructuring.
+- The re-scorers are **blind to the previous score**: the brief goes to the configured brief step only, and every fragment invocation resolves with an empty report namespace, so a measurement cannot read the previous measurement's or the improvement's reports. A measurement that needs more evidence collects it inside its own fragment.
 - The loop stops when any of these happens:
-  1. **Score ≥ goal** — done.
-  2. **Plateau** — a fix iteration improved the score by less than `--goal-plateau` points (default 3): it keeps reporting "you can do better", but the measurement says it isn't.
-  3. **Iteration cap** — `--goal-max-iterations` (default 3) is exhausted.
-  4. A run fails or produces no parseable score.
+  1. **Score ≥ target** — done.
+  2. **Plateau** — an improvement round raised the score by fewer than `plateau` points (default 3): it keeps reporting "you can do better", but the measurement says it isn't.
+  3. **Iteration cap** — `maxIterations` improvement rounds (default 3) are exhausted.
+  4. A fragment fails or a measurement produces no parseable score.
 
-Flags: `--goal <1-100>`, `--goal-max-iterations <n>`, `--goal-plateau <n>`. The same values can live on a pipeline in `.convoy/config.yaml` (`goal:`, `goalMaxIterations:`, `goalPlateau:`) — which is exactly how the built-in `ship` sets its target — and the CLI flags override them. Goal mode requires a pipeline that both ends in a `quality-score-report` step and has at least one writable step: `ship` qualifies; `implement` (no score) and `review`/`review-lite` (report-only, no writable step) will each refuse `--goal` with a clear error, because the goal-fixer edits the repository.
+Legacy goal configuration — pipeline-level scalar `goal:`, `goalMaxIterations:`, `goalPlateau:`, or a top-level `pipelines.goal-fix` entry — no longer loads: Convoy refuses it with one aggregated diagnostic naming every legacy path and printing a copyable terminal-goal-step skeleton that preserves your target and stopping values. Nothing is silently converted, and your file is never rewritten. The name `goal-fix` is reserved.
 
-Goal mode is a bounded loop, not an open cheque: the plateau and the iteration cap exist precisely so the loop cannot chase a score forever. If it stops below the goal, the branch is left at the best measured state and the final score report tells you what is still missing.
+Goal mode is a bounded loop, not an open cheque: the plateau and the iteration cap exist precisely so the loop cannot chase a score forever. If it stops below the target, the branch is left at the best measured state and the final score report tells you what is still missing.
 
-**The loop finishing is not the same as the goal being met.** A run that plateaus or exhausts its iterations below the target still ends successfully — it did what it was asked, it just could not get there. Post-hooks are therefore run **once, after the whole loop**, and receive `CONVOY_GOAL_REACHED` (`true`/`false`), `CONVOY_GOAL_SCORE` and `CONVOY_GOAL_TARGET`, so a hook that opens a pull request can require the bar was actually cleared:
+**The loop finishing is not the same as the goal being met.** A run that plateaus or exhausts its iterations below the target still ends successfully — it did what it was asked, it just could not get there. Post-hooks are therefore run **once, after the whole cycle**, and receive `CONVOY_GOAL_REACHED` (`true`/`false`), `CONVOY_GOAL_SCORE` and `CONVOY_GOAL_TARGET`, so a hook that opens a pull request can require the bar was actually cleared:
 
 ```yaml
 hooks:
@@ -284,7 +322,7 @@ hooks:
             fi
 ```
 
-The dashboard is one screen for the whole loop: it never remounts between iterations. The header shows the goal, the current iteration, and the trajectory (`◆ convoy · goal 90 · iter 2/4 · 71 → …`), the feed announces each new iteration (`goal loop: iteration 2/4 · last 71/100`), and the pipeline panel retitles itself to the pipeline actually running (`pipeline · goal-fix`). When the loop ends — goal met, plateau, iteration cap, no score, or a failure — the dashboard holds its finish screen **once**, with the verdict in place of the live goal readout (`✓ goal 92/100`, `plateau 86/100`, `cap 88/100`, `no score`, or `✗ run failed`) and the full trajectory (`71 → 84 → 92`); the terminal prints the trajectory and why it stopped after the dashboard closes.
+The dashboard shows the goal, the current iteration, and the trajectory (`◆ convoy · goal 90 · iter 2/4 · 71 → …`), and when the cycle ends — goal met, plateau, iteration cap, no score, or a failure — the dashboard holds its finish screen **once**, with the verdict in place of the live goal readout (`✓ goal 92/100`, `plateau 86/100`, `cap 88/100`, `no score`, or `✗ run failed`) and the full trajectory (`71 → 84 → 92`); the terminal prints the trajectory and why it stopped after the dashboard closes. Goal fragment phases appear under the parent pipeline with their iteration-qualified names (for example `goal-measure-1-score-report`); the whole cycle runs in one run, so the dashboard never remounts between rounds.
 
 ## Requirements
 
@@ -720,7 +758,7 @@ The rules:
 - **Conventions over wiring**: every agent step gets the PRD, the cumulative diff against the base branch (except the first step; opt out with `diff: false`), and the previous step's report (`reports: previous|all|none|[names]`). Its report lands at `reports/<step>.md`; writable steps commit repository changes as `convoy(<step>): …`, while read-only steps verify that the repository stayed unchanged.
 - **Aliases**: the built-in agents answer to their short names in steps — `patterns`, `security`, `design`, `tests`, `adversarial`, `run-report` — as well as their full names.
 - **Read-only agents**: set `agents.<name>.readOnly: true` to enforce audit-only behavior. Convoy disables the agent's write/edit/bash tools, denies edit/bash/task permissions, saves the phase report from the assistant response if the agent cannot write it directly, and checks the clean Git baseline before finalizing. If Git-visible files, HEAD, or the active branch change during the step, Convoy fails without committing or deleting anything; the changes stay intact for the user to inspect and resolve.
-- **Verifying steps**: add `verify: true` on a **step** (not on the agent) to hand a read-only step bash back under the same policy writable agents get. Allowlisted project test/typecheck/lint scripts run silently; the hard denylist (`git push`, `sudo`, installs, …) stays deny — OpenCode rejects those before the gate, and `--yolo` cannot approve them. It exists because a validator that cannot run anything can only restate what earlier phases claimed. Built-in pipelines set it on the steps that need it: `scope` in `review` / `review-lite` / `review-cc`, `score-report` in `review` / `review-lite` / `ship` / `goal-fix`, and `validation` in `fixer`. Project pipelines that use `review-validator` or `implementation-validator` must set `verify: true` on those steps themselves. Write and edit tools stay disabled and the clean-baseline check above still runs, so a verifying step that changes the repository fails like any other read-only one. Two caveats worth knowing: bash can write through shell redirection, so "doesn't write" is enforced by the Git baseline rather than by the tool list, and anything Git ignores (build caches, coverage output) is invisible to that check. `verify` is ignored unless the agent is `readOnly`, and it is dropped for steps forced read-only by `parallel:` or `models:`, where concurrent agents would fight over one working tree. Not available on `runner: claude-code` steps, whose tool envelope excludes Bash.
+- **Verifying steps**: add `verify: true` on a **step** (not on the agent) to hand a read-only step bash back under the same policy writable agents get. Allowlisted project test/typecheck/lint scripts run silently; the hard denylist (`git push`, `sudo`, installs, …) stays deny — OpenCode rejects those before the gate, and `--yolo` cannot approve them. It exists because a validator that cannot run anything can only restate what earlier phases claimed. Built-in pipelines set it on the steps that need it: `scope` in `review` / `review-lite` / `review-cc`, `score-report` in `review` / `review-lite` / `ship`, including `ship`'s embedded goal measure, and `validation` in `fixer`. Project pipelines that use `review-validator` or `implementation-validator` must set `verify: true` on those steps themselves. Write and edit tools stay disabled and the clean-baseline check above still runs, so a verifying step that changes the repository fails like any other read-only one. Two caveats worth knowing: bash can write through shell redirection, so "doesn't write" is enforced by the Git baseline rather than by the tool list, and anything Git ignores (build caches, coverage output) is invisible to that check. `verify` is ignored unless the agent is `readOnly`, and it is dropped for steps forced read-only by `parallel:` or `models:`, where concurrent agents would fight over one working tree. Not available on `runner: claude-code` steps, whose tool envelope excludes Bash.
 - **Human steps**: use `type: human` with optional `name` and `description` to insert an interactive gate. The old `human-review` string still works as a legacy shorthand, but named `type: human` steps are preferred for planning, QA, approval, or any other human checkpoint.
 - **Advisor steps**: set `advisor: <provider/model[#variant]>` on a step to give its executor a stronger reviewing model, consulted at decision points without ever running tools or producing the deliverable. The point is that the cheap model keeps the loop and the whole transcript — the advisor reads that transcript verbatim, so nothing is re-serialized across a handoff and no intent is lost, which is the failure mode of plan-then-execute pipelines. It is consulted at three moments: **before the phase's first write** (Convoy holds that edit, consults, and hands back the advice mid-turn), **before the phase is accepted as done** (the advisor reviews the finished work and can send the phase one more turn in the same session), and **on demand** through an `advisor` tool the executor calls when it is stuck or about to commit to an approach. Precedence mirrors models: step `advisor` > agent `advisor` > `defaults.advisor`, with `advisor: false` opting one step out of a broader default and no built-in fallback, so a config that doesn't ask for an advisor costs exactly what it costs today. `--advisor <model>` and `--no-advisor` force either end for a whole run, which is how you compare executor-only, executor+advisor, and advisor-only over one unmodified pipeline. Advisor output is capped (a synthetic `convoy-advisor-*` model alias overrides only `limit.output`, inheriting real credentials and pricing from the model it names) and its spend is reported separately in `SUMMARY.md` as an executor/advisor token split — if the advisor's share of output is not small, the pattern is wired backwards. Every request, completion/failure, delivery, exhausted budget, and `advisor_feedback` adoption decision is appended to the private `events/advisor.jsonl` journal and shown in the phase's **advisor** dashboard tab. `defaults.advisorAuditPolicy` controls content retention: `summary` stores hashes and lengths, `redacted` stores lengths only, and `full` is explicit opt-in to store content. Every advisor failure degrades rather than failing the phase. Not available on `runner: claude-code` steps, which own their own loop.
 - **Claude Code steps**: set `runner: claude-code` on an audit step to execute it with the locally installed [`claude` CLI](https://code.claude.com) instead of an OpenCode session, authenticated by whatever that install already uses — a Claude subscription login or an API key. This is how subscription users get genuine cross-vendor diversity in review pipelines without paying per token. The optional `model` accepts `opus`, `sonnet`, `haiku`, a `claude-*` ID, or the equivalent `anthropic/claude-*` form; omit it to use the CLI default. Convoy launches Claude with `--safe-mode`, disabling repository/user customizations such as `CLAUDE.md`, skills, plugins, hooks, and MCP servers, and exposes only the built-in read/search tools within the target and attached directories. Git-visible file, commit, or branch changes still fail the step but are left intact rather than deleted. Claude Code steps can't fan out across `models:` and stream their thinking/output/tool calls into the dashboard like any other step; their private raw event stream is written incrementally to `logs/<step>.<attempt>.claude.jsonl`, including failed attempts. Once a step finishes, `[o]` reopens its session interactively via `claude --resume --safe-mode` with the same tool envelope and full context. Claude Code is an **optional dependency**: only a pipeline that actually contains such a step requires the CLI, checked fail-fast at launch.

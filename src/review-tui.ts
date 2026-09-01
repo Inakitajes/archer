@@ -71,13 +71,15 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   pushStepRows(rows, plan, width)
   rows.push(plain(""))
 
-  // Goal mode is a bounded loop the operator is consenting to in full: the
-  // initial run plus up to maxIterations fix runs of the writable goal-fix
-  // pipeline. Surface it before confirmation so the cost/mutation envelope is
+  // The goal cycle is a bounded loop the operator is consenting to in full:
+  // iteration-zero measurement plus up to maxIterations improve/measure
+  // rounds. Surface it before confirmation so the cost/mutation envelope is
   // explicit in the TUI review, not just the headless plan.
   if (plan.goal) {
-    rows.push(labelRow("goal", [fg(theme.text)(`target ${plan.goal.target}/100 · up to ${plan.goal.maxIterations} fix iterations · plateau ${plan.goal.plateau}`)]))
-    rows.push(continuation([fg(theme.dim)(`fix pipeline ${sanitizeReviewInline(plan.goal.fixPipeline.name)} · writable goal-fixer + re-scorers`)]))
+    const measurements = 1 + plan.goal.maxIterations
+    rows.push(labelRow("goal", [fg(theme.text)(`target ${plan.goal.target}/100 · up to ${counted(measurements, "measurement")} · plateau ${plan.goal.plateau}`)]))
+    rows.push(continuation([fg(theme.faint)("improve "), fg(theme.dim)(`${counted(plan.goal.improve.steps.length, "step")} · brief goes to ${sanitizeReviewInline(plan.goal.briefRecipient)}`)]))
+    rows.push(continuation([fg(theme.faint)("measure "), fg(theme.dim)(`${counted(plan.goal.measure.steps.length, "step")} · score from ${sanitizeReviewInline(plan.goal.scoreProducer)}`)]))
     rows.push(plain(""))
   }
 
@@ -237,6 +239,10 @@ function labelRow(label: string, value: TextChunk[]): StyledText {
 
 function continuation(value: TextChunk[], indent = labelWidth): StyledText {
   return new StyledText([raw(" ".repeat(indent)), ...value])
+}
+
+function counted(n: number, noun: string) {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`
 }
 
 function displayPath(path: string): string {

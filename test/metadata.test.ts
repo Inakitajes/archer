@@ -164,6 +164,61 @@ describe("readRunMetadata", () => {
     }
   })
 
+  test("round-trips a schema-v4 goal record with its complete goal state", async () => {
+    const { dir, cleanup } = await withDir("v4goal")
+    const path = `${dir}/metadata.json`
+    const goal = {
+      target: 90,
+      maxIterations: 3,
+      plateau: 3,
+      iteration: 1,
+      stage: "complete" as const,
+      scores: [
+        { score: 71, dimensions: { prd: 60, tests: 70, security: 90, maintainability: 80, operational: 85, scope: 80 }, verdict: "not-ready", mustFix: [] },
+        { score: 92, dimensions: { prd: 92, tests: 88, security: 95, maintainability: 90, operational: 94, scope: 90 }, verdict: "ready-with-caveats" as const, mustFix: ["SC-1"], gaps: { prd: "more tests" } },
+      ],
+      bestScore: 92,
+      outcome: "goal",
+      restored: false,
+    }
+    await Bun.write(
+      path,
+      JSON.stringify({ schemaVersion: 4, runID: "run-goal", targetDir: "/repo", createdAt: 1, updatedAt: 2, control: { state: "running" }, phases: {}, goal }),
+    )
+    try {
+      const result = await readRunMetadata(path)
+      expect(result).toBeDefined()
+      expect(result!.schemaVersion).toBe(4)
+      expect(result!.goal).toBeDefined()
+      expect(result!.goal!.target).toBe(90)
+      expect(result!.goal!.stage).toBe("complete")
+      expect(result!.goal!.outcome).toBe("goal")
+      expect(result!.goal!.bestScore).toBe(92)
+      // Complete QualityScore objects, not just numbers: the trajectory and the
+      // next improve brief can be rebuilt from the durable record.
+      expect(result!.goal!.scores).toHaveLength(2)
+      expect(result!.goal!.scores[0]!.score).toBe(71)
+      expect(result!.goal!.scores[1]!.dimensions.prd).toBe(92)
+      expect(result!.goal!.scores[1]!.mustFix).toEqual(["SC-1"])
+      expect(result!.goal!.scores.map((entry) => entry.score)).toEqual([71, 92])
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("a schema-v4 record without a goal member reads as a plain run with no goal state", async () => {
+    const { dir, cleanup } = await withDir("v4nogoal")
+    const path = `${dir}/metadata.json`
+    await Bun.write(path, JSON.stringify({ schemaVersion: 4, runID: "run-plain", targetDir: "/repo", createdAt: 1, updatedAt: 2, control: { state: "running" }, phases: { a: { status: "completed" } } }))
+    try {
+      const result = await readRunMetadata(path)
+      expect(result!.schemaVersion).toBe(4)
+      expect(result!.goal).toBeUndefined()
+    } finally {
+      await cleanup()
+    }
+  })
+
   test("preserves pausing control state", async () => {
     const { dir, cleanup } = await withDir("pausing")
     const path = `${dir}/metadata.json`
@@ -556,6 +611,37 @@ describe("openRunMetadata", () => {
     }
   })
 
+  test("checkpointGoal persists a durable goal record across reopen", async () => {
+    const { dir, ws, cleanup } = await withDir("goal-state")
+    const store = await openRunMetadata(ws, "/target", validPipeline([validAgentStep("design")]))
+    expect(store.goalState()).toBeUndefined()
+    await store.checkpointGoal({
+      target: 90,
+      maxIterations: 3,
+      plateau: 3,
+      iteration: 1,
+      stage: "measure",
+      scores: [{ score: 71, dimensions: { prd: 60, tests: 70, security: 90, maintainability: 80, operational: 85, scope: 80 }, verdict: "not-ready", mustFix: [] }],
+      bestScore: 71,
+    })
+    try {
+      const raw = await readRunMetadata(`${dir}/metadata.json`)
+      expect(raw!.schemaVersion).toBe(4)
+      expect(raw!.goal).toBeDefined()
+      expect(raw!.goal!.stage).toBe("measure")
+      expect(raw!.goal!.iteration).toBe(1)
+      expect(raw!.goal!.scores[0]!.score).toBe(71)
+      expect(raw!.goal!.bestScore).toBe(71)
+      // A reopened store exposes the same durable record: resume derives its
+      // next action from it rather than reconstructing a child pipeline.
+      const reopened = await openRunMetadata(ws, "/target", validPipeline([validAgentStep("design")]))
+      expect(reopened.goalState()!.scores.map((entry) => entry.score)).toEqual([71])
+      expect(reopened.goalState()!.stage).toBe("measure")
+    } finally {
+      await cleanup()
+    }
+  })
+
   test("assertSafePipelineArtifacts: rejects null steps", async () => {
     const { ws, cleanup } = await withDir("err1")
     const bad = { name: "bad", steps: null } as unknown as Pipeline
@@ -704,6 +790,8 @@ describe("recordProgress", () => {
       pipeline: validPipeline([]),
       snapshot: () => undefined,
       phaseStatus: () => undefined,
+      goalState: () => undefined,
+      checkpointGoal: () => Promise.resolve(),
       serverStarted: (url: string) => { storeCalls.push(`serverStarted(${url})`) },
       serverStopped: () => Promise.resolve(),
       phaseStarted: (name: string) => { storeCalls.push(`phaseStarted(${name})`); return Promise.resolve() },

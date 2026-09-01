@@ -68,7 +68,7 @@ function launcherChoices() {
   ]
 }
 
-async function createPicker(options: { presetFeature?: typeof feature; insideWorktree?: { dir: string; branch?: string }; isolateDefault?: boolean }) {
+async function createPicker(options: { presetFeature?: typeof feature; insideWorktree?: { dir: string; branch?: string }; isolateDefault?: boolean; dirtReader?: (dir: string) => Promise<string> }) {
   const testRenderer = await createTestRenderer({ width: 120, height: 40 })
   const picker = new LaunchPicker(
     testRenderer.renderer,
@@ -76,7 +76,10 @@ async function createPicker(options: { presetFeature?: typeof feature; insideWor
     launcherChoices(),
     "configured",
     { isolate: options.isolateDefault ?? true, reason: "test" },
-    {} as never,
+    {
+      // Default to a clean tree so scripted readers are the only dirt source.
+      readDirtyStatus: options.dirtReader ?? (async () => ""),
+    } as never,
     { enabled: true, entries: [] },
     [{ id: feature.changeID, title: "Add foo" }],
     [],
@@ -163,5 +166,45 @@ describe("detectInsideWorktree", () => {
     const inside = await detectInsideWorktree(worktreeDir)
     expect(inside?.dir).toBe(worktreeDir)
     expect(inside?.branch).toBe("feat/add-foo")
+  })
+})
+
+describe("the continue handoff's dirty preflight", () => {
+  test("dirt in the feature worktree drives the notice and the counted toggle, reading the worktree itself", async () => {
+    const dirty = " M leftover.ts\n"
+    const dirsRead: string[] = []
+    const session = await createPicker({
+      presetFeature: feature,
+      dirtReader: async (dir) => {
+        dirsRead.push(dir)
+        return dirty
+      },
+    })
+    try {
+      const view = session.picker as unknown as PickerView & { mode: string; refreshDirt(): Promise<void> }
+      view.mode = "options"
+      await view.refreshDirt()
+      await session.renderOnce()
+      // The execution dir is the preset worktree (D1), not the launcher's cwd.
+      expect(dirsRead).toEqual([feature.worktreeDir])
+      const chunks = view.optionsDetail(120).chunks.map((chunk) => chunk.text).join("")
+      expect(chunks).toContain("1 file uncommitted")
+      expect(chunks).toContain("Include dirty tree (1 uncommitted)")
+    } finally {
+      await closePicker(session)
+    }
+  })
+
+  test("a clean feature worktree stays quiet", async () => {
+    const session = await createPicker({ presetFeature: feature })
+    try {
+      const view = session.picker as unknown as PickerView & { mode: string; refreshDirt(): Promise<void> }
+      view.mode = "options"
+      await view.refreshDirt()
+      await session.renderOnce()
+      expect(view.optionsDetail(120).chunks.map((chunk) => chunk.text).join("")).not.toContain("uncommitted")
+    } finally {
+      await closePicker(session)
+    }
   })
 })

@@ -1466,11 +1466,11 @@ describe("goal loop header", () => {
           { name: "fix", description: "" },
           { name: "score__gpt", description: "" },
         ],
-        { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "goal-fix", steps: [] } },
+        { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "fixer", steps: [] } },
       )
       await renderOnce()
       const frame = captureCharFrame()
-      expect(frame).toContain("pipeline · goal-fix")
+      expect(frame).toContain("pipeline · fixer")
       expect(frame).toContain("fix")
       expect(frame).toContain("score__gpt")
     } finally {
@@ -1486,7 +1486,7 @@ describe("goal loop header", () => {
       await renderOnce()
       expect(captureCharFrame()).toContain("$1.82")
 
-      dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "goal-fix", steps: [] } })
+      dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "fixer", steps: [] } })
       await renderOnce()
       const frame = captureCharFrame()
       expect(frame).toContain("$1.82")
@@ -1505,7 +1505,7 @@ describe("goal loop header", () => {
       // The header clock (under the status word) has advanced past zero.
       expect(captureCharFrame()).not.toContain("0:00")
 
-      dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "goal-fix", steps: [] } })
+      dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "fixer", steps: [] } })
       await renderOnce()
       // The clock kept running from the loop's start rather than the new run's.
       expect(captureCharFrame()).not.toContain("0:00")

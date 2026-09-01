@@ -106,6 +106,31 @@ describe("renderRunPlan", () => {
     expect(output).toContain("1 attachments")
   })
 
+  test("renders the goal cycle consent envelope in compact and full plans", () => {
+    // The headless review names the bounded loop the operator is consenting to:
+    // iteration-zero measurement plus up to maxIterations improve/measure rounds,
+    // the plateau, the brief recipient, and the authoritative score step.
+    const plan = samplePlan({
+      goal: {
+        target: 85,
+        maxIterations: 2,
+        plateau: 3,
+        briefRecipient: "fix",
+        scoreProducer: "arbiter",
+        improve: { steps: [] },
+        measure: { steps: [] },
+      },
+    })
+
+    const compact = renderRunPlan(plan, true)
+    expect(compact).toContain("Goal cycle: target 85/100 · up to 3 measurements (2 improve rounds) · plateau 3")
+
+    const full = renderRunPlan(plan, false)
+    expect(full).toContain("Goal cycle: target 85/100 · up to 3 measurements (2 improve rounds) · plateau 3")
+    expect(full).toContain("Improve: 0 steps · brief goes to fix")
+    expect(full).toContain("Measure: 0 steps · authoritative score from arbiter")
+  })
+
   test("renders a smart judge when present", () => {
     const plan = samplePlan()
     plan.smartJudge = {

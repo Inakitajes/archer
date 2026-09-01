@@ -175,12 +175,6 @@ export type RunOutcome = {
   /** The goal loop's score trajectory including this run, oldest first; absent when not in goal mode. */
   goalTrajectory?: number[]
   /**
-   * Another goal-loop iteration will follow this run. The runner suppresses the
-   * finish-screen hold so the loop runs unattended instead of waiting on a
-   * keypress between iterations.
-   */
-  goalContinues?: boolean
-  /**
    * The goal loop's live view, copied onto the hold so the finish screen keeps
    * the verdict and trajectory the header painted. Absent outside goal mode.
    */

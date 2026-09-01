@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:tes
 import { parseAndRun, parseArgs, parseCommand, resolveRunOptions } from "../src/cli"
 import { addWorktree } from "../src/git"
 import { stepNames } from "../src/pipeline"
+import type { RunMetadata } from "../src/metadata"
 import type { AgentStep } from "../src/types"
 
 const dirs: string[] = []
@@ -258,6 +259,61 @@ describe("CLI semantic regression coverage", () => {
     expect(resumed.options.gateway).toBe("openrouter")
     expect(resumed.options.plan?.prompt.source).toBe("resume")
     expect(resumed.options.worktree).toBe(false)
+  })
+
+  test("resume of a legacy schema-v3 goal-fix record is refused before any plan is built", async () => {
+    // The retired goal-fix child-run host recorded schema-v3 metadata with a
+    // plain "goal-fix" pipeline (no terminal goal step). Replaying it as a
+    // resume would start an unbriefed improvement flow; the guard must refuse
+    // before buildReviewedPlan can construct a runnable plan. If the guard is
+    // removed, parseCommand resolves a runnable plan and this test fails.
+    const dir = await projectWithQuickPipeline()
+    const runID = "20260519-103145-x7q3"
+    const runDir = join(process.env.CONVOY_HOME!, ".convoy", "runs", runID)
+    await mkdir(runDir, { recursive: true })
+    await writeFile(
+      join(runDir, "metadata.json"),
+      JSON.stringify({
+        schemaVersion: 3,
+        runID,
+        targetDir: dir,
+        createdAt: 0,
+        updatedAt: 0,
+        control: { state: "running" },
+        phases: { fix: { status: "completed" } },
+        pipeline: {
+          name: "goal-fix",
+          steps: [
+            { type: "agent", name: "fix", stepName: "fix", agentName: "goal-fixer", description: "Fix", model: "m", inputFiles: [], inputDiff: true, reportPath: "reports/fix.md", groupId: "g1" },
+            { type: "agent", name: "score-report", stepName: "score-report", agentName: "quality-score-report", description: "Consensus", model: "m", inputFiles: [], inputDiff: true, reportPath: "reports/score-report.md", groupId: "g2", readOnly: true },
+          ],
+        },
+      }),
+    )
+    await writeFile(join(runDir, "prd.md"), "legacy goal-fix prompt")
+
+    await expect(parseCommand(["--dir", dir, "--resume", runID])).rejects.toThrow(/legacy goal-fix/)
+  })
+
+  test("the resumed-run guard also refuses a retry of a legacy goal-fix record", async () => {
+    // `retryOptions` runs the same `assertResumableRun` guard before rebuilding
+    // a plan: a retry of a legacy record would run an unbriefed fix pipeline
+    // from step zero. Exercise the shared guard under retry semantics.
+    const { assertResumableRun } = await import("../src/cli")
+    const legacy: RunMetadata = {
+      schemaVersion: 3,
+      runID: "20260519-103245-x7q4",
+      targetDir: "/tmp/repo",
+      createdAt: 0,
+      updatedAt: 0,
+      control: { state: "running" },
+      phases: {},
+      pipeline: { name: "goal-fix", steps: [] },
+    }
+    expect(() => assertResumableRun(legacy, legacy.runID, { retry: true })).toThrow(/legacy goal-fix|unbriefed/)
+    expect(() => assertResumableRun(legacy, legacy.runID)).toThrow(/legacy goal-fix|unbriefed/)
+    // Non-goal-fix records stay continuable.
+    expect(() => assertResumableRun({ ...legacy, pipeline: { name: "ship", steps: [] } }, legacy.runID)).not.toThrow()
   })
 
   test("validates step filters against the resolved pipeline", async () => {

@@ -5,15 +5,17 @@
  * The scorer agents emit a fenced `quality-score` JSON block at the end of
  * their report. This module validates that block, computes the canonical
  * weighted total from the dimensions and weights in code, and derives the
- * verdict. The goal loop (--goal) reads this from reports/score-report.md to
- * decide whether to keep iterating, so the score is a control signal computed
- * here — never an agent-supplied number taken on faith.
+ * verdict. The embedded goal scheduler reads this from the promoted
+ * reports/score-report.md to decide whether to keep iterating, so the score is
+ * a control signal computed here — never an agent-supplied number taken on
+ * faith.
  */
 
 import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import { log } from "./log"
+import type { DeliverableContract } from "./types"
 
 export const qualityDimensions = ["prd", "tests", "security", "maintainability", "operational", "scope"] as const
 
@@ -32,7 +34,7 @@ export type QualityScore = {
   verdict: QualityScoreVerdict
   /** Findings that must be resolved before merge, each prefixed by its finding id and tagged with its absolute severity. */
   mustFix: string[]
-  /** Concrete actions that would raise the score, one per weak dimension; the goal-fix loop acts on these. */
+  /** Concrete actions that would raise the score, one per weak dimension; the goal cycle's improve fragment acts on these. */
   gaps?: Partial<Record<QualityDimension, string>>
   confidence?: "high" | "medium" | "low"
 }
@@ -135,11 +137,20 @@ export function qualityVerdict(score: number): QualityScoreVerdict {
   return "failing"
 }
 
-/** The pipeline's authoritative scorer step, when it has one: the step running the quality-score-report agent. */
+/**
+ * The pipeline's authoritative scorer step, when it has one. The contract is
+ * what makes a step authoritative — a goal measure fragment may end in an
+ * arbitrarily named step whose `deliverable: quality-score` override produces
+ * the machine-readable score — so the quality-score deliverable contract wins,
+ * with the `quality-score-report` agent identity kept as the fallback for
+ * steps resolved before deliverable contracts were persisted (legacy metadata).
+ */
 export function consensusStep(
-  pipeline: { steps: readonly { type: string; agentName?: string; reportPath?: string }[] },
+  pipeline: { steps: readonly { type: string; agentName?: string; reportPath?: string; deliverableContract?: DeliverableContract }[] },
 ): { type: string; agentName?: string; reportPath: string } | undefined {
-  const step = pipeline.steps.find((candidate) => candidate.type === "agent" && candidate.agentName === "quality-score-report")
+  const step =
+    pipeline.steps.find((candidate) => candidate.type === "agent" && candidate.deliverableContract?.kind === "quality-score-report") ??
+    pipeline.steps.find((candidate) => candidate.type === "agent" && candidate.agentName === "quality-score-report")
   return step && step.reportPath ? { ...step, reportPath: step.reportPath } : undefined
 }
 

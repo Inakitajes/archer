@@ -3,11 +3,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { overallStatus, reconcileAdvisorJournal, replayHistory } from "../src/attach-runtime"
+import { goalLoopViewFrom, overallStatus, reconcileAdvisorJournal, replayHistory } from "../src/attach-runtime"
 import { noopProgress } from "../src/progress"
 
 import type { AdvisorEvent } from "../src/advisor-events"
-import type { PhaseMetadata, RunMetadata } from "../src/metadata"
+import type { GoalRunState, PhaseMetadata, RunMetadata } from "../src/metadata"
+import type { QualityScore } from "../src/quality-score"
 import type { ProgressPhaseSnapshot, ProgressUI } from "../src/progress"
 
 const dirs: string[] = []
@@ -23,6 +24,10 @@ function metadata(phases: Record<string, PhaseMetadata>): RunMetadata {
     control: { state: "running" },
     phases,
   }
+}
+
+function score(value: number): QualityScore {
+  return { score: value, dimensions: { prd: 0, tests: 0, security: 0, maintainability: 0, operational: 0, scope: 0 }, verdict: "ready-with-caveats", mustFix: [], gaps: {} }
 }
 
 test("overall status requires every recorded phase to finish cleanly", () => {
@@ -51,6 +56,51 @@ test("history replay restores sessions and maps interrupted phases to failed", (
     ["design", expect.objectContaining({ status: "completed", sessionID: "ses-design", cost: 0.1 })],
     ["build", expect.objectContaining({ status: "failed", sessionID: "ses-build" })],
   ])
+})
+
+test("goalLoopViewFrom reconstructs the dashboard's goal view from the durable record", () => {
+  expect(goalLoopViewFrom(undefined)).toBeUndefined()
+
+  const goal: GoalRunState = {
+    target: 90,
+    maxIterations: 3,
+    plateau: 3,
+    iteration: 2,
+    stage: "complete",
+    scores: [score(71), score(92)],
+    bestScore: 92,
+    outcome: "goal",
+    restored: false,
+  }
+  expect(goalLoopViewFrom(goal)).toEqual({
+    target: 90,
+    iteration: 2,
+    maxRuns: 4,
+    plateau: 3,
+    scores: [71, 92],
+    outcome: { reason: "goal", reached: true, restored: false },
+  })
+})
+
+test("goalLoopViewFrom maps every settled outcome to the dashboard verdict", () => {
+  const base: GoalRunState = { target: 85, maxIterations: 3, plateau: 3, iteration: 1, stage: "complete", scores: [score(71), score(84)], bestScore: 84 }
+  expect(goalLoopViewFrom({ ...base, outcome: "plateau", restored: true })?.outcome).toEqual({
+    reason: "plateau",
+    reached: false,
+    restored: true,
+  })
+  expect(goalLoopViewFrom({ ...base, outcome: "max-iterations" })?.outcome).toEqual({
+    reason: "max-iterations",
+    reached: false,
+    restored: false,
+  })
+  expect(goalLoopViewFrom({ ...base, outcome: "no-score" })?.outcome).toEqual({
+    reason: "no-score",
+    reached: false,
+    restored: false,
+  })
+  // A "failed" record left the cycle un-settled: no verdict is shown.
+  expect(goalLoopViewFrom({ ...base, outcome: "failed" })?.outcome).toBeUndefined()
 })
 
 test("advisor journal reconciliation restores events missing from metadata", async () => {

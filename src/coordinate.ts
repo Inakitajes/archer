@@ -4,8 +4,6 @@ import { join, resolve, sep } from "node:path"
 
 import { startControlServer } from "./control-server"
 import { ControlProgress, type ControlProgressOptions } from "./control-progress"
-import { runGoalLoop, type GoalLoopConfig } from "./goal-loop"
-import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { pidAlive } from "./runs"
 import { hostedTeardownFromError, isUserAbortError, run } from "./runner"
 import { isOfficialStandaloneExecutable } from "./update"
@@ -15,7 +13,7 @@ import type { RunOptions, RunPlan } from "./types"
 /**
  * The coordinator split: a production CLI run writes a launch file and spawns
  * a detached `--coordinate` process; that process serves the control server and
- * runs `run()` / `runGoalLoop()` with a ControlProgress adapter instead of a
+ * runs `run()` with a ControlProgress adapter instead of a
  * TUI. The ready file is the parent's handshake that the control plane is up.
  */
 
@@ -24,8 +22,6 @@ export type LaunchFile = {
   /** The full reviewed run options minus functions (progress is stripped). */
   options: RunOptions
   plan?: RunPlan
-  /** Goal-loop config when goal mode is on; the loop stays in the coordinator. */
-  goal?: GoalLoopConfig
 }
 
 export type PendingLaunch = {
@@ -56,13 +52,12 @@ export function pendingRoot(): string {
 }
 
 /** Strips functions so the launch payload survives JSON round-tripping. */
-export function launchPayload(options: RunOptions, plan: RunPlan | undefined, goal: GoalLoopConfig | undefined): LaunchFile {
+export function launchPayload(options: RunOptions, plan: RunPlan | undefined): LaunchFile {
   const { progress: _progress, ...rest } = options
   return {
     schemaVersion: 1,
     options: rest,
     ...(plan ? { plan } : {}),
-    ...(goal ? { goal } : {}),
   }
 }
 
@@ -279,13 +274,12 @@ export function assertInternalLaunchPath(launchPath: string, root = pendingRoot(
 }
 
 /**
- * Injected dependencies for `runCoordinateBoot`. Tests replace `run` /
- * `runGoalLoop` so the boot contract (release, finish hold, error teardown)
- * can be asserted without spawning a real pipeline.
+ * Injected dependencies for `runCoordinateBoot`. Tests replace `run` so the
+ * boot contract (release, finish hold, error teardown) can be asserted without
+ * spawning a real pipeline.
  */
 export type CoordinateBootDeps = {
   run: typeof run
-  runGoalLoop: typeof runGoalLoop
   startControlServer: typeof startControlServer
   createProgress: (options: ControlProgressOptions) => ControlProgress
   hostedTeardownFromError: typeof hostedTeardownFromError
@@ -295,7 +289,6 @@ export type CoordinateBootDeps = {
 
 const defaultCoordinateBootDeps: CoordinateBootDeps = {
   run,
-  runGoalLoop,
   startControlServer,
   createProgress: (options) => new ControlProgress(options),
   hostedTeardownFromError,
@@ -335,15 +328,10 @@ export async function runCoordinateBoot(
     // metadata.server gains the control URL (no token) for liveness/debug.
     process.env.CONVOY_CONTROL_URL = server.url
 
-    if (launch.goal) {
-      const config: GoalLoopConfig = {
-        goal: launch.goal.goal,
-        maxIterations: launch.goal.maxIterations ?? defaultGoalMaxIterations,
-        plateau: launch.goal.plateau ?? defaultGoalPlateau,
-      }
-      await deps.runGoalLoop(options, plan, config)
-      return 0
-    }
+    // run() owns the whole cycle: when the reviewed pipeline declares a
+    // terminal goal step, it executes the prefix, measurement zero, and the
+    // bounded improve/measure rounds inside this one run — one workspace, one
+    // metadata store, one server, one hook lifecycle, one finish hold.
     try {
       const result = await deps.run(options)
       await progress.runFinished({ status: "completed", runDir: result.dir })

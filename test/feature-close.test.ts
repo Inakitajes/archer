@@ -149,6 +149,7 @@ const closeInput = (fixture: Fixture) => ({
 })
 
 const originalPath = process.env.PATH
+const originalConvoyHome = process.env.CONVOY_HOME
 
 beforeAll(async () => {
   // The OpenSpec CLI double leads PATH so `runClose` never shells out to the
@@ -166,7 +167,11 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  delete process.env.CONVOY_HOME
+  // Restore rather than delete: the preload sets CONVOY_HOME for the whole
+  // process, and dropping it would expose the operator's real home to
+  // later test files.
+  if (originalConvoyHome === undefined) delete process.env.CONVOY_HOME
+  else process.env.CONVOY_HOME = originalConvoyHome
   // The fake bin dir must not leak into other test files sharing this process.
   if (originalPath !== undefined) process.env.PATH = originalPath
   await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))

@@ -22,6 +22,7 @@ import {
   humanStepType,
   humanReviewStep,
   isHumanStepSpec,
+  isGoalStepSpec,
   isSafeStepName,
   readOnlyAgentSuffix,
   resolvePipeline,
@@ -315,11 +316,11 @@ defaults:
 #                        and a one-page extractive recap of the whole run (reports/run-report.md)
 #   implement-lite       like implement, but the code-writing phase drops to DeepSeek V4 Flash 0731 (Grok 4.6 advises)
 #   ship                 the close: merge the advanced base in (resolving conflicts), score the merged
-#                        result against the rubric, and loop until it clears 85/100
+#                        result against the rubric, and loop until it clears 85/100 (its terminal
+#                        goal step owns the improve/re-score cycle)
 #                        wants permissions.allow: git merge*, git add*, git checkout --ours*|--theirs*
 #                        and, optionally, hooks.pipelines.ship to fetch the base first / open the PR after
 #                        (post-hooks get CONVOY_GOAL_REACHED, so the PR step can require the bar was met)
-#   goal-fix             the goal loop's fix iteration (not run directly; ship's goal or --goal drives it)
 #   fixer                turn a list of findings into proven regression tests, minimal fixes, and a verdict each
 #   review               report-only: parallel audits across two models, one prioritized report, then a verified score
 #   review-lite          like review, but every phase runs on GLM 5.3 / DeepSeek V4 Flash 0731 / Grok 4.6 instead of Opus
@@ -517,6 +518,11 @@ export function parseConvoyConfig(body: string, source: string, targetDir: strin
   v.knownKeys(root, "", ["version", "defaults", "agents", "pipelines", "permissions", "hooks", "attachments", "notifications", "modelRouting", "loopGuard"])
 
   if (root.version !== undefined && root.version !== 1) v.fail("version", `unsupported value ${JSON.stringify(root.version)}; this convoy reads version 1`)
+
+  // Legacy goal configuration is refused before anything else validates, so a
+  // legacy scalar or goal-fix pipeline can never load, run, or be silently
+  // converted — and every legacy path is named in one diagnostic.
+  rejectLegacyGoalConfig(source, root)
 
   if (root.defaults !== undefined && root.defaults !== null) config.defaults = validateDefaults(v, root.defaults)
   if (root.agents !== undefined) config.agents = validateAgents(v, root.agents, targetDir)
@@ -718,7 +724,7 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
   for (const [name, value] of Object.entries(record)) {
     const path = `pipelines.${name}`
     const entry = v.record(value, path)
-    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "goal", "goalMaxIterations", "goalPlateau", "defaultPrompt", "suggestedPrompts", "steps"])
+    v.knownKeys(entry, path, ["description", "maxConcurrentAgents", "defaultPrompt", "suggestedPrompts", "steps"])
 
     if (!Array.isArray(entry.steps) || entry.steps.length === 0) v.fail(`${path}.steps`, "must be a non-empty list of steps")
     const steps = (entry.steps as unknown[]).map((step, index) => validateStep(v, step, `${path}.steps[${index}]`))
@@ -742,9 +748,6 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
     pipelines[name] = {
       ...(entry.description !== undefined ? { description: v.nonEmptyString(entry.description, `${path}.description`) } : {}),
       ...(entry.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: v.positiveInt(entry.maxConcurrentAgents, `${path}.maxConcurrentAgents`) } : {}),
-      ...(entry.goal !== undefined ? { goal: validatePipelineGoal(v, entry.goal, `${path}.goal`) } : {}),
-      ...(entry.goalMaxIterations !== undefined ? { goalMaxIterations: v.positiveInt(entry.goalMaxIterations, `${path}.goalMaxIterations`) } : {}),
-      ...(entry.goalPlateau !== undefined ? { goalPlateau: v.positiveInt(entry.goalPlateau, `${path}.goalPlateau`) } : {}),
       ...(defaultPrompt !== undefined ? { defaultPrompt } : {}),
       ...(suggestedPrompts !== undefined && suggestedPrompts.length > 0 ? { suggestedPrompts } : {}),
       steps,
@@ -753,12 +756,87 @@ function validatePipelines(v: Validator, raw: unknown): Record<string, PipelineS
   return pipelines
 }
 
-/** A pipeline's configured goal lives in the same 1–100 range the CLI enforces: 0 would make the goal loop a no-op. */
-function validatePipelineGoal(v: Validator, raw: unknown, path: string): number {
-  return v.rangeInt(raw, path, 1, 100)
+type StepContext = { insideParallel?: boolean; insideGoalFragment?: boolean }
+
+/**
+ * Scans the raw pipelines mapping for every legacy goal shape — pipeline-level
+ * scalar `goal`/`goalMaxIterations`/`goalPlateau`, and a top-level pipeline
+ * named `goal-fix` — and fails the load with one aggregated diagnostic that
+ * names every path and prints a copyable terminal-goal-step skeleton. It never
+ * writes or mutates the operator's file: the skeleton is advisory text only.
+ */
+function rejectLegacyGoalConfig(source: string, root: Record<string, unknown>): void {
+  const pipelines = root.pipelines
+  if (!pipelines || typeof pipelines !== "object" || Array.isArray(pipelines)) return
+
+  const paths: string[] = []
+  const scalarOwners: { name: string; entry: Record<string, unknown> }[] = []
+  let goalFixSteps: unknown
+  for (const [name, value] of Object.entries(pipelines as Record<string, unknown>)) {
+    if (name === "goal-fix") {
+      paths.push(`pipelines.goal-fix — a top-level "goal-fix" pipeline is reserved; declare its steps inside the owning pipeline's terminal goal step`)
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const entry = value as Record<string, unknown>
+        if (Array.isArray(entry.steps)) goalFixSteps = entry.steps
+      }
+      continue
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue
+    const entry = value as Record<string, unknown>
+    const scalars = (["goal", "goalMaxIterations", "goalPlateau"] as const).filter((key) => entry[key] !== undefined)
+    if (scalars.length > 0) {
+      paths.push(...scalars.map((key) => `pipelines.${name}.${key} — goal policy belongs in a terminal \`goal\` step`))
+      scalarOwners.push({ name, entry })
+    }
+  }
+  if (paths.length === 0) return
+
+  const skeletonOwners = scalarOwners.length > 0 ? scalarOwners : [{ name: "<your-pipeline>", entry: {} as Record<string, unknown> }]
+  const skeletons = skeletonOwners.map(({ name, entry }) => {
+    const target = typeof entry.goal === "number" ? entry.goal : "<1-100>"
+    const maxIterations = typeof entry.goalMaxIterations === "number" ? entry.goalMaxIterations : 3
+    const plateau = typeof entry.goalPlateau === "number" ? entry.goalPlateau : 3
+    const lines = [
+      `  pipelines:`,
+      `    ${name}:`,
+      `      # the terminal goal step must be the pipeline's final step`,
+      `      steps:`,
+      `        # ...keep the pipeline's ordinary steps here...`,
+      `        - goal:`,
+      `            target: ${target}`,
+      `            maxIterations: ${maxIterations}`,
+      `            plateau: ${plateau}`,
+      `            improve:`,
+      `              briefStep: fix # the improve step that alone receives the score brief`,
+      `              steps:`,
+      `                - # your directed-fix step(s), able to modify the repository`,
+      `            measure:`,
+      `              steps:`,
+      `                - # read-only scoring steps ending in exactly one quality-score deliverable`,
+    ]
+    if (goalFixSteps !== undefined) {
+      lines.push(`        # source material from pipelines.goal-fix — split these between improve and measure yourself:`)
+      for (const line of Bun.YAML.stringify(goalFixSteps).trimEnd().split("\n")) {
+        lines.push(`        # ${line}`)
+      }
+    }
+    return lines.join("\n")
+  })
+
+  throw new ConfigError(
+    [
+      `${source}: legacy goal configuration can no longer run and must migrate to the embedded goal step:`,
+      ...paths.map((path) => `  - ${path}`),
+      "",
+      "Goal mode is enabled exclusively by a terminal `goal` step (the pipeline's last step);",
+      "there are no goal CLI flags and no separate goal-fix pipeline. Equivalent skeleton:",
+      "",
+      ...skeletons,
+    ].join("\n"),
+  )
 }
 
-function validateStep(v: Validator, raw: unknown, path: string, context: { insideParallel?: boolean } = {}): StepSpec {
+function validateStep(v: Validator, raw: unknown, path: string, context: StepContext = {}): StepSpec {
   if (typeof raw === "string") {
     if (!raw.trim()) v.fail(path, "step name can't be empty")
     if (!isSafeStepName(raw)) v.fail(path, "must be a filesystem-safe identifier using letters, numbers, hyphens, or underscores")
@@ -768,16 +846,60 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
 
   const record = v.record(raw, path)
 
+  if ("goal" in record) {
+    if (context.insideParallel) v.fail(path, "goal steps can't run inside a parallel block")
+    if (context.insideGoalFragment) v.fail(path, "goal steps can't nest inside a goal fragment")
+    v.knownKeys(record, path, ["goal"])
+    const node = v.record(record.goal, `${path}.goal`)
+    v.knownKeys(node, `${path}.goal`, ["target", "maxIterations", "plateau", "improve", "measure"])
+    if (node.target === undefined) v.fail(`${path}.goal.target`, "is required: an integer from 1 through 100")
+    const target = v.rangeInt(node.target, `${path}.goal.target`, 1, 100)
+    const maxIterations = node.maxIterations !== undefined ? v.positiveInt(node.maxIterations, `${path}.goal.maxIterations`) : undefined
+    const plateau = node.plateau !== undefined ? v.positiveInt(node.plateau, `${path}.goal.plateau`) : undefined
+
+    const fragmentSteps = (value: unknown, fragmentPath: string): StepSpec[] => {
+      const fragment = v.record(value, fragmentPath)
+      if (!Array.isArray(fragment.steps) || fragment.steps.length === 0) {
+        v.fail(`${fragmentPath}.steps`, "must be a non-empty list of steps")
+      }
+      return (fragment.steps as unknown[]).map((step, index) => validateStep(v, step, `${fragmentPath}.steps[${index}]`, { insideGoalFragment: true }))
+    }
+
+    if (node.improve === undefined) v.fail(`${path}.goal.improve`, "is required: a mapping with briefStep and steps")
+    const improve = v.record(node.improve, `${path}.goal.improve`)
+    v.knownKeys(improve, `${path}.goal.improve`, ["briefStep", "steps"])
+    const briefStep = v.nonEmptyString(improve.briefStep, `${path}.goal.improve.briefStep`)
+    const improveSteps = fragmentSteps(node.improve, `${path}.goal.improve`)
+
+    if (node.measure === undefined) v.fail(`${path}.goal.measure`, "is required: { steps }")
+    const measure = v.record(node.measure, `${path}.goal.measure`)
+    v.knownKeys(measure, `${path}.goal.measure`, ["steps"])
+    const measureSteps = fragmentSteps(node.measure, `${path}.goal.measure`)
+
+    return {
+      goal: {
+        target,
+        ...(maxIterations !== undefined ? { maxIterations } : {}),
+        ...(plateau !== undefined ? { plateau } : {}),
+        improve: { briefStep, steps: improveSteps },
+        measure: { steps: measureSteps },
+      },
+    }
+  }
+
   if ("parallel" in record) {
     if (context.insideParallel) v.fail(path, "parallel blocks can't be nested")
     v.knownKeys(record, path, ["parallel"])
     if (!Array.isArray(record.parallel) || record.parallel.length === 0) v.fail(`${path}.parallel`, "must be a non-empty list of steps")
-    const members = (record.parallel as unknown[]).map((step, index) => validateStep(v, step, `${path}.parallel[${index}]`, { insideParallel: true }))
+    const members = (record.parallel as unknown[]).map((step, index) =>
+      validateStep(v, step, `${path}.parallel[${index}]`, { insideParallel: true, ...(context.insideGoalFragment ? { insideGoalFragment: true } : {}) }),
+    )
     return { parallel: members as (string | AgentStepSpec)[] }
   }
 
   if ("type" in record) {
     if (context.insideParallel) v.fail(path, "human steps can't run inside a parallel block")
+    if (context.insideGoalFragment) v.fail(path, "human steps can't run inside a goal fragment")
     v.knownKeys(record, path, ["type", "name", "description"])
     if (record.type !== humanStepType) v.fail(`${path}.type`, `must be "${humanStepType}"`)
     const step: HumanStepSpec = { type: humanStepType }
@@ -786,7 +908,7 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
     return step
   }
 
-  v.knownKeys(record, path, ["agent", "name", "model", "models", "runner", "advisor", "advisorMaxCalls", "maxAttempts", "reports", "diff", "verify", "prdHistory"])
+  v.knownKeys(record, path, ["agent", "name", "model", "models", "runner", "advisor", "advisorMaxCalls", "maxAttempts", "reports", "diff", "verify", "prdHistory", "deliverable"])
 
   const agent = validateStepName(v, record.agent, `${path}.agent`)
   if (context.insideParallel && agent === humanReviewStep) v.fail(path, `"${humanReviewStep}" can't run inside a parallel block`)
@@ -831,7 +953,14 @@ function validateStep(v: Validator, raw: unknown, path: string, context: { insid
     ...(record.diff !== undefined ? { diff: v.boolean(record.diff, `${path}.diff`) } : {}),
     ...(record.verify !== undefined ? { verify: v.boolean(record.verify, `${path}.verify`) } : {}),
     ...(record.prdHistory !== undefined ? { prdHistory: v.boolean(record.prdHistory, `${path}.prdHistory`) } : {}),
+    ...(record.deliverable !== undefined ? { deliverable: validateDeliverable(v, record.deliverable, `${path}.deliverable`) } : {}),
   }
+}
+
+/** The only explicit deliverable override: an arbitrarily named step can produce the machine-readable score a measure fragment ends in. */
+function validateDeliverable(v: Validator, raw: unknown, path: string): "quality-score" | "markdown" {
+  if (raw !== "quality-score" && raw !== "markdown") v.fail(path, `must be "quality-score" or "markdown"`)
+  return raw
 }
 
 function validateStepName(v: Validator, raw: unknown, path: string): string {
@@ -1061,15 +1190,12 @@ export function defaultConfigTemplate(): ConvoyConfig {
  */
 export function materializePipelineSpec(spec: PipelineSpec, effectiveDefaultModel?: string): PipelineSpec {
   const steps = spec.steps.map<StepSpec>((raw) => materializeStep(raw, effectiveDefaultModel))
-  // The goal settings travel with the copy: `ship` carries its target in its
-  // spec, so dropping them here would turn "customize this built-in" into
-  // "silently disable its loop".
+  // The terminal goal step travels with the copy, fragments included: `ship`
+  // carries its target and subflows in its spec, so dropping them here would
+  // turn "customize this built-in" into "silently disable its loop".
   return {
     ...(spec.description ? { description: spec.description } : {}),
     ...(spec.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: spec.maxConcurrentAgents } : {}),
-    ...(spec.goal !== undefined ? { goal: spec.goal } : {}),
-    ...(spec.goalMaxIterations !== undefined ? { goalMaxIterations: spec.goalMaxIterations } : {}),
-    ...(spec.goalPlateau !== undefined ? { goalPlateau: spec.goalPlateau } : {}),
     ...(spec.defaultPrompt ? { defaultPrompt: spec.defaultPrompt } : {}),
     ...(spec.suggestedPrompts?.length ? { suggestedPrompts: [...spec.suggestedPrompts] } : {}),
     steps,
@@ -1081,6 +1207,15 @@ function materializeStep(raw: StepSpec, effectiveDefaultModel: string | undefine
     return { parallel: raw.parallel.map((inner) => materializeStep(inner, effectiveDefaultModel) as string | AgentStepSpec) }
   }
   if (isHumanStepSpec(raw)) return structuredClone(raw)
+  if (isGoalStepSpec(raw)) {
+    return {
+      goal: {
+        ...structuredClone(raw.goal),
+        improve: { ...structuredClone(raw.goal.improve), steps: raw.goal.improve.steps.map((step) => materializeStep(step, effectiveDefaultModel)) },
+        measure: { steps: raw.goal.measure.steps.map((step) => materializeStep(step, effectiveDefaultModel)) },
+      },
+    }
+  }
   if (typeof raw === "string") return raw === humanReviewStep ? raw : materializeAgentStep({ agent: raw }, effectiveDefaultModel)
   if (raw.agent === humanReviewStep) return raw.agent
   return materializeAgentStep(structuredClone(raw), effectiveDefaultModel)

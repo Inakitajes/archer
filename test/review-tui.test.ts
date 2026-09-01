@@ -118,6 +118,42 @@ describe("run review TUI", () => {
     expect(lines.some((line) => line.includes("runtime  smart permissions · 2 attachments · judge openrouter/openai/gpt-5.6-terra#xhigh"))).toBe(true)
   })
 
+  test("renders the terminal goal block as immutable policy, not a toggle", () => {
+    // A goal pipeline's review must surface the bounded consent envelope — the
+    // target, the measurement count (1 + iterations), the plateau, and both
+    // fragments — as part of the plan, with no goal-mode switch anywhere.
+    const plan = planWith(
+      [agentStep({ name: "sync", stepName: "sync", groupId: "g1", resolvedModel: resolved("openai/gpt-5.6-sol", "openai/gpt-5.6-sol") })],
+      {
+        goal: {
+          target: 85,
+          maxIterations: 2,
+          plateau: 3,
+          briefRecipient: "fix",
+          scoreProducer: "arbiter",
+          improve: {
+            steps: [agentStep({ name: "fix", stepName: "fix", groupId: "improve-g1", resolvedModel: resolved("openai/gpt-5.6-sol", "openai/gpt-5.6-sol") })],
+          },
+          measure: {
+            steps: [
+              agentStep({ name: "score", stepName: "score", groupId: "measure-g1", readOnly: true, resolvedModel: resolved("openai/gpt-5.6-sol", "openai/gpt-5.6-sol") }),
+              agentStep({ name: "arbiter", stepName: "arbiter", groupId: "measure-g2", readOnly: true, resolvedModel: resolved("openai/gpt-5.6-sol", "openai/gpt-5.6-sol") }),
+            ],
+          },
+        },
+      },
+    )
+
+    const lines = plain(runReviewLines(plan, 100))
+
+    expect(lines.some((line) => line.includes("goal     target 85/100 · up to 3 measurements · plateau 3"))).toBe(true)
+    expect(lines.some((line) => line.includes("improve 1 step · brief goes to fix"))).toBe(true)
+    expect(lines.some((line) => line.includes("measure 2 steps · score from arbiter"))).toBe(true)
+    // The fragment steps are internal: they render in the goal block, not as
+    // selectable pipeline rows that could be filtered or reordered.
+    expect(lines.some((line) => line.includes("score · read-only"))).toBe(false)
+  })
+
   test("renders an OpenRouter Nitro gateway with the throughput note and the plain remap target", () => {
     const plan = planWith(
       [agentStep({ name: "implementer", stepName: "implementer", groupId: "g1", resolvedModel: resolved("zai/glm-5.2#xhigh", "openrouter/z-ai/glm-5.2#xhigh", "nitro") })],

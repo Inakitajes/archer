@@ -1,5 +1,6 @@
 import { normalizeStepRunnerModel, stepRunnerFor } from "./step-runners"
-import type { AgentSpec, AgentStep, DeliverableContract, HumanStep, Pipeline, Step, StepRunner } from "./types"
+import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
+import type { AgentSpec, AgentStep, DeliverableContract, HumanStep, Pipeline, ResolvedGoalPlan, ResolvedPipelineFragment, Step, StepRunner } from "./types"
 
 export const defaultGptModel = "openai/gpt-5.6-terra"
 export const defaultGptVariant = "xhigh"
@@ -16,7 +17,7 @@ const opusViaOpenRouter = "openrouter/anthropic/claude-opus-5"
 /** Grok 4.6 high: the default design and adversarial pass, and the second leg of every review/ship fan-out. */
 const grokModel = "openrouter/x-ai/grok-4.6#high"
 const kimiModel = "openrouter/moonshotai/kimi-k3"
-/** DeepSeek V4 Flash 0731 on OpenRouter: the cheap implementer for `implement-lite`, review-lite's report, and goal-fix's fixer. */
+/** DeepSeek V4 Flash 0731 on OpenRouter: the cheap implementer for `implement-lite`, review-lite's report, and ship's goal fixer. */
 const deepseekModel = "openrouter/deepseek/deepseek-v4-flash-0731"
 /** DeepSeek V4 Flash on OpenRouter with reasoning raised: same model the user's `modelRouting.overrides` maps local NaN to. */
 const deepseekHighModel = `${deepseekModel}#high`
@@ -368,6 +369,46 @@ export type AgentStepSpec = {
   verify?: boolean
   /** Attach the original branch PRD from the project's history when available. */
   prdHistory?: boolean
+  /**
+   * Overrides the deliverable contract inferred from the agent: the only way
+   * an arbitrarily named agent can produce the machine-readable quality score
+   * a measure fragment must end in. Validation reads this contract, never the
+   * agent or step name.
+   */
+  deliverable?: "quality-score" | "markdown"
+}
+
+/** The improve fragment: a writable directed-fix subflow that names its brief recipient by step name. */
+export type GoalImproveSpec = {
+  /** Exactly one improve agent step must carry this (explicit or derived) name; it alone receives the score brief. */
+  briefStep: string
+  steps: StepSpec[]
+}
+
+/** The measure fragment: a read-only scoring subflow ending in one quality-score deliverable. */
+export type GoalMeasureSpec = {
+  steps: StepSpec[]
+}
+
+/**
+ * The terminal control node that exclusively enables goal execution. Target is
+ * required (1–100); maxIterations/plateau default to three. Placement and
+ * fragment roles are validated by pipeline resolution, not by agent names.
+ */
+export type GoalStepSpec = {
+  goal: {
+    target: number
+    maxIterations?: number
+    plateau?: number
+    improve: GoalImproveSpec
+    measure: GoalMeasureSpec
+  }
+}
+
+export type StepSpec = string | AgentStepSpec | HumanStepSpec | ParallelStepSpec | GoalStepSpec
+
+export function isGoalStepSpec(raw: StepSpec): raw is GoalStepSpec {
+  return typeof raw === "object" && raw !== null && !isParallelSpec(raw) && "goal" in raw
 }
 
 export type HumanStepSpec = {
@@ -383,8 +424,6 @@ export type ParallelStepSpec = {
   parallel: (string | AgentStepSpec)[]
 }
 
-export type StepSpec = string | AgentStepSpec | HumanStepSpec | ParallelStepSpec
-
 export type PipelineSpec = {
   description?: string
   /**
@@ -393,15 +432,6 @@ export type PipelineSpec = {
    * loses to the `--max-concurrent` CLI flag. Unset inherits the defaults chain.
    */
   maxConcurrentAgents?: number
-  /**
-   * Goal loop: keep fixing until the quality score reaches this value (1–100).
-   * Requires the pipeline to end in a quality-score-report step. CLI --goal wins.
-   */
-  goal?: number
-  /** Goal loop: cap on fix iterations after the initial run. CLI --goal-max-iterations wins. */
-  goalMaxIterations?: number
-  /** Goal loop: stop when a fix iteration improves the score by less than this many points. CLI --goal-plateau wins. */
-  goalPlateau?: number
   /**
    * Prompt text used when the pipeline runs without an explicit prompt: the
    * TUI prefills its prompt field with it and the CLI falls back to it. Set on
@@ -474,32 +504,6 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
       { agent: "run-report", model: defaultRunReportModel, advisor: false, reports: "all", diff: false },
     ],
   },
-  // The goal loop's fix iteration: applies exactly the gaps the previous
-  // scoring round reported (delivered as a per-step phase brief on the fixer),
-  // then re-scores with the same independent scorer fan-out and consensus. The
-  // loop keeps the same worktree, so the diff accumulates; nothing here is run
-  // directly by a user, only by the loop `ship` starts (or an explicit --goal).
-  "goal-fix": {
-    description: "The goal loop's fix iteration: apply exactly the gaps from the previous scoring round, then re-score. Not run directly; ship's goal or --goal drives it.",
-    steps: [
-      { agent: "goal-fixer", name: "fix", model: deepseekHighModel, advisor: grokModel, reports: "none", diff: true, prdHistory: true },
-      {
-        parallel: [
-          // The re-scorers must stay blind to the previous score: the fixer's
-          // report restates it, so the scorer steps receive no reports at all
-          // (they grade the artifact, not the round's history). They still get
-          // the original PRD via prdHistory: the rubric's `prd` dimension (30%
-          // of the score) cannot be graded without it.
-          { agent: "quality-scorer", name: "score", models: [grokModel, glm53HighModel], reports: "none", prdHistory: true },
-        ],
-      },
-      // The consensus sees only the fresh scorer reports, never the fixer's,
-      // so its measurement cannot anchor on the number it is reconciling; the
-      // original PRD is attached so disagreements on the `prd` dimension can be
-      // judged against the actual requirements.
-      { agent: "quality-score-report", name: "score-report", model: glm53HighModel, reports: ["score"], verify: true, prdHistory: true },
-    ],
-  },
   // Report-only review + the measurement layer: after the parallel audits, two
   // independent quality-scorers grade the same diff against the rubric and a
   // consensus step reconciles and verifies. The score block is the deliverable
@@ -560,12 +564,16 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   // and what is left is proving it merges and clears the bar. Sync lands the
   // advanced base first, so the scorers grade the branch as it will actually
   // merge rather than a diff that no longer describes what lands. Then the
-  // measurement, and — because `goal` is declared here rather than left to the
-  // caller — the fix/re-score loop runs on its own until the score clears 85.
+  // terminal goal step owns the whole loop: measure first, and — because the
+  // goal is declared here rather than left to the caller — the improve/re-score
+  // cycle runs on its own until the score clears 85.
   //
-  // There are no separate audit phases: the scorer already grades bugs,
-  // security, maintainability and scope against the rubric, and an open-ended
-  // audit in front of it only produces findings the score then has to re-weigh.
+  // The improve/measure fragments are internal to this pipeline: never
+  // selectable, and resolved with an empty report namespace so every
+  // measurement is independent of the round before it. There are no separate
+  // audit phases: the scorer already grades bugs, security, maintainability
+  // and scope against the rubric, and an open-ended audit in front of it only
+  // produces findings the score then has to re-weigh.
   //
   // Two things it expects from config rather than shipping itself, because both
   // are machine-local. Conflict resolution needs `git merge*`, `git add*` and
@@ -576,16 +584,43 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   // CONVOY_GOAL_REACHED so the PR step can require the bar to have been met.
   ship: {
     description: "Sync the branch with its base (merge + conflict resolution), measure the merged result against the quality rubric, and iterate until it clears 85/100",
-    goal: 85,
     defaultPrompt: "Sync this branch with its base and iterate until it clears the quality bar.",
     steps: [
       { agent: "sync-with-base", name: "sync", model: glm53HighModel, reports: "none" },
       {
-        parallel: [
-          { agent: "quality-scorer", name: "score", models: [grokModel, glm53HighModel], reports: "all", prdHistory: true },
-        ],
+        goal: {
+          target: 85,
+          improve: {
+            briefStep: "fix",
+            steps: [
+              // The directed fixer: applies exactly the gaps the previous
+              // scoring round reported, which arrive as its per-step brief.
+              { agent: "goal-fixer", name: "fix", model: deepseekHighModel, advisor: grokModel, reports: "none", diff: true, prdHistory: true },
+            ],
+          },
+          measure: {
+            steps: [
+              {
+                parallel: [
+                  // The re-scorers must stay blind to the previous score: the
+                  // fixer's report restates it, so the scorer steps receive no
+                  // reports at all (they grade the artifact, not the round's
+                  // history). They still get the original PRD via prdHistory
+                  // and the current diff: the rubric's `prd` dimension (30% of
+                  // the score) cannot be graded without them.
+                  { agent: "quality-scorer", name: "score", models: [grokModel, glm53HighModel], reports: "none", diff: true, prdHistory: true },
+                ],
+              },
+              // The consensus sees only the fresh scorer reports, never the
+              // fixer's, so its measurement cannot anchor on the number it is
+              // reconciling; the original PRD is attached so disagreements on
+              // the `prd` dimension can be judged against the actual
+              // requirements.
+              { agent: "quality-score-report", name: "score-report", model: grokModel, reports: ["score"], verify: true, diff: true, prdHistory: true },
+            ],
+          },
+        },
       },
-      { agent: "quality-score-report", name: "score-report", model: grokModel, reports: "all", verify: true, prdHistory: true },
     ],
   },
   // The follow-up to a report-only run: feed it the findings (as the prompt or an
@@ -711,6 +746,20 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
   let genericHumanCount = 0
   const mixedVerify = mixedVerifyAgents(input.spec.steps, input.agents)
 
+  // The terminal goal node: at most one, and only ever the pipeline's final
+  // entry. Everything before it is the ordinary prefix.
+  const goalIndex = input.spec.steps.findIndex(isGoalStepSpec)
+  if (goalIndex !== -1) {
+    if (input.spec.steps.some((raw, index) => index !== goalIndex && isGoalStepSpec(raw))) {
+      throw new Error(`pipeline "${input.name}" has more than one goal step; a pipeline can carry at most one, and it must be the final step`)
+    }
+    if (goalIndex !== input.spec.steps.length - 1) {
+      throw new Error(`pipeline "${input.name}": step ${goalIndex + 1} is a goal step, but goal steps must be the pipeline's final step (nothing may follow them)`)
+    }
+  }
+  const goalSpec: GoalStepSpec | undefined = goalIndex === -1 ? undefined : (input.spec.steps[goalIndex] as GoalStepSpec)
+  const ordinarySteps = goalSpec ? input.spec.steps.filter((_, index) => index !== goalIndex) : input.spec.steps
+
   const claimAgentName = (name: string, position: string) => {
     if (name === humanReviewStep || name.startsWith(`${humanReviewStep}-`)) {
       throw new Error(`pipeline "${input.name}": step ${position} can't use the reserved name "${name}"`)
@@ -730,7 +779,7 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
     names.add(name)
   }
 
-  for (const [index, raw] of input.spec.steps.entries()) {
+  for (const [index, raw] of ordinarySteps.entries()) {
     const position = String(index + 1)
     const groupId = `g${index + 1}`
 
@@ -741,6 +790,9 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
       for (const inner of raw.parallel) {
         if (typeof inner === "object" && inner !== null && "parallel" in inner) {
           throw new Error(`pipeline "${input.name}": step ${position} can't nest a parallel block inside another`)
+        }
+        if (isGoalStepSpec(inner as StepSpec)) {
+          throw new Error(`pipeline "${input.name}": step ${position} can't nest a goal step inside a parallel block`)
         }
       }
       const members = raw.parallel.flatMap((inner, innerIndex) => {
@@ -799,17 +851,183 @@ export function resolvePipeline(input: ResolvePipelineInput): Pipeline {
     throw new Error(`pipeline "${input.name}" has no agent steps`)
   }
 
+  const goalPlan = goalSpec ? resolveGoalStep(input, goalSpec.goal) : undefined
+
   return {
     name: input.name,
     ...(input.spec.description ? { description: input.spec.description } : {}),
     ...(input.spec.maxConcurrentAgents !== undefined ? { maxConcurrentAgents: input.spec.maxConcurrentAgents } : {}),
-    ...(input.spec.goal !== undefined ? { goal: input.spec.goal } : {}),
-    ...(input.spec.goalMaxIterations !== undefined ? { goalMaxIterations: input.spec.goalMaxIterations } : {}),
-    ...(input.spec.goalPlateau !== undefined ? { goalPlateau: input.spec.goalPlateau } : {}),
+    ...(goalPlan ? { goalPlan } : {}),
     ...(input.spec.defaultPrompt ? { defaultPrompt: input.spec.defaultPrompt } : {}),
     ...(input.spec.suggestedPrompts?.length ? { suggestedPrompts: input.spec.suggestedPrompts } : {}),
     steps,
   }
+}
+
+/**
+ * Validates and resolves one terminal goal step's policy and its two
+ * fragments. Validation uses declared structure and deliverable contracts —
+ * never reserved agent or step names — so a custom goal pipeline needs no
+ * `goal-fixer`, `score-report`, or `goal-fix` name anywhere.
+ */
+function resolveGoalStep(input: ResolvePipelineInput, goal: GoalStepSpec["goal"]): ResolvedGoalPlan {
+  if (typeof goal.target !== "number" || !Number.isInteger(goal.target) || goal.target < 1 || goal.target > 100) {
+    throw new Error(`pipeline "${input.name}": goal.target must be an integer from 1 through 100`)
+  }
+  const maxIterations = goal.maxIterations ?? defaultGoalMaxIterations
+  const plateau = goal.plateau ?? defaultGoalPlateau
+  if (!Number.isInteger(maxIterations) || maxIterations < 1) {
+    throw new Error(`pipeline "${input.name}": goal.maxIterations must be a positive integer (got ${JSON.stringify(goal.maxIterations)})`)
+  }
+  if (!Number.isInteger(plateau) || plateau < 1) {
+    throw new Error(`pipeline "${input.name}": goal.plateau must be a positive integer (got ${JSON.stringify(goal.plateau)})`)
+  }
+
+  const improve = resolveFragment(input, "goal.improve", "improve", goal.improve.steps)
+  const measure = resolveFragment(input, "goal.measure", "measure", goal.measure.steps)
+
+  if (improve.length === 0) {
+    throw new Error(`pipeline "${input.name}": goal.improve.steps must be a non-empty list`)
+  }
+  if (measure.length === 0) {
+    throw new Error(`pipeline "${input.name}": goal.measure.steps must be a non-empty list`)
+  }
+
+  // The brief recipient is resolved by configured step reference: exactly one
+  // improve agent step must carry the briefStep name.
+  const recipients = improve.filter((step) => step.stepName === goal.improve.briefStep)
+  if (recipients.length !== 1) {
+    const known = improve.map((step) => step.stepName).join(", ")
+    throw new Error(
+      recipients.length === 0
+        ? `pipeline "${input.name}": goal.improve.briefStep "${goal.improve.briefStep}" does not name an improve step (improve steps: ${known})`
+        : `pipeline "${input.name}": goal.improve.briefStep "${goal.improve.briefStep}" matches ${recipients.length} improve steps; exactly one is required`,
+    )
+  }
+
+  if (!improve.some((step) => !step.readOnly)) {
+    throw new Error(`pipeline "${input.name}": goal.improve must contain at least one step able to modify the repository`)
+  }
+
+  const writableMeasure = measure.filter((step) => !step.readOnly)
+  if (writableMeasure.length > 0) {
+    throw new Error(
+      `pipeline "${input.name}": goal.measure must be read-only; ${writableMeasure.map((step) => `"${step.name}"`).join(", ")} can modify the repository`,
+    )
+  }
+
+  // The authoritative score: exactly one machine-readable quality-score
+  // deliverable, and it must be the fragment's final step.
+  const scoring = measure.filter((step) => step.deliverableContract?.kind === "quality-score-report")
+  const finalStep = measure[measure.length - 1]
+  if (scoring.length !== 1 || scoring[0] !== finalStep) {
+    throw new Error(
+      `pipeline "${input.name}": goal.measure must end in exactly one step whose deliverable contract is a machine-readable quality score (found ${scoring.length};${scoring.length === 1 ? " it is not the final step" : " set deliverable: quality-score on the final step"})`,
+    )
+  }
+
+  return {
+    target: goal.target,
+    maxIterations,
+    plateau,
+    briefRecipient: recipients[0]!.name,
+    improve: { steps: improve },
+    measure: { steps: measure },
+    scoreProducer: finalStep.name,
+  }
+}
+
+/**
+ * Resolves one goal fragment: the same step mechanics as a pipeline (aliases,
+ * model precedence, fan-outs, parallel groups, advisors) but with a fresh
+ * name registry and an empty report namespace, so a fragment's `reports`
+ * selectors and inputs only ever reference steps earlier in the same
+ * fragment — never prefix, previous rounds, or other invocations.
+ */
+function resolveFragment(
+  input: ResolvePipelineInput,
+  label: string,
+  groupIdPrefix: string,
+  rawSteps: readonly StepSpec[],
+): AgentStep[] {
+  const fragmentInput: ResolveStepInput = {
+    name: input.name,
+    agents: input.agents,
+    ...(input.defaultModel !== undefined ? { defaultModel: input.defaultModel } : {}),
+    ...(input.defaultAdvisor !== undefined ? { defaultAdvisor: input.defaultAdvisor } : {}),
+    ...(input.defaultAdvisorMaxCalls !== undefined ? { defaultAdvisorMaxCalls: input.defaultAdvisorMaxCalls } : {}),
+  }
+  const names = new Set<string>()
+  const claimName = (name: string, position: string) => {
+    if (name === humanReviewStep || name.startsWith(`${humanReviewStep}-`)) {
+      throw new Error(`pipeline "${input.name}": ${label} step ${position} can't use the reserved name "${name}"`)
+    }
+    if (!isSafeStepName(name)) {
+      throw new Error(
+        `pipeline "${input.name}": ${label} step ${position} name "${name}" must be a filesystem-safe identifier using letters, numbers, hyphens, or underscores`,
+      )
+    }
+    if (names.has(name)) {
+      throw new Error(`pipeline "${input.name}": duplicate ${label} step name "${name}"; set an explicit name: on one of them`)
+    }
+    names.add(name)
+  }
+
+  const steps: AgentStep[] = []
+  for (const [index, raw] of rawSteps.entries()) {
+    const position = `${label}.${index + 1}`
+    const groupId = `${groupIdPrefix}-g${index + 1}`
+
+    if (isGoalStepSpec(raw)) {
+      throw new Error(`pipeline "${input.name}": ${label} step ${index + 1} can't nest a goal step inside a goal fragment`)
+    }
+    if (asHumanStepSpec(raw)) {
+      throw new Error(`pipeline "${input.name}": ${label} step ${index + 1} can't use a human step inside a goal fragment`)
+    }
+
+    if (isParallelSpec(raw)) {
+      if (raw.parallel.length === 0) {
+        throw new Error(`pipeline "${input.name}": ${label} step ${index + 1} is an empty parallel block`)
+      }
+      for (const [innerIndex, inner] of raw.parallel.entries()) {
+        if (typeof inner === "object" && inner !== null && "parallel" in inner) {
+          throw new Error(`pipeline "${input.name}": ${label} step ${index + 1} can't nest a parallel block inside another`)
+        }
+        if (isGoalStepSpec(inner as StepSpec)) {
+          throw new Error(`pipeline "${input.name}": ${label} step ${index + 1} can't nest a goal step inside a parallel block`)
+        }
+        if (asHumanStepSpec(inner as StepSpec)) {
+          throw new Error(`pipeline "${input.name}": ${label} step ${index + 1}.${innerIndex + 1} can't use a human step inside a parallel block`)
+        }
+      }
+      const members = raw.parallel.flatMap((inner, innerIndex) =>
+        resolveAgentStepSpec(inner, {
+          input: fragmentInput,
+          position: `${position}.${innerIndex + 1}`,
+          groupId,
+          forcedReadOnly: true,
+          priorSteps: steps,
+          claimName,
+          mixedVerify: mixedVerifyAgents(rawSteps, input.agents),
+        }),
+      )
+      steps.push(...members)
+      continue
+    }
+
+    const spec: AgentStepSpec = typeof raw === "string" ? { agent: raw } : (raw as AgentStepSpec)
+    const members = resolveAgentStepSpec(spec, {
+      input: fragmentInput,
+      position,
+      groupId,
+      forcedReadOnly: Boolean(spec.models && spec.models.length > 0),
+      priorSteps: steps,
+      claimName,
+      mixedVerify: mixedVerifyAgents(rawSteps, input.agents),
+    })
+    steps.push(...members)
+  }
+  return steps
 }
 
 export function isParallelSpec(raw: StepSpec): raw is ParallelStepSpec {
@@ -840,8 +1058,10 @@ function asHumanStepSpec(raw: StepSpec): HumanStepSpec | LegacyHumanStepSpec | u
   return undefined
 }
 
+type ResolveStepInput = Pick<ResolvePipelineInput, "name" | "agents" | "defaultModel" | "defaultAdvisor" | "defaultAdvisorMaxCalls">
+
 type ResolveStepContext = {
-  input: ResolvePipelineInput
+  input: ResolveStepInput
   /** Human-readable position for error messages; may be dotted (e.g. "3.2") inside a parallel block. */
   position: string
   groupId: string
@@ -966,7 +1186,7 @@ function resolveAgentStepSpec(raw: string | AgentStepSpec, ctx: ResolveStepConte
       inputFiles: ["prd.md", ...reportInputs(ctx.input.name, name, spec.reports ?? "previous", ctx.priorSteps)],
       inputDiff: spec.diff ?? ctx.priorSteps.length > 0,
       reportPath: `reports/${name}.md`,
-      deliverableContract: defaultDeliverableContract(agent.name, Boolean(forced || agent.readOnly)),
+      deliverableContract: explicitDeliverableContract(spec, agent.name, Boolean(forced || agent.readOnly)),
       ...(forced || agent.readOnly ? { readOnly: true } : {}),
       ...(verify ? { verify: true } : {}),
       ...(spec.prdHistory ? { prdHistory: true } : {}),
@@ -986,6 +1206,18 @@ export const qualityScoreDeliverableContract: DeliverableContract = {
 export function defaultDeliverableContract(agentName: string, _readOnly: boolean): DeliverableContract {
   if (agentName === "quality-score-report") return qualityScoreDeliverableContract
   return { kind: "markdown-report" }
+}
+
+/**
+ * A step's deliverable contract: the step's explicit `deliverable:` override
+ * when set (the only way an arbitrarily named agent can produce the
+ * machine-readable score a measure fragment must end in), otherwise the
+ * contract inferred from the agent identity.
+ */
+function explicitDeliverableContract(spec: AgentStepSpec, agentName: string, readOnly: boolean): DeliverableContract {
+  if (spec.deliverable === "quality-score") return qualityScoreDeliverableContract
+  if (spec.deliverable === "markdown") return { kind: "markdown-report" }
+  return defaultDeliverableContract(agentName, readOnly)
 }
 
 /**
@@ -1034,7 +1266,7 @@ export function slugifyModel(value: string): string {
  */
 export function synthesizeReadOnlyAgents(pipeline: Pipeline, baseAgents: readonly AgentSpec[]): AgentSpec[] {
   const synthesized = new Map<string, AgentSpec>()
-  for (const step of pipeline.steps) {
+  for (const step of [...pipeline.steps, ...goalFragmentSteps(pipeline)]) {
     if (step.type !== "agent" || !step.agentName.endsWith(readOnlyAgentSuffix)) continue
     if (synthesized.has(step.agentName)) continue
     const baseName = step.agentName.slice(0, -readOnlyAgentSuffix.length)
@@ -1054,7 +1286,7 @@ export function synthesizeReadOnlyAgents(pipeline: Pipeline, baseAgents: readonl
  */
 export function synthesizeVerifyingAgents(pipeline: Pipeline, baseAgents: readonly AgentSpec[]): AgentSpec[] {
   const synthesized = new Map<string, AgentSpec>()
-  for (const step of pipeline.steps) {
+  for (const step of [...pipeline.steps, ...goalFragmentSteps(pipeline)]) {
     if (step.type !== "agent" || !step.agentName.endsWith(verifyAgentSuffix)) continue
     if (synthesized.has(step.agentName)) continue
     const baseName = step.agentName.slice(0, -verifyAgentSuffix.length)
@@ -1120,16 +1352,33 @@ export function stepNames(pipeline: Pipeline): string[] {
   return pipeline.steps.map((step) => step.name)
 }
 
+/** The concrete steps of a pipeline's goal fragments (improve then measure); empty when the pipeline has no goal step. */
+export function goalFragmentSteps(pipeline: Pipeline): AgentStep[] {
+  const plan = pipeline.goalPlan
+  if (!plan) return []
+  return [...plan.improve.steps, ...plan.measure.steps]
+}
+
 export function validateStepFilters(pipeline: Pipeline, filters: { onlySteps: string[]; skipSteps: string[] }) {
   const valid = new Set(stepNames(pipeline))
   for (const step of pipeline.steps) {
     if (step.type === "agent") valid.add(step.stepName)
   }
+  // Internal goal phases are outside the filter namespace: naming one must
+  // fail instead of partially compiling a loop, even when the name would also
+  // match a prefix step.
+  const goalSteps = goalFragmentSteps(pipeline)
   for (const [flag, names] of [
     ["--only", filters.onlySteps],
     ["--skip", filters.skipSteps],
   ] as const) {
     for (const name of names) {
+      const target = goalSteps.find((step) => step.name === name || step.stepName === name)
+      if (target) {
+        throw new Error(
+          `${flag}: "${name}" is a goal ${goalPlanFragmentOf(pipeline, target)} phase and cannot be filtered; goal measurement and improvement are mandatory invariants of pipeline "${pipeline.name}"`,
+        )
+      }
       if (valid.has(name)) continue
       // Human gates may already be filtered out (--no-human-step/--no-human-review, no TTY);
       // referencing them must not turn into a typo error.
@@ -1137,6 +1386,18 @@ export function validateStepFilters(pipeline: Pipeline, filters: { onlySteps: st
       throw new Error(`${flag}: unknown step "${name}" in pipeline "${pipeline.name}" (valid: ${[...valid].join(", ")})`)
     }
   }
+  // A filter that would prevent mandatory goal measurement: --only must leave
+  // the prefix runnable, but the goal cycle itself is never filterable —
+  // naming no prefix step while a goal step exists means only goal control was
+  // requested, which cannot execute.
+  if (pipeline.goalPlan && filters.onlySteps.length > 0 && filters.onlySteps.every((name) => !valid.has(name))) {
+    throw new Error(`--only: none of the requested steps belong to pipeline "${pipeline.name}" (valid: ${[...valid].join(", ")})`)
+  }
+}
+
+/** Which fragment (improve or measure) a goal step belongs to, for filter diagnostics. */
+function goalPlanFragmentOf(pipeline: Pipeline, step: AgentStep): string {
+  return pipeline.goalPlan?.improve.steps.includes(step) ? "improve" : "measure"
 }
 
 /** Whether a pipeline contains any agent step that may edit the repository (a writable, non-read-only step). */

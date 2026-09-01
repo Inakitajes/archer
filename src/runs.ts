@@ -5,7 +5,7 @@ import { stdin, stdout } from "node:process"
 
 import { readControlFile } from "./control-client"
 import type { PendingSnapshot } from "./control-server"
-import { readRunMetadata, type PhaseMetadataStatus, type RunMetadata } from "./metadata"
+import { readRunMetadata, type GoalRunState, type PhaseMetadataStatus, type RunMetadata } from "./metadata"
 import { isValidRunID, runsRoot } from "./workspace"
 import { readAdvisorSplit } from "./advisor-report"
 import type { TuiRoute } from "./tui-session"
@@ -39,6 +39,22 @@ export type RunEntry = {
   advisorCost?: number
   createdAt?: number
   phases: RunPhaseInfo[]
+  /** The durable goal-cycle record exposed to run history (schema-v4 goal runs only). */
+  goal?: RunEntryGoal
+}
+
+/** The goal-cycle facts run history presents, derived from the durable metadata record. */
+export type RunEntryGoal = {
+  target: number
+  /** The measurement round the run is in (0 for the opening measurement). */
+  iteration: number
+  stage: string
+  /** The most recent authoritative score. */
+  score?: number
+  /** Numeric trajectory of every completed measurement, oldest first. */
+  trajectory?: number[]
+  outcome?: string
+  restored?: boolean
 }
 
 export type RunsResolution =
@@ -128,6 +144,7 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
   const split = await readAdvisorSplit(dir)
   const executorCost = totalCost(metadata, split.executorPhases) ?? (split.executor.cost > 0 ? split.executor.cost : undefined)
   const advisorCost = split.advisor.cost
+  const goal = metadata?.goal
   return {
     runID,
     dir,
@@ -146,6 +163,24 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
     advisorCost,
     createdAt: metadata?.createdAt,
     phases: phaseInfos(metadata),
+    ...(goal ? { goal: goalInfo(goal) } : {}),
+  }
+}
+
+/** A goal run's history facts, all derived from the durable record. */
+function goalInfo(goal: GoalRunState): RunEntryGoal {
+  return {
+    target: goal.target,
+    iteration: goal.iteration,
+    stage: goal.stage,
+    ...(goal.scores.length > 0
+      ? {
+          score: goal.scores[goal.scores.length - 1]!.score,
+          trajectory: goal.scores.map((entry) => entry.score),
+        }
+      : {}),
+    ...(goal.outcome ? { outcome: goal.outcome } : {}),
+    ...(goal.restored !== undefined ? { restored: goal.restored } : {}),
   }
 }
 
@@ -287,6 +322,11 @@ function phaseInfos(metadata: RunMetadata | undefined): RunPhaseInfo[] {
 function printRunList(runs: RunEntry[]) {
   const statusText = (run: RunEntry) =>
     run.live ? (run.waiting ? `running · waiting for a ${run.waiting === "permission" ? "permission" : "review"}` : "running") : run.status
+  const goalText = (run: RunEntry) => {
+    if (!run.goal) return ""
+    const trajectory = run.goal.trajectory ? ` · ${run.goal.trajectory.join(" → ")}` : ""
+    return ` · goal ${run.goal.target}${run.goal.outcome ? ` ${run.goal.outcome}` : ` ${run.goal.stage}`}${trajectory}`
+  }
   const numberWidth = String(runs.length).length
   const statusWidth = Math.max(...runs.map((run) => statusText(run).length))
   stdout.write(`\nruns in ${runsRoot()}:\n`)
@@ -294,7 +334,7 @@ function printRunList(runs: RunEntry[]) {
     const number = String(index + 1).padStart(numberWidth)
     const cost = (run.cost !== undefined ? `$${run.cost.toFixed(2)}${run.advisorCost ? ` (${run.executorCost?.toFixed(2) ?? "0.00"}+${run.advisorCost.toFixed(2)} adv)` : ""}` : "").padStart(8)
     const marker = run.live ? "●" : " "
-    stdout.write(`  ${number}. ${marker} ${run.runID}  ${statusText(run).padEnd(statusWidth)}  ${cost}  ${run.title}\n`)
+    stdout.write(`  ${number}. ${marker} ${run.runID}  ${statusText(run).padEnd(statusWidth)}${goalText(run)}  ${cost}  ${run.title}\n`)
   }
 }
 

@@ -52,11 +52,13 @@ export type PendingHumanView = {
 }
 
 /**
- * Goal-loop `resetPipeline` payload: the client swaps its dashboard onto the
- * next iteration's run while keeping the clock and cost running. Everything
- * here is plain JSON data (ProgressPhase and Pipeline are data-only types).
- * `goalLoop` carries the loop's live view (scores so far, iteration counter)
- * so the client's header keeps the trajectory the in-process dashboard sees.
+ * Hosted-run `resetPipeline` payload: the runner repoints the dashboard at the
+ * run's phases and identity once (a goal cycle is one logical run), and the
+ * same payload travels to an attaching client so it rebuilds identically.
+ * Everything here is plain JSON data (ProgressPhase and Pipeline are data-only
+ * types). `goalLoop` carries the goal cycle's live view (scores so far,
+ * iteration counter) so the client's header keeps the trajectory the
+ * in-process dashboard sees.
  */
 export type ControlReset = {
   runID: string

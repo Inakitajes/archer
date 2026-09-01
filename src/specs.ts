@@ -150,12 +150,10 @@ export async function loadSpecsView(targetDir: string): Promise<SpecsView> {
   try {
     const { assembleControlBoard, createBoardReads } = await import("./control-board")
     const board = await assembleControlBoard(createBoardReads(targetDir))
-    // SC-1: spin moves a change's files into a feature worktree, so the board —
-    // whose rows are assembled over every `git worktree` — sees features the
-    // main checkout's `openspec/changes/` no longer carries. Those worktree
-    // changes must land in the Active Changes list too, or a feature spun out
-    // while `convoy specs` runs from main appears nowhere and its row actions
-    // stay unreachable.
+    // A change the board resolves to a feature worktree reads its artifacts
+    // and title from that worktree (SC-1), and that copy REPLACES whatever
+    // the launch checkout's `openspec/changes/` holds for the id — a stale
+    // husk on the base checkout must not shadow the real files.
     const merged = await mergeWorktreeChanges(changes, board.rows)
     return {
       targetDir,
@@ -172,26 +170,40 @@ export async function loadSpecsView(targetDir: string): Promise<SpecsView> {
 }
 
 /**
- * Appends changes the board derived from feature worktrees that the current
- * checkout does not show. Each such change's artifacts are loaded from its own
- * worktree and their file paths are **absolute** — the browser reads them
- * against its process cwd (the launch checkout), and a worktree path is the
- * only one that resolves there. Main-checkout changes keep their repo-relative
- * paths. Order stays alphabetical by id so the list reads stably.
+ * Reconciles the launch checkout's change entries with the board's worktree
+ * rows. A change the board resolves to a feature worktree loads its artifacts
+ * and title from that worktree's own `openspec/changes/<id>/` tree, addressed
+ * by absolute paths (the SC-1 mechanics), and that copy **replaces** whatever
+ * the launch checkout produced for the same id — mirroring the precedence
+ * `assembleControlBoard` already applies to rows, where worktree rows outrank
+ * same-id rows stranded on the base checkout (design D1). Appending remains
+ * the case for ids the launch checkout never listed. The merge degrades, never
+ * drops: a worktree row without a usable directory leaves the launch
+ * checkout's entry standing, and a worktree copy without markdown only fills
+ * ids the launch checkout doesn't carry — a husk listing beats no listing
+ * (design D3). Order stays alphabetical by id so the list reads stably.
+ *
+ * Exported for tests: the no-directory guard is unreachable through
+ * `assembleControlBoard` (it always sets `worktreeDir` on worktree rows), so
+ * only a synthetic row can exercise it.
  */
-async function mergeWorktreeChanges(changes: SpecsChangeEntry[], rows: FeatureRow[] | undefined): Promise<SpecsChangeEntry[]> {
+export async function mergeWorktreeChanges(
+  changes: SpecsChangeEntry[],
+  rows: FeatureRow[] | undefined,
+): Promise<SpecsChangeEntry[]> {
   if (!rows) return changes
-  const seen = new Set(changes.map((change) => change.id))
-  const out = [...changes]
+  const byId = new Map(changes.map((change) => [change.id, change]))
   for (const row of rows) {
-    if (row.location !== "worktree" || seen.has(row.id)) continue
-    const worktreeChangesDir = join(row.worktreeDir ?? "", openspecDirName, "changes")
-    // A change with no artifacts still lists by its id (same as main).
+    if (row.location !== "worktree" || !row.worktreeDir) continue
+    const worktreeChangesDir = join(row.worktreeDir, openspecDirName, "changes")
+    // A worktree copy without markdown must not replace a real listing, but an
+    // id the launch checkout never listed still appends (a husk listing beats
+    // no listing — D3), so the row stays reachable.
     const entry = await loadSpecsChange(worktreeChangesDir, row.id, { absolute: true })
-    out.push(entry)
-    seen.add(row.id)
+    if (entry.artifacts.length === 0 && byId.has(row.id)) continue
+    byId.set(row.id, entry)
   }
-  return out.sort((a, b) => a.id.localeCompare(b.id))
+  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id))
 }
 
 async function loadSpecsChange(

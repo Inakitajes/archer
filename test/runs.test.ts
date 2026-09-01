@@ -74,6 +74,50 @@ describe("run history listing", () => {
     expect(older!.cost).toBeUndefined()
   })
 
+  test("a schema-v4 goal run exposes its score, trajectory, stage, and outcome in history", async () => {
+    const runID = "20260614-000000-gool"
+    const dir = join(root, runID)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "prd.md"), "# Goal run\n")
+    await writeFile(
+      join(dir, "metadata.json"),
+      JSON.stringify({
+        schemaVersion: 4,
+        runID,
+        targetDir: "/tmp/repo",
+        createdAt: 1,
+        updatedAt: 2,
+        control: { state: "running" },
+        phases: { "goal-measure-0-score": { status: "completed" }, "goal-measure-1-score-report": { status: "completed" } },
+        goal: {
+          target: 90,
+          maxIterations: 3,
+          plateau: 3,
+          iteration: 1,
+          stage: "complete",
+          scores: [
+            { score: 71, dimensions: { prd: 60, tests: 70, security: 90, maintainability: 80, operational: 85, scope: 80 }, verdict: "not-ready", mustFix: [] },
+            { score: 92, dimensions: { prd: 92, tests: 88, security: 95, maintainability: 90, operational: 94, scope: 90 }, verdict: "ready-with-caveats", mustFix: [] },
+          ],
+          bestScore: 92,
+          outcome: "goal",
+          restored: false,
+        },
+      }),
+    )
+    const runs = await listRuns(root)
+    const run = runs.find((entry) => entry.runID === runID)!
+    expect(run.goal).toBeDefined()
+    expect(run.goal!.target).toBe(90)
+    expect(run.goal!.stage).toBe("complete")
+    expect(run.goal!.outcome).toBe("goal")
+    expect(run.goal!.score).toBe(92)
+    expect(run.goal!.trajectory).toEqual([71, 92])
+    expect(run.goal!.restored).toBe(false)
+    // The completion of every recorded phase keeps the status a normal completion.
+    expect(run.statusKind).toBe("completed")
+  })
+
   test("returns empty for a missing root", async () => {
     expect(await listRuns(join(root, "does-not-exist"))).toEqual([])
   })

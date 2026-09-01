@@ -308,20 +308,26 @@ test("nitro routes the smart judge and the goal-fix pipeline through the same ga
     yolo: false,
     smart: true,
     smartJudgeModel: "anthropic/claude-haiku-4.5",
-    goal: 90,
-    goalMaxIterations: 2,
-    goalPlateau: 3,
-    goalFixPipeline: {
-      name: "goal-fix",
-      steps: [
-        { type: "agent", name: "fixer", stepName: "fixer", groupId: "g1", agentName: "goal-fixer", description: "Fix", model: "openai/gpt-5.6-sol", inputFiles: ["prd.md"], inputDiff: true, reportPath: "reports/fixer.md" },
-      ],
-    },
     pipeline: {
       name: "ship",
       steps: [
         { type: "agent", name: "implementer", stepName: "implementer", groupId: "g1", agentName: "implementer", description: "Implement", model: "openai/gpt-5.6-sol", inputFiles: ["prd.md"], inputDiff: false, reportPath: "reports/implementer.md" },
       ],
+      // The terminal goal step's fragments are frozen with the pipeline, so
+      // nitro routes their models through the same gateway as the prefix.
+      goalPlan: {
+        target: 90,
+        maxIterations: 2,
+        plateau: 3,
+        briefRecipient: "fixer",
+        improve: {
+          steps: [
+            { type: "agent", name: "fixer", stepName: "fixer", groupId: "improve-g1", agentName: "goal-fixer", description: "Fix", model: "openai/gpt-5.6-sol", inputFiles: ["prd.md"], inputDiff: true, reportPath: "reports/fixer.md" },
+          ],
+        },
+        measure: { steps: [] },
+        scoreProducer: "score-report",
+      },
     },
     agents: [],
     permissions: { allow: [], deny: [] },
@@ -330,7 +336,7 @@ test("nitro routes the smart judge and the goal-fix pipeline through the same ga
 
   const plan = buildRunPlan(options)
   expect(plan.smartJudge?.model).toMatchObject({ gateway: "nitro", target: "openrouter/anthropic/claude-haiku-4.5" })
-  const fixer = plan.goal?.fixPipeline.steps[0]
+  const fixer = plan.goal?.improve.steps[0]
   expect(fixer?.type === "agent" && fixer.resolvedModel?.target).toBe("openrouter/openai/gpt-5.6-sol")
 })
 

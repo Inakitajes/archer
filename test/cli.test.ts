@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { goalModeFor, goalModeRejectionError, parseArgs, parseCommand, resolveRunOptions, runHomeNavigationLoop, shouldLaunchHome } from "../src/cli"
+import { goalModeFor, parseArgs, parseCommand, resolveRunOptions, runHomeNavigationLoop, shouldLaunchHome } from "../src/cli"
 import { modelGateways } from "../src/model-routing"
 import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import type { Pipeline, RunPlan } from "../src/types"
@@ -126,26 +126,13 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--gateway", "invalid"])).toThrow('"nitro"')
   })
 
-  test("parses --goal with its iteration and plateau controls", () => {
-    const result = parseArgs(["--goal", "90", "--goal-max-iterations", "5", "--goal-plateau", "2"])
-    expect(result.goal).toBe(90)
-    expect(result.goalMaxIterations).toBe(5)
-    expect(result.goalPlateau).toBe(2)
-  })
-
-  test("rejects invalid --goal values", () => {
-    expect(() => parseArgs(["--goal", "101"])).toThrow("--goal must be an integer from 1 to 100")
-    expect(() => parseArgs(["--goal", "0"])).toThrow("--goal must be an integer from 1 to 100")
-    expect(() => parseArgs(["--goal", "abc"])).toThrow("--goal must be an integer from 1 to 100")
-    expect(() => parseArgs(["--goal-max-iterations", "0"])).toThrow("--goal-max-iterations must be a positive integer")
-  })
-
-  test("parses --goal with strict integer parsing", () => {
-    // A goal is a whole number between 1 and 100; anything else must be
-    // rejected instead of silently coerced by parseInt.
-    expect(() => parseArgs(["--goal", "90abc"])).toThrow(/--goal/)
-    expect(() => parseArgs(["--goal", "1.5"])).toThrow(/--goal/)
-    expect(() => parseArgs(["--goal", "90 "])).toThrow(/--goal/)
+  test("the retired goal flags fail with a migration error before any side effect", () => {
+    // Retired with the embedded goal step: the refusal happens in the parser,
+    // before plan review, worktree creation, or run startup.
+    for (const flag of ["--goal", "--goal-max-iterations", "--goal-plateau"]) {
+      expect(() => parseArgs([flag, "90"])).toThrow(new RegExp(`retired flag: ${flag}`.replace("-", "\\-")))
+      expect(() => parseArgs([flag, "90"])).toThrow(/goal`? step/)
+    }
   })
 
   test("parses --plan", () => {
@@ -698,6 +685,14 @@ describe("parseCommand default prompt fallback", () => {
   test("an unknown pipeline surfaces its error instead of the prompt error", async () => {
     await expect(parseCommand(["-p", "nope"])).rejects.toThrow('unknown pipeline "nope"')
   })
+
+  test("requesting goal-fix directly never starts a run and lists it nowhere", async () => {
+    // `goal-fix` is reserved: goal fragments are internal to the owning
+    // pipeline's terminal goal step, so there is no public pipeline by that
+    // name to select through the CLI, launcher, plan-only, retry, or resume.
+    await expect(parseCommand(["-p", "goal-fix", "build it"])).rejects.toThrow('unknown pipeline "goal-fix"')
+    expect(Object.keys(builtInPipelines)).not.toContain("goal-fix")
+  })
 })
 
 describe("resolveRunOptions", () => {
@@ -727,73 +722,30 @@ describe("resolveRunOptions", () => {
 })
 
 describe("goalModeFor", () => {
-  // A pipeline is goal-eligible only when it has a quality-score-report step
-  // (consensus) AND a writable step. report-only scored pipelines (review) have
-  // the consensus step but no writable step, so --goal is refused — the
-  // goal-fixer would mutate a pipeline whose contract says "makes no changes".
+  // Goal execution is enabled exclusively by the pipeline's own terminal goal
+  // step; there is no run flag, no toggle, and no separate goal-fix pipeline to
+  // resolve. The resolver validated the step's structure and fragment roles.
   const ship = resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents })
-  const reviewScored = resolvePipeline({ name: "review", spec: builtInPipelines.review!, agents: builtInAgents })
+  const review = resolvePipeline({ name: "review", spec: builtInPipelines.review!, agents: builtInAgents })
   const implement = resolvePipeline({ name: "implement", spec: builtInPipelines.implement!, agents: builtInAgents })
-  const goalFix = resolvePipeline({ name: "goal-fix", spec: builtInPipelines["goal-fix"]!, agents: builtInAgents })
 
   function planWith(pipeline: Pipeline): RunPlan {
     return { pipeline } as RunPlan
   }
 
-  test("is off when no goal is set", () => {
-    expect(goalModeFor({}, planWith(ship))).toEqual({ mode: "off" })
+  test("is off when the pipeline has no goal step", () => {
+    expect(goalModeFor(planWith(implement))).toEqual({ mode: "off" })
+    expect(goalModeFor(planWith(review))).toEqual({ mode: "off" })
   })
 
-  test("is on for a scored pipeline with a writable step and a resolved fix pipeline", () => {
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(ship))
-    expect(decision).toEqual({ mode: "on", goal: 90 })
+  test("is on for ship, whose terminal goal step declares target 85 with defaults", () => {
+    expect(goalModeFor(planWith(ship))).toEqual({ mode: "on", goal: 85, maxIterations: 3, plateau: 3 })
   })
 
-  test("rejects --goal on a report-only scored pipeline (no writable step)", () => {
-    // review ends in a quality-score-report step but every step is
-    // read-only, so --goal would run the writable goal-fixer against a pipeline
-    // documented as "makes no changes" — refuse it with a clear reason.
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(reviewScored))
-    expect(decision.mode).toBe("rejected")
-    if (decision.mode === "rejected") expect(decision.reason).toBe("not-writable")
-  })
-
-  test("rejects --goal on a pipeline with no consensus step", () => {
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: goalFix }, planWith(implement))
-    expect(decision.mode).toBe("rejected")
-    if (decision.mode === "rejected") expect(decision.reason).toBe("no-consensus")
-  })
-
-  test("rejects --goal when the goal-fix pipeline could not be resolved", () => {
-    const decision = goalModeFor({ goal: 90 }, planWith(ship))
-    expect(decision.mode).toBe("rejected")
-    if (decision.mode === "rejected") expect(decision.reason).toBe("no-fix-pipeline")
-  })
-
-  test("rejects --goal when the fix pipeline lacks a goal-fixer step", () => {
-    // A project override of goal-fix that drops the goal-fixer step would leave
-    // the fixer running blind (no brief reaches it); reject so the
-    // misconfiguration is surfaced, not silently swallowed.
-    const badFix = { ...goalFix, steps: goalFix.steps.filter((s) => !(s.type === "agent" && s.agentName === "goal-fixer")) }
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(ship))
-    expect(decision.mode).toBe("rejected")
-    if (decision.mode === "rejected") expect(decision.reason).toBe("bad-fix-pipeline")
-  })
-
-  test("rejects --goal when the fix pipeline lacks a consensus step", () => {
-    const noConsensus = { ...goalFix, steps: goalFix.steps.filter((s) => !(s.type === "agent" && s.agentName === "quality-score-report")) }
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: noConsensus }, planWith(ship))
-    expect(decision.mode).toBe("rejected")
-    if (decision.mode === "rejected") expect(decision.reason).toBe("bad-fix-pipeline")
-  })
-
-  test("the bad-fix-pipeline rejection error mentions the project override", () => {
-    const badFix = { ...goalFix, steps: [] }
-    const decision = goalModeFor({ goal: 90, goalFixPipeline: badFix }, planWith(ship))
-    if (decision.mode === "rejected") {
-      const error = goalModeRejectionError(decision, planWith(ship))
-      expect(error.message).toContain("goal-fixer step")
-      expect(error.message).toContain("quality-score-report step")
-    }
+  test("is off for a pipeline whose goal step is absent even when it ends in a score", () => {
+    const reviewScored = resolvePipeline({ name: "review", spec: builtInPipelines.review!, agents: builtInAgents })
+    // review ends in a quality-score-report step but declares no goal step:
+    // ending in a score alone no longer implies goal execution.
+    expect(goalModeFor(planWith(reviewScored)).mode).toBe("off")
   })
 })

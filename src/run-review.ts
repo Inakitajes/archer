@@ -33,13 +33,15 @@ export function renderRunPlan(plan: RunPlan, compact = false, options: RunPlanRe
     `Advisors: ${plan.pipeline.steps.filter((step) => step.type === "agent" && Boolean(plannedStepAdvisor(step))).length}/${plan.pipeline.steps.filter((step) => step.type === "agent").length} steps advised`,
   ]
   if (plan.goal) {
-    // Goal mode is a bounded loop the operator is consenting to in full: the
-    // initial run plus up to maxIterations fix runs of the writable goal-fix
-    // pipeline. Surface it before confirmation so the cost/mutation envelope is
+    // The goal cycle is a bounded loop the operator is consenting to in full:
+    // iteration-zero measurement plus up to maxIterations improve/measure
+    // rounds. Surface it before confirmation so the cost/mutation envelope is
     // explicit, not discovered after the first run.
+    const measurements = 1 + plan.goal.maxIterations
     lines.push(
-      `Goal mode: target ${plan.goal.target}/100 · up to ${plan.goal.maxIterations} fix iterations · plateau ${plan.goal.plateau}`,
-      `  Fix pipeline: ${sanitizeInline(plan.goal.fixPipeline.name)} · ${plan.goal.fixPipeline.steps.length} steps (writable goal-fixer + re-scorers)`,
+      `Goal cycle: target ${plan.goal.target}/100 · up to ${measurements} measurements (${plan.goal.maxIterations} improve rounds) · plateau ${plan.goal.plateau}`,
+      `  Improve: ${plan.goal.improve.steps.length} step${plan.goal.improve.steps.length === 1 ? "" : "s"} · brief goes to ${sanitizeInline(plan.goal.briefRecipient)}`,
+      `  Measure: ${plan.goal.measure.steps.length} step${plan.goal.measure.steps.length === 1 ? "" : "s"} · authoritative score from ${sanitizeInline(plan.goal.scoreProducer)}`,
     )
   }
   const promptLines = options.fullPrompt && !compact

@@ -23,10 +23,12 @@ import {
   agentAliases,
   humanReviewStep,
   humanStepType,
+  isGoalStepSpec,
   isHumanStepSpec,
   isParallelSpec,
   isSafeStepName,
   type AgentStepSpec,
+  type GoalStepSpec,
   type HumanStepSpec,
   type ParallelStepSpec,
   type PipelineSpec,
@@ -722,14 +724,14 @@ export class ConfigEditor {
     if (meta?.t !== "step") return undefined
     const steps = this.stepsOf(meta.pipeline)
     const spec = steps === undefined ? undefined : specAt(steps, meta.index, meta.member)
-    if (!steps || spec === undefined || isParallelSpec(spec) || isHumanStep(spec)) return undefined
+    if (!steps || spec === undefined || isParallelSpec(spec) || isHumanStep(spec) || isGoalStep(spec)) return undefined
     return { steps, spec: spec as string | AgentStepSpec, meta }
   }
 
   private editStepModel(pipelineName: string, index: number, member?: number) {
     const steps = this.stepsOf(pipelineName)
     const spec = steps === undefined ? undefined : specAt(steps, index, member)
-    if (!steps || spec === undefined || isParallelSpec(spec) || isHumanStep(spec)) return
+    if (!steps || spec === undefined || isParallelSpec(spec) || isHumanStep(spec) || isGoalStep(spec)) return
     const obj = asStepObject(spec)
     if (stepRunnerFor(obj.runner).id === "claude-code") {
       this.openClaudeModelPicker(`${stepLabel(pipelineName, index, member)}.model — Claude CLI alias/ID`, obj.model, (value) => {
@@ -842,7 +844,7 @@ export class ConfigEditor {
     if (meta?.t !== "step") return
     const steps = this.stepsOf(meta.pipeline)
     const spec = steps === undefined ? undefined : specAt(steps, meta.index, meta.member)
-    if (!steps || spec === undefined || isParallelSpec(spec)) return
+    if (!steps || spec === undefined || isParallelSpec(spec) || isGoalStep(spec)) return
     const current = typeof spec === "string" ? undefined : spec.name
     this.openInput(`${stepLabel(meta.pipeline, meta.index, meta.member)}.name`, current ?? "", "step/report name, empty to clear", {
       validate: (value) => {
@@ -975,6 +977,10 @@ export class ConfigEditor {
     }
     if (isHumanStep(spec)) {
       this.message("Can't parallelize", "Human steps can't run inside a parallel block.")
+      return
+    }
+    if (isGoalStep(spec)) {
+      this.message("Can't parallelize", "A terminal goal node can't run inside a parallel block.")
       return
     }
     const at = wrapInParallel(steps, meta.index)
@@ -1367,6 +1373,8 @@ export class ConfigEditor {
             rows.push(parallelHeaderRow(name, index, spec))
             spec.parallel.forEach((member, memberIndex) => rows.push(memberRow(name, index, memberIndex, member)))
             rows.push(actionRow("        ⊕ add member", { t: "add-member", pipeline: name, index }))
+          } else if (isGoalStep(spec)) {
+            rows.push(goalRow(name, index, spec))
           } else {
             rows.push(stepRow(name, index, spec))
           }
@@ -1517,6 +1525,22 @@ export class ConfigEditor {
           lines.push(plain(""))
           push([fg(theme.accent)("enter/a"), fg(theme.dim)(" add member   "), fg(theme.accent)("g"), fg(theme.dim)(" dissolve")])
           push([fg(theme.accent)("d"), fg(theme.dim)(" delete group   "), fg(theme.accent)("shift+↑/↓"), fg(theme.dim)(" move")])
+          break
+        }
+        if (spec !== undefined && isGoalStep(spec)) {
+          const goal = spec.goal
+          const rounds = goal.maxIterations ?? 3
+          const plateau = goal.plateau ?? 3
+          const improveN = goal.improve.steps.length
+          const measureN = goal.measure.steps.length
+          push([fg(theme.text)(`terminal goal ${position} of ${meta.pipeline}`)])
+          for (const line of wrapText("Measures first, then improves until the score clears the target.", width).slice(0, 3)) {
+            push([fg(theme.faint)(line)])
+          }
+          lines.push(plain(""))
+          push([fg(theme.dim)(`target ${goal.target}/100 · ${rounds} round${rounds === 1 ? "" : "s"} · plateau ${plateau}`)])
+          push([fg(theme.dim)(`improve ${counted(improveN, "step")} · brief goes to ${goal.improve.briefStep}`)])
+          push([fg(theme.dim)(`measure ${counted(measureN, "step")}`)])
           break
         }
         if (spec !== undefined && isHumanStep(spec)) {
@@ -1714,7 +1738,21 @@ function pipelineRow(name: string, spec: PipelineSpec, open: boolean): Row {
   }
 }
 
-function stepRow(pipeline: string, index: number, spec: Exclude<StepSpec, ParallelStepSpec>): Row {
+function goalRow(pipeline: string, index: number, spec: GoalStepSpec): Row {
+  const rounds = spec.goal.maxIterations ?? 3
+  const plateau = spec.goal.plateau ?? 3
+  const label = `goal (target ${spec.goal.target} · ${rounds} round${rounds === 1 ? "" : "s"} · plateau ${plateau})`
+  return {
+    meta: { t: "step", pipeline, index },
+    chunks: (selected, width) => [
+      selected ? fg(theme.accent)("    ▸ ") : raw("      "),
+      fg(theme.faint)(`${index + 1}. `),
+      selected ? bold(fg(theme.text)(truncateChunkSafe(label, Math.max(8, width - 12)))) : fg(theme.text)(truncateChunkSafe(label, Math.max(8, width - 12))),
+    ],
+  }
+}
+
+function stepRow(pipeline: string, index: number, spec: Exclude<StepSpec, ParallelStepSpec | GoalStepSpec>): Row {
   const human = isHumanStep(spec)
   const agent = isHumanStepSpec(spec) ? (spec.name ?? humanStepType) : agentOf(spec)
   return {
@@ -1765,15 +1803,20 @@ function setDefault(defaults: ConvoyDefaults, key: keyof ConvoyDefaults, value: 
 }
 
 export function isHumanStep(spec: StepSpec): spec is HumanStepSpec | typeof humanReviewStep | (AgentStepSpec & { agent: typeof humanReviewStep }) {
-  return !isParallelSpec(spec) && (isHumanStepSpec(spec) || agentOf(spec) === humanReviewStep)
+  return !isParallelSpec(spec) && !isGoalStepSpec(spec) && (isHumanStepSpec(spec) || agentOf(spec) === humanReviewStep)
 }
 
-/** Only meaningful for non-parallel steps; callers must guard with isParallelSpec first. */
-function agentOf(spec: Exclude<StepSpec, ParallelStepSpec | HumanStepSpec>): string {
+/** The terminal goal control node: policy plus its two internal fragments. */
+export function isGoalStep(spec: StepSpec): spec is GoalStepSpec {
+  return isGoalStepSpec(spec)
+}
+
+/** Only meaningful for non-parallel, non-goal steps; callers must guard first. */
+function agentOf(spec: Exclude<StepSpec, ParallelStepSpec | HumanStepSpec | GoalStepSpec>): string {
   return typeof spec === "string" ? spec : spec.agent
 }
 
-export function asStepObject(spec: Exclude<StepSpec, ParallelStepSpec | HumanStepSpec>): AgentStepSpec {
+export function asStepObject(spec: Exclude<StepSpec, ParallelStepSpec | HumanStepSpec | GoalStepSpec>): AgentStepSpec {
   return typeof spec === "string" ? { agent: spec } : { ...spec }
 }
 
@@ -1806,11 +1849,11 @@ export function setSpecAt(steps: StepSpec[], index: number, member: number | und
 /**
  * Wraps the sequential agent step at index into a parallel group, joining the
  * group directly above/below instead when one exists. Returns the step's new
- * address, or undefined for human steps and group headers.
+ * address, or undefined for human steps, goal nodes, and group headers.
  */
 export function wrapInParallel(steps: StepSpec[], index: number): { index: number; member: number } | undefined {
   const spec = steps[index]
-  if (spec === undefined || isParallelSpec(spec) || isHumanStep(spec)) return undefined
+  if (spec === undefined || isParallelSpec(spec) || isHumanStep(spec) || isGoalStep(spec)) return undefined
   const step = spec as string | AgentStepSpec
   const prev = steps[index - 1]
   if (prev !== undefined && isParallelSpec(prev)) {
@@ -1963,6 +2006,10 @@ function splitNameList(value: string): string[] {
     .split(",")
     .map((part) => part.trim())
     .filter((part) => part.length > 0)
+}
+
+function counted(n: number, noun: string) {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`
 }
 
 /** Greedy word-wrap for the detail panel. */

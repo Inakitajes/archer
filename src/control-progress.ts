@@ -28,8 +28,9 @@ import type { Pipeline } from "./types"
  *   no controller attached the promises simply hold (never auto-reject).
  * - `runFinished` holds only while a controller is connected; without one
  *   (`--no-tui`) it resolves immediately so the run exits like today.
- * - `resetPipeline` (goal loop) pushes a `reset` event so the attached
- *   dashboard rebuilds for the next iteration.
+ * - `resetPipeline` pushes a `reset` event so an attached dashboard rebuilds
+ *   for the run the executor is serving (a goal cycle is one logical run, so
+ *   this fires once at run start rather than once per iteration).
  * - pause/abort/keep-awake are wired when the runner calls `setHostControls` /
  *   `setAbortHandler`.
  * - The live view is *not* duplicated here: the attach client follows the

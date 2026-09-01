@@ -21,6 +21,10 @@ import {
   agentsForPipeline,
   validateStepFilters,
   verifyAgentSuffix,
+  type AgentStepSpec,
+  type GoalImproveSpec,
+  type GoalMeasureSpec,
+  type GoalStepSpec,
   type PipelineSpec,
 } from "../src/pipeline"
 import type { AgentStep, DeliverableContract } from "../src/types"
@@ -266,13 +270,8 @@ describe("built-in ship pipeline", () => {
   })
   const shipSteps = () => ship().steps.filter((step): step is AgentStep => step.type === "agent")
 
-  test("is sync then the measurement layer: no open-ended audits in between", () => {
-    expect(shipSteps().map((step) => step.name)).toEqual([
-      "sync",
-      "score__openrouter-x-ai-grok-4-6-high",
-      "score__openrouter-z-ai-glm-5-3-high",
-      "score-report",
-    ])
+  test("the prefix is just the sync; the measurement layer lives in the goal step", () => {
+    expect(shipSteps().map((step) => step.name)).toEqual(["sync"])
   })
 
   test("syncs the base in before anything reads the diff, so the score describes the merged result", () => {
@@ -284,12 +283,27 @@ describe("built-in ship pipeline", () => {
     expect(sync?.readOnly).toBeFalsy()
   })
 
-  test("declares its own goal, so the fix/re-score loop runs without --goal", () => {
-    expect(ship().goal).toBe(85)
+  test("declares its own goal, so the improve/re-score loop runs without --goal", () => {
+    const goal = ship().goalPlan
+    expect(goal?.target).toBe(85)
+    expect(goal?.maxIterations).toBe(3)
+    expect(goal?.plateau).toBe(3)
+    expect(goal?.briefRecipient).toBe("fix")
+    expect(goal?.scoreProducer).toBe("score-report")
+  })
+
+  test("the improve fragment is the directed fixer: writable, diff attached, PRD attached", () => {
+    const goal = ship().goalPlan!
+    const [fix] = goal.improve.steps
+
+    expect(goal.improve.steps.map((step) => step.name)).toEqual(["fix"])
+    expect(fix).toMatchObject({ agentName: "goal-fixer", inputDiff: true, prdHistory: true })
+    expect(fix?.readOnly).toBeFalsy()
   })
 
   test("fans the scorers across Grok 4.6 high + GLM 5.3 high as forced read-only", () => {
-    const scorers = shipSteps().filter((step) => step.stepName === "score")
+    const goal = ship().goalPlan!
+    const scorers = goal.measure.steps.filter((step) => step.stepName === "score")
 
     expect(scorers).toHaveLength(2)
     expect(scorers.map((step) => ({ model: step.model, variant: step.variant }))).toEqual([
@@ -301,15 +315,17 @@ describe("built-in ship pipeline", () => {
       expect(step.agentName).toBe("quality-scorer")
       expect(step.readOnly).toBe(true)
       expect(step.verify).toBeUndefined()
-      // No review-scope step feeds these, so the diff has to arrive by the
-      // "every step after the first gets it" default.
+      // The fixer's report restates the previous score, so the re-scorers stay
+      // blind to it: they grade the current artifact with the PRD and the diff,
+      // never a report from the round before.
       expect(step.inputDiff).toBe(true)
-      expect(step.inputFiles).toEqual(["prd.md", "reports/sync.md"])
+      expect(step.inputFiles).toEqual(["prd.md"])
     }
   })
 
-  test("consensus step keeps bash to verify the scorers' claims and reads every report", () => {
-    const report = shipSteps().find((step) => step.name === "score-report")
+  test("consensus step keeps bash to verify the scorers' claims and reads every scorer report", () => {
+    const goal = ship().goalPlan!
+    const report = goal.measure.steps.find((step) => step.name === "score-report")
 
     expect(report).toMatchObject({
       agentName: "quality-score-report",
@@ -320,7 +336,6 @@ describe("built-in ship pipeline", () => {
     })
     expect(report?.inputFiles).toEqual([
       "prd.md",
-      "reports/sync.md",
       "reports/score__openrouter-x-ai-grok-4-6-high.md",
       "reports/score__openrouter-z-ai-glm-5-3-high.md",
     ])
@@ -436,17 +451,15 @@ describe("PRD history pipeline plumbing", () => {
 
     // ship and goal-fix have no scope step; their scorers and consensus carry
     // the PRD so the measurement is graded against the original requirements.
-    for (const name of ["ship", "goal-fix"] as const) {
-      const steps = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents }).steps
-      expect(steps.filter((step): step is AgentStep => step.type === "agent" && step.name === "score").every((step) => step.prdHistory === true)).toBe(true)
-      expect(steps.find((step): step is AgentStep => step.type === "agent" && step.name === "score-report")?.prdHistory).toBe(true)
-    }
-
-    // goal-fix also attaches the PRD on the fixer, so it knows the original
+    // ship's measurement now lives in its goal step: the fragment's scorers and
+    // consensus carry the PRD so the measurement is graded against the original
+    // requirements, and the fixer does too, so it knows the original
     // requirements while closing exactly the reported gaps.
     {
-      const steps = resolvePipeline({ name: "goal-fix", spec: builtInPipelines["goal-fix"]!, agents: builtInAgents }).steps
-      expect(steps.find((step): step is AgentStep => step.type === "agent" && step.name === "fix")?.prdHistory).toBe(true)
+      const goal = resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents }).goalPlan!
+      expect(goal.measure.steps.filter((step) => step.name === "score").every((step) => step.prdHistory === true)).toBe(true)
+      expect(goal.measure.steps.find((step) => step.name === "score-report")?.prdHistory).toBe(true)
+      expect(goal.improve.steps.find((step) => step.name === "fix")?.prdHistory).toBe(true)
     }
 
     // Non-scored pipelines attach no historical PRD anywhere.
@@ -707,7 +720,7 @@ describe("built-in default prompts", () => {
   })
 
   test("pipelines where the prompt IS the description carry no defaultPrompt", () => {
-    for (const name of ["implement", "implement-lite", "fixer", "goal-fix"]) {
+    for (const name of ["implement", "implement-lite", "fixer"]) {
       const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
       expect(pipeline.defaultPrompt, `${name} should not have a defaultPrompt`).toBeUndefined()
       expect(pipeline.suggestedPrompts, `${name} should not have suggestions`).toBeUndefined()
@@ -859,6 +872,32 @@ describe("step filters", () => {
     })
     expect(() => validateStepFilters(pipeline, { onlySteps: ["clean-code"], skipSteps: [] })).not.toThrow()
     expect(() => validateStepFilters(pipeline, { onlySteps: ["clean-code__anthropic-claude-opus-4-7"], skipSteps: [] })).not.toThrow()
+  })
+
+  test("rejects filters naming internal goal phases, even ones that also match prefix steps", () => {
+    // A goal pipeline whose prefix happens to share a step name with the
+    // measure fragment: the filter must still refuse, because partially
+    // compiling a loop is never valid.
+    const pipeline = resolvePipeline({
+      name: "scored",
+      spec: {
+        steps: [
+          { agent: "implementer", name: "score" },
+          {
+            goal: {
+              target: 85,
+              improve: { briefStep: "fix", steps: [{ agent: "review-fixer", name: "fix" }] },
+              measure: { steps: [{ agent: "quality-score-report", name: "score-report" }] },
+            },
+          },
+        ],
+      },
+      agents: builtInAgents,
+    })
+    expect(() => validateStepFilters(pipeline, { onlySteps: [], skipSteps: ["fix"] })).toThrow(/goal improve phase/)
+    expect(() => validateStepFilters(pipeline, { onlySteps: [], skipSteps: ["score-report"] })).toThrow(/goal measure phase/)
+    // A prefix step that only exists in the prefix stays filterable.
+    expect(() => validateStepFilters(pipeline, { onlySteps: [], skipSteps: ["score"] })).not.toThrow()
   })
 })
 
@@ -1342,5 +1381,226 @@ describe("deliverable contracts", () => {
     expect(defaultSteps["implementer"]?.deliverableContract).toEqual({ kind: "markdown-report" })
     // readOnly is only set when true; a writable phase leaves it undefined.
     expect(defaultSteps["implementer"]?.readOnly).toBeFalsy()
+  })
+})
+
+describe("terminal goal step", () => {
+  const prefix = (): AgentStepSpec[] => [{ agent: "implementer", reports: "none" }]
+
+  const goalImprove = (): GoalImproveSpec => ({
+    briefStep: "fix",
+    steps: [{ agent: "review-fixer", name: "fix", reports: "none", diff: true }],
+  })
+
+  const goalMeasure = (): GoalMeasureSpec => ({
+    steps: [
+      { parallel: [{ agent: "quality-scorer", name: "score", models: [defaultAdversarialModel, "openrouter/z-ai/glm-5.3#high"], reports: "none" }] },
+      { agent: "quality-score-report", name: "score-report", reports: ["score"] },
+    ],
+  })
+
+  const goalNode = (overrides: Partial<GoalStepSpec["goal"]> = {}): GoalStepSpec => ({
+    goal: {
+      target: 85,
+      improve: goalImprove(),
+      measure: goalMeasure(),
+      ...overrides,
+    },
+  })
+
+  // A valid embedded goal: a writable prefix, an improve fragment whose fixer
+  // is the brief recipient, and a read-only measure fragment ending in the
+  // consensus score. Deliberately uses writable/read-only agents that exist in
+  // the catalogue without leaning on any goal-reserved step name.
+  const goalSpec = (): PipelineSpec => ({ steps: [...prefix(), goalNode({ target: 90 })] })
+
+  const resolveGoal = (spec: PipelineSpec = goalSpec()) => resolvePipeline({ name: "scored", spec, agents: builtInAgents })
+
+  test("a pipeline with one terminal goal step resolves a goal plan beside its prefix", () => {
+    const pipeline = resolveGoal()
+
+    // The prefix is the ordinary step list; the goal node is not a step in it.
+    expect(pipeline.steps.map((step) => step.name)).toEqual(["implementer"])
+
+    const goal = pipeline.goalPlan
+    expect(goal).toBeDefined()
+    expect(goal?.target).toBe(90)
+    // Omitted cap/plateau use the documented defaults of three.
+    expect(goal?.maxIterations).toBe(3)
+    expect(goal?.plateau).toBe(3)
+  })
+
+  test("explicit maxIterations and plateau are respected", () => {
+    const goal = resolveGoal({ steps: [...prefix(), goalNode({ target: 85, maxIterations: 5, plateau: 2 })] }).goalPlan
+    expect(goal?.maxIterations).toBe(5)
+    expect(goal?.plateau).toBe(2)
+  })
+
+  test("fragments resolve to ordered concrete steps with the improve brief recipient by structure", () => {
+    const goal = resolveGoal().goalPlan!
+
+    expect(goal.briefRecipient).toBe("fix")
+    expect(goal.improve.steps.map((step) => step.name)).toEqual(["fix"])
+
+    // Fan-out members keep their model-disambiguated physical names.
+    const names = goal.measure.steps.map((step) => step.name)
+    expect(names).toEqual([
+      "score__openrouter-x-ai-grok-4-6-high",
+      "score__openrouter-z-ai-glm-5-3-high",
+      "score-report",
+    ])
+    // The score producer is the unique final quality-score deliverable.
+    expect(goal.scoreProducer).toBe("score-report")
+  })
+
+  test("improve keeps a writable step and measure is entirely read-only", () => {
+    const goal = resolveGoal().goalPlan!
+    expect(goal.improve.steps.some((step) => !step.readOnly)).toBe(true)
+    for (const step of goal.measure.steps) {
+      expect(step.readOnly).toBe(true)
+    }
+  })
+
+  test("target bounds are enforced with a path-specific error", () => {
+    for (const target of [0, 101, -1]) {
+      expect(() => resolveGoal({ steps: [...prefix(), goalNode({ target })] })).toThrow(/goal\.target/)
+    }
+  })
+
+  test("a missing target is rejected", () => {
+    const node = goalNode()
+    delete (node.goal as { target?: number }).target
+    expect(() => resolveGoal({ steps: [...prefix(), node] })).toThrow(/goal\.target/)
+  })
+
+  test("a pipeline without a goal step stays ordinary", () => {
+    const pipeline = resolvePipeline({ name: "plain", spec: { steps: [{ agent: "implementer" }] }, agents: builtInAgents })
+    expect(pipeline.goalPlan).toBeUndefined()
+    expect(pipeline.steps.map((step) => step.name)).toEqual(["implementer"])
+  })
+
+  test("rejects two goal steps", () => {
+    expect(() => resolveGoal({ steps: [...prefix(), goalNode(), goalNode()] })).toThrow(/more than one goal step/)
+  })
+
+  test("rejects a step after the goal step", () => {
+    expect(() => resolveGoal({ steps: [goalNode(), ...prefix()] })).toThrow(/final step/)
+  })
+
+  test("rejects a goal step nested in a parallel block", () => {
+    expect(() => resolveGoal({ steps: [{ parallel: [{ agent: "implementer" }, goalNode() as never] }] })).toThrow(/parallel/)
+  })
+
+  test("rejects a goal step nested inside a goal fragment", () => {
+    expect(() =>
+      resolveGoal({
+        steps: [...prefix(), goalNode({ improve: { briefStep: "fix", steps: [goalNode()] } })],
+      }),
+    ).toThrow(/nest a goal step inside a goal fragment/)
+  })
+
+  test("rejects empty improve and measure fragments", () => {
+    expect(() => resolveGoal({ steps: [...prefix(), goalNode({ improve: { briefStep: "fix", steps: [] } })] })).toThrow(
+      /goal\.improve\.steps must be a non-empty list/,
+    )
+    expect(() => resolveGoal({ steps: [...prefix(), goalNode({ measure: { steps: [] } })] })).toThrow(
+      /goal\.measure\.steps must be a non-empty list/,
+    )
+  })
+
+  test("rejects human steps inside a goal fragment", () => {
+    expect(() =>
+      resolveGoal({
+        steps: [...prefix(), goalNode({ improve: { briefStep: "fix", steps: [{ agent: "review-fixer", name: "fix" }, { type: "human", name: "gate" }] } })],
+      }),
+    ).toThrow(/human step inside a goal fragment/)
+  })
+
+  test("rejects a briefStep that names no improve step or names several", () => {
+    expect(() => resolveGoal({ steps: [...prefix(), goalNode({ improve: { briefStep: "nope", steps: [{ agent: "review-fixer", name: "fix" }] } })] })).toThrow(
+      /briefStep "nope" does not name an improve step/,
+    )
+
+    // A models fan-out produces several resolved steps under one briefStep
+    // name: the brief would go to every variant, so it is ambiguous rather
+    // than directed.
+    expect(() =>
+      resolveGoal({
+        steps: [
+          ...prefix(),
+          goalNode({
+            improve: { briefStep: "fix", steps: [{ agent: "review-fixer", name: "fix", models: [defaultAdversarialModel, "openrouter/z-ai/glm-5.3#high"] }] },
+          }),
+        ],
+      }),
+    ).toThrow(/matches 2 improve steps/)
+  })
+
+  test("rejects a measure fragment that can modify the repository", () => {
+    expect(() =>
+      resolveGoal({ steps: [...prefix(), goalNode({ measure: { steps: [{ agent: "implementer", name: "score" }] } })] }),
+    ).toThrow(/goal\.measure must be read-only/)
+  })
+
+  test("rejects a measure fragment that does not end in exactly one quality-score deliverable", () => {
+    expect(() =>
+      resolveGoal({ steps: [...prefix(), goalNode({ measure: { steps: [{ agent: "review-scope", name: "check", reports: "none" }] } })] }),
+    ).toThrow(/quality score/)
+    expect(() =>
+      resolveGoal({
+        steps: [
+          ...prefix(),
+          goalNode({
+            measure: { steps: [{ agent: "quality-score-report", name: "score-report", reports: "none" }, { agent: "review-scope", name: "after", reports: "none" }] },
+          }),
+        ],
+      }),
+    ).toThrow(/must end in exactly one/)
+  })
+
+  test("fragment report selectors resolve only within their own invocation", () => {
+    // The pipeline prefix has a "report" step, but a measure fragment that
+    // names it must fail: fragments resolve with an empty report namespace, so
+    // a measurement cannot read prefix or previous-round reports.
+    const crossRound: PipelineSpec = {
+      steps: [
+        { agent: "review-scope", name: "scope", reports: "none" },
+        goalNode({
+          measure: {
+            steps: [
+              { agent: "review-scope", name: "evidence", reports: ["scope"] },
+              { agent: "quality-score-report", name: "score-report", reports: ["evidence"] },
+            ],
+          },
+        }),
+      ],
+    }
+    expect(() => resolveGoal(crossRound)).toThrow(/not an earlier agent step/)
+  })
+
+  test("an arbitrarily named repair and consensus resolve without reserved names", () => {
+    const spec: PipelineSpec = {
+      steps: [
+        ...prefix(),
+        {
+          goal: {
+            target: 80,
+            improve: {
+              briefStep: "repair",
+              steps: [{ agent: "implementation-fixer", name: "repair", reports: "none", diff: true, deliverable: "markdown" }],
+            },
+            measure: {
+              steps: [
+                { parallel: [{ agent: "quality-scorer", name: "grade", models: [defaultAdversarialModel, "openrouter/z-ai/glm-5.3#high"], reports: "none" }] },
+                { agent: "review-report", name: "arbiter", model: "openai/gpt-5.6-sol#xhigh", reports: ["grade"], deliverable: "quality-score" },
+              ],
+            },
+          },
+        },
+      ],
+    }
+    const goal = resolveGoal(spec).goalPlan!
+    expect(goal.briefRecipient).toBe("repair")
+    expect(goal.scoreProducer).toBe("arbiter")
   })
 })

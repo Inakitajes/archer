@@ -159,6 +159,46 @@ describe("frozen run metadata regressions", () => {
     expect(resumed.phaseStatus(step.name)).toBe("failed")
     expect(resumed.repositoryBaseline(step.name)).toEqual({ head: "abc123", ref: "main" })
   })
+
+  test("a legacy schema-v3 goal-fix metadata record opens safely as a plain run", async () => {
+    // Runs recorded by the retired goal-fix child-run host (schema v3, no goal
+    // step anywhere) stay readable: metadata never guesses their intent, and the
+    // frozen pipeline is replayed as an ordinary record for inspection.
+    const ws = await workspace()
+    const legacyGoalFix: Pipeline = {
+      name: "goal-fix",
+      steps: [
+        { ...implementer, name: "fix", stepName: "fix", agentName: "goal-fixer", reportPath: "reports/fix.md", groupId: "g1" },
+        { ...implementer, name: "score", stepName: "score", agentName: "quality-scorer", reportPath: "reports/score.md", groupId: "g2", readOnly: true },
+        { ...implementer, name: "score-report", stepName: "score-report", agentName: "quality-score-report", reportPath: "reports/score-report.md", groupId: "g3", readOnly: true },
+      ],
+    }
+    await writeFile(
+      join(ws.dir, "metadata.json"),
+      JSON.stringify({
+        schemaVersion: 3,
+        runID: ws.runID,
+        targetDir: "/repo",
+        createdAt: 0,
+        updatedAt: 0,
+        control: { state: "completed" },
+        phases: { fix: { status: "completed" }, score: { status: "completed" }, "score-report": { status: "failed" } },
+        pipeline: legacyGoalFix,
+        // Obsolete transport fields from the retired child-run host are ignored.
+        keptWorkspaces: ["..."],
+      }),
+    )
+
+    const read = await readRunMetadata(join(ws.dir, "metadata.json"))
+    expect(read?.pipeline?.name).toBe("goal-fix")
+    expect(read?.pipeline?.steps.map((step) => step.name)).toEqual(["fix", "score", "score-report"])
+    // No embedded goal state exists on a legacy record — nothing to synthesize.
+    expect((read?.pipeline as Pipeline & { goalPlan?: unknown }).goalPlan).toBeUndefined()
+
+    const resumed = await openRunMetadata(ws, "/repo", defaultPipeline())
+    expect(resumed.pipeline.name).toBe("goal-fix")
+    expect(resumed.pipeline.steps).toHaveLength(3)
+  })
 })
 
 describe("malicious frozen metadata regressions", () => {

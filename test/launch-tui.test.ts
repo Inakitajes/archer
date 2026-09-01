@@ -1,15 +1,21 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test, afterAll } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { LaunchPicker, adjustGoalTarget, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultGoalTarget, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, pipelineRow, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, trimPromptField, typedText, wrapPromptLines } from "../src/launch-tui"
+import { LaunchPicker, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultDirtyStatus, dirtReading, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, pipelineRow, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, trimPromptField, typedText, wrapPromptLines } from "../src/launch-tui"
+import type { LaunchRunTuiOptions } from "../src/launch-tui"
+import { ensureRepoReady, statusPorcelain } from "../src/git"
 import type { OpenSpecChangeSummary } from "../src/openspec"
 
+import { buildRunPlan } from "../src/run-plan"
 import { builtInAgents, builtInPipelines, hasWritableStep, resolvePipeline } from "../src/pipeline"
 import { parseConvoyConfig } from "../src/config"
 import { consensusStep } from "../src/quality-score"
 import { displayWidth } from "../src/tui-theme"
 import type { LimitsSnapshot } from "../src/limits"
 import type { KeyEvent } from "@opentui/core"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 function key(partial: Partial<KeyEvent>): KeyEvent {
   return partial as KeyEvent
@@ -59,6 +65,7 @@ async function createLauncher(
   specs: readonly OpenSpecChangeSummary[] = [],
   autoSpecIds: readonly string[] = [],
   presetChange?: string,
+  callbacks: Partial<Pick<LaunchRunTuiOptions, "readDirtyStatus" | "prepareRun">> = {},
 ) {
   const testRenderer = await createTestRenderer({ width, height })
   const picker = new LaunchPicker(
@@ -67,7 +74,12 @@ async function createLauncher(
     launcherChoices(choiceCount),
     "configured",
     { isolate: false, reason: "test" },
-    {} as never,
+    {
+      // Default the dirt reader to a clean tree: this worktree is often dirty
+      // while a change is in flight, and real porcelain would shift frames.
+      readDirtyStatus: async () => "",
+      ...callbacks,
+    } as never,
     { enabled: true, entries: [] },
     specs,
     autoSpecIds,
@@ -87,14 +99,21 @@ type LaunchPickerView = {
   optionIndex: number
   gateway: string
   modal: { kind: string; index: number } | undefined
-  toggleState: { worktree: boolean }
+  toggleState: { worktree: boolean; includeDirty: boolean; [key: string]: unknown }
   promptChoosing: boolean
   specIndex: number
   selectedChangeId?: string
+  prepared?: {
+    selection: { includeDirty: boolean }
+    dirt: { files: number; matters: boolean; blocked: boolean; preview: string }
+  }
   modalWidth(): number
   promptDetail(width: number): { chunks: Array<{ text: string }> }
   optionsDetail(width: number): { chunks: Array<{ text: string }> }
   pipelineDetail(width: number): { chunks: Array<{ text: string }> }
+  reviewDetail(width: number): { chunks: Array<{ text: string }> }
+  prepareReview(pipelineName: string): Promise<void>
+  refreshDirt(): Promise<void>
   runSelection(pipelineName: string, initializeGit?: boolean): { prompt: string; change?: string }
 }
 
@@ -1040,65 +1059,20 @@ describe("launch TUI gateway selector", () => {
   })
 })
 
-describe("launch TUI goal mode", () => {
-  test("defaultGoalTarget is 90", () => {
-    expect(defaultGoalTarget).toBe(90)
-  })
-
-  test("adjustGoalTarget increases by delta", () => {
-    expect(adjustGoalTarget(90, 5)).toBe(95)
-    expect(adjustGoalTarget(85, 5)).toBe(90)
-    expect(adjustGoalTarget(50, 10)).toBe(60)
-  })
-
-  test("adjustGoalTarget decreases by delta", () => {
-    expect(adjustGoalTarget(90, -5)).toBe(85)
-    expect(adjustGoalTarget(95, -10)).toBe(85)
-  })
-
-  test("adjustGoalTarget clamps to 100 at the top", () => {
-    expect(adjustGoalTarget(98, 5)).toBe(100)
-    expect(adjustGoalTarget(100, 5)).toBe(100)
-  })
-
-  test("adjustGoalTarget clamps to 1 at the bottom and never returns 0", () => {
-    expect(adjustGoalTarget(3, -5)).toBe(1)
-    expect(adjustGoalTarget(1, -5)).toBe(1)
-    expect(adjustGoalTarget(1, -100)).toBe(1)
-  })
-
-  test("adjustGoalTarget with 0 delta returns the current value", () => {
-    expect(adjustGoalTarget(90, 0)).toBe(90)
-    expect(adjustGoalTarget(1, 0)).toBe(1)
-    expect(adjustGoalTarget(100, 0)).toBe(100)
-  })
-
-  test("consensusStep detects scored built-in pipelines", () => {
-    // Scored: pipelines that end in a quality-score-report step
-    for (const name of ["ship", "review", "review-lite", "goal-fix"]) {
+describe("launch TUI goal classification", () => {
+  // The launcher classifies pipelines directly by the presence of a valid
+  // terminal goal step — the only way a pipeline enters goal execution. There
+  // is no goal-mode toggle and no scored+writable eligibility heuristic.
+  test("only pipelines with a terminal goal step are classified as goal pipelines", () => {
+    const hasGoal = (name: string) => {
       const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
-      expect(consensusStep(pipeline)).toBeDefined()
-    }
-  })
-
-  test("consensusStep rejects non-scored built-in pipelines", () => {
-    for (const name of ["implement", "implement-lite", "fixer", "review-cc", "hunter"]) {
-      const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
-      expect(consensusStep(pipeline)).toBeUndefined()
-    }
-  })
-
-  test("only ship is goal-eligible: review scores but cannot be fixed, implement can be fixed but is not scored", () => {
-    // Goal mode needs both halves; the launcher's `scored` flag is the AND of them.
-    const eligible = (name: string) => {
-      const pipeline = resolvePipeline({ name, spec: builtInPipelines[name]!, agents: builtInAgents })
-      return Boolean(consensusStep(pipeline)) && hasWritableStep(pipeline)
+      return Boolean(pipeline.goalPlan)
     }
 
-    expect(eligible("ship")).toBe(true)
-    expect(eligible("review")).toBe(false)
-    expect(eligible("review-lite")).toBe(false)
-    expect(eligible("implement")).toBe(false)
+    expect(hasGoal("ship")).toBe(true)
+    expect(hasGoal("review")).toBe(false)
+    expect(hasGoal("review-lite")).toBe(false)
+    expect(hasGoal("implement")).toBe(false)
   })
 })
 
@@ -1378,6 +1352,331 @@ describe("launch TUI preset change (specs viewer handoff)", () => {
       const view = launchView(launcher.picker)
       expect(view.selectedChangeId).toBeUndefined()
       expect(launcher.captureCharFrame()).toContain("2 active changes · pick one when writing the prompt")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+})
+
+/** Seven dirty porcelain entries, as `git status --porcelain` reports them. */
+const dirtySeven = [" M src/a.ts", " M src/b.ts", "?? src/c.ts", " M src/d.ts", " M src/e.ts", " M src/f.ts", " M src/g.ts"].join("\n")
+
+function optionsText(view: LaunchPickerView, width = 80) {
+  return view.optionsDetail(width).chunks.map((chunk) => chunk.text).join("")
+}
+
+/** A minimal frozen plan for the injected prepareRun, as runReviewLines renders it. */
+function fakePlan() {
+  return buildRunPlan({
+    prompt: "do the thing",
+    targetDir: process.cwd(),
+    baseRef: "main",
+    worktree: false,
+    dirty: false,
+    pipeline: { name: "pipeline-1", steps: [] } as never,
+    hooks: { pre: [], post: [], pipelines: {} },
+    files: [],
+    permissions: "yolo",
+  } as never)
+}
+
+/** Polls for an asynchronous picker transition (prepare/refresh are fire-and-forget in the handlers). */
+async function until(predicate: () => boolean, what: string) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (predicate()) return
+    await Bun.sleep(10)
+  }
+  throw new Error(`timed out waiting for ${what}`)
+}
+
+describe("dirtReading predicate matrix", () => {
+  const cases = [
+    [undefined, "plain"],
+    [{ worktreeDir: "/wt/feat-add-foo" }, "preset feature"],
+  ] as const
+  const porcelains: Array<[string, string]> = [
+    ["clean", ""],
+    ["dirty", dirtySeven],
+  ]
+
+  for (const [preset, presetLabel] of cases) {
+    for (const worktree of [false, true]) {
+      for (const [porcelainName, porcelain] of porcelains) {
+        for (const includeDirty of [false, true]) {
+          test(`${presetLabel} · worktree ${worktree ? "on" : "off"} · ${porcelainName} · includeDirty ${includeDirty}`, () => {
+            const dirt = dirtReading(porcelain, { presetFeature: preset, worktree, includeDirty })
+            expect(dirt.files).toBe(porcelain === "" ? 0 : 7)
+            expect(dirt.matters).toBe(preset ? true : !worktree)
+            expect(dirt.blocked).toBe(dirt.matters && dirt.files > 0 && !includeDirty)
+          })
+        }
+      }
+    }
+  }
+})
+
+describe("dirtReading parity with the execution-time gate", () => {
+  const dirs: string[] = []
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  async function makeRepo(dirty: boolean): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-dirt-parity-"))
+    dirs.push(dir)
+    const git = async (...args: string[]) => {
+      const proc = Bun.spawn(["git", ...args], { cwd: dir, stdout: "pipe", stderr: "pipe" })
+      if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(proc.stderr).text()}`)
+    }
+    await git("init", "-q")
+    await git("config", "user.email", "o@e.com")
+    await git("config", "user.name", "O")
+    await Bun.write(join(dir, "README.md"), "# repo\n")
+    await git("add", ".")
+    await git("commit", "-q", "-m", "init")
+    if (dirty) await Bun.write(join(dir, "dirty.txt"), "uncommitted\n")
+    return dir
+  }
+
+  // The predicate must refuse exactly what ensureRepoReady(executionDir,
+  // { allowDirty: options.worktree }) would refuse, so the launcher's warning
+  // and the post-review gate can never disagree about what counts (task 4.2).
+  for (const dirty of [false, true]) {
+    for (const worktree of [false, true]) {
+      for (const includeDirty of [false, true]) {
+        test(`gate parity: ${dirty ? "dirty" : "clean"} · worktree ${worktree ? "on" : "off"} · includeDirty ${includeDirty}`, async () => {
+          const dir = await makeRepo(dirty)
+          const porcelain = await statusPorcelain(dir)
+          const gate = await ensureRepoReady(dir, { allowDirty: worktree, includeDirty }).then(
+            () => false,
+            () => true,
+          )
+          expect(dirtReading(porcelain, { worktree, includeDirty }).blocked).toBe(gate)
+
+          // A continue handoff always executes with isolation off, so the gate
+          // sees allowDirty=false even with the worktree toggle on — the
+          // predicate mirrors that through `matters`.
+          const gatePreset = await ensureRepoReady(dir, { allowDirty: false, includeDirty }).then(
+            () => false,
+            () => true,
+          )
+          expect(dirtReading(porcelain, { presetFeature: { worktreeDir: dir }, worktree: true, includeDirty }).blocked).toBe(gatePreset)
+        })
+      }
+    }
+  }
+
+  test("the default reader surfaces the gate's own porcelain and resolves clean when git can't answer", async () => {
+    const dir = await makeRepo(true)
+    expect(await defaultDirtyStatus(dir)).toContain("dirty.txt")
+    expect(await defaultDirtyStatus(join(tmpdir(), "convoy-no-such-dir"))).toBe("")
+  })
+})
+
+describe("launch TUI dirty-tree preflight (options step)", () => {
+  test("a dirty plain run shows the notice and the counted toggle label", async () => {
+    const launcher = await createLauncher(100, 40, 1, [], [], undefined, { readDirtyStatus: async () => dirtySeven })
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await view.refreshDirt()
+      await launcher.renderOnce()
+      const text = optionsText(view)
+      expect(text).toContain("7 files uncommitted")
+      expect(text).toContain("Include dirty tree")
+      expect(text).toContain("(7 uncommitted)")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("a clean tree stays quiet and the toggle keeps its standard label", async () => {
+    const launcher = await createLauncher(100, 40, 1, [], [], undefined, { readDirtyStatus: async () => "" })
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await view.refreshDirt()
+      await launcher.renderOnce()
+      const text = optionsText(view)
+      expect(text).not.toContain("uncommitted")
+      expect(text).toContain("Include dirty tree")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("worktree isolation makes source dirt irrelevant", async () => {
+    const launcher = await createLauncher(100, 40, 1, [], [], undefined, { readDirtyStatus: async () => dirtySeven })
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      view.toggleState.worktree = true
+      await view.refreshDirt()
+      await launcher.renderOnce()
+      const text = optionsText(view)
+      expect(text).not.toContain("uncommitted")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("the notice and count disappear once the toggle covers the dirt", async () => {
+    const launcher = await createLauncher(100, 40, 1, [], [], undefined, { readDirtyStatus: async () => dirtySeven })
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await view.refreshDirt()
+      expect(optionsText(view)).toContain("7 files uncommitted")
+      view.toggleState.includeDirty = true
+      const text = optionsText(view)
+      expect(text).not.toContain("uncommitted")
+      expect(text).toContain("Include dirty tree")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("the options step and the review each read the tree fresh, never reusing the earlier status", async () => {
+    const reads = ["", dirtySeven]
+    const dirs: string[] = []
+    let calls = 0
+    const launcher = await createLauncher(100, 40, 1, [], [], undefined, {
+      readDirtyStatus: async (dir) => {
+        calls += 1
+        dirs.push(dir)
+        return reads[calls - 1] ?? ""
+      },
+      prepareRun: async () => ({ options: {} as never, plan: fakePlan() }),
+    })
+    try {
+      await launcher.renderOnce()
+      launcher.mockInput.pressEnter() // pipelines -> prompt editor (no specs)
+      for (const ch of "ship it") launcher.mockInput.pressKey(ch)
+      launcher.mockInput.pressEnter() // submit -> options
+      const view = launchView(launcher.picker)
+      await until(() => view.mode === "options", "options step")
+      await until(() => calls === 1, "the options-step dirt read")
+      expect(dirs[0]).toBe(process.cwd())
+      expect(view.prepared).toBeUndefined()
+
+      await view.prepareReview("pipeline-1")
+      await until(() => view.mode === "review", "review step")
+      await until(() => calls === 2, "the review-time dirt read")
+      expect(view.prepared?.dirt).toMatchObject({ files: 7, matters: true, blocked: true })
+      await launcher.renderOnce()
+      expect(launcher.captureCharFrame()).toContain("uncommitted")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+})
+
+describe("launch TUI dirty-tree review warning and accept-time choice", () => {
+  function reviewLauncher(reader: () => Promise<string>) {
+    return createLauncher(100, 40, 1, [], [], undefined, {
+      readDirtyStatus: reader,
+      prepareRun: async () => ({ options: {} as never, plan: fakePlan() }),
+    })
+  }
+
+  test("a dirty tree with the toggle off shows the warning; with it on or clean, none", async () => {
+    const launcher = await reviewLauncher(async () => dirtySeven)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await view.prepareReview("pipeline-1")
+      await until(() => view.mode === "review", "review step")
+      expect(view.reviewDetail(80).chunks.map((chunk) => chunk.text).join("")).toContain("would refuse")
+
+      view.toggleState.includeDirty = true
+      await view.prepareReview("pipeline-1")
+      await until(() => view.mode === "review" && view.prepared?.dirt.blocked === false, "re-prepared review")
+      expect(view.reviewDetail(80).chunks.map((chunk) => chunk.text).join("")).not.toContain("would refuse")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("a clean tree shows no warning", async () => {
+    const launcher = await reviewLauncher(async () => "")
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await view.prepareReview("pipeline-1")
+      await until(() => view.mode === "review", "review step")
+      expect(view.reviewDetail(80).chunks.map((chunk) => chunk.text).join("")).not.toContain("would refuse")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("accepting with unhandled dirt offers the choice; include re-prepares and the second accept starts the run", async () => {
+    const launcher = await reviewLauncher(async () => dirtySeven)
+    // No closeLauncher: the second accept finishes the picker and resolves its
+    // result below, so closeLauncher's "resolves undefined" would fail.
+    const view = launchView(launcher.picker)
+    view.mode = "options"
+    await view.prepareReview("pipeline-1")
+    await until(() => view.mode === "review", "review step")
+
+    launcher.renderer.keyInput.emit("keypress", keyEvent("return"))
+    await launcher.renderOnce()
+    expect(view.modal?.kind).toBe("dirty")
+    const frame = launcher.captureCharFrame()
+    expect(frame).toContain("uncommitted changes")
+    expect(frame).toContain("i include · o options · esc stay")
+    expect(frame).toContain("M src/a.ts")
+
+    launcher.mockInput.pressKey("i")
+    await until(() => view.mode === "review" && view.modal === undefined && view.prepared?.selection.includeDirty === true, "the include re-prepare")
+    expect(view.prepared?.dirt.blocked).toBe(false)
+    await launcher.renderOnce()
+    expect(launcher.captureCharFrame()).not.toContain("would refuse")
+
+    launcher.renderer.keyInput.emit("keypress", keyEvent("return"))
+    await expect(launcher.picker.result).resolves.toMatchObject({ action: "run", selection: { includeDirty: true } })
+  })
+
+  test("choosing options returns with prompt, toggles, and selection intact", async () => {
+    const launcher = await reviewLauncher(async () => dirtySeven)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      view.prompt = "my prompt"
+      view.optionIndex = 2
+      await view.prepareReview("pipeline-1")
+      await until(() => view.mode === "review", "review step")
+
+      launcher.renderer.keyInput.emit("keypress", keyEvent("return"))
+      await until(() => view.modal?.kind === "dirty", "the dirty choice")
+      launcher.mockInput.pressKey("o")
+      await launcher.renderOnce()
+      expect(view.mode).toBe("options")
+      expect(view.prompt).toBe("my prompt")
+      expect(view.optionIndex).toBe(2)
+      expect(view.toggleState.includeDirty).toBe(false)
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  test("dismissing keeps the session in review, and a repeated accept re-offers the choice", async () => {
+    const launcher = await reviewLauncher(async () => dirtySeven)
+    try {
+      const view = launchView(launcher.picker)
+      view.mode = "options"
+      await view.prepareReview("pipeline-1")
+      await until(() => view.mode === "review", "review step")
+
+      launcher.renderer.keyInput.emit("keypress", keyEvent("return"))
+      await until(() => view.modal?.kind === "dirty", "the dirty choice")
+      launcher.renderer.keyInput.emit("keypress", keyEvent("escape"))
+      await launcher.renderOnce()
+      expect(view.modal).toBeUndefined()
+      expect(view.mode).toBe("review")
+
+      launcher.renderer.keyInput.emit("keypress", keyEvent("return"))
+      await until(() => view.modal?.kind === "dirty", "the re-offered choice")
     } finally {
       await closeLauncher(launcher)
     }

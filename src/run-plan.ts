@@ -1,9 +1,8 @@
 import { resolveModel, type ModelGateway, type ModelRoutingOverrides } from "./model-routing"
 import type { OpenSpecBundle } from "./openspec"
 import type { PrdHistoryPreview } from "./prd-history"
-import { defaultGoalMaxIterations, defaultGoalPlateau } from "./quality-score"
 import { stepRunnerFor } from "./step-runners"
-import type { AgentStep, Pipeline, RunOptions, RunPlan, Step } from "./types"
+import type { AgentStep, Pipeline, ResolvedGoalPlan, RunOptions, RunPlan, Step } from "./types"
 
 export type BuildRunPlanInput = RunOptions & {
   promptSource?: RunPlan["prompt"]["source"]
@@ -25,6 +24,9 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
   const gateway = input.gateway ?? "configured"
   const overrides = input.modelRoutingOverrides ?? {}
   // The immutable plan must never recursively freeze caller-owned config.
+  // The pipeline's terminal goal step — policy and both fragments — is part of
+  // that frozen copy, so the reviewed plan is the sole authority for the goal
+  // cycle: nothing is re-resolved or re-routed between iterations.
   const pipeline = routePipeline(filterPipeline(structuredClone(input.pipeline), input.onlySteps, input.skipSteps), gateway, overrides, input.modelOverride, {
     advisorOverride: input.advisorOverride,
     advisorDisabled: input.advisorDisabled,
@@ -33,22 +35,6 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     ? resolveModel(input.smartJudgeModel, gateway, overrides)
     : undefined
   const hooks = hooksForPlan(input, pipeline.name)
-  // Goal mode: when on, route the goal-fix pipeline through the same gateway
-  // and freeze its config into the plan the operator reviews and preflights —
-  // so the full bounded loop (target, cap, plateau, fix pipeline, mutation) is
-  // visible and validated before a single model session starts.
-  const goal =
-    input.goal !== undefined && input.goalFixPipeline
-      ? {
-          target: input.goal,
-          maxIterations: input.goalMaxIterations ?? defaultGoalMaxIterations,
-          plateau: input.goalPlateau ?? defaultGoalPlateau,
-          fixPipeline: routePipeline(structuredClone(input.goalFixPipeline), gateway, overrides, input.modelOverride, {
-            advisorOverride: input.advisorOverride,
-            advisorDisabled: input.advisorDisabled,
-          }),
-        }
-      : undefined
   return deepFreeze({
     prompt: { source: input.promptSource ?? (input.resumeRunID ? "resume" : "inline"), text: input.prompt },
     target: {
@@ -67,7 +53,7 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     ...(input.openspec ? { openspec: input.openspec } : {}),
     ...(input.prdHistoryPreview ? { prdHistory: input.prdHistoryPreview } : {}),
     permissions: input.yolo ? "yolo" : input.smart ? "smart" : "interactive",
-    ...(goal ? { goal } : {}),
+    ...(pipeline.goalPlan ? { goal: pipeline.goalPlan } : {}),
     ...(input.resumeRunID
       ? {
           resume: {
@@ -97,18 +83,37 @@ export function routePipeline(
 ): Pipeline {
   return {
     ...pipeline,
-    steps: pipeline.steps.map((step): Step => {
-      if (step.type !== "agent" || stepRunnerFor(step.runner).id !== "opencode") return structuredClone(step)
-      const configured = modelOverride || `${step.model}${step.variant ? `#${step.variant}` : ""}`
-      const resolvedModel = resolveModel(configured, gateway, overrides)
-      return {
-        ...step,
-        model: `${resolvedModel.providerID}/${resolvedModel.modelID}`,
-        ...(resolvedModel.variant ? { variant: resolvedModel.variant } : { variant: undefined }),
-        resolvedModel,
-        ...routeAdvisor(step, gateway, overrides, advisor),
-      }
-    }),
+    steps: pipeline.steps.map((step): Step => routeStep(step, gateway, overrides, modelOverride, advisor)),
+    // The goal fragments are frozen with the plan: their models and advisors
+    // route exactly once, so every iteration runs the reviewed models.
+    ...(pipeline.goalPlan
+      ? {
+          goalPlan: {
+            ...pipeline.goalPlan,
+            improve: { steps: pipeline.goalPlan.improve.steps.map((step) => routeStep(step, gateway, overrides, modelOverride, advisor) as AgentStep) },
+            measure: { steps: pipeline.goalPlan.measure.steps.map((step) => routeStep(step, gateway, overrides, modelOverride, advisor) as AgentStep) },
+          },
+        }
+      : {}),
+  }
+}
+
+function routeStep(
+  step: Step,
+  gateway: ModelGateway,
+  overrides: ModelRoutingOverrides,
+  modelOverride: string,
+  advisor: AdvisorPlanOverrides,
+): Step {
+  if (step.type !== "agent" || stepRunnerFor(step.runner).id !== "opencode") return structuredClone(step)
+  const configured = modelOverride || `${step.model}${step.variant ? `#${step.variant}` : ""}`
+  const resolvedModel = resolveModel(configured, gateway, overrides)
+  return {
+    ...step,
+    model: `${resolvedModel.providerID}/${resolvedModel.modelID}`,
+    ...(resolvedModel.variant ? { variant: resolvedModel.variant } : { variant: undefined }),
+    resolvedModel,
+    ...routeAdvisor(step, gateway, overrides, advisor),
   }
 }
 
@@ -170,9 +175,10 @@ export function plannedStepModel(step: AgentStep): string {
 /**
  * Every OpenRouter model a nitro run must route by throughput: executors,
  * advisors, and (when smart mode consults one) the permission judge. The goal
- * loop's fix iterations run as their own `run()` with their own plan, so they
- * collect from their own pipeline. Deduplicated by model id — a model shared
- * by an executor and an advisor needs the option declared exactly once.
+ * fragments live in the same reviewed pipeline as the prefix, so their OpenRouter
+ * models are collected here once and preflighted with the parent plan — including
+ * models that would only run in a later iteration. Deduplicated by model id — a
+ * model shared by an executor and an advisor needs the option declared exactly once.
  */
 export function throughputRoutedModels(
   pipeline: Pipeline,
@@ -182,7 +188,10 @@ export function throughputRoutedModels(
   const add = (model: { providerID: string; modelID: string } | undefined) => {
     if (model && model.providerID === "openrouter") models.set(model.modelID, { providerID: model.providerID, modelID: model.modelID })
   }
-  for (const step of pipeline.steps) {
+  // The goal fragments preflight with the prefix: a model unavailable through
+  // the selected gateway rejects the parent plan before any phase starts, even
+  // when it would only run in a later iteration.
+  for (const step of [...pipeline.steps, ...(pipeline.goalPlan ? [...pipeline.goalPlan.improve.steps, ...pipeline.goalPlan.measure.steps] : [])]) {
     if (step.type !== "agent" || stepRunnerFor(step.runner).id !== "opencode") continue
     add(step.resolvedModel)
     add(step.resolvedAdvisor)

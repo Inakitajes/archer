@@ -750,4 +750,44 @@ describe("run() with a hosted progress", () => {
       await rm(repo, { recursive: true, force: true })
     }
   })
+
+  test("drives the embedded goal cycle through run() with correctly wired deps", async () => {
+    const repo = await cleanRepo()
+    const dashboard = fakeDashboard()
+    // A goal pipeline whose fragments are empty: the scheduler still runs
+    // measure(0), which produces no authoritative score, so the cycle settles
+    // as no-score. This exercises the full run() → runGoalCycle wiring — the
+    // live view through the hosted progress, the durable checkpoint, and the
+    // score read — without needing a real agent session.
+    const goalPipeline: RunOptions["pipeline"] = {
+      name: "goal-run",
+      steps: [],
+      goalPlan: {
+        target: 90,
+        maxIterations: 3,
+        plateau: 3,
+        briefRecipient: "fix",
+        improve: { steps: [] },
+        measure: { steps: [] },
+        scoreProducer: "score-report",
+      },
+    }
+    try {
+      const result = await run(makeOptions(repo, { pipeline: goalPipeline, progress: dashboard.progress }))
+      try {
+        // The scheduler published the live goal view through the hosted progress.
+        expect(dashboard.events).toContain("setGoalLoop")
+        expect(dashboard.events).toContain("resetPipeline")
+        // The durable goal record was checkpointed with the settled outcome.
+        const metadata = JSON.parse(await readFile(join(result.dir, "metadata.json"), "utf8"))
+        expect(metadata.goal).toMatchObject({ target: 90, outcome: "no-score" })
+        // No consensus step exists, so the run carries no quality score.
+        expect(result.qualityScore).toBeUndefined()
+      } finally {
+        await result.release?.()
+      }
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
 })

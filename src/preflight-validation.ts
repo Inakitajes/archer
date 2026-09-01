@@ -10,13 +10,13 @@ export function preflightTargets(plan: RunPlan): ResolvedModel[] {
   const targets = plan.pipeline.steps.flatMap((step) =>
     step.type === "agent" && step.runner !== "claude-code" && step.resolvedModel ? [step.resolvedModel] : [],
   )
-  // Goal mode runs the goal-fix pipeline for each fix iteration, but its models
-  // are absent from the main pipeline. Preflight them alongside the initial run
-  // so an unavailable model surfaces before the first run is paid for, not after.
+  // The goal fragments preflight with the prefix: an unavailable model must
+  // reject the parent plan before the first run is paid for, even when it
+  // would only run in a later iteration.
   if (plan.goal) {
-    for (const step of plan.goal.fixPipeline.steps) {
-      if (step.type === "agent" && step.runner !== "claude-code" && step.resolvedModel) targets.push(step.resolvedModel)
-      if (step.type === "agent" && step.resolvedAdvisor) targets.push(step.resolvedAdvisor)
+    for (const step of [...plan.goal.improve.steps, ...plan.goal.measure.steps]) {
+      if (step.runner !== "claude-code" && step.resolvedModel) targets.push(step.resolvedModel)
+      if (step.resolvedAdvisor) targets.push(step.resolvedAdvisor)
     }
   }
   // Advising models are validated as themselves, not as the synthetic capped

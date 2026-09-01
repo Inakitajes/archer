@@ -12,6 +12,7 @@ import {
   describeDefault,
   dissolveParallel,
   ejectMember,
+  isGoalStep,
   isHumanStep,
   moveMember,
   priorStepNames,
@@ -22,7 +23,7 @@ import {
   wrapInParallel,
 } from "../src/config-tui"
 
-import type { AgentStepSpec, StepSpec } from "../src/pipeline"
+import type { AgentStepSpec, GoalStepSpec, StepSpec } from "../src/pipeline"
 
 const steps = (): StepSpec[] => [
   { agent: "review-scope", name: "scope", reports: "none" },
@@ -93,6 +94,22 @@ describe("parallel group editing", () => {
     expect(wrapInParallel(list, 1)).toBeUndefined()
     expect(wrapInParallel(list, 2)).toBeUndefined()
     expect(list).toHaveLength(3)
+  })
+
+  test("wrapInParallel refuses the terminal goal node", () => {
+    const goalNode: GoalStepSpec = {
+      goal: {
+        target: 85,
+        maxIterations: 3,
+        plateau: 3,
+        improve: { briefStep: "fix", steps: [{ agent: "goal-fixer", name: "fix" }] },
+        measure: { steps: ["quality-score-report"] },
+      },
+    }
+    const list: StepSpec[] = ["implementer", goalNode, "security"]
+    expect(wrapInParallel(list, 1)).toBeUndefined()
+    expect(list).toHaveLength(3)
+    expect(list[1]).toBe(goalNode)
   })
 
   test("wrapInParallel returns undefined for out-of-bounds index", () => {
@@ -301,6 +318,22 @@ describe("claudeModelPickerState", () => {
   test("sets index to 0 when current is empty string", () => {
     const state = claudeModelPickerState("")
     expect(state.index).toBe(0)
+  })
+})
+
+describe("goal node classification", () => {
+  test("isGoalStep recognizes the terminal goal control node and nothing else", () => {
+    const node = { goal: { target: 85, improve: { briefStep: "fix", steps: [{ agent: "goal-fixer", name: "fix" }] }, measure: { steps: ["quality-score-report"] } } }
+    expect(isGoalStep(node)).toBe(true)
+    expect(isGoalStep({ parallel: ["patterns"] })).toBe(false)
+    expect(isGoalStep({ type: "human" })).toBe(false)
+    expect(isGoalStep({ agent: "patterns" })).toBe(false)
+    expect(isGoalStep("patterns")).toBe(false)
+  })
+
+  test("goal rows do not masquerade as human gates or plain agent steps", () => {
+    const node = { goal: { target: 85, improve: { briefStep: "fix", steps: [{ agent: "goal-fixer", name: "fix" }] }, measure: { steps: ["quality-score-report"] } } }
+    expect(isHumanStep(node)).toBe(false)
   })
 })
 

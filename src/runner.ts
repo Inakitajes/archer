@@ -16,7 +16,7 @@ import { opencodeConfig } from "./agents"
 import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
 import { ensureClaudeAvailable, openClaudeSessionWindow, promptClaudePhase } from "./claude-code"
-import { addAllAndCommit, createCleanRepoSnapshot, currentBranch, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
+import { addAllAndCommit, createCleanRepoSnapshot, currentBranch, currentHead, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
 import { getSessionEventHub, payloadProperties } from "./event-hub"
 import { askHumanAction, phaseGatePrompt, runHumanReviewGate } from "./human"
@@ -33,12 +33,14 @@ import { installWriteReportTool, startReportBridge, type ReportBridge } from "./
 import { createReportRuntime, type ReportPhaseHandle, type ReportRuntime } from "./report-runtime"
 import { stepCommitMessageFactory } from "./step-commit"
 import { throughputRoutedModels } from "./run-plan"
+import { promoteScoreReport, runGoalCycle, type GoalCycleOutcome } from "./goal-scheduler"
 import { formatTerminalTitle, projectName, RunStatusTracker, trackRunStatus } from "./run-status"
 import { popTerminalTitle, pushTerminalTitle, writeTerminalTitle } from "./terminal-title"
 import {
   noopProgress,
   type ActivityKind,
   type AutoAccept,
+  type GoalLoopView,
   type HumanReviewAction,
   type ProgressDiffSummary,
   type ProgressMessage,
@@ -55,7 +57,7 @@ import {
 import { discoverProjectContextFiles } from "./project-context"
 import { createStepRunnerImpl, stepRunnerFor, stepRunnerModel, type StepRunnerId, type StepRunnerImpl } from "./step-runners"
 import { createTerminalInput, type TerminalInput } from "./terminal-input"
-import type { AgentSpec, AgentStep, DeliverableContract, HookSet, HookSpec, Pipeline, RunOptions, Step } from "./types"
+import type { AgentSpec, AgentStep, DeliverableContract, HookSet, HookSpec, Pipeline, ResolvedGoalPlan, RunOptions, Step } from "./types"
 import { consensusStep, loadQualityRubricWeights, parseQualityScoreReport, qualityDimensionWeights, type QualityDimension, type QualityScore } from "./quality-score"
 import { addTokens, emptyTokens, tokensFromValue } from "./usage"
 import { cleanupWorkspace, createWorkspace, opencodeConfigDir, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
@@ -395,17 +397,13 @@ export type RunResult = {
   dir: string
   /** Parsed consensus score when the pipeline ended in a quality-score-report step. */
   qualityScore?: QualityScore
-  /**
-   * Set only under `deferPostHooks`: the workspace was left on disk so the
-   * caller can run this run's post-hooks against it, and is the caller's to
-   * clean up afterwards.
-   */
-  workspace?: Workspace
+  /** Present when the pipeline's terminal goal step ran: the complete cycle outcome. */
+  goal?: GoalCycleOutcome
   /**
    * Present on a hosted run (options.progress set): closes the run's opencode
    * server, releases its coordinator lease, and clears its metadata server
-   * entry — everything the finally defers so the caller (the goal loop) decides
-   * when the previous iteration's run may shut down.
+   * entry — everything the finally defers so the caller decides when the run
+   * may shut down.
    */
   release?: () => Promise<void>
 }
@@ -602,7 +600,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       // let this run's finally never tear it down.
       options.progress.setHostControls?.(hostControls)
       options.progress.setAbortHandler?.(() => shutdown.request("Ctrl+C"))
-      options.progress.resetPipeline?.(phases, { runID: workspace.runID, targetDir: options.targetDir, runDir: workspace.dir, pipeline, ...(options.retainFeedMessage ? { retainMessage: options.retainFeedMessage } : {}) })
+      options.progress.resetPipeline?.(phases, { runID: workspace.runID, targetDir: options.targetDir, runDir: workspace.dir, pipeline })
       progress = trackRunStatus(recordProgress(options.progress, metadata), statusTracker)
     } else {
       // Production CLI never reaches here: every run is a coordinated process
@@ -750,103 +748,120 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     const serverUrl = opencode.url
     const runMetadata = metadata
 
-    for (const batch of planBatches(pipeline.steps)) {
-      shutdown.throwIfRequested()
-      await control.awaitRunnable(shutdown.signal)
-      const [first] = batch
+    // One shared execution context: the pipeline prefix and every goal
+    // fragment invocation run through the same machinery against the same
+    // workspace, metadata store, server, and gates.
+    const phaseGroupsContext = {
+      client,
+      workspace,
+      metadata: runMetadata,
+      options,
+      extraFiles,
+      projectContextFiles,
+      progress,
+      shutdown,
+      control,
+      gitLock,
+      limitAgents,
+      resuming,
+      serverUrl,
+      permissions,
+      terminalInput,
+      advisors,
+      reports,
+    } satisfies PhaseGroupContext
 
-      if (batch.length === 1 && first?.type === "human") {
-        control.beginBatch(1)
-        if (shouldSkip(first, options)) {
-          progress.phaseSkipped(first.name)
-          log.warn(`[${first.name}] skipped by flag`)
-          await control.checkpointAfterBatch(shutdown.signal)
-          continue
-        }
-        await runHumanReviewGate(workspace, options, opencode.url, progress, permissions, first.name)
-        await control.checkpointAfterBatch(shutdown.signal)
-        continue
-      }
+    await executePhaseGroups(phaseGroupsContext, pipeline.steps)
 
-      const agentBatch = batch as AgentStep[]
-      control.beginBatch(agentBatch.filter((step) => !shouldSkip(step, options)).length)
-      const results = await Promise.allSettled(
-        agentBatch.map(async (step) => {
-          if (shouldSkip(step, options)) {
-            progress.phaseSkipped(step.name)
-            log.warn(`[${step.name}] skipped by flag`)
-            return
-          }
-          await limitAgents(async () => {
-            const restored = resuming && (await restorePhaseFromPreviousRun(workspace, runMetadata, step, progress))
-            if (!restored) {
-              await runPhase(client, workspace, runMetadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions, terminalInput }, advisors, reports)
-            }
-          })
-        }),
-      )
-
-      // Every batch member runs to completion (Promise.allSettled, not
-      // fail-fast) since forced-read-only siblings can't corrupt each other's
-      // work; a user abort takes priority and propagates unwrapped so the
-      // existing isUserAbortError handling below keeps working.
-      const userAbort = results.find((result): result is PromiseRejectedResult => result.status === "rejected" && isUserAbortError(result.reason))
-      if (userAbort) throw userAbort.reason
-      const failures = results.flatMap((result, index) => (result.status === "rejected" ? [{ name: agentBatch[index]!.name, error: result.reason }] : []))
-      await control.checkpointAfterBatch(shutdown.signal)
-      if (failures.length > 0) throw new PhaseGroupError(failures)
+    // The embedded goal cycle: measurement zero, then bounded improve/measure
+    // rounds — all inside this one run context. One workspace, one metadata
+    // store, one server, one hook lifecycle; every invocation runs through the
+    // same phase machinery as the prefix, under invocation-qualified physical
+    // phase IDs and iteration-qualified report paths.
+    let goalOutcome: GoalCycleOutcome | undefined
+    let goalView: GoalLoopView | undefined
+    if (pipeline.goalPlan) {
+      const rubricWeights = await loadQualityRubricWeights(options.targetDir)
+      goalOutcome = await runGoalCycle(pipeline.goalPlan, {
+        targetDir: options.targetDir,
+        isAbort: isUserAbortError,
+        // A resumed goal run continues from its durable record's pending
+        // improve/measure group instead of restarting the cycle.
+        ...(options.resumeRunID ? { resume: runMetadata.goalState() } : {}),
+      }, {
+        executeGroups: (invocation) => executePhaseGroups(phaseGroupsContext, invocation.steps),
+        parseScore: async (invocation) => (await readRunQualityScore({ name: pipeline.name, steps: invocation.steps }, workspace.dir, rubricWeights))?.score,
+        promoteScore: (invocation) => promoteScoreReport(workspace.dir, invocation),
+        captureSnapshot: createCleanRepoSnapshot,
+        restoreSnapshot: restoreRepoSnapshot,
+        isCleanRepo: async (cwd) => (await statusPorcelain(cwd)).trim() === "",
+        currentHead,
+        checkpoint: (state) => runMetadata.checkpointGoal(state),
+        onView: (view) => {
+          goalView = view
+          progress.setGoalLoop?.(view)
+        },
+      })
     }
 
     progress.message("writing run summary")
     const advisorSection = advisorNeeds.agents.size > 0 ? renderAdvisorSplit(await readAdvisorSplit(workspace.dir)) : undefined
+    const goalSection = goalOutcome && pipeline.goalPlan ? renderGoalSummarySection(goalOutcome, pipeline.goalPlan) : undefined
     await writeSummary(
       workspace,
       pipeline.steps.map((step) => step.name),
-      advisorSection ? [advisorSection] : [],
+      [...(goalSection ? [goalSection] : []), ...(advisorSection ? [advisorSection] : [])],
     )
     // Capture the consensus score before cleanup: the workspace (and with it
-    // reports/score-report.md) is deleted on success, and the goal loop needs
-    // the score and the report text to decide whether to keep fixing.
-    // The rubric weights are loaded once per run so the canonical recompute
-    // uses the project's overrides (.convoy/quality-rubric.md) when present,
-    // matching the weights the scorer agents read from that same rubric.
+    // reports/score-report.md) is deleted on success, and finish tooling needs
+    // the score and the report text. Under a goal cycle the authoritative
+    // measurement lives in the measure fragment's latest invocation, which the
+    // scheduler promoted to the conventional reports/score-report.md. The
+    // fragment copy below is resolved with unqualified names, so a
+    // custom-named consensus step would point at a report path that never got
+    // written; point it at the promoted conventional location instead.
     const rubricWeights = await loadQualityRubricWeights(options.targetDir)
-    const runScoreResult = await readRunQualityScore(pipeline, workspace.dir, rubricWeights)
+    let scorePipeline = pipeline
+    if (pipeline.goalPlan) {
+      const consensus = pipeline.goalPlan.measure.steps.find((step) => step.deliverableContract?.kind === "quality-score-report")
+      scorePipeline = consensus
+        ? { ...pipeline, steps: [{ ...consensus, reportPath: "reports/score-report.md" }] }
+        : { ...pipeline, steps: pipeline.goalPlan.measure.steps }
+    }
+    const runScoreResult = await readRunQualityScore(scorePipeline, workspace.dir, rubricWeights)
     if (runScoreResult) {
       log.info(`quality score: ${runScoreResult.score.score}/100 (${runScoreResult.score.verdict})`)
     }
-    // Under a goal loop the run is one iteration of a longer piece of work, so
-    // "the work finished" is the loop's call to make, not this run's.
-    if (!options.deferPostHooks) {
-      postHooksStarted = true
-      await runHooks("post", hookSet.post, {
-        workspace,
-        targetDir: options.targetDir,
-        pipelineName: pipeline.name,
-        prompt: options.prompt,
-        status: "success",
-        progress,
-        signal: shutdown.signal,
-        ...(runScoreResult ? { score: runScoreResult.score.score } : {}),
-      })
-    } else if (hookSet.post.length > 0) {
-      // Their dashboard rows exist either way, so resolve them here rather than
-      // leaving them pending forever — the same treatment pre-hooks get on a
-      // resume. The caller runs them once the loop is done.
-      for (const name of hookPhaseNames("post", hookSet.post)) progress.phaseSkipped(name)
-      log.info("post-hooks deferred to the end of the goal loop")
-    }
+    // Post-hooks run once, after the whole cycle (a goal cycle's outcome rides
+    // along: CONVOY_GOAL_REACHED distinguishes "cleared the bar" from "gave up
+    // short of it" in a way `when: success` alone cannot).
+    postHooksStarted = true
+    await runHooks("post", hookSet.post, {
+      workspace,
+      targetDir: options.targetDir,
+      pipelineName: pipeline.name,
+      prompt: options.prompt,
+      status: "success",
+      progress,
+      signal: shutdown.signal,
+      ...(runScoreResult ? { score: runScoreResult.score.score } : {}),
+      ...(goalOutcome && pipeline.goalPlan
+        ? {
+            goal: {
+              reached: goalOutcome.reached,
+              target: pipeline.goalPlan.target,
+              ...(goalOutcome.bestScore !== undefined ? { score: goalOutcome.bestScore } : {}),
+            },
+          }
+        : {}),
+    })
     await caffeinate.stop()
     await holdFinishScreen(progress, shutdown, {
       status: "completed",
       runDir: workspace.dir,
       ...(runScoreResult ? { qualityScore: runScoreResult.score.score } : {}),
-      // The goal loop passes earlier iterations' scores; this run's own score
-      // completes the trajectory shown on the finish screen.
-      ...(options.goalTrajectory || runScoreResult ? { goalTrajectory: [...(options.goalTrajectory ?? []), ...(runScoreResult ? [runScoreResult.score.score] : [])] } : {}),
-      // A goal-loop iteration that will be followed by another must not hold the
-      // finish screen: the loop runs unattended instead of waiting on a keypress.
-      ...(options.goalContinues ? { goalContinues: true } : {}),
+      // The finish screen freezes the verdict and the full measured trajectory.
+      ...(goalView ? { goalLoop: goalView } : {}),
     }, Boolean(options.progress))
     // Hosted runs skip the finish hold, so the tracker's runFinished wrapper
     // never fires here. Publish the terminal snapshot now so Herdr shows
@@ -856,12 +871,13 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       status: "completed",
       runDir: workspace.dir,
       ...(runScoreResult ? { qualityScore: runScoreResult.score.score } : {}),
+      ...(goalView ? { goalLoop: goalView } : {}),
     })
     return {
       runID: workspace.runID,
       dir: workspace.dir,
       ...(runScoreResult ? { qualityScore: runScoreResult.score } : {}),
-      ...(options.deferPostHooks ? { workspace } : {}),
+      ...(goalOutcome ? { goal: goalOutcome } : {}),
       // The release closure is built by the finally below; the arrow reads the
       // variable afterwards, so it is always ready by the time the loop calls it.
       ...(options.progress ? { release: async () => { await deferredRelease?.() } } : {}),
@@ -980,20 +996,102 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
   }
 }
 
+/**
+ * Everything `executePhaseGroups` needs to run one ordered list of steps
+ * against the run's shared machinery. Built once per run by `run()` — the
+ * workspace, metadata store, OpenCode client, permission gate, control
+ * bindings, and hooks all outlive any single phase group.
+ */
+export type PhaseGroupContext = {
+  client: OpencodeClient
+  workspace: Workspace
+  metadata: RunMetadataStore
+  options: RunOptions
+  extraFiles: FilePartInput[]
+  projectContextFiles: string[]
+  progress: ProgressUI
+  shutdown: RunShutdown
+  control: RunControl
+  gitLock: GitLock
+  limitAgents: ReturnType<typeof createConcurrencyLimiter>
+  resuming: boolean
+  serverUrl: string
+  permissions: PermissionGate | undefined
+  terminalInput: TerminalInput
+  advisors: AdvisorRuntime | undefined
+  reports: ReportRuntime | undefined
+}
+
+/**
+ * Executes an ordered list of pipeline steps as phase groups: batches them
+ * (parallel blocks and model fan-outs share a group), gates each batch on
+ * pause/control state, restores completed phases on resume, and runs each
+ * phase through the full attempt/commit/permission/baseline machinery.
+ *
+ * Extracted from `run()` verbatim so a future scheduler can execute goal
+ * fragments through exactly this path — same attempts, commits, permissions,
+ * advisors, failure gates, read-only baselines, and usage accounting — while
+ * the outer run keeps one workspace, one metadata store, and one lifecycle.
+ * Every batch member runs to completion (Promise.allSettled, not fail-fast)
+ * since forced-read-only siblings can't corrupt each other's work; a user
+ * abort takes priority and propagates unwrapped, and ordinary failures
+ * aggregate into one `PhaseGroupError` after the control checkpoint.
+ */
+export async function executePhaseGroups(ctx: PhaseGroupContext, steps: readonly Step[]): Promise<void> {
+  const { client, workspace, metadata, options, extraFiles, projectContextFiles, progress, shutdown, control, gitLock, limitAgents, resuming, serverUrl, permissions, terminalInput, advisors, reports } = ctx
+
+  for (const batch of planBatches(steps)) {
+    shutdown.throwIfRequested()
+    await control.awaitRunnable(shutdown.signal)
+    const [first] = batch
+
+    if (batch.length === 1 && first?.type === "human") {
+      control.beginBatch(1)
+      if (shouldSkip(first, options)) {
+        progress.phaseSkipped(first.name)
+        log.warn(`[${first.name}] skipped by flag`)
+        await control.checkpointAfterBatch(shutdown.signal)
+        continue
+      }
+      await runHumanReviewGate(workspace, options, serverUrl, progress, permissions, first.name)
+      await control.checkpointAfterBatch(shutdown.signal)
+      continue
+    }
+
+    const agentBatch = batch as AgentStep[]
+    control.beginBatch(agentBatch.filter((step) => !shouldSkip(step, options)).length)
+    const results = await Promise.allSettled(
+      agentBatch.map(async (step) => {
+        if (shouldSkip(step, options)) {
+          progress.phaseSkipped(step.name)
+          log.warn(`[${step.name}] skipped by flag`)
+          return
+        }
+        await limitAgents(async () => {
+          const restored = resuming && (await restorePhaseFromPreviousRun(workspace, metadata, step, progress))
+          if (!restored) {
+            await runPhase(client, workspace, metadata, step, options, extraFiles, projectContextFiles, progress, shutdown, gitLock, { serverUrl, permissions, terminalInput }, advisors, reports)
+          }
+        })
+      }),
+    )
+
+    const userAbort = results.find((result): result is PromiseRejectedResult => result.status === "rejected" && isUserAbortError(result.reason))
+    if (userAbort) throw userAbort.reason
+    const failures = results.flatMap((result, index) => (result.status === "rejected" ? [{ name: agentBatch[index]!.name, error: result.reason }] : []))
+    await control.checkpointAfterBatch(shutdown.signal)
+    if (failures.length > 0) throw new PhaseGroupError(failures)
+  }
+}
+
 async function settleRunWorkspace(
   workspace: Workspace,
-  options: Pick<RunOptions, "keepRunDir" | "deferPostHooks">,
+  options: Pick<RunOptions, "keepRunDir">,
   progress: ProgressUI,
   runErr: unknown,
 ) {
   if (runErr) {
     log.warn(`Run dir preserved at ${workspace.dir}`)
-    return
-  }
-  if (options.deferPostHooks) {
-    // The deferred post-hooks still resolve CONVOY_RUN_DIR and `cwd: run`
-    // against this workspace, so it outlives the run; the caller deletes it
-    // once it has run them.
     return
   }
   if (options.keepRunDir || progress.keepRunDirRequested?.()) {
@@ -1008,14 +1106,12 @@ async function settleRunWorkspace(
 // readable. A signal (SIGTERM, a second Ctrl+C) must still tear the run down
 // without user input, hence the race against the shutdown signal.
 //
-// A goal-loop iteration flagged `goalContinues` skips the hold entirely: the
-// loop's promise is "don't stop until the score reaches the target", and
-// blocking on a keypress between every iteration would defeat it. The run's
-// phases were already shown live in the TUI; the trajectory is logged when the
-// loop ends. A hosted run (options.progress set) never holds either: the loop
-// holds exactly once, at the very end, through this same helper.
+// A hosted run (options.progress set) never holds: its caller — the
+// coordinator — owns the terminal and the attached dashboard shows the finish
+// screen through the control protocol. A goal cycle runs inside the run, so
+// there is exactly one hold, at the very end, with the verdict and trajectory.
 export async function holdFinishScreen(progress: ProgressUI, shutdown: RunShutdown, outcome: RunOutcome, hosted = false) {
-  if (!progress.runFinished || shutdown.aborted || outcome.goalContinues || hosted) return
+  if (!progress.runFinished || shutdown.aborted || hosted) return
   await Promise.race([
     progress.runFinished(outcome),
     new Promise<void>((resolve) => shutdown.signal.addEventListener("abort", () => resolve(), { once: true })),
@@ -3284,6 +3380,19 @@ export function progressPhases(pipeline: Pipeline, hooks?: HookSet): ProgressPha
   const hookPhase = (stage: HookStage, specs: readonly HookSpec[]) =>
     hookPhaseNames(stage, specs).map((name, index) => ({ name, description: specs[index]!.command }))
   return [...hookPhase("pre", hooks.pre), ...steps, ...hookPhase("post", hooks.post)]
+}
+
+/** The goal-cycle section embedded in SUMMARY.md: policy, trajectory, verdict, and restore status. */
+function renderGoalSummarySection(outcome: GoalCycleOutcome, plan: ResolvedGoalPlan): string {
+  const final = outcome.bestScore ?? outcome.scores[outcome.scores.length - 1]
+  const trajectory = outcome.scores.length > 0 ? `trajectory: ${outcome.scores.join(" → ")}` : "trajectory: (no completed measurement)"
+  return [
+    "## Goal cycle",
+    "",
+    `target ${plan.target}/100 · up to ${1 + plan.maxIterations} measurements (${plan.maxIterations} improve rounds) · plateau ${plan.plateau} · brief to ${plan.briefRecipient}`,
+    trajectory,
+    `outcome: ${outcome.reason}${outcome.reached ? " (goal met)" : ""}${final !== undefined ? ` · best ${final}/100` : ""} · restored: ${outcome.restored ? "yes" : "no"}`,
+  ].join("\n")
 }
 
 export function modelOverrideNotice(pipeline: Pipeline, override: string): string | undefined {

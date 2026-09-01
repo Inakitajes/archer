@@ -5,7 +5,7 @@ import { readRunMetadata, type PhaseMetadata, type RunMetadata } from "./metadat
 import { watchSession, type SessionWatcher } from "./runner"
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
-import type { ProgressPhaseSnapshot, ProgressUI } from "./progress"
+import type { GoalLoopView, ProgressPhaseSnapshot, ProgressUI } from "./progress"
 
 const pollMs = 1_000
 
@@ -139,6 +139,31 @@ export function overallStatus(metadata: RunMetadata): "completed" | "failed" {
   const statuses = Object.values(metadata.phases).map((phase) => phase.status)
   const allDone = statuses.length > 0 && statuses.every((status) => status === "completed" || status === "skipped")
   return allDone ? "completed" : "failed"
+}
+
+/**
+ * Reconstructs the dashboard's goal-loop view from a durable goal record, so a
+ * stopped run's finish screen shows the same target, trajectory, verdict, and
+ * restore result it showed live — no ephemeral process state required.
+ */
+export function goalLoopViewFrom(goal: RunMetadata["goal"]): GoalLoopView | undefined {
+  if (!goal) return undefined
+  const outcome: GoalLoopView["outcome"] | undefined =
+    goal.outcome && goal.outcome !== "failed"
+      ? {
+          reason: goal.outcome === "goal" ? "goal" : goal.outcome === "plateau" ? "plateau" : goal.outcome === "no-score" ? "no-score" : "max-iterations",
+          reached: goal.outcome === "goal",
+          restored: goal.restored ?? false,
+        }
+      : undefined
+  return {
+    target: goal.target,
+    iteration: Math.max(1, goal.scores.length),
+    maxRuns: 1 + goal.maxIterations,
+    plateau: goal.plateau,
+    scores: goal.scores.map((entry) => entry.score),
+    ...(outcome ? { outcome } : {}),
+  }
 }
 
 /**

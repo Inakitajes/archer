@@ -40,6 +40,7 @@ import {
   defaultRunReportModel,
   defaultOpusModel,
   isHumanStepSpec,
+  isGoalStepSpec,
   isParallelSpec,
   resolvePipeline,
 } from "../src/pipeline"
@@ -497,36 +498,153 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: fixer, goal-fix, hunter, hunter-max, implement, implement-lite, quick, review, review-cc, review-lite, ship)',
+      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-lite, quick, review, review-cc, review-lite, ship)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
   })
 
-  test("parses a pipeline's goal fields and resolves them onto the pipeline", async () => {
+  test("parses a terminal goal step and resolves its fragments onto the pipeline", async () => {
     const dir = await projectDir()
     const config = parse(
-      "pipelines:\n  scored:\n    steps:\n      - implementer\n      - quality-score-report\n    goal: 92\n    goalMaxIterations: 5\n    goalPlateau: 2",
+      [
+        "pipelines:",
+        "  scored:",
+        "    steps:",
+        "      - implementer",
+        "      - goal:",
+        "          target: 92",
+        "          maxIterations: 5",
+        "          plateau: 2",
+        "          improve:",
+        "            briefStep: fix",
+        "            steps:",
+        "              - agent: goal-fixer",
+        "                name: fix",
+        "          measure:",
+        "            steps:",
+        "              - agent: quality-score-report",
+        "                name: score-report",
+      ].join("\n"),
       dir,
     )
     const spec = selectPipelineSpec(config, "scored")
-    expect(spec).toMatchObject({ goal: 92, goalMaxIterations: 5, goalPlateau: 2 })
+    const node = spec.steps[1] as { goal: { target: number; maxIterations: number; plateau: number } }
+    expect(node.goal).toMatchObject({ target: 92, maxIterations: 5, plateau: 2 })
 
     const resolved = resolvePipeline({ name: "scored", spec, agents: builtInAgents })
-    expect(resolved.goal).toBe(92)
-    expect(resolved.goalMaxIterations).toBe(5)
-    expect(resolved.goalPlateau).toBe(2)
+    expect(resolved.goalPlan).toMatchObject({ target: 92, maxIterations: 5, plateau: 2, briefRecipient: "fix", scoreProducer: "score-report" })
   })
 
-  test("rejects a pipeline goal outside 1–100", async () => {
+  test("a config with a terminal goal step round-trips through serialize + reparse", async () => {
+    // The config editor materializes a goal pipeline into the editable copy and
+    // saves it back; that serialization must preserve the full embedded goal
+    // definition so a saved goal pipeline still declares its loop.
     const dir = await projectDir()
-    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    goal: 150", dir)).toThrow("between 1 and 100")
+    const config = parse(
+      [
+        "pipelines:",
+        "  scored:",
+        "    steps:",
+        "      - implementer",
+        "      - goal:",
+        "          target: 85",
+        "          maxIterations: 2",
+        "          plateau: 4",
+        "          improve:",
+        "            briefStep: fix",
+        "            steps:",
+        "              - agent: goal-fixer",
+        "                name: fix",
+        "          measure:",
+        "            steps:",
+        "              - parallel:",
+        "                  - quality-scorer",
+        "                  - agent: quality-score-report",
+        "                    name: score-report",
+      ].join("\n"),
+      dir,
+    )
+
+    const path = join(dir, ".convoy", "config.yaml")
+    await writeConvoyConfig(path, config, dir)
+    const reparsed = parse(await readFile(path, "utf8"), dir)
+    expect(reparsed.pipelines).toEqual(config.pipelines)
+
+    const before = resolvePipeline({ name: "scored", spec: selectPipelineSpec(config, "scored"), agents: builtInAgents })
+    const after = resolvePipeline({ name: "scored", spec: selectPipelineSpec(reparsed, "scored"), agents: builtInAgents })
+    expect(after.goalPlan).toMatchObject({
+      target: 85,
+      maxIterations: 2,
+      plateau: 4,
+      briefRecipient: "fix",
+      scoreProducer: "score-report",
+    })
+    expect(after.goalPlan?.measure.steps).toHaveLength(2)
+    expect(before.goalPlan).toEqual(after.goalPlan)
   })
 
-  test("rejects a pipeline goal of zero", async () => {
-    // goal: 0 would make the loop a no-op — any score instantly meets it — so
-    // the configured goal must live in the same 1–100 range the CLI enforces.
+  test("rejects a goal target outside 1–100", async () => {
     const dir = await projectDir()
-    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - implementer\n    goal: 0", dir)).toThrow("between 1 and 100")
+    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - goal:\n          target: 150\n          improve:\n            briefStep: fix\n            steps:\n              - implementer\n          measure:\n            steps:\n              - quality-score-report", dir)).toThrow("goal.target")
+  })
+
+  test("rejects a goal target of zero", async () => {
+    // target: 0 would make the loop a no-op — any score instantly meets it — so
+    // the configured target must live in the same 1–100 range the CLI enforced.
+    const dir = await projectDir()
+    expect(() => parse("pipelines:\n  bad:\n    steps:\n      - goal:\n          target: 0\n          improve:\n            briefStep: fix\n            steps:\n              - implementer\n          measure:\n            steps:\n              - quality-score-report", dir)).toThrow("goal.target")
+  })
+
+  test("legacy scalar goal fails the load with a migration diagnostic, before anything runs", async () => {
+    const dir = await projectDir()
+    const body = "pipelines:\n  scored:\n    steps:\n      - implementer\n    goal: 85"
+    expect(() => parse(body, dir)).toThrow(/legacy goal configuration/)
+    expect(() => parse(body, dir)).toThrow(/terminal `goal` step/)
+    // The skeleton preserves the operator's target.
+    expect(() => parse(body, dir)).toThrow(/target: 85/)
+  })
+
+  test("every legacy goal path is aggregated into one diagnostic", async () => {
+    const dir = await projectDir()
+    const body = [
+      "pipelines:",
+      "  a:",
+      "    steps:",
+      "      - implementer",
+      "    goal: 85",
+      "    goalMaxIterations: 2",
+      "    goalPlateau: 4",
+      "  b:",
+      "    steps:",
+      "      - implementer",
+      "    goal: 70",
+      "  goal-fix:",
+      "    steps:",
+      "      - goal-fixer",
+    ].join("\n")
+    try {
+      parse(body, dir)
+      throw new Error("expected the parse to fail")
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      for (const path of ["pipelines.a.goal", "pipelines.a.goalMaxIterations", "pipelines.a.goalPlateau", "pipelines.b.goal", "pipelines.goal-fix"]) {
+        expect(message).toContain(path)
+      }
+      // Both scalar owners get skeletons; the goal-fix steps appear as source material.
+      expect(message).toContain("target: 85")
+      expect(message).toContain("target: 70")
+      expect(message).toContain("source material from pipelines.goal-fix")
+    }
+  })
+
+  test("the reserved goal-fix name is refused from project pipeline definitions", async () => {
+    const dir = await projectDir()
+    expect(() => parse("pipelines:\n  goal-fix:\n    steps:\n      - implementer", dir)).toThrow(/goal-fix/)
+  })
+
+  test("the goal-fix built-in is gone from the public registry", () => {
+    expect(builtInPipelines["goal-fix"]).toBeUndefined()
+    expect(Object.keys(builtInPipelines)).not.toContain("goal-fix")
   })
 
   test("parses defaultPrompt and suggestedPrompts and resolves them onto the pipeline", async () => {
@@ -908,8 +1026,8 @@ describe("serialization", () => {
     const template = defaultConfigTemplate()
     expect(template.defaults.model).toBe(`${defaultGptModel}#${defaultGptVariant}`)
     const steps = template.pipelines.implement!.steps
-    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "design")).toEqual({ agent: "design", model: defaultImplementReviewModel, advisor: false })
-    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && step.agent === "adversarial")).toEqual({ agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" })
+    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && !isGoalStepSpec(step) && step.agent === "design")).toEqual({ agent: "design", model: defaultImplementReviewModel, advisor: false })
+    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && !isGoalStepSpec(step) && step.agent === "adversarial")).toEqual({ agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" })
     const reparsed = parse(serializeConvoyConfig(template))
     expect(reparsed.defaults).toEqual(template.defaults)
     expect(reparsed.pipelines).toEqual(template.pipelines)
@@ -1250,10 +1368,15 @@ describe("materializing built-in pipelines", () => {
     expect(originalMember.name).toBe("clean-code")
   })
 
-  test("carries the goal settings into the copy, so customizing ship does not disable its loop", () => {
-    const spec = { description: "d", goal: 85, goalMaxIterations: 4, goalPlateau: 2, steps: ["patterns"] }
-    expect(materializePipelineSpec(spec)).toMatchObject({ goal: 85, goalMaxIterations: 4, goalPlateau: 2 })
-    expect(materializePipelineSpec(builtInPipelines.ship!).goal).toBe(85)
+  test("carries the terminal goal step into the copy, so customizing ship does not disable its loop", () => {
+    const materialized = materializePipelineSpec(builtInPipelines.ship!)
+    const node = materialized.steps[1] as { goal?: { target: number; improve: unknown; measure: unknown } }
+    expect(node.goal?.target).toBe(85)
+    // The fragments travel with the copy, deep-cloned: editing the copy can
+    // never touch the built-in's goal definition.
+    expect(node.goal?.improve).toBeDefined()
+    expect(node.goal?.measure).toBeDefined()
+    expect(builtInPipelines.ship!.steps[1]).not.toBe(materialized.steps[1])
   })
 
   test("inlines built-in agent model preferences only when a default model would shadow them", () => {

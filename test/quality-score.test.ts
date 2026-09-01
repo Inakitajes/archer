@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { parseQualityRubricWeights, parseQualityScoreReport, qualityDimensions, qualityDimensionWeights, qualityVerdict, renderQualityScoreReport, weightedQualityScore, type QualityDimension, type QualityDimensionScores } from "../src/quality-score"
+import { consensusStep, parseQualityRubricWeights, parseQualityScoreReport, qualityDimensions, qualityDimensionWeights, qualityVerdict, renderQualityScoreReport, weightedQualityScore, type QualityDimension, type QualityDimensionScores } from "../src/quality-score"
 
 const dimensions: QualityDimensionScores = { prd: 92, tests: 70, security: 95, maintainability: 88, operational: 90, scope: 85 }
 
@@ -345,5 +345,52 @@ describe("parseQualityRubricWeights", () => {
     // rubric never produces a contradictory score.
     const total = qualityDimensions.reduce((sum, d) => sum + qualityDimensionWeights[d], 0)
     expect(total).toBeCloseTo(1)
+  })
+})
+
+describe("consensusStep", () => {
+  const agentStep = (overrides: Record<string, unknown> = {}) => ({ type: "agent", agentName: "quality-score-report", reportPath: "reports/score-report.md", ...overrides })
+
+  test("finds the quality-score-report agent step by identity on legacy steps without a contract", () => {
+    const step = agentStep()
+    expect(consensusStep({ steps: [step] })).toEqual(step)
+  })
+
+  test("finds an arbitrarily named consensus step by its quality-score deliverable contract", () => {
+    // The embedded goal DSL validates measure fragments by deliverable contract,
+    // not agent or step names: a custom pipeline may end measurement in a step
+    // named anything, as long as it declares deliverable: quality-score. The
+    // runner's score lookup must resolve that same contract.
+    const step = agentStep({ agentName: "custom-consensus", name: "my-consensus", deliverableContract: { kind: "quality-score-report", schemaVersion: 1, retryOnMissingOrInvalid: 1 } })
+    expect(consensusStep({ steps: [step] })).toEqual(step)
+  })
+
+  test("prefers the deliverable contract over the agent identity when both indicate a score", () => {
+    const contractStep = agentStep({ agentName: "not-the-consensus", deliverableContract: { kind: "quality-score-report", schemaVersion: 1, retryOnMissingOrInvalid: 1 } })
+    const identityStep = agentStep({ name: "consensus", deliverableContract: { kind: "markdown-report" } })
+    expect(consensusStep({ steps: [contractStep, identityStep] })).toEqual(contractStep)
+  })
+
+  test("returns undefined when no step produces a quality score", () => {
+    const step = agentStep({ agentName: "implementer", deliverableContract: { kind: "markdown-report" } })
+    expect(consensusStep({ steps: [step] })).toBeUndefined()
+  })
+
+  test("keeps matching the quality-score-report agent identity as the legacy fallback", () => {
+    // A step resolved before deliverable contracts were persisted carries no
+    // contract; the agent identity must still identify it as the scorer.
+    const step = agentStep({ deliverableContract: undefined })
+    expect(consensusStep({ steps: [step] })).toEqual(step)
+  })
+
+  test("skips human and non-agent steps", () => {
+    const step = agentStep({ deliverableContract: { kind: "quality-score-report", schemaVersion: 1, retryOnMissingOrInvalid: 1 } })
+    const human = { type: "human", name: "gate", description: "" }
+    expect(consensusStep({ steps: [human, step] })).toEqual(step)
+  })
+
+  test("handles a step without a report path as absent", () => {
+    const step = agentStep({ reportPath: undefined })
+    expect(consensusStep({ steps: [step] })).toBeUndefined()
   })
 })

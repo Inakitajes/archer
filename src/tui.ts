@@ -1563,11 +1563,13 @@ export class TuiProgress implements ProgressUI {
   }
 
   /**
-   * One goal-loop iteration is over and the next run is about to start. Folds
-   * the finished iteration's usage into `priorUsage` (so the header's cost and
-   * tokens keep running), swaps in the pending phases and the run ids, and
-   * clears everything that belonged to the previous iteration's run. `startedAt`
-   * and the accumulated totals survive deliberately.
+   * Repoints this dashboard at a hosted run's phases and identity. A goal
+   * cycle runs as one logical run, so this is called once when the runner
+   * starts with a shared hosted progress (and on a control `reset` for an
+   * attaching client): it folds any already-rendered usage into `priorUsage`
+   * (keeping the header's cost and tokens running), swaps in the run's phases
+   * and identity, and clears everything that belonged to a previously rendered
+   * run. `startedAt` and the accumulated totals survive deliberately.
    */
   resetPipeline(phases: readonly ProgressPhase[], next: { runID: string; targetDir: string; runDir: string; pipeline: Pipeline; retainMessage?: string }): void {
     const usage = totalUsage(this.phases)

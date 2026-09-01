@@ -93,6 +93,34 @@ describe("hooks", () => {
     expect(await realpath((await readFile(join(context.workspace.dir, "cwd.out"), "utf8")).trim())).toBe(await realpath(context.workspace.dir))
   })
 
+  test("post hooks receive the goal-cycle outcome as CONVOY_GOAL_* variables", async () => {
+    // The goal loop lets a hook distinguish "cleared the bar" from "gave up
+    // short of it": both runs succeed, but CONVOY_GOAL_REACHED carries the
+    // verdict and CONVOY_GOAL_SCORE the best measured score.
+    const context = await hookContext()
+    await runHooks("post", [{ command: 'printf "%s:%s:%s" "$CONVOY_GOAL_REACHED" "$CONVOY_GOAL_TARGET" "$CONVOY_GOAL_SCORE" > goal.out', when: "always" }], {
+      ...context,
+      status: "success",
+      goal: { reached: true, target: 85, score: 92 },
+    })
+    expect(await readFile(join(context.targetDir, "goal.out"), "utf8")).toBe("true:85:92")
+
+    // A cycle that never produced a parseable score leaves CONVOY_GOAL_SCORE
+    // unset rather than faking a number; reached stays honest too.
+    await runHooks("post", [{ command: 'printf "%s:%s:%s" "$CONVOY_GOAL_REACHED" "$CONVOY_GOAL_TARGET" "${CONVOY_GOAL_SCORE-unset}" > goal2.out', when: "always" }], {
+      ...context,
+      status: "success",
+      goal: { reached: false, target: 90 },
+    })
+    expect(await readFile(join(context.targetDir, "goal2.out"), "utf8")).toBe("false:90:unset")
+  })
+
+  test("hooks without a goal cycle see no CONVOY_GOAL_* variables", async () => {
+    const context = await hookContext()
+    await runHooks("post", [{ command: 'printf "%s" "${CONVOY_GOAL_REACHED-unset}" > nogoal.out', when: "always" }], { ...context, status: "success" })
+    expect(await readFile(join(context.targetDir, "nogoal.out"), "utf8")).toBe("unset")
+  })
+
   test("fails on a non-zero hook unless continueOnError is true", async () => {
     const context = await hookContext()
 

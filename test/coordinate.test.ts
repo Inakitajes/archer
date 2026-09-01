@@ -77,7 +77,7 @@ describe("launch file round-trip", () => {
       planOnly: false,
       noConfirm: false,
     }
-    const payload = launchPayload(options, undefined, undefined)
+    const payload = launchPayload(options, undefined)
     const pending = await writePendingLaunch(payload, dir)
     const loaded = await readLaunchFile(pending.launchPath)
 
@@ -129,7 +129,7 @@ describe("waitForCoordinatorReady", () => {
 describe("spawnCoordinator", () => {
   test("records the child pid so the sweep can tell live coordinators from orphans", async () => {
     const root = await scratch()
-    const pending = await writePendingLaunch(launchPayload({ ...minimalOptions() } as RunOptions, undefined, undefined), root)
+    const pending = await writePendingLaunch(launchPayload({ ...minimalOptions() } as RunOptions, undefined), root)
     // writePendingLaunch fires a concurrent sweep that deletes pending dirs
     // whose recorded pid is not alive. A fabricated pid races that sweep into
     // deleting this dir between the pid write and the read below; the test
@@ -211,7 +211,7 @@ describe("runCoordinateBoot", () => {
   })
 
   async function writeBootLaunch(root: string) {
-    return writePendingLaunch(launchPayload({ ...minimalOptions() } as RunOptions, minimalPlan(), undefined), root)
+    return writePendingLaunch(launchPayload({ ...minimalOptions() } as RunOptions, minimalPlan()), root)
   }
 
   test("a non-goal run releases the hosted teardown and drives the finish hold", async () => {
@@ -318,7 +318,6 @@ describe("runCoordinateBoot", () => {
       launchPayload(
         { ...minimalOptions(), pipeline: { name: "implement-lite", steps: [unresolved] } } as RunOptions,
         { ...minimalPlan(), pipeline: { name: "implement-lite", steps: [resolved] } },
-        undefined,
       ),
       root,
     )
@@ -353,7 +352,7 @@ describe("runCoordinateBoot", () => {
     // in the log but the first ask-level permission is not auto-allowed.
     const root = await scratch()
     const pending = await writePendingLaunch(
-      launchPayload({ ...minimalOptions(), yolo: true } as RunOptions, minimalPlan(), undefined),
+      launchPayload({ ...minimalOptions(), yolo: true } as RunOptions, minimalPlan()),
       root,
     )
     let received: RunOptions | undefined
@@ -381,7 +380,7 @@ describe("runCoordinateBoot", () => {
   test("a --smart launch seeds the shared autoAccept so the judge is on from the first permission", async () => {
     const root = await scratch()
     const pending = await writePendingLaunch(
-      launchPayload({ ...minimalOptions(), smart: true } as RunOptions, minimalPlan(), undefined),
+      launchPayload({ ...minimalOptions(), smart: true } as RunOptions, minimalPlan()),
       root,
     )
     let received: RunOptions | undefined

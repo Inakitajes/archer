@@ -2,6 +2,7 @@ import { describe, expect, test, mock } from "bun:test"
 
 import { preflightTargets, validatePreflightTargets } from "../src/preflight-validation"
 import { preflightRunPlan } from "../src/preflight"
+import type { ResolvedModel } from "../src/model-routing"
 import type { RunPlan } from "../src/types"
 
 function plan(): RunPlan {
@@ -77,6 +78,48 @@ function nitroPlan(): RunPlan {
     target: "openrouter/z-ai/glm-5.2:nitro#xhigh",
   }
   result.modelRouting.gateway = "nitro"
+  return result
+}
+
+/** A goal plan whose improve-only step routes to a distinct model (gpt-5.6-terra). */
+function goalPlan(): RunPlan {
+  const result = plan()
+  const prefix = result.pipeline.steps[0]!
+  if (prefix.type !== "agent") throw new Error("expected agent step")
+  const improveModel: ResolvedModel = {
+    configured: "openai/gpt-5.6-terra#xhigh",
+    logical: "openai/gpt-5.6-terra#xhigh",
+    gateway: "configured",
+    providerID: "openai",
+    modelID: "gpt-5.6-terra",
+    variant: "xhigh",
+    target: "openai/gpt-5.6-terra#xhigh",
+  }
+  result.goal = {
+    target: 85,
+    maxIterations: 3,
+    plateau: 3,
+    briefRecipient: "fix",
+    scoreProducer: "arbiter",
+    improve: {
+      steps: [
+        {
+          ...prefix,
+          name: "fix",
+          stepName: "fix",
+          agentName: "goal-fixer",
+          groupId: "improve-g1",
+          model: "openai/gpt-5.6-terra#xhigh",
+          resolvedModel: improveModel,
+        },
+      ],
+    },
+    measure: {
+      steps: [
+        { ...prefix, name: "arbiter", stepName: "arbiter", groupId: "measure-g1", readOnly: true, reportPath: "reports/arbiter.md" },
+      ],
+    },
+  }
   return result
 }
 
@@ -227,6 +270,38 @@ describe("OpenCode run-plan preflight", () => {
       preflightRunPlan(
         reviewed,
         async () => catalog({ providerID: "openai", modelID: "gpt-5.6-terra", variants: ["high"] }),
+      ),
+    ).rejects.toThrow("Model unavailable")
+  })
+
+  test("preflights every goal-fragment model and advisor once with the prefix", () => {
+    // The improve and measure fragments are part of the reviewed plan: models
+    // that would only run in a later iteration still reject the parent plan
+    // before any phase starts.
+    const reviewed = goalPlan()
+    expect(preflightTargets(reviewed).map((target) => target.target)).toEqual([
+      "vercel/openai/gpt-5.6-sol",
+      "openai/gpt-5.6-terra#xhigh",
+      "vercel/openai/gpt-5.6-sol",
+    ])
+  })
+
+  test("rejects a goal-improve-only model that is unavailable up front", async () => {
+    const reviewed = goalPlan()
+
+    // The catalog serves the prefix and measure models but not the improve
+    // step's: the run must refuse before the prefix is paid for, because the
+    // improvement would only surface later.
+    await expect(
+      preflightRunPlan(
+        reviewed,
+        async () => ({
+          all: [
+            { id: "vercel", models: { "openai/gpt-5.6-sol": { variants: {} } } },
+            { id: "openai", models: { "gpt-5.6-sol": { variants: {} } } },
+          ],
+          connected: ["vercel", "openai"],
+        }),
       ),
     ).rejects.toThrow("Model unavailable")
   })

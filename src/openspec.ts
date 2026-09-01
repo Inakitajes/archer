@@ -75,7 +75,6 @@ export function openSpecPromptFor(pipelineName: string): string {
     case "ship":
       return "Ship the attached OpenSpec change."
     case "fixer":
-    case "goal-fix":
       return "Apply the attached OpenSpec change."
     case "hunter":
     case "hunter-max":

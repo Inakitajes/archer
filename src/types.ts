@@ -59,40 +59,6 @@ export type RunOptions = {
   /** Resolved model for the smart auto-accept judge (--smart-model → config → --model → defaults.model). */
   smartJudgeModel: string
   /**
-   * Goal loop: keep fixing until the quality score reaches this value (1–100).
-   * Requires a pipeline that ends in a quality-score-report step. CLI --goal
-   * beats the pipeline's own `goal:` config.
-   */
-  goal?: number
-  /** Goal loop: cap on fix iterations after the initial run. Defaults to 3. */
-  goalMaxIterations?: number
-  /** Goal loop: stop when a fix iteration improves the score by less than this many points. Defaults to 3. */
-  goalPlateau?: number
-  /**
-   * Goal loop: the resolved goal-fix pipeline the loop runs for fix iterations
-   * (same config chain as the main pipeline). Absent when goal mode is off.
-   */
-  goalFixPipeline?: Pipeline
-  /** Goal loop: scores of the iterations that already ran (this run's own score is appended for display). */
-  goalTrajectory?: number[]
-  /**
-   * Goal loop: this run is one of the loop's iterations and another will follow
-   * (or this is the initial run that the loop will keep building on). The runner
-   * suppresses the finish-screen hold so the loop continues unattended instead
-   * of blocking on a keypress between every iteration.
-   */
-  goalContinues?: boolean
-  /**
-   * Goal loop: hand this run's post-hooks back to the caller instead of running
-   * them. A loop is one piece of work spread over several runs, so post-hooks —
-   * which mean "the work is finished" — must fire once, after the last
-   * iteration, with the loop's outcome available to them. Deferring also keeps
-   * the run workspace alive so the caller can still resolve CONVOY_RUN_DIR; the
-   * caller owns cleaning it up. Pre-hooks are unaffected: they run before work,
-   * and running them ahead of each fix round is harmless.
-   */
-  deferPostHooks?: boolean
-  /**
    * A shared progress UI the caller owns (the goal loop's dashboard). When set,
    * the runner does not create or stop its own UI, does not hold the finish
    * screen, and hands the server/lease cleanup back via `RunResult.release`
@@ -105,13 +71,6 @@ export type RunOptions = {
    * it); otherwise it derives one from `yolo`/`smart`.
    */
   autoAccept?: AutoAccept
-  /**
-   * Goal loop: the iteration announcement text the loop placed in the feed
-   * before this run started. The runner forwards it to `resetPipeline` as
-   * `retainMessage` so the dashboard preserves exactly that entry rather than
-   * guessing the last feed item is the announcement.
-   */
-  retainFeedMessage?: string
   /** Resolved pipeline for new runs; resumed runs replay the pipeline frozen in their metadata. */
   pipeline: Pipeline
   /** Resolved agent registry (built-ins plus project agents) used to assemble the opencode config. */
@@ -269,17 +228,46 @@ export type HumanStep = {
 
 export type Step = AgentStep | HumanStep
 
+/**
+ * One improve/measure invocation resolved to concrete steps. Fragments are
+ * resolved with an empty report namespace: their steps' `reports` selectors
+ * and `inputFiles` only ever reference steps earlier in the same fragment.
+ */
+export type ResolvedPipelineFragment = {
+  steps: AgentStep[]
+}
+
+/**
+ * The frozen goal policy and its two resolved fragments. Produced once by
+ * pipeline resolution, routed (models/advisors frozen) with the parent plan,
+ * and the sole authority for goal execution — there is no separate goal-fix
+ * pipeline and no run-time goal flag that can alter this.
+ */
+export type ResolvedGoalPlan = {
+  target: number
+  /** Cap on improvement rounds after iteration-zero measurement. */
+  maxIterations: number
+  /** Stop when an improvement round raises the score by fewer points than this. */
+  plateau: number
+  /** The improve step (by resolved name) that alone receives the sanitized score brief. */
+  briefRecipient: string
+  improve: ResolvedPipelineFragment
+  measure: ResolvedPipelineFragment
+  /** The measure step (by resolved name) whose deliverable contract is the authoritative machine-readable score. */
+  scoreProducer: string
+}
+
 export type Pipeline = {
   name: string
   description?: string
   /** Per-pipeline cap on concurrent agents within a group; unset inherits the defaults/CLI chain. */
   maxConcurrentAgents?: number
-  /** Goal loop: keep fixing until the quality score reaches this value. CLI --goal wins. */
-  goal?: number
-  /** Goal loop: cap on fix iterations after the initial run. */
-  goalMaxIterations?: number
-  /** Goal loop: stop when a fix iteration improves the score by less than this many points. */
-  goalPlateau?: number
+  /**
+   * The pipeline's terminal `goal` step, resolved: the target, stopping policy,
+   * and the concrete improve/measure fragments. Absent when the pipeline has
+   * no goal step and runs once as an ordinary pipeline.
+   */
+  goalPlan?: ResolvedGoalPlan
   /**
    * Prompt text used when the pipeline runs without an explicit prompt: the
    * TUI prefills its prompt field with it and the CLI falls back to it. Set on
@@ -328,17 +316,12 @@ export type RunPlan = {
   prdHistory?: PrdHistoryPreview
   permissions: "interactive" | "smart" | "yolo"
   /**
-   * Goal mode, when enabled for this run: the target score, the bounded loop
-   * configuration, and the routed goal-fix pipeline the iterations will run.
-   * Surfaced in the reviewed plan and preflighted alongside the main pipeline
-   * so the operator consents to the full loop — not just its first iteration.
+   * The frozen goal cycle, when the pipeline declares a terminal goal step:
+   * target, stopping policy, and the routed improve/measure fragments, frozen
+   * with the plan so the operator consents to and preflights the complete
+   * loop. Derived only from the pipeline; no run flag can create or alter it.
    */
-  goal?: {
-    target: number
-    maxIterations: number
-    plateau: number
-    fixPipeline: Pipeline
-  }
+  goal?: ResolvedGoalPlan
   resume?: {
     runID: string
     /** Set when an explicit --gateway reroutes pending phases away from the run's frozen gateway. */

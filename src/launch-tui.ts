@@ -7,7 +7,7 @@ import { BoxRenderable, StyledText, TextRenderable, bg, bold, createCliRenderer,
 
 import { defaultAdvisorMaxCalls } from "./advisor"
 import { buildAgentRegistry, emptyHooksConfig, loadMergedConvoyConfig } from "./config"
-import { currentBranch, mainWorktreeDir, resolveWorktreeDefault } from "./git"
+import { currentBranch, dirtyFilesPreview, mainWorktreeDir, resolveWorktreeDefault, statusPorcelain } from "./git"
 import { hooksForPipeline } from "./hooks"
 import { openRouterLowBalance, startLimitsPoller } from "./limits"
 import { builtInPipelines, defaultPipelineName, hasWritableStep, resolvePipeline } from "./pipeline"
@@ -38,8 +38,6 @@ export type LaunchRunSelection = {
   yolo: boolean
   smart: boolean
   gateway: ModelGateway
-  /** Goal mode: keep fixing until the quality score reaches this value (1–100). Only set for scored pipelines when goal mode is on. */
-  goal?: number
   /** Worktree creation is intentionally deferred until after plan confirmation. */
   isolateWorktree?: boolean
   /** The branch confirmed in the branch step; the worktree is created with exactly this name. */
@@ -87,6 +85,15 @@ export type LaunchReviewedRun = LaunchRunPreparation & {
   selection: LaunchRunSelection
 }
 
+/**
+ * The review as prepared: the frozen preparation plus the fresh dirt reading
+ * taken when it was prepared (D2/D6) — the review's warning and the
+ * accept-time choice render from this, never from an earlier step's status.
+ */
+type PreparedReview = LaunchReviewedRun & {
+  dirt: DirtReading & { preview: string }
+}
+
 export type LaunchRunTuiResult = LaunchReviewedRun | LaunchNavigationSelection | undefined
 
 export type LaunchRunTuiOptions = {
@@ -109,6 +116,13 @@ export type LaunchRunTuiOptions = {
   proposeBranchName(input: { prompt: string; guidance?: string }): Promise<LaunchBranchProposal>
   /** Sanitizes a candidate and reports where it would live, suffixing it when the name is taken. */
   checkBranchName(name: string): Promise<LaunchBranchCheck>
+  /**
+   * Reads `git status --porcelain` for the execution tree. Injected so tests
+   * script dirt without fixture repos; the default wraps `statusPorcelain`
+   * and resolves to "" on failure (the gate reports the real problem at
+   * execution time).
+   */
+  readDirtyStatus?(dir: string): Promise<string>
 }
 
 /** Checkout-local history the launcher preloads so the notice can update as toggles change. */
@@ -152,7 +166,7 @@ export type PipelineChoice = {
   hooks: HookNode[]
   valid: boolean
   advisedSteps: number
-  /** True when the pipeline ends in a quality-score-report step, enabling goal mode. */
+  /** True when the pipeline declares a valid terminal goal step: the only way a pipeline enters goal execution. */
   scored: boolean
   error?: string
   /** Prompt text to prefill when launching this pipeline without a prompt; undefined when the prompt stays mandatory. */
@@ -258,6 +272,7 @@ type Modal =
   | { kind: "loading"; title: string; message: string; footer?: string }
   | { kind: "confirm"; title: string; message: string; footer?: string; onConfirm: () => void }
   | { kind: "gateway"; title: string; index: number }
+  | { kind: "dirty"; title: string; message: string; preview?: string; footer?: string }
 
 /** The gateway selector is always the first selectable row of the options step. */
 const gatewayOptionIndex = 0
@@ -311,16 +326,45 @@ const toggles: readonly ToggleSpec[] = [
   },
 ]
 
-/** The default target a scored run aims for when goal mode is toggled on in the launcher. */
-export const defaultGoalTarget = 90
+/** One launcher read of the execution tree's dirt, interpreted against the run's shape. */
+export type DirtReading = {
+  /** Number of dirty porcelain entries in the execution tree. */
+  files: number
+  /** Whether that dirt can affect this run at all: a fresh isolated worktree starts clean, so source dirt is irrelevant. */
+  matters: boolean
+  /** Whether the run would refuse to start: dirt matters, exists, and was not explicitly included. */
+  blocked: boolean
+}
+
+/**
+ * The single predicate the launcher's dirt surfaces share — options notice,
+ * toggle count, review warning, and the accept-time choice all derive from
+ * this one function, so none of them can drift from what the post-review
+ * `ensureRepoReady` gate would refuse: `matters` mirrors the gate's
+ * `allowDirty` (a continue handoff executes inside the feature's own
+ * worktree, so its dirt matters; a fresh isolated worktree starts clean), and
+ * `blocked` mirrors its refusal rule exactly.
+ */
+export function dirtReading(
+  porcelain: string,
+  options: { presetFeature?: { worktreeDir: string } | undefined; worktree: boolean; includeDirty: boolean },
+): DirtReading {
+  const files = porcelain.split("\n").filter((line) => line.trim() !== "").length
+  const matters = options.presetFeature ? true : !options.worktree
+  return { files, matters, blocked: matters && files > 0 && !options.includeDirty }
+}
+
+/** The injected reader's default: the gate's own git call, resolving to "" when git can't answer. */
+export async function defaultDirtyStatus(dir: string): Promise<string> {
+  try {
+    return await statusPorcelain(dir)
+  } catch {
+    return ""
+  }
+}
 
 /** The terminal width at or below which the launcher stacks its two panels. */
 export const compactLaunchMaxWidth = 84
-
-/** Adjusts a goal target by delta, clamped to 1–100 (never 0: a 0 goal would make the loop a no-op). */
-export function adjustGoalTarget(current: number, delta: number): number {
-  return Math.max(1, Math.min(100, current + delta))
-}
 
 export async function launchRunTui(options: LaunchRunTuiOptions, route?: TuiRoute): Promise<LaunchRunTuiResult> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -433,10 +477,9 @@ export function pipelineChoices(config: ConvoyConfig | undefined, agents: readon
         hooks,
         valid: true,
         advisedSteps: pipeline.steps.filter((step) => step.type === "agent" && Boolean(step.resolvedAdvisor ?? step.advisor)).length,
-        // Goal mode needs both a consensus score step and a writable step: a
-        // report-only scored pipeline (review, review-lite) would be mutated by
-        // the goal-fixer, contradicting its "makes no changes" contract.
-        scored: Boolean(consensusStep(pipeline)) && hasWritableStep(pipeline),
+        // Pipelines are classified directly by the presence of a valid terminal
+        // goal step: the resolver already validated its structure and roles.
+        scored: Boolean(pipeline.goalPlan),
         defaultPrompt: pipeline.defaultPrompt,
         suggestedPrompts: pipeline.suggestedPrompts,
         attachesPrdHistory: pipeline.steps.some((step) => step.type === "agent" && step.prdHistory),
@@ -523,10 +566,16 @@ export class LaunchPicker {
   private optionScroll = 0
   private message = ""
   private modal?: Modal
-  private prepared?: LaunchReviewedRun
+  private prepared?: PreparedReview
   private reviewScroll = 0
   private reviewTotalLines = 0
   private reviewFullPrompt = false
+  /**
+   * The porcelain answer the options step last read, cached only to render the
+   * notice synchronously — `matters`/`blocked` are re-derived from the live
+   * toggles on every render, and the review never trusts it (D2).
+   */
+  private dirtPorcelain?: string
 
   // Branch step state. `branchDir` is the worktree path for the current name,
   // and `branchEdited` flips as soon as the user types: a proposed name may be
@@ -554,13 +603,6 @@ export class LaunchPicker {
     // Always overwritten in the constructor, from defaults.worktree or the branch.
     worktree: true,
   }
-
-  // Goal mode: only visible and toggleable for scored pipelines. The target
-  // persists across pipeline switches; runSelection gates it on the selected
-  // pipeline actually being scored, so a stale true never leaks into a
-  // non-scored run.
-  private goalEnabled = false
-  private goalTarget = defaultGoalTarget
 
   private readonly ticker: ReturnType<typeof setInterval>
   // When the screen was last rebuilt, so the ticker can hold its old 250ms pace
@@ -651,6 +693,26 @@ export class LaunchPicker {
         }
         return
       }
+      // The dirty-tree choice (D4): [i] flips Include dirty tree with explicit
+      // consent and re-prepares the review, [o] returns to the options step
+      // with the session intact, and escape dismisses — staying in review,
+      // where accepting again re-offers the choice.
+      if (modal.kind === "dirty") {
+        if (key.name === "i") {
+          this.modal = undefined
+          this.toggleState.includeDirty = true
+          void this.prepareReview(this.currentChoice().name)
+        } else if (key.name === "o") {
+          this.modal = undefined
+          this.mode = "options"
+          void this.refreshDirt()
+          this.render()
+        } else if (key.name === "escape") {
+          this.modal = undefined
+          this.render()
+        }
+        return
+      }
       // Only the message modal can be dismissed; loading blocks input until the async job finishes.
       if (modal.kind === "message" && (key.name === "return" || key.name === "linefeed" || key.name === "escape" || key.name === "space" || key.name === "q")) {
         this.modal = undefined
@@ -684,7 +746,7 @@ export class LaunchPicker {
     private gateway: ModelGateway,
     private readonly worktreeDefault: WorktreeDefault,
     // Named `callbacks` rather than `hooks`: this file already uses "hooks" for the pipeline's shell hooks.
-    private readonly callbacks: Pick<LaunchRunTuiOptions, "prepareRun" | "proposeBranchName" | "checkBranchName">,
+    private readonly callbacks: Pick<LaunchRunTuiOptions, "prepareRun" | "proposeBranchName" | "checkBranchName" | "readDirtyStatus">,
     private readonly history: LaunchHistoryContext = { enabled: true, entries: [] },
     private readonly specs: readonly OpenSpecChangeSummary[] = [],
     /** Active change ids the run would attach without an explicit pick; see launchRunTui. */
@@ -969,6 +1031,7 @@ export class LaunchPicker {
         this.promptError = ""
         this.mode = "options"
         this.optionIndex = 0
+        void this.refreshDirt()
       }
       this.render()
       return
@@ -1108,6 +1171,7 @@ export class LaunchPicker {
     this.promptError = ""
     this.mode = "options"
     this.optionIndex = 0
+    void this.refreshDirt()
     this.render()
   }
 
@@ -1156,17 +1220,9 @@ export class LaunchPicker {
         return
       case "left":
         if (this.optionIndex === gatewayOptionIndex) this.cycleGateway(-1)
-        else if (this.optionIndex > toggles.length && this.goalEnabled) {
-          this.goalTarget = adjustGoalTarget(this.goalTarget, -5)
-          this.render()
-        }
         return
       case "right":
         if (this.optionIndex === gatewayOptionIndex) this.cycleGateway(1)
-        else if (this.optionIndex > toggles.length && this.goalEnabled) {
-          this.goalTarget = adjustGoalTarget(this.goalTarget, 5)
-          this.render()
-        }
         return
       case "return":
       case "linefeed":
@@ -1247,6 +1303,7 @@ export class LaunchPicker {
       case "back":
         this.mode = "options"
         this.branchError = ""
+        void this.refreshDirt()
         this.render()
         return
     }
@@ -1322,13 +1379,22 @@ export class LaunchPicker {
         this.render()
         return
       case "start":
-        if (this.prepared) this.finish(this.prepared)
+        if (this.prepared) {
+          // Unhandled dirt at accept time offers an explicit choice in-TUI
+          // (D4) instead of letting the post-exit gate throw the session away.
+          if (this.prepared.dirt.blocked) {
+            this.openDirtyChoice(this.prepared.dirt)
+            return
+          }
+          this.finish(this.prepared)
+        }
         return
       case "back":
         this.prepared = undefined
         this.mode = this.toggleState.worktree ? "branch" : "options"
         this.reviewScroll = 0
         this.reviewTotalLines = 0
+        if (this.mode === "options") void this.refreshDirt()
         this.render()
         return
       case "cancel":
@@ -1478,7 +1544,23 @@ export class LaunchPicker {
       const status = await repoBootstrapStatus(this.targetDir)
       const selection = this.runSelection(pipelineName, status !== "ready")
       const preparation = await this.callbacks.prepareRun(selection)
-      this.prepared = { action: "run", selection, ...preparation }
+      // The review rechecks the execution tree instead of trusting any status
+      // cached from the options step (D2): the warning, the accept-time
+      // choice, and the flags line all derive from this fresh read.
+      const porcelain = await this.readDirtyStatus(this.executionDir())
+      this.prepared = {
+        action: "run",
+        selection,
+        ...preparation,
+        dirt: {
+          ...dirtReading(porcelain, {
+            presetFeature: this.presetFeature,
+            worktree: this.toggleState.worktree,
+            includeDirty: this.toggleState.includeDirty,
+          }),
+          preview: dirtyFilesPreview(porcelain),
+        },
+      }
       this.mode = "review"
       this.reviewScroll = 0
       this.reviewTotalLines = 0
@@ -1492,11 +1574,59 @@ export class LaunchPicker {
     }
   }
 
+  /** The checkout the run would execute in: the feature's worktree for a continue handoff, the target checkout otherwise. */
+  private executionDir(): string {
+    return this.presetFeature?.worktreeDir ?? this.targetDir
+  }
+
+  /** The injected porcelain reader, defaulting to the gate's own git call. */
+  private readDirtyStatus(dir: string): Promise<string> {
+    return (this.callbacks.readDirtyStatus ?? defaultDirtyStatus)(dir)
+  }
+
+  /**
+   * The cached porcelain answer interpreted against the current toggles via
+   * the shared predicate: re-derived on every render, so flipping the worktree
+   * or Include dirty tree toggles moves the notice and the count without
+   * another git read.
+   */
+  private currentDirt(): DirtReading {
+    return dirtReading(this.dirtPorcelain ?? "", {
+      presetFeature: this.presetFeature,
+      worktree: this.toggleState.worktree,
+      includeDirty: this.toggleState.includeDirty,
+    })
+  }
+
+  /** Reads the execution tree's dirt fresh, then repaints the open step with it (D2). */
+  private async refreshDirt() {
+    try {
+      this.dirtPorcelain = await this.readDirtyStatus(this.executionDir())
+    } catch {
+      // The gate reports the real problem at execution time; the notice just stays quiet.
+      this.dirtPorcelain = ""
+    }
+    this.render()
+  }
+
+  /** The accept-time dirty choice: include, back to options, or stay in review (D4). */
+  private openDirtyChoice(dirt: DirtReading & { preview: string }) {
+    const files = `${dirt.files} uncommitted file${dirt.files === 1 ? "" : "s"}`
+    this.modal = {
+      kind: "dirty",
+      title: "uncommitted changes",
+      message: `${files} — this run would refuse to start with them. Including them lands them in the first commit.`,
+      preview: dirt.preview,
+      footer: "i include · o options · esc stay",
+    }
+    this.render()
+  }
+
   private runSelection(pipelineName: string, initializeGit = false): LaunchRunSelection {
     // A continue handoff executes inside the feature's existing worktree with
     // its branch frozen into the plan — no namer, no `ensureFreeBranchName`,
     // no new worktree (which is why `isolateWorktree` stays false).
-    const targetDir = this.presetFeature?.worktreeDir ?? this.targetDir
+    const targetDir = this.executionDir()
     const frozenBranch = this.presetFeature
       ? { branchName: this.presetFeature.branch, worktreeDir: this.presetFeature.worktreeDir }
       : this.toggleState.worktree && this.branchName
@@ -1513,7 +1643,6 @@ export class LaunchPicker {
       yolo: this.toggleState.yolo,
       smart: this.toggleState.smart,
       gateway: this.gateway,
-      ...(this.goalEnabled && this.currentChoice().scored ? { goal: this.goalTarget } : {}),
       isolateWorktree: this.toggleState.worktree,
       ...(frozenBranch ?? {}),
       ...(initializeGit ? { initializeGit: true } : {}),
@@ -1529,12 +1658,7 @@ export class LaunchPicker {
       return
     }
     const key = toggles[this.optionIndex - 1]?.key
-    if (!key) {
-      // The goal row sits after the boolean toggles and only exists for scored pipelines.
-      if (this.currentChoice().scored) this.goalEnabled = !this.goalEnabled
-      this.render()
-      return
-    }
+    if (!key) return
     const next = !this.toggleState[key]
     this.toggleState[key] = next
     if (key === "smart" && next) this.toggleState.yolo = false
@@ -1592,7 +1716,7 @@ export class LaunchPicker {
 
   /** Number of selectable rows in the options step: the gateway selector, the built-in toggles, and the goal row when the pipeline is scored. */
   private optionCount(): number {
-    return 1 + toggles.length + (this.currentChoice().scored ? 1 : 0)
+    return 1 + toggles.length
   }
 
   private currentChoice() {
@@ -1699,7 +1823,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     const lines: StyledText[] = []
 
     this.modalBox.title = ` ${truncate(modal.title, boxWidth - 8)} `
-    this.modalBox.borderColor = modal.kind === "message" ? theme.yellow : theme.accent
+    this.modalBox.borderColor = modal.kind === "message" || modal.kind === "dirty" ? theme.yellow : theme.accent
 
     if (modal.kind === "loading") {
       const frame = spinnerFrame(Date.now())
@@ -1718,6 +1842,16 @@ this.detailBox.title = reviewing ? " review " : " run setup "
         const hint = gatewayHint(gateway)
         const hintChunk = hint ? fg(theme.faint)(`   ${truncate(hint, Math.max(8, width - label.length - 9))}`) : undefined
         lines.push(new StyledText(hintChunk ? [marker, diamond, value, hintChunk] : [marker, diamond, value]))
+      }
+    } else if (modal.kind === "dirty") {
+      // Prose first, then the gate's own preview verbatim (D4): wrapWords
+      // collapses whitespace, so the file list is rendered as its own lines.
+      for (const line of wrapWords(modal.message, width)) lines.push(new StyledText([fg(theme.text)(line)]))
+      if (modal.preview) {
+        lines.push(plain(""))
+        for (const previewLine of modal.preview.split("\n").filter(Boolean)) {
+          lines.push(new StyledText([fg(theme.dim)(truncate(previewLine, width))]))
+        }
       }
     } else {
       for (const line of wrapWords(modal.message, width)) lines.push(new StyledText([fg(theme.text)(line)]))
@@ -2027,6 +2161,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     }
     this.pushOpenSpecNotice(lines, width)
     this.pushHistoryNotice(lines, width, "options")
+    this.pushDirtNotice(lines, width)
     lines.push(plain(""))
     lines.push(new StyledText([fg(theme.dim)(truncate("Choose a gateway and toggle extra run parameters, then press Enter to review.", width))]))
 
@@ -2058,9 +2193,14 @@ this.detailBox.title = reviewing ? " review " : " run setup "
       const enabled = this.toggleState[spec.key]
       const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
       const toggle = toggleSwitch(enabled)
+      // While the execution tree's dirt is unhandled, the Include dirty tree
+      // toggle carries the live count — the same number the notice names.
+      // The count stays dim so the control name remains the row's primary weight.
+      const dirt = spec.key === "includeDirty" ? this.currentDirt() : undefined
       const label = selected ? bold(fg(theme.text)(spec.label)) : fg(theme.text)(spec.label)
+      const count = dirt?.blocked ? fg(theme.dim)(` (${dirt.files} uncommitted)`) : undefined
       const flag = fg(enabled ? theme.green : theme.dim)(spec.flag)
-      lines.push(padBetween([marker, ...toggle, raw(" "), label], [flag], width))
+      lines.push(padBetween([marker, ...toggle, raw(" "), label, ...(count ? [count] : [])], [flag], width))
       this.optionRows.push(index + 1)
       // The worktree default depends on which branch you're on, so say why it
       // landed where it did — otherwise the checkbox looks like it moves on its own.
@@ -2080,25 +2220,6 @@ this.detailBox.title = reviewing ? " review " : " run setup "
         lines.push(new StyledText([raw("        "), fg(theme.yellow)(truncate(warning, Math.max(8, width - 8)))]))
         this.optionRows.push(index + 1)
       }
-    }
-
-    // Goal mode toggle: only for scored pipelines. Sits after the boolean
-    // toggles and uses left/right to adjust the target by 5.
-    if (this.currentChoice().scored) {
-      const goalOptionIndex = toggles.length + 1
-      const selected = this.optionIndex === goalOptionIndex
-      const enabled = this.goalEnabled
-      const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
-      const toggle = toggleSwitch(enabled)
-      const label = selected ? bold(fg(theme.text)("Goal mode")) : fg(theme.text)("Goal mode")
-      const flag = fg(enabled ? theme.green : theme.dim)(enabled ? `--goal ${this.goalTarget}` : `--goal ${defaultGoalTarget}`)
-      lines.push(padBetween([marker, ...toggle, raw(" "), label], [flag], width))
-      this.optionRows.push(goalOptionIndex)
-      const description = enabled
-        ? `Keep fixing until the quality score reaches ${this.goalTarget}/100. ←/→ adjust the target.`
-        : "Keep fixing until the quality score reaches a target (default 90). Only for scored pipelines."
-      lines.push(new StyledText([raw("        "), fg(theme.dim)(truncate(description, Math.max(8, width - 8)))]))
-      this.optionRows.push(goalOptionIndex)
     }
 
     const flags = this.enabledFlags()
@@ -2182,6 +2303,17 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     if (!prepared) return joinLines([t`${fg(theme.red)("Unable to load the run review.")}`])
 
     const reviewRows = runReviewLines(prepared.plan, width, { fullPrompt: this.reviewFullPrompt })
+    // The fresh dirt reading from preparation (D2): warn only when the run
+    // would actually refuse — the toggle on or a clean tree stays silent.
+    // Same 9-cell label column as the rest of the review (and the options
+    // notice), not a dashboard ⚠ banner.
+    if (prepared.dirt.blocked) {
+      const headline = `${prepared.dirt.files} uncommitted file${prepared.dirt.files === 1 ? "" : "s"} — this run would refuse them; include them or stash first`
+      reviewRows.unshift(
+        new StyledText([fg(theme.faint)("tree     "), fg(theme.yellow)(truncate(headline, Math.max(8, width - 9)))]),
+        plain(""),
+      )
+    }
     const visible = this.reviewVisibleRows()
     const maxScroll = Math.max(0, reviewRows.length - visible)
     this.reviewScroll = clamp(this.reviewScroll, 0, maxScroll)
@@ -2245,6 +2377,22 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.dim)(truncate(`${this.specs.length} active changes · pick one when writing the prompt`, value))]))
   }
 
+  /**
+   * The dirt notice, the tree counterpart of the history and OpenSpec notices:
+   * the execution tree holds uncommitted changes this run would refuse, so the
+   * operator learns it while the Include dirty tree toggle is still one
+   * keystroke away. Quiet when the tree is clean, when the toggle already
+   * covers the dirt, or when the dirt doesn't matter (fresh worktree
+   * isolation).
+   */
+  private pushDirtNotice(lines: StyledText[], width: number) {
+    const dirt = this.currentDirt()
+    if (!dirt.blocked) return
+    const headline = `${dirt.files} file${dirt.files === 1 ? "" : "s"} uncommitted — enable 'Include dirty tree' or stash`
+    lines.push(plain(""))
+    lines.push(new StyledText([fg(theme.faint)("tree     "), fg(theme.yellow)(truncate(headline, Math.max(8, width - 9)))]))
+  }
+
   private enabledFlags() {
     const flags = [`--pipeline ${this.currentChoice().name}`]
     flags.push(`--gateway ${this.gateway}`)
@@ -2255,7 +2403,6 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     if (!this.toggleState.keepRunDir) flags.push("--no-keep-run-dir")
     flags.push(this.toggleState.tui ? "--tui" : "--no-tui")
     flags.push(this.toggleState.worktree ? "--worktree" : "--no-worktree")
-    if (this.goalEnabled && this.currentChoice().scored) flags.push(`--goal ${this.goalTarget}`)
     if (this.selectedChangeId) flags.push(`--change ${this.selectedChangeId}`)
     return flags
   }

@@ -13,6 +13,7 @@ import type {
   ProgressUsage,
   RunControlState,
 } from "./progress"
+import type { QualityScore } from "./quality-score"
 import type { Pipeline } from "./types"
 import type { ModelGateway } from "./model-routing"
 import { PhaseUsage } from "./usage"
@@ -37,8 +38,43 @@ export type PhaseMetadata = {
   advisorEvents?: AdvisorEvent[]
 }
 
+/** The stage a goal cycle's durable record says the run is in. */
+export type GoalRunStage = "measure" | "improve" | "complete"
+
+/** The final outcome of a goal cycle, when it settled. */
+export type GoalRunOutcome = "goal" | "plateau" | "max-iterations" | "no-score" | "failed"
+
+/**
+ * The durable goal-cycle record (schema v4). Written by the embedded scheduler
+ * after every stage boundary so a crashed coordinator can resume from the exact
+ * pending improve/measure group, and so live attach, run history, and stopped-run
+ * reconstruction can present the same target, trajectory, stage, outcome, and
+ * restore result from durable state instead of ephemeral process data. `scores`
+ * holds every completed authoritative measurement as a complete `QualityScore`
+ * object; the numeric trajectory and best score are derived from it.
+ */
+export type GoalRunState = {
+  /** The frozen goal policy every stage of the cycle runs under. */
+  target: number
+  maxIterations: number
+  plateau: number
+  /** The measurement round the cycle is in (0 for the opening measurement). */
+  iteration: number
+  /** The activity the cycle is in, or "complete" once it settled. */
+  stage: GoalRunStage
+  /** Every completed authoritative measurement, oldest first. */
+  scores: QualityScore[]
+  /** The highest authoritative score measured across the cycle. */
+  bestScore?: number
+  outcome?: GoalRunOutcome
+  /** Whether the branch was restored to the best measured state at settlement. */
+  restored?: boolean
+  /** Why a best-state restore did not happen (concurrent commit, dirty tree, missing snapshot). */
+  restoreRefusedReason?: string
+}
+
 export type RunMetadata = {
-  schemaVersion: 3
+  schemaVersion: 3 | 4
   runID: string
   targetDir: string
   createdAt: number
@@ -50,6 +86,8 @@ export type RunMetadata = {
   server?: { url: string; pid: number; startedAt: number; controlUrl?: string }
   control: { state: RunControlState; requestedAt?: number; pausedAt?: number }
   phases: Record<string, PhaseMetadata>
+  /** The durable goal-cycle record, present when the pipeline declares a terminal goal step (schema v4). */
+  goal?: GoalRunState
 }
 
 export type RunMetadataStore = {
@@ -57,6 +95,10 @@ export type RunMetadataStore = {
   pipeline: Pipeline
   snapshot(name: string): ProgressPhaseSnapshot | undefined
   phaseStatus(name: string): PhaseMetadataStatus | undefined
+  /** The durable goal-cycle record, when the run has reached a goal checkpoint. */
+  goalState(): GoalRunState | undefined
+  /** Persists a goal checkpoint after a stage boundary, score promotion, or settlement. */
+  checkpointGoal(state: GoalRunState): Promise<void>
   /** Records the run's live opencode server URL so `convoy runs` can attach; cleared by serverStopped. */
   serverStarted(url: string): void
   serverStopped(): Promise<void>
@@ -202,6 +244,13 @@ export async function openRunMetadata(
     },
     phaseStatus(name) {
       return data.phases[name]?.status
+    },
+    goalState() {
+      return data.goal
+    },
+    async checkpointGoal(state) {
+      data.goal = state
+      await persist({ throwOnError: true })
     },
     serverStarted(url) {
       // The coordinator sets CONVOY_CONTROL_URL before run() boots; the token
@@ -388,14 +437,19 @@ export async function readRunMetadata(path: string): Promise<RunMetadata | undef
   }
   try {
     const parsed = JSON.parse(body) as Partial<RunMetadata> & { schemaVersion?: number }
-    // v1 predates the frozen pipeline; v1/v2 predate cooperative run control.
-    if (![1, 2, 3].includes(parsed.schemaVersion ?? 0) || typeof parsed.phases !== "object" || !parsed.phases) {
+    // v1 predates the frozen pipeline; v1/v2/v3 predate cooperative run control
+    // and durable goal state. Schema-v3 records (including historical goal-fix
+    // child runs) stay readable as plain runs; the goal record only exists
+    // from v4 onward.
+    if (![1, 2, 3, 4].includes(parsed.schemaVersion ?? 0) || typeof parsed.phases !== "object" || !parsed.phases) {
       log.warn(`ignoring run metadata with unknown shape at ${path}`)
       return undefined
     }
     const state = parsed.control?.state
     const control = state === "running" || state === "pausing" || state === "paused" ? parsed.control! : { state: "running" as const }
-    return { ...parsed, schemaVersion: 3, control, phases: parsed.phases } as RunMetadata
+    // Normalize: old records without a goal record stay schema-v3, so their
+    // readers never guess that a goal cycle existed.
+    return { ...parsed, schemaVersion: parsed.schemaVersion === 4 ? 4 : 3, control, phases: parsed.phases } as RunMetadata
   } catch {
     log.warn(`ignoring corrupt run metadata at ${path}`)
     return undefined
@@ -404,5 +458,5 @@ export async function readRunMetadata(path: string): Promise<RunMetadata | undef
 
 function newMetadata(runID: string, targetDir: string): RunMetadata {
   const now = Date.now()
-  return { schemaVersion: 3, runID, targetDir, createdAt: now, updatedAt: now, control: { state: "running" }, phases: {} }
+  return { schemaVersion: 4, runID, targetDir, createdAt: now, updatedAt: now, control: { state: "running" }, phases: {} }
 }

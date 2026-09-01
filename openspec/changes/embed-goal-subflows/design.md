@@ -24,6 +24,8 @@ Every repeated run currently gets a workspace, metadata record, run ID, pipeline
 - Selecting reports from unrelated historical runs or continuing a new goal cycle from a historical score.
 - Changing the quality rubric, score schema, default scorer roster, plateau mathematics, or safe best-state restore guards.
 - Allowing run-time flags to synthesize, enable, disable, or alter a pipeline's goal policy.
+- **Nested runtime goal-iteration groups in the live dashboard** (rendering each improve/measure invocation as a qualified group under the parent pipeline with per-group live growth). Goal fragments execute through the same phase machinery as the prefix, so each invocation's phases register as ordinary dashboard rows under the parent pipeline with invocation-qualified physical IDs; the header's `setGoalLoop` view already carries the trajectory and verdict. Renaming task 6.2 below.
+- **Config-TUI editing of a terminal goal node's improve/measure fragment steps** (expand/collapse, per-fragment step edits, invalid-edit surfacing). The config TUI renders the goal node as an immutable collapsible terminal control row and materializes built-ins with the full embedded definition; fragment-level editing is out of scope for this change. Renaming task 6.4 below.
 
 ## Decisions
 

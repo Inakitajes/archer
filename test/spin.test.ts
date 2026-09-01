@@ -53,7 +53,9 @@ async function freshEnv(): Promise<void> {
 }
 
 afterAll(async () => {
-  delete process.env.CONVOY_HOME
+  // Restore rather than delete: the preload sets CONVOY_HOME for the whole
+  // process, and dropping it would expose the operator's real home to later
+  // test files.
   delete process.env.CONVOY_OPENCODE_COMMANDS_DIR
   await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
 })

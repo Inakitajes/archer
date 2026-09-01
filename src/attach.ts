@@ -1,7 +1,7 @@
 import { join } from "node:path"
 import { stdout } from "node:process"
 
-import { LiveAttach, overallStatus, reconcileAdvisorJournal, replayHistory, waitForServerUrl } from "./attach-runtime"
+import { LiveAttach, goalLoopViewFrom, overallStatus, reconcileAdvisorJournal, replayHistory, waitForServerUrl } from "./attach-runtime"
 import { createControlClient, readControlFile, type ControlClient } from "./control-client"
 import type { ControlReset, ControlRole, PendingSnapshot } from "./control-server"
 import { readRunMetadata } from "./metadata"
@@ -88,8 +88,9 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
   const server = (await isServerLive(metadata.server)) ? metadata.server : undefined
   const controlFile = await readControlFile(runID)
   // A coordinated run is live through its control server even when its
-  // OpenCode server is momentarily down: a goal loop releases iteration N's
-  // server before N+1 boots, and the coordinator answers throughout.
+  // OpenCode server is momentarily down (a fresh coordinator booting, a server
+  // that died mid-flight): the coordinator answers throughout, so the
+  // dashboard can attach and watch rather than failing on the first lap.
   const controlLive = controlFile ? await isControlLive(controlFile) : false
   const controlServer = controlFile && controlLive ? controlFile : undefined
 
@@ -153,7 +154,8 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
 
   if (!live) {
     replayHistory(tui, metadata)
-    await Promise.race([tui.runFinished?.({ status: overallStatus(metadata), runDir: dir }) ?? Promise.resolve(), detached])
+    const goalLoop = goalLoopViewFrom(metadata.goal)
+    await Promise.race([tui.runFinished?.({ status: overallStatus(metadata), runDir: dir, ...(goalLoop ? { goalLoop } : {}) }) ?? Promise.resolve(), detached])
     tui.stop()
     return
   }
@@ -287,7 +289,8 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
     const latest = (await readRunMetadata(view.metaPath)) ?? metadata
     await reconcileAdvisorJournal(latest, view.runDir)
     replayHistory(tui, latest)
-    await Promise.race([tui.runFinished?.({ status: overallStatus(latest), runDir: view.runDir }) ?? Promise.resolve(), detached])
+    const goalLoop = goalLoopViewFrom(latest.goal)
+    await Promise.race([tui.runFinished?.({ status: overallStatus(latest), runDir: view.runDir, ...(goalLoop ? { goalLoop } : {}) }) ?? Promise.resolve(), detached])
   }
   tui.stop()
 }

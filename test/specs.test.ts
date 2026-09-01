@@ -11,6 +11,7 @@ import {
   classifySpecArtifact,
   groupChangeArtifacts,
   loadSpecsView,
+  mergeWorktreeChanges,
   printSpecsList,
   specArtifactLabel,
   specGroupSource,
@@ -402,6 +403,209 @@ describe("SC-1: the board shows features spun out into worktrees", () => {
       }
     } finally {
       await rm(repo, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * A minimal repo with one committed commit and a `git(...)` helper — the same
+ * shape the SC-1 fixture uses. The caller adds changes, worktrees, and files.
+ */
+async function initGitRepo(prefix: string): Promise<{
+  repo: string
+  git: (...args: string[]) => Promise<string>
+  cleanup: () => Promise<void>
+}> {
+  const repo = await mkdtemp(join(tmpdir(), prefix))
+  const exec = promisify(nodeExecFile)
+  const git = async (...args: string[]) => (await exec("git", args, { cwd: repo })).stdout.trim()
+  await git("init", "-b", "main")
+  await git("config", "user.email", "operator@example.com")
+  await git("config", "user.name", "Operator")
+  await writeFile(join(repo, "README.md"), "# repo\n")
+  await git("add", ".")
+  await git("commit", "-m", "chore: init")
+  return {
+    repo,
+    git,
+    cleanup: async () => {
+      await rm(repo, { recursive: true, force: true })
+    },
+  }
+}
+
+/** Isolates CONVOY_HOME for the duration of `fn` so the board join never reads the operator's real runs. */
+async function withIsolatedHome(fn: () => Promise<void>): Promise<void> {
+  const home = await mkdtemp(join(tmpdir(), "convoy-specs-home-"))
+  const prevHome = process.env.CONVOY_HOME
+  process.env.CONVOY_HOME = home
+  try {
+    await fn()
+  } finally {
+    if (prevHome === undefined) delete process.env.CONVOY_HOME
+    else process.env.CONVOY_HOME = prevHome
+    await rm(home, { recursive: true, force: true })
+  }
+}
+
+describe("worktree-backed changes read their artifacts from the worktree", () => {
+  test("a stale skeleton on the launch checkout no longer shadows the worktree's artifacts", async () => {
+    const { repo, git, cleanup } = await initGitRepo("convoy-specs-husk-")
+    try {
+      // The husk the incident reported: a change directory on the launch
+      // checkout whose `specs/` survives but holds no markdown anywhere.
+      await mkdir(join(repo, "openspec", "changes", "add-gadget", "specs"), { recursive: true })
+
+      // The real files live untracked in the feature worktree.
+      const wt = join(repo, "wt")
+      await git("worktree", "add", "-b", "feat/add-gadget", wt, "main")
+      const wtChange = join(wt, "openspec", "changes", "add-gadget")
+      await mkdir(join(wtChange, "specs", "cli"), { recursive: true })
+      await writeFile(join(wtChange, "proposal.md"), "# Add gadget\n")
+      await writeFile(join(wtChange, "design.md"), "# Design\n")
+      await writeFile(join(wtChange, "tasks.md"), "- [ ] one\n")
+      await writeFile(join(wtChange, "specs", "cli", "spec.md"), "## ADDED Requirements\n### Requirement: Gadget\n")
+
+      await withIsolatedHome(async () => {
+        const view = await loadSpecsView(repo)
+        const entry = view.changes.find((change) => change.id === "add-gadget")
+        expect(entry).toBeDefined()
+        // Title and artifacts come from the worktree's proposal, not the husk.
+        expect(entry!.title).toBe("Add gadget")
+        expect(entry!.artifacts.length).toBe(4)
+        for (const artifact of entry!.artifacts) {
+          expect(artifact.file).toContain(wt)
+          await expect(readFile(artifact.file, "utf8")).resolves.toBeDefined()
+        }
+        // The merge must never leave a zero-artifact entry behind.
+        expect(view.changes.every((change) => change.artifacts.length > 0)).toBe(true)
+      })
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("diverging copies resolve to the worktree", async () => {
+    const { repo, git, cleanup } = await initGitRepo("convoy-specs-diverge-")
+    try {
+      // Both sides carry markdown for the same id, with different titles.
+      const baseChange = join(repo, "openspec", "changes", "renamed-thing")
+      await mkdir(baseChange, { recursive: true })
+      await writeFile(join(baseChange, "proposal.md"), "# Base proposal\n")
+
+      const wt = join(repo, "wt")
+      await git("worktree", "add", "-b", "feat/renamed-thing", wt, "main")
+      const wtChange = join(wt, "openspec", "changes", "renamed-thing")
+      await mkdir(wtChange, { recursive: true })
+      await writeFile(join(wtChange, "proposal.md"), "# Worktree proposal\n")
+      await writeFile(join(wtChange, "tasks.md"), "- [ ] only in the worktree\n")
+
+      await withIsolatedHome(async () => {
+        const view = await loadSpecsView(repo)
+        const entry = view.changes.find((change) => change.id === "renamed-thing")
+        expect(entry).toBeDefined()
+        expect(entry!.title).toBe("Worktree proposal")
+        for (const artifact of entry!.artifacts) {
+          expect(artifact.file).toContain(wt)
+        }
+        const proposal = entry!.artifacts.find((artifact) => artifact.section === "proposal")
+        await expect(readFile(proposal!.file, "utf8")).resolves.toBe("# Worktree proposal\n")
+      })
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("a worktree copy without markdown leaves the launch checkout's entry standing", async () => {
+    const { repo, git, cleanup } = await initGitRepo("convoy-specs-guard-")
+    try {
+      // The launch checkout carries the change's real files (untracked — a
+      // committed copy would travel into the worktree via the base ref).
+      const baseChange = join(repo, "openspec", "changes", "keep-main")
+      await mkdir(baseChange, { recursive: true })
+      await writeFile(join(baseChange, "proposal.md"), "# Keep on main\n")
+
+      // A worktree also lists the id (and a second, launch-unknown id), but
+      // neither worktree copy has a single markdown file.
+      const wt = join(repo, "wt")
+      await git("worktree", "add", "-b", "feat/elsewhere", wt, "main")
+      await mkdir(join(wt, "openspec", "changes", "keep-main"), { recursive: true })
+      await mkdir(join(wt, "openspec", "changes", "ghost-change"), { recursive: true })
+
+      await withIsolatedHome(async () => {
+        const view = await loadSpecsView(repo)
+        const kept = view.changes.find((change) => change.id === "keep-main")
+        expect(kept).toBeDefined()
+        // The launch checkout's entry stands: repo-relative paths, its own title.
+        expect(kept!.title).toBe("Keep on main")
+        expect(kept!.artifacts.map((artifact) => artifact.file)).toEqual([
+          join("openspec", "changes", "keep-main", "proposal.md"),
+        ])
+        // An id the launch checkout never listed still appends (husk listing
+        // beats no listing) — the merge never drops a row.
+        const ghost = view.changes.find((change) => change.id === "ghost-change")
+        expect(ghost).toBeDefined()
+        expect(ghost!.title).toBe("ghost-change")
+        expect(ghost!.artifacts).toEqual([])
+      })
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("a worktree row without a worktreeDir leaves the launch checkout's entry untouched", async () => {
+    const base: SpecsChangeEntry = {
+      kind: "change",
+      id: "solo",
+      title: "Solo",
+      artifacts: [{ section: "proposal", file: join("openspec", "changes", "solo", "proposal.md") }],
+    }
+    // Unreachable through assembleControlBoard (it always sets worktreeDir on
+    // worktree rows), so a synthetic row exercises the guard directly.
+    const rows = [
+      {
+        id: "solo",
+        location: "worktree",
+        runs: [],
+        liveRuns: 0,
+        uncommittedProposal: false,
+        probablyMerged: false,
+        stage: "proposing",
+      },
+    ] as const
+    const merged = await mergeWorktreeChanges([base], rows as unknown as Parameters<typeof mergeWorktreeChanges>[1])
+    expect(merged).toHaveLength(1)
+    expect(merged[0]).toBe(base)
+  })
+
+  test("a stranded change keeps repo-relative paths beside a worktree-backed one", async () => {
+    const { repo, git, cleanup } = await initGitRepo("convoy-specs-stranded-")
+    try {
+      // Stranded on the launch checkout: no worktree resolves to it.
+      const stranded = join(repo, "openspec", "changes", "stranded-idea")
+      await mkdir(stranded, { recursive: true })
+      await writeFile(join(stranded, "proposal.md"), "# Stranded idea\n")
+
+      const wt = join(repo, "wt")
+      await git("worktree", "add", "-b", "feat/add-gadget", wt, "main")
+      const wtChange = join(wt, "openspec", "changes", "add-gadget")
+      await mkdir(wtChange, { recursive: true })
+      await writeFile(join(wtChange, "proposal.md"), "# Add gadget\n")
+
+      await withIsolatedHome(async () => {
+        const view = await loadSpecsView(repo)
+        const strandedEntry = view.changes.find((change) => change.id === "stranded-idea")
+        expect(strandedEntry).toBeDefined()
+        expect(strandedEntry!.artifacts.map((artifact) => artifact.file)).toEqual([
+          join("openspec", "changes", "stranded-idea", "proposal.md"),
+        ])
+        const worktreeEntry = view.changes.find((change) => change.id === "add-gadget")
+        expect(worktreeEntry).toBeDefined()
+        expect(worktreeEntry!.artifacts.length).toBeGreaterThan(0)
+        expect(worktreeEntry!.artifacts.every((artifact) => artifact.file.includes(wt))).toBe(true)
+      })
+    } finally {
+      await cleanup()
     }
   })
 })

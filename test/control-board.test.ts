@@ -1,11 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
   assembleControlBoard,
   branchForChange,
+  createBoardReads,
   hasUncommittedProposal,
   openspecTaskCounts,
   type BoardReads,
@@ -27,6 +28,12 @@ function readsFixture(input: {
   worktrees?: BoardWorktree[]
   mainChanges?: string[]
   worktreeChanges?: string[]
+  /** Per-worktree change ids, overriding `worktreeChanges` for that dir. */
+  worktreeChangesByDir?: Record<string, string[]>
+  /** Whether each (dir, id) change dir carries markdown; defaults to true. */
+  markdown?: Record<string, Record<string, boolean>>
+  /** Per-dir, per-id proposal title; defaults to `Title of <id>` so foreign copies can be told apart. */
+  titles?: Record<string, Record<string, string>>
   tasks?: Record<string, Record<string, BoardTasks>>
   runs?: BoardRun[]
   status?: Record<string, string>
@@ -42,6 +49,9 @@ function readsFixture(input: {
     ],
     mainChanges = [],
     worktreeChanges = ["add-foo"],
+    worktreeChangesByDir = {},
+    markdown = {},
+    titles = {},
     tasks = {},
     runs = [],
     status = {},
@@ -50,11 +60,13 @@ function readsFixture(input: {
     baseBranch = "main",
     present = true,
   } = input
+  const idsFor = (dir: string) => worktreeChangesByDir[dir] ?? worktreeChanges
   return {
     worktrees: async () => worktrees,
-    openspecPresent: async (dir) => (dir === mainDir ? present : worktreeChanges.length > 0),
-    changeIds: async (dir) => (dir === mainDir ? mainChanges : worktreeChanges),
-    changeTitle: async (_dir, id) => `Title of ${id}`,
+    openspecPresent: async (dir) => (dir === mainDir ? present : idsFor(dir).length > 0),
+    changeIds: async (dir) => (dir === mainDir ? mainChanges : idsFor(dir)),
+    changeHasMarkdown: async (dir, id) => markdown[dir]?.[id] ?? true,
+    changeTitle: async (dir, id) => titles[dir]?.[id] ?? `Title of ${id}`,
     taskCounts: async (dir) => new Map(Object.entries(tasks[dir] ?? {})),
     runs: async () => runs,
     status: async (dir) => status[dir] ?? "",
@@ -63,6 +75,24 @@ function readsFixture(input: {
     baseBranch: async () => baseBranch,
     canonicalSpecs: async () => ["openspec/specs/specs-viewer/spec.md"],
   }
+}
+
+/** Real-repo plumbing for the integration test below. */
+async function git(args: string[], cwd: string): Promise<void> {
+  const proc = Bun.spawn(["git", "-c", "commit.gpgsign=false", ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "convoy-test",
+      GIT_AUTHOR_EMAIL: "convoy-test@example.invalid",
+      GIT_COMMITTER_NAME: "convoy-test",
+      GIT_COMMITTER_EMAIL: "convoy-test@example.invalid",
+    },
+  })
+  const stderr = await new Response(proc.stderr).text()
+  if ((await proc.exited) !== 0) throw new Error(`git ${args.join(" ")}: ${stderr}`)
 }
 
 describe("branchForChange", () => {
@@ -224,6 +254,168 @@ describe("assembleControlBoard", () => {
   })
 })
 
+describe("change rows resolve to the owning worktree", () => {
+  const changeId = "specs-viewer-worktree-artifacts"
+  const foreignDir = "/wt/feat-preflight-dirty-tree-in-launcher"
+  const ownerDir = "/wt/feat-specs-viewer-worktree-artifacts"
+
+  test("a husk in an earlier worktree cannot steal the row", async () => {
+    const worktrees: BoardWorktree[] = [
+      { dir: mainDir, branch: "main", main: true },
+      { dir: foreignDir, branch: "feat/preflight-dirty-tree-in-launcher", main: false },
+      { dir: ownerDir, branch: `feat/${changeId}`, main: false },
+    ]
+    const board = await assembleControlBoard(
+      readsFixture({
+        worktrees,
+        worktreeChangesByDir: { [foreignDir]: [changeId], [ownerDir]: [changeId] },
+        // The foreign listing is a husk: no markdown inside.
+        markdown: { [foreignDir]: { [changeId]: false } },
+        tasks: { [ownerDir]: { [changeId]: { done: 6, total: 6 } } },
+        runs: [{ runID: "r1", branch: `feat/${changeId}`, live: false }],
+      }),
+    )
+    expect(board.rows).toHaveLength(1)
+    const row = board.rows[0]!
+    expect(row.worktreeDir).toBe(ownerDir)
+    expect(row.branch).toBe(`feat/${changeId}`)
+    expect(row.tasks).toEqual({ done: 6, total: 6 })
+    // Complete tasks in the owning worktree read ready to close, not implementing.
+    expect(row.stage).toBe("ready")
+    expect(row.runs).toHaveLength(1)
+  })
+
+  test("branch match outranks a fuller foreign copy", async () => {
+    const worktrees: BoardWorktree[] = [
+      { dir: mainDir, branch: "main", main: true },
+      { dir: "/wt/feat-other", branch: "feat/other", main: false },
+      { dir: worktreeDir, branch: "feat/add-foo", main: false },
+    ]
+    // Both copies bear markdown; only the later worktree's branch matches the id.
+    const board = await assembleControlBoard(
+      readsFixture({ worktrees, worktreeChangesByDir: { "/wt/feat-other": ["add-foo"] } }),
+    )
+    expect(board.rows).toHaveLength(1)
+    const row = board.rows[0]!
+    expect(row.worktreeDir).toBe(worktreeDir)
+    expect(row.branch).toBe("feat/add-foo")
+  })
+
+  test("a markdown-bearing copy outranks an earlier husk when no branch matches", async () => {
+    const worktrees: BoardWorktree[] = [
+      { dir: mainDir, branch: "main", main: true },
+      { dir: "/wt/feat-alpha", branch: "feat/alpha", main: false },
+      { dir: "/wt/feat-beta", branch: "feat/beta", main: false },
+    ]
+    const board = await assembleControlBoard(
+      readsFixture({
+        worktrees,
+        worktreeChangesByDir: { "/wt/feat-alpha": ["add-foo"], "/wt/feat-beta": ["add-foo"] },
+        markdown: { "/wt/feat-alpha": { "add-foo": false } },
+      }),
+    )
+    expect(board.rows).toHaveLength(1)
+    const row = board.rows[0]!
+    expect(row.worktreeDir).toBe("/wt/feat-beta")
+    expect(row.branch).toBeUndefined()
+  })
+
+  test("husk-only candidates keep the row present, degraded from the first-listed candidate", async () => {
+    const worktrees: BoardWorktree[] = [
+      { dir: mainDir, branch: "main", main: true },
+      { dir: "/wt/feat-alpha", branch: "feat/alpha", main: false },
+      { dir: "/wt/feat-beta", branch: "feat/beta", main: false },
+    ]
+    const board = await assembleControlBoard(
+      readsFixture({
+        worktrees,
+        worktreeChangesByDir: { "/wt/feat-alpha": ["add-foo"], "/wt/feat-beta": ["add-foo"] },
+        markdown: {
+          "/wt/feat-alpha": { "add-foo": false },
+          "/wt/feat-beta": { "add-foo": false },
+        },
+        // Runs recorded against `feat/<id>` still link through the shared-id fallback.
+        runs: [{ runID: "r1", branch: "feat/add-foo", live: false }],
+      }),
+    )
+    expect(board.rows).toHaveLength(1)
+    const row = board.rows[0]!
+    expect(row.worktreeDir).toBe("/wt/feat-alpha")
+    expect(row.branch).toBeUndefined()
+    expect(row.tasks).toBeUndefined()
+    expect(row.runs).toHaveLength(1)
+    expect(row.stage).toBe("implementing")
+  })
+
+  test("single-copy rows keep today's facts and walk order", async () => {
+    const worktrees: BoardWorktree[] = [
+      { dir: mainDir, branch: "main", main: true },
+      { dir: "/wt/feat-alpha", branch: "feat/alpha", main: false },
+      { dir: "/wt/feat-beta", branch: "feat/beta", main: false },
+    ]
+    const board = await assembleControlBoard(
+      readsFixture({
+        worktrees,
+        worktreeChangesByDir: { "/wt/feat-alpha": ["alpha"], "/wt/feat-beta": ["beta"] },
+        mainChanges: ["on-main"],
+        tasks: {
+          "/wt/feat-alpha": { alpha: { done: 2, total: 5 } },
+          "/wt/feat-beta": { beta: { done: 4, total: 4 } },
+        },
+      }),
+    )
+    expect(board.rows.map((row) => row.id)).toEqual(["alpha", "beta", "on-main"])
+    const [alpha, beta, onMain] = board.rows
+    expect(alpha!.worktreeDir).toBe("/wt/feat-alpha")
+    expect(alpha!.branch).toBe("feat/alpha")
+    expect(alpha!.tasks).toEqual({ done: 2, total: 5 })
+    expect(beta!.worktreeDir).toBe("/wt/feat-beta")
+    expect(beta!.branch).toBe("feat/beta")
+    expect(beta!.tasks).toEqual({ done: 4, total: 4 })
+    expect(onMain!.location).toBe("main")
+    expect(onMain!.worktreeDir).toBeUndefined()
+  })
+
+  test("title and uncommitted-marker come from the winning checkout", async () => {
+    const worktrees: BoardWorktree[] = [
+      { dir: mainDir, branch: "main", main: true },
+      { dir: foreignDir, branch: "feat/preflight-dirty-tree-in-launcher", main: false },
+      { dir: ownerDir, branch: `feat/${changeId}`, main: false },
+    ]
+    const board = await assembleControlBoard(
+      readsFixture({
+        worktrees,
+        worktreeChangesByDir: { [foreignDir]: [changeId], [ownerDir]: [changeId] },
+        markdown: { [foreignDir]: { [changeId]: false } },
+        // The husk's stale proposal and status must not leak into the row: the owner supplies every derived fact.,
+        titles: { [foreignDir]: { [changeId]: "Stale foreign title" }, [ownerDir]: { [changeId]: "Real owner title" } },
+        status: { [foreignDir]: `?? openspec/changes/${changeId}/proposal.md\n`, [ownerDir]: "" },
+      }),
+    )
+    const row = board.rows[0]!
+    expect(row.title).toBe("Real owner title")
+    expect(row.uncommittedProposal).toBe(false)
+  })
+
+  test("an id resolved from worktrees never duplicates as a stranded main row", async () => {
+    const worktrees: BoardWorktree[] = [
+      { dir: mainDir, branch: "main", main: true },
+      { dir: foreignDir, branch: "feat/preflight-dirty-tree-in-launcher", main: false },
+      { dir: ownerDir, branch: `feat/${changeId}`, main: false },
+    ]
+    const board = await assembleControlBoard(
+      readsFixture({
+        worktrees,
+        mainChanges: [changeId],
+        worktreeChangesByDir: { [foreignDir]: [changeId], [ownerDir]: [changeId] },
+        markdown: { [foreignDir]: { [changeId]: false } },
+      }),
+    )
+    expect(board.rows).toHaveLength(1)
+    expect(board.rows[0]!.worktreeDir).toBe(ownerDir)
+  })
+})
+
 describe("openspecTaskCounts", () => {
   test("falls back to checkbox parsing when the openspec CLI is absent", async () => {
     // A spawn of a missing binary throws (ENOENT) rather than exiting
@@ -242,6 +434,79 @@ describe("openspecTaskCounts", () => {
       expect(counts.get("add-foo")).toEqual({ done: 2, total: 3 })
     } finally {
       process.env.PATH = originalPath
+    }
+  })
+})
+
+describe("createBoardReads.changeHasMarkdown", () => {
+  test("a husk with only empty subdirectories is not markdown-bearing; any .md file is", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "convoy-board-markdown-"))
+    cleanupDirs.push(dir)
+    const reads = createBoardReads(dir)
+
+    // A husk: directories only, no markdown anywhere below.
+    const husk = join(dir, "openspec", "changes", "husk-id", "specs", "cli")
+    await mkdir(husk, { recursive: true })
+    await expect(reads.changeHasMarkdown(dir, "husk-id")).resolves.toBe(false)
+
+    // A real copy: markdown nested under the capability subtree.
+    const real = join(dir, "openspec", "changes", "real-id", "specs", "cli")
+    await mkdir(real, { recursive: true })
+    await writeFile(join(real, "spec.md"), "# cli\n")
+    await expect(reads.changeHasMarkdown(dir, "real-id")).resolves.toBe(true)
+
+    // A missing directory reads as false, never throws.
+    await expect(reads.changeHasMarkdown(dir, "ghost-id")).resolves.toBe(false)
+  })
+})
+
+describe("createBoardReads precedence over real git worktrees", () => {
+  test("a husk in an earlier worktree cannot steal the row from the branch-matching owner", async () => {
+    // `git worktree` echoes canonical paths (e.g. /private/var/... on macOS), so
+    // resolve the temp root through realpath before building the expected dirs..
+    const top = await realpath(await mkdtemp(join(tmpdir(), "convoy-board-repo-")))
+    cleanupDirs.push(top)
+    const root = join(top, "repo")
+    const foreign = join(top, "wt-foreign")
+    const owner = join(top, "wt-owner")
+    await mkdir(root)
+    await git(["init", "-q", "-b", "main"], root)
+    await writeFile(join(root, "README.md"), "base\n")
+    await git(["add", "README.md"], root)
+    await git(["commit", "-q", "-m", "chore: init"], root)
+
+    const changeId = "specs-viewer-worktree-artifacts"
+
+    // Earlier worktree: an unrelated branch carrying an untracked husk of the id..
+    await git(["worktree", "add", "-q", "-b", "feat/other", foreign], root)
+    const husk = join(foreign, "openspec", "changes", changeId, "specs", "cli")
+    await mkdir(husk, { recursive: true })
+
+    // Later worktree: the branch-matching owner carrying the real change artifacts..
+    await git(["worktree", "add", "-q", "-b", `feat/${changeId}`, owner], root)
+    const changeRoot = join(owner, "openspec", "changes", changeId)
+    await mkdir(join(changeRoot, "specs", "cli"), { recursive: true })
+    await writeFile(join(changeRoot, "proposal.md"), "# Proposal: owner copy\n")
+    await writeFile(join(changeRoot, "tasks.md"), "# Tasks\n\n- [x] one\n- [x] two\n- [x] three\n- [x] four\n- [x] five\n- [x] six\n")
+    await writeFile(join(changeRoot, "specs", "cli", "spec.md"), "# cli\n")
+
+    // Isolate run-history reads: nothing under the temp home means no runs,
+    // which keeps the join independent of this machine's ~/.convoy state..
+    const previousHome = process.env.CONVOY_HOME
+    const home = await mkdtemp(join(tmpdir(), "convoy-board-home-"))
+    cleanupDirs.push(home)
+    process.env.CONVOY_HOME = home
+    try {
+      const board = await assembleControlBoard(createBoardReads(root))
+      expect(board.rows).toHaveLength(1)
+      const row = board.rows[0]!
+      expect(row.id).toBe(changeId)
+      expect(row.worktreeDir).toBe(owner)
+      expect(row.branch).toBe(`feat/${changeId}`)
+      expect(row.tasks).toEqual({ done: 6, total: 6 })
+      expect(row.stage).toBe("ready")
+    } finally {
+      process.env.CONVOY_HOME = previousHome
     }
   })
 })
