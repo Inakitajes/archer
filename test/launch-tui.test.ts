@@ -667,34 +667,53 @@ describe("launch TUI pipeline preview", () => {
     expect(lines.length).toBeGreaterThan(0)
   })
 
-  test("goalLines previews the policy and both fragments with their models", () => {
-    const lines = plainLines(goalLines({
-      target: 85,
-      maxIterations: 3,
-      plateau: 3,
-      briefRecipient: "fix",
-      scoreProducer: "score-report",
-      measure: [
-        { stepName: "score", groupId: "g1", kind: "agent", modelLabel: "x-ai-grok-5", advisorLabel: "" },
-        { stepName: "score", groupId: "g1", kind: "agent", modelLabel: "glm-5.3-high", advisorLabel: "" },
-        { stepName: "score-report", groupId: "g2", kind: "agent", modelLabel: "x-ai-grok-5", advisorLabel: "" },
-      ],
-      improve: [
-        { stepName: "fix", groupId: "g3", kind: "agent", modelLabel: "deepseek-v4-flash", advisorLabel: "x-ai-grok-5 advisor ×3" },
-      ],
-    } satisfies GoalPreview, 100))
+  const scoredGoal = {
+    target: 85,
+    maxIterations: 3,
+    plateau: 3,
+    briefRecipient: "fix",
+    scoreProducer: "score-report",
+    measure: [
+      { stepName: "score", groupId: "g1", kind: "agent", modelLabel: "x-ai-grok-5", advisorLabel: "" },
+      { stepName: "score", groupId: "g1", kind: "agent", modelLabel: "glm-5.3-high", advisorLabel: "" },
+      { stepName: "score-report", groupId: "g2", kind: "agent", modelLabel: "x-ai-grok-5", advisorLabel: "" },
+    ],
+    improve: [
+      { stepName: "fix", groupId: "g3", kind: "agent", modelLabel: "deepseek-v4-flash", advisorLabel: "x-ai-grok-5 advisor ×3" },
+    ],
+  } satisfies GoalPreview
 
-    // The policy row leads: the operator sees the loop's full envelope
-    // (measurement zero plus the bounded improve rounds) in the list itself.
-    expect(lines[0]).toContain("goal cycle  · target 85/100 · up to 4 measurements · plateau 3")
-    // Measurement zero runs first, so measure is the first branch.
-    expect(lines).toContain("  measure  · 3 steps · score from score-report")
-    expect(lines).toContain("  improve  · 1 step · brief goes to fix")
+  test("goalLines previews the policy and both fragments with their models", () => {
+    const lines = plainLines(goalLines(scoredGoal, 100))
+
+    // A distinct section, then the three policy facts as separate chips —
+    // target, improve-round cap (not a derived measurement count), plateau.
+    expect(lines[0]).toBe("goal")
+    expect(lines[1]).toContain("85/100")
+    expect(lines[1]).toContain("↺ ≤3 rounds")
+    expect(lines[1]).toContain("plateau 3")
+    expect(lines[1]).not.toContain("target 85/100")
+    expect(lines.join("\n")).not.toContain("4 measurements")
+    // Measurement zero runs first; improve names the loop-back.
+    expect(lines).toContain("  measure  · score ← score-report")
+    expect(lines).toContain("  improve  · brief → fix  · then re-measure")
     // Fragment steps render as indented trees with their resolved models,
     // including the fan-out and the fixer's advisor relationship.
     expect(lines).toContain("  ○ score  · 2 models")
     expect(lines).toContain("  ○ score-report  · x-ai-grok-5")
     expect(lines).toContain("  ○ fix  · deepseek-v4-flash → x-ai-grok-5 advisor ×3")
+  })
+
+  test("goalLines collapses policy chips and fragment roles when the panel is narrow", () => {
+    const lines = plainLines(goalLines(scoredGoal, 24))
+    const joined = lines.join("\n")
+    expect(joined).toContain("85/100")
+    expect(joined).toContain("↺3")
+    expect(joined).toContain("p3")
+    expect(joined).toContain("measure")
+    expect(joined).toContain("improve")
+    expect(lines.some((line) => line.includes("then re-measure"))).toBe(false)
+    expect(lines.every((line) => displayWidth(line) <= 24)).toBe(true)
   })
 })
 
@@ -1167,7 +1186,8 @@ describe("launch TUI goal classification", () => {
     try {
       const detail = launchView(picker).pipelineDetail(80).chunks.map((chunk) => chunk.text).join("")
       expect(detail).toContain("○ implementer  · gpt-5.6")
-      expect(detail).not.toContain("goal cycle")
+      expect(detail).not.toContain("goal")
+      expect(detail).not.toContain("↺")
       expect(detail).not.toContain("measure  ·")
       expect(detail).not.toContain("improve  ·")
     } finally {
@@ -1214,9 +1234,13 @@ describe("launch TUI goal classification", () => {
     const launcher = { ...testRenderer, picker }
     try {
       const detail = launchView(picker).pipelineDetail(80).chunks.map((chunk) => chunk.text).join("")
-      expect(detail).toContain("goal cycle  · target 85/100 · up to 4 measurements · plateau 3")
-      expect(detail).toContain("measure  · 3 steps · score from score-report")
-      expect(detail).toContain("improve  · 1 step · brief goes to fix")
+      expect(detail).toContain("goal")
+      expect(detail).toContain("85/100")
+      expect(detail).toContain("↺ ≤3 rounds")
+      expect(detail).toContain("plateau 3")
+      expect(detail).not.toContain("4 measurements")
+      expect(detail).toContain("measure  · score ← score-report")
+      expect(detail).toContain("improve  · brief → fix  · then re-measure")
       expect(detail).toContain("○ fix  · deepseek-v4-flash")
     } finally {
       await closeLauncher(launcher)

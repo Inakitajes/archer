@@ -17,7 +17,7 @@ import { consensusStep } from "./quality-score"
 import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
 import { listOpenSpecChanges, loadOpenSpecBundle, openSpecPromptFor, type OpenSpecChangeSummary } from "./openspec"
 import { runReviewLines } from "./review-tui"
-import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { chunksLength, clipChunks, displayWidth, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { ConvoyConfig } from "./config"
@@ -2955,29 +2955,64 @@ export function hookLines(hooks: readonly HookNode[], width: number): StyledText
   return lines
 }
 
-// Previews the selected scored pipeline's goal cycle the way the review
-// screen summarizes it: the stopping policy, then the measure and improve
-// fragments as indented step trees — measurement zero runs first, improve
-// rounds follow — so the loop's models and roles are visible before the
-// operator ever reaches Review. Exported pure, like stepTree and hookLines
-// beside it, for direct unit tests.
+// Previews the selected scored pipeline's goal cycle as a scannable loop:
+// a distinct section, three policy chips (target, improve-round cap, plateau),
+// then measure and improve as indented step trees — measurement zero first,
+// improve rounds that re-measure after. Exported pure, like stepTree and
+// hookLines beside it, for direct unit tests.
 export function goalLines(goal: GoalPreview, width: number): StyledText[] {
   const indent = "  "
-  const measurements = 1 + goal.maxIterations
-  const policy = `target ${goal.target}/100 · up to ${counted(measurements, "measurement")} · plateau ${goal.plateau}`
-  const lines: StyledText[] = [
-    new StyledText([fg(theme.faint)("goal cycle"), fg(theme.faint)("  · "), fg(theme.dim)(truncate(policy, Math.max(6, width - 14)))]),
-  ]
-  const branch = (label: string, detail: string, steps: readonly StepNode[]) => {
-    const used = indent.length + label.length + 4
-    lines.push(new StyledText([fg(theme.faint)(`${indent}${label}`), fg(theme.faint)("  · "), fg(theme.dim)(truncate(detail, Math.max(6, width - used)))]))
+  const inner = Math.max(1, width - indent.length)
+  const target = `${goal.target}/100`
+  const rounds = `↺ ≤${counted(goal.maxIterations, "round")}`
+  const plateau = `plateau ${goal.plateau}`
+  const sep = "  · "
+  const policyWidth = displayWidth(target) + displayWidth(sep) + displayWidth(rounds) + displayWidth(sep) + displayWidth(plateau)
+  const lines: StyledText[] = []
+  if (policyWidth <= inner) {
+    lines.push(new StyledText([fg(theme.faint)("goal")]))
+    lines.push(
+      new StyledText([
+        raw(indent),
+        fg(theme.text)(target),
+        fg(theme.faint)(sep),
+        fg(theme.dim)(rounds),
+        fg(theme.faint)(sep),
+        fg(theme.dim)(plateau),
+      ]),
+    )
+  } else {
+    const compact = `goal  · ${target} · ↺${goal.maxIterations} · p${goal.plateau}`
+    lines.push(new StyledText([fg(theme.faint)(truncate(compact, width))]))
+  }
+
+  const fragment = (label: string, role: string, extra: string | undefined, steps: readonly StepNode[]) => {
+    lines.push(fragmentHeader(indent, label, role, extra, width))
     // The fragment tree renders against the narrower inner width so the
     // branch indent keeps every row inside the panel.
     for (const line of stepTree(steps, width - indent.length)) lines.push(new StyledText([raw(indent), ...line.chunks]))
   }
-  branch("measure", `${counted(goal.measure.length, "step")} · score from ${goal.scoreProducer}`, goal.measure)
-  branch("improve", `${counted(goal.improve.length, "step")} · brief goes to ${goal.briefRecipient}`, goal.improve)
+  fragment("measure", `score ← ${goal.scoreProducer}`, undefined, goal.measure)
+  fragment("improve", `brief → ${goal.briefRecipient}`, "then re-measure", goal.improve)
   return lines
+}
+
+function fragmentHeader(indent: string, label: string, role: string, extra: string | undefined, width: number): StyledText {
+  const prefix = indent + label
+  const clauses = extra ? [role, extra] : [role]
+  const fits = (parts: string[]) => displayWidth(parts.length === 0 ? prefix : `${prefix}  · ${parts.join("  · ")}`) <= width
+  let parts = clauses
+  if (!fits(parts) && extra) parts = [extra]
+  if (!fits(parts) && extra) parts = ["↺"]
+  if (!fits(parts)) parts = role && fits([role]) ? [role] : []
+  if (!fits(parts)) parts = []
+  const chunks: TextChunk[] = [fg(theme.faint)(indent), fg(theme.teal)(label)]
+  if (parts.length > 0) {
+    // Join with the same "  · " the rest of the preview uses. `truncate`
+    // would collapse those spaces, and `fits` already guaranteed the row.
+    chunks.push(fg(theme.faint)("  · "), fg(theme.dim)(parts.join("  · ")))
+  }
+  return new StyledText(chunks)
 }
 
 function counted(n: number, noun: string) {
