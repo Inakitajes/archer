@@ -1810,19 +1810,30 @@ export class LaunchPicker {
     this.usageBox.visible = usageVisible
 
     this.bodyBox.flexDirection = compact ? "column" : "row"
+    // Stacked panels sit flush (the shell's own chrome has no gaps either);
+    // keeping the row layout's 1-column gap here would spend a body row on a
+    // blank separator above the setup panel and push its bottom border under
+    // the footer.
+    this.bodyBox.gap = compact ? 0 : 1
     if (compact) {
+      const pipelineHeight = this.compactPipelineHeight(this.compactBodyHeight())
       this.leftBox.width = "100%"
-      this.leftBox.height = this.compactPipelineHeight(this.compactBodyHeight())
+      this.leftBox.height = pipelineHeight
       this.pipelineBox.width = "100%"
       this.pipelineBox.height = "100%"
+      // Review owns the whole body (the sidebar is display:none, so it takes
+      // no rows); otherwise the setup panel takes exactly the rows the
+      // pipeline list leaves, so its bottom border always lands on the body's
+      // last row instead of "auto"-sizing past it when the content runs long.
+      this.detailBox.height = reviewing ? "100%" : Math.max(3, bodyHeight - pipelineHeight)
     } else {
       this.leftBox.width = pipelineWidth
       this.leftBox.height = bodyHeight
       this.pipelineBox.width = "100%"
       this.pipelineBox.height = usageVisible ? bodyHeight - usageHeight : bodyHeight
+      this.detailBox.height = "100%"
     }
     this.detailBox.width = compact || reviewing ? "100%" : detailWidth
-    this.detailBox.height = compact ? "auto" : "100%"
 this.detailBox.title = reviewing ? " review " : " run setup "
      // The pipeline sidebar never borrows the accent: the steps are uniform,
      // dimmed containers, and the selected pipeline's own row carries the
@@ -2557,8 +2568,11 @@ this.detailBox.title = reviewing ? " review " : " run setup "
 
   private detailContentHeight() {
     if (!this.usesCompactLayout()) return this.listHeight()
-    const bodyHeight = this.compactBodyHeight()
-    return bodyHeight - this.compactPipelineHeight(bodyHeight) - 1
+    // compactBodyHeight already discounts the header, footer, and the detail
+    // panel's own borders, so the setup panel's text budget is what remains
+    // after the pipeline list's share — exactly the rows the stacked,
+    // gap-free box shows.
+    return Math.max(1, this.compactBodyHeight() - this.compactPipelineHeight(this.compactBodyHeight()))
   }
 
   private reviewVisibleRows() {

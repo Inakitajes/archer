@@ -154,6 +154,37 @@ describe("launch TUI compact layout", () => {
     }
   })
 
+  test("stacked compact panels sit flush and keep the setup panel's bottom border", async () => {
+    const launcher = await createLauncher(80, 30)
+    try {
+      await launcher.renderOnce()
+      const rows = launcher.captureCharFrame().split("\n")
+      const pipelines = panelRow(rows.join("\n"), "pipelines")
+      const setup = panelRow(rows.join("\n"), "run setup")
+      const footer = rows.findIndex((line) => line.includes("↑/↓ select"))
+
+      // Flush stacking: the pipelines bottom border sits directly above the
+      // setup panel — no blank separator row spent on the row layout's gap.
+      expect(rows[setup - 1]).toContain("╰")
+      // The setup panel closes on the body's last row, right above the footer.
+      expect(rows[footer - 2]).toContain("╰")
+
+      // Options content is taller than the panel's compact share; the box
+      // must clip it inside its budget instead of auto-sizing past the body
+      // and losing the bottom border under the footer.
+      launcher.mockInput.pressEnter()
+      await launcher.mockInput.typeText("ship it")
+      launcher.mockInput.pressEnter()
+      await launcher.renderOnce()
+      const optionsRows = launcher.captureCharFrame().split("\n")
+      const optionsFooter = optionsRows.findIndex((line) => line.includes("space toggle"))
+      expect(optionsFooter).toBeGreaterThanOrEqual(0)
+      expect(optionsRows[optionsFooter - 2]).toContain("╰")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
   test("updates the layout and preserves scrolling after a resize", async () => {
     const launcher = await createLauncher(90, 24, 10)
     try {
