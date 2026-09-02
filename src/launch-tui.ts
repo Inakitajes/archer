@@ -17,7 +17,7 @@ import { consensusStep } from "./quality-score"
 import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
 import { listOpenSpecChanges, loadOpenSpecBundle, openSpecPromptFor, type OpenSpecChangeSummary } from "./openspec"
 import { runReviewLines } from "./review-tui"
-import { chunksLength, clipChunks, displayWidth, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { chunksLength, clipChunks, displayWidth, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, sectionLabel, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { ConvoyConfig } from "./config"
@@ -2026,7 +2026,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
       lines.push(t`${fg(theme.red)("invalid pipeline")}`)
       for (const line of wrapWords(choice.error ?? "unknown error", width)) lines.push(t`${fg(theme.dim)(line)}`)
     } else {
-      lines.push(t`${fg(theme.faint)("steps")}`)
+      lines.push(new StyledText([sectionLabel("steps")]))
       for (const line of stepTree(choice.steps, width)) lines.push(line)
       const agentSteps = choice.steps.filter((step) => step.kind === "agent").length
       lines.push(plain(""), t`${fg(theme.teal)(`Advisors: ${choice.advisedSteps}/${agentSteps} steps advised`)}`)
@@ -2187,7 +2187,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     const spec = this.selectedSpec()
     if (spec) {
       const label = spec.title === spec.id ? spec.id : `${spec.id} · ${spec.title}`
-      lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.teal)(truncate(label, Math.max(10, width - 9)))]))
+      lines.push(new StyledText([sectionLabel("openspec "), fg(theme.teal)(truncate(label, Math.max(10, width - 9)))]))
     }
     // The continue handoff shows what is being reused, so "no new worktree"
     // is a visible fact of the options step rather than an assumption.
@@ -2404,13 +2404,13 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     lines.push(plain(""))
     if (auto.length > 0) {
       const titled = auto.filter((spec) => spec.title !== spec.id)
-      lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.teal)(truncate(`${auto.map((spec) => spec.id).join(", ")} · bundle attaches to every step`, value))]))
+      lines.push(new StyledText([sectionLabel("openspec "), fg(theme.teal)(truncate(`${auto.map((spec) => spec.id).join(", ")} · bundle attaches to every step`, value))]))
       if (titled.length > 0) {
         lines.push(new StyledText([raw("         "), fg(theme.dim)(truncate(titled.map((spec) => spec.title).join(" · "), value))]))
       }
       return
     }
-    lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.dim)(truncate(`${this.specs.length} active changes · pick one when writing the prompt`, value))]))
+    lines.push(new StyledText([sectionLabel("openspec "), fg(theme.dim)(truncate(`${this.specs.length} active changes · pick one when writing the prompt`, value))]))
   }
 
   /**
@@ -2940,9 +2940,9 @@ function relationshipLabel(node: StepNode): string {
 // `○ <stage>  · <label>`, with an extra annotation for non-default post-hook
 // `when` values. Stages pad to the same width so labels align across rows.
 export function hookLines(hooks: readonly HookNode[], width: number): StyledText[] {
-  if (hooks.length === 0) return [new StyledText([fg(theme.faint)("hooks  · none")])]
+  if (hooks.length === 0) return [new StyledText([sectionLabel("hooks"), fg(theme.faint)("  · none")])]
 
-  const lines: StyledText[] = [t`${fg(theme.faint)("hooks")}`]
+  const lines: StyledText[] = [new StyledText([sectionLabel("hooks")])]
   for (const hook of hooks) {
     const stage = hook.stage.padEnd(4)
     const annotation = hook.when === "failure" ? "on failure" : hook.when === "always" ? "always" : ""
@@ -2957,11 +2957,15 @@ export function hookLines(hooks: readonly HookNode[], width: number): StyledText
 
 // Previews the selected scored pipeline's goal cycle as a scannable loop:
 // a distinct section, three policy chips (target, improve-round cap, plateau),
-// then measure and improve as indented step trees — measurement zero first,
+// then measure and improve as subsections — teal fragment headers one indent
+// in, their step trees one indent deeper still — measurement zero first,
 // improve rounds that re-measure after. Exported pure, like stepTree and
 // hookLines beside it, for direct unit tests.
 export function goalLines(goal: GoalPreview, width: number): StyledText[] {
   const indent = "  "
+  // Fragment headers sit at `indent`; their step trees one level deeper, so
+  // the loop's fragments read as subsections of goal rather than peers of it.
+  const child = indent + indent
   const inner = Math.max(1, width - indent.length)
   const target = `${goal.target}/100`
   const rounds = `↺ ≤${counted(goal.maxIterations, "round")}`
@@ -2970,7 +2974,7 @@ export function goalLines(goal: GoalPreview, width: number): StyledText[] {
   const policyWidth = displayWidth(target) + displayWidth(sep) + displayWidth(rounds) + displayWidth(sep) + displayWidth(plateau)
   const lines: StyledText[] = []
   if (policyWidth <= inner) {
-    lines.push(new StyledText([fg(theme.faint)("goal")]))
+    lines.push(new StyledText([sectionLabel("goal")]))
     lines.push(
       new StyledText([
         raw(indent),
@@ -2982,15 +2986,15 @@ export function goalLines(goal: GoalPreview, width: number): StyledText[] {
       ]),
     )
   } else {
-    const compact = `goal  · ${target} · ↺${goal.maxIterations} · p${goal.plateau}`
-    lines.push(new StyledText([fg(theme.faint)(truncate(compact, width))]))
+    const compact = `${target} · ↺${goal.maxIterations} · p${goal.plateau}`
+    lines.push(new StyledText([sectionLabel("goal"), fg(theme.faint)("  · "), fg(theme.faint)(truncate(compact, Math.max(0, width - 8)))]))
   }
 
   const fragment = (label: string, role: string, extra: string | undefined, steps: readonly StepNode[]) => {
     lines.push(fragmentHeader(indent, label, role, extra, width))
-    // The fragment tree renders against the narrower inner width so the
+    // The fragment tree renders against the narrower child width so the
     // branch indent keeps every row inside the panel.
-    for (const line of stepTree(steps, width - indent.length)) lines.push(new StyledText([raw(indent), ...line.chunks]))
+    for (const line of stepTree(steps, Math.max(1, width - child.length))) lines.push(new StyledText([raw(child), ...line.chunks]))
   }
   fragment("measure", `score ← ${goal.scoreProducer}`, undefined, goal.measure)
   fragment("improve", `brief → ${goal.briefRecipient}`, "then re-measure", goal.improve)

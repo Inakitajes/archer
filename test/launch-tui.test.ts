@@ -697,11 +697,12 @@ describe("launch TUI pipeline preview", () => {
     // Measurement zero runs first; improve names the loop-back.
     expect(lines).toContain("  measure  · score ← score-report")
     expect(lines).toContain("  improve  · brief → fix  · then re-measure")
-    // Fragment steps render as indented trees with their resolved models,
-    // including the fan-out and the fixer's advisor relationship.
-    expect(lines).toContain("  ○ score  · 2 models")
-    expect(lines).toContain("  ○ score-report  · x-ai-grok-5")
-    expect(lines).toContain("  ○ fix  · deepseek-v4-flash → x-ai-grok-5 advisor ×3")
+    // Fragment steps render as subsections: one indent deeper than their
+    // fragment header, including the fan-out and the fixer's advisor
+    // relationship, with their resolved models.
+    expect(lines).toContain("    ○ score  · 2 models")
+    expect(lines).toContain("    ○ score-report  · x-ai-grok-5")
+    expect(lines).toContain("    ○ fix  · deepseek-v4-flash → x-ai-grok-5 advisor ×3")
   })
 
   test("goalLines collapses policy chips and fragment roles when the panel is narrow", () => {

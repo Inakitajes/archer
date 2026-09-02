@@ -1,4 +1,4 @@
-import { StyledText, fg, stringToStyledText } from "@opentui/core"
+import { StyledText, bold, fg, stringToStyledText } from "@opentui/core"
 
 import type { CliRenderer, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
@@ -186,6 +186,14 @@ export function plain(text: string): StyledText {
 
 export function raw(text: string): TextChunk {
   return stringToStyledText(text).chunks[0] ?? fg(theme.text)(text)
+}
+
+// The run-shape sections — steps, goal, openspec, hooks — are the rows an
+// operator scans a setup or preview panel for, so their labels render
+// accent-bold instead of the faint metadata labels beside them. A chunk (not a
+// StyledText) so free rows and padded label columns can both embed it.
+export function sectionLabel(label: string): TextChunk {
+  return bold(fg(theme.accent)(label))
 }
 
 export function padBetween(left: TextChunk[], right: TextChunk[], width: number): StyledText {
