@@ -31,7 +31,7 @@ import {
   truncate,
 } from "./tui-theme"
 import { versionDetails } from "./version"
-import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
+import { homeRendererConfig, sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 import type { PaletteColor } from "./tui-theme"
@@ -136,7 +136,7 @@ export async function launchHomeTui(
   // doesn't travel with the session, so the terminal itself has to answer
   // whether it speaks the Kitty graphics protocol.
   const kittyGraphics = await probeKittyGraphics()
-  const renderer = await createCliRenderer({ screenMode: "alternate-screen", consoleMode: "console-overlay", exitOnCtrlC: false })
+  const renderer = await createCliRenderer(homeRendererConfig(kittyGraphics))
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
   return new HomeLauncher(renderer, targetDir, { initialSelection: options.initialSelection, kittyGraphics }).result
