@@ -19,7 +19,7 @@
 ## 4. Integration verification
 
 - [x] 4.1 Run `bun test test/home-tui.test.ts test/kitty-graphics.test.ts test/png-tint.test.ts` plus the full `bun test` suite and fix any fallout
-- [ ] 4.2 Manual check in Ghostty/Kitty at three sizes (≥160×50, ~90×40, ~60×20): poster centered and uncropped, caps respected, chrome row slim and faint, dock untouched, selection swaps images without moving the wordmark; record results in the change notes
+- [x] 4.2 Manual check in Ghostty/Kitty at three sizes (≥160×50, ~90×40, ~60×20): poster centered and uncropped, caps respected, chrome row slim and faint, dock untouched, selection swaps images without moving the wordmark; record results in the change notes (verified by the user across four feedback rounds: column controls, tighter then 2-row dock, whole-block centering with equal margins, and the 48-col two-line description)
 
 ## 5. Poster polish (user feedback after first cut)
 
@@ -33,17 +33,29 @@
 - [x] 6.2 Wrap the contextual description to at most `DESCRIPTION_LINES = 2` centered rows via `wrapStyled`, ellipsis via `clipChunks` on overflow; update the delta spec (REMOVED single-line header -> RENAMED + MODIFIED) and the narrow-home test
 - [x] 6.3 Verify: `bun test` full suite green, `tsc --noEmit` clean, poster geometry numbers unchanged (59x16 @ 160x50 / 90x40, 60x20 fallback)
 
-## Verification notes (tasks 4.2 + 5.x + 6.x)
+## 7. Centered poster block (user feedback, third round)
+
+- [x] 7.1 Treat wordmark + card + controls + description as one vertically centered block: `posterLayout()` splits the leftover into equal `topPad`/`bottomPad` margins (the selector hugs the image at the fixed 1-row gap instead of the dock pinning to the bottom edge); dock box grows by `bottomPad` with a dynamic `paddingBottom`
+- [x] 7.2 Update the delta spec (block centering + equal margins) and the pinned placements (90x28/80x24 card rows shift +1 to 9); add assertions for margin equality (|topPad-bottomPad| <= 1) and selector adjacency (card bottom + 1)
+
+## 8. Breathing room + capped description (user feedback, fourth round)
+
+- [x] 8.1 Two blank rows between the photo and the selector: `DOCK_GAP_ROWS` 1 -> 2 (card budgets shrink one row: 33x9 @ 90x28, 18x5 @ 80x24); update placements + selector adjacency (+2) in tests
+- [x] 8.2 Cap the description at `DESCRIPTION_MAX_COLS = 48` cells at any terminal width and always wrap long text to two balanced centered rows (`descriptionLines()` splits at the word boundary nearest the middle; greedy fill + `truncate` ellipsis past two rows); update the delta spec and wide-home test
+
+## Verification notes (tasks 4.2 + 5.x + 6.x + 7.x + 8.x)
 
 Automated evidence from the real `HomeLauncher.posterLayout()` + `tintPngToAccent`
-(cell aspect 0.5, accent #7AA2F7), column dock + 2-row description (7 rows), 1-row poster
-gap, 2-row wordmark gap, 60-col cap:
+(cell aspect 0.5, accent #7AA2F7), column dock + 2-row capped description (7 rows),
+2-row poster gap, 2-row wordmark gap, 60-col cap, whole-block vertical centering
+(equal margins):
 
-- 160x50: card 59x16 @ col 50, row 16; wordmark (3 rows) @ row 11; chrome 2 rows. Caps bind (59<=60, 16<=50), uncropped, horizontally centered, poster vertically centered.
-- 90x40: card 59x16 @ col 15, row 11; wordmark @ row 6.
-- 60x20: FALLBACK (nav-only) — column dock + wordmark + 2-row gap leave < 4 card rows, so the poster yields instead of shrinking to a 7x2 noise dither.
-- Geometry unit tests pin the placements (`c=37,r=10,x=0,y=0,w=800,h=436` at 90x28; `c=22,r=6` at 80x24), the wordmark-above-card disjointness, the caps, the centered column controls, the slim faint chrome row, and both too-short-canvas fallbacks (120x12 and 60x20).
-- Composited runtime simulation (1440x900 px canvas, 9x18 cells) reviewed: poster centered, image whole and larger, wordmark fixed above the card.
+- 160x50: card 59x16 @ col 50, row 16; wordmark (3 rows) @ row 11; chrome 2 rows; margins 8 top / 9 bottom; selector two blank rows under the card; description wraps to 48 cols (two balanced rows) even here.
+- 90x40: card 59x16 @ col 15, row 11; wordmark @ row 6; margins 3 / 4.
+- 70x30: card 40x11 @ col 15, row 9; selector two blank rows under the card; desc wraps to 2 rows; margins 1 / 1.
+- 60x20: FALLBACK (nav-only) — column dock + wordmark + 2-row gap leave < 4 card rows, so the poster yields instead of shrinking to a noise dither.
+- Geometry unit tests pin the placements (`\x1b[10;29H` c=33,r=9 at 90x28; `\x1b[10;32H` c=18,r=5 at 80x24), margin equality (|topPad-bottomPad| <= 1), selector adjacency (card bottom + 2), the capped two-line description (wide + narrow), the wordmark-above-card disjointness, the caps, the centered column controls, the slim faint chrome row, and both too-short-canvas fallbacks (120x12 and 60x20).
+- Composited runtime simulations (9x18 px cells) reviewed at 160x50 / 90x40 / 70x30: poster centered as one block with the controls, image whole, margins even, description a narrow centered subtitle.
 - Full `bun test`: 2711 pass / 0 fail; `tsc --noEmit` clean.
 
 Pending: human eyeball check in a real Ghostty/Kitty session (`convoy` with no args) at the

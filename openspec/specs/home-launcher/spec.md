@@ -7,23 +7,27 @@ Defines a clear, responsive Home launcher that communicates product identity, pr
 ## Requirements
 
 ### Requirement: Home presents a unified masthead
-The Home launcher SHALL display a left-aligned three-line `CONVOY` wordmark in one uniform neutral tone. To its right, the masthead SHALL show the complete version string right-aligned on the first row and the project path right-aligned on the second row. The version string SHALL include any prerelease and build metadata already present in the build's version, including local-build metadata, and SHALL NOT append a parenthetical suffix or separately display the commit or platform. The launcher SHALL reserve one blank row above the wordmark and one blank row between the masthead and the body content. Compact widths SHALL fall back to a text wordmark with the version string right-aligned and a labeled project row below, without overflowing the terminal width. The launcher MUST NOT render a footer.
+In non-graphics mode the Home launcher SHALL display a left-aligned three-line `CONVOY` wordmark in one uniform neutral tone. To its right, the masthead SHALL show the complete version string right-aligned on the first row and the project path right-aligned on the second row. The version string SHALL include any prerelease and build metadata already present in the build's version, including local-build metadata, and SHALL NOT append a parenthetical suffix or separately display the commit or platform. Compact widths SHALL fall back to a text wordmark with the version string right-aligned and a labeled project row below, without overflowing the terminal width. In graphics mode the masthead SHALL instead be a single slim chrome row below one blank top-padding row: the labeled project path on the left and the complete version string right-aligned, both in a faint tone; the block wordmark is rendered as part of the centered destination poster instead. The launcher MUST NOT render a footer and SHALL keep one blank row between the masthead region and the body content.
 
 #### Scenario: Wide masthead
-- **WHEN** Home opens with enough width for the full wordmark, version string, and project path
+- **WHEN** Home opens without graphics support, with enough width for the full wordmark, version string, and project path
 - **THEN** the wordmark is left-aligned, the version string is right-aligned on the first masthead row, and the project path is right-aligned on the second masthead row
 
 #### Scenario: Commit fragment instead of the full hash
-- **WHEN** the masthead renders a stable or local build version
-- **THEN** the first masthead row ends with the build's complete version string, including any embedded local-build metadata, and contains no parenthetical commit or platform details
+- **WHEN** the masthead or chrome renders a stable or local build version
+- **THEN** it shows the build's complete version string, including any embedded local-build metadata, and contains no parenthetical commit or platform details
 
 #### Scenario: Compact masthead
 - **WHEN** the terminal cannot fit the block wordmark beside the version string
 - **THEN** Home shows a text `CONVOY` wordmark with the version string right-aligned and a labeled `project  <path>` row below it
 
+#### Scenario: Slim chrome in graphics mode
+- **WHEN** Home opens in a graphics-capable terminal with a valid destination image
+- **THEN** the top shows one faint chrome row with the labeled project path on the left and the version string right-aligned, and no wordmark appears in the masthead region
+
 #### Scenario: No footer
 - **WHEN** Home renders in any width or graphics mode
-- **THEN** no selection counter and no key hints appear anywhere on screen, one blank row pads the top of the screen, and two blank rows pad the bottom below the content
+- **THEN** no selection counter and no key hints appear anywhere on screen, one blank row pads the top of the screen, and two blank rows pad the bottom below the content; in poster mode the centered block keeps its equal top and bottom margins instead of a fixed bottom pad
 
 ### Requirement: Active destination is visibly bracketed by diamonds
 The Home launcher SHALL render the selected destination with one filled diamond before and one filled diamond after its shortcut and label. Inactive destinations SHALL reserve equivalent marker width so changing selection does not shift the destination layout.
@@ -37,11 +41,23 @@ The Home launcher SHALL render the selected destination with one filled diamond 
 - **THEN** the selected item gains both diamonds without changing the positions of the other items
 
 ### Requirement: Graphics-capable Home preserves the image experience
-When a valid Home image is available and Kitty Graphics is supported, the Home launcher SHALL display the selected destination image using the existing aspect-fill crop behavior between the masthead and the destination controls, separated from the masthead by one blank row and from the controls by two blank rows, without overlapping either region.
+When a valid Home image is available and Kitty Graphics is supported, the Home launcher SHALL display the selected destination image as a centered poster: the block `CONVOY` wordmark above the image separated from it by two blank rows, centered horizontally in the terminal. The wordmark, the image, the destination controls, and the description SHALL form one block that is vertically centered between the chrome row and the bottom of the terminal, so the controls always follow the image after two blank rows and the blank margin above the wordmark equals the blank margin below the description (each at least one row, within one row for odd leftovers). In this mode the destination controls SHALL render as a centered column of the four destinations. The image SHALL be scaled with aspect-preserving contain fit — the whole image is visible and never cropped — and SHALL NOT exceed 60 columns wide or 50 rows tall. When the available space is smaller than the capped card, the image SHALL shrink to fit while keeping its aspect ratio. The poster MUST NOT overlap the chrome row or the destination controls and SHALL keep at least one blank row below the chrome and at least two blank rows above the controls.
 
 #### Scenario: Kitty Graphics available
 - **WHEN** Home opens in a terminal that supports Kitty Graphics and the selected destination has a valid image
-- **THEN** the cropped image is displayed below the masthead with one blank row above and two blank rows before the destination controls
+- **THEN** the uncropped image is displayed centered with the block wordmark two rows above it and the destinations listed as a centered column two blank rows under the image, with the blank margin above the wordmark matching the margin below the description
+
+#### Scenario: Large terminal respects the cap
+- **WHEN** the space between the chrome and the controls is larger than the caps
+- **THEN** the image card is at most 60 columns wide and 50 rows tall and the remaining space stays plain background around the centered poster
+
+#### Scenario: Small terminal shrinks the card
+- **WHEN** the space between the chrome and the controls is smaller than the capped card
+- **THEN** the card scales down with its aspect ratio intact and still does not overlap the chrome or the controls
+
+#### Scenario: Selection swaps the poster image in place
+- **WHEN** the selection moves to another destination with a valid image
+- **THEN** the wordmark stays put and only the image changes, without moving the poster
 
 ### Requirement: Non-graphics Home prioritizes navigation
 When Kitty Graphics is unavailable or no valid image can be displayed, the Home launcher SHALL display neither an image nor an ASCII sculpture. It SHALL vertically center the destination selector together with its selected destination description in the available body.
@@ -54,9 +70,21 @@ When Kitty Graphics is unavailable or no valid image can be displayed, the Home 
 - **WHEN** Kitty Graphics is supported but the selected destination has no valid displayable image
 - **THEN** Home uses the same vertically centered navigation-only fallback without showing ASCII artwork
 
-### Requirement: Destination description remains a single contextual line
-The Home launcher SHALL show the selected destination description as one line beneath the selector, separated from it by one blank row, and SHALL clip the line with an ellipsis when needed.
+### Requirement: Destination description wraps to at most two contextual lines
+The Home launcher SHALL show the selected destination description beneath the selector, separated from it by one blank row, centered inside a fixed maximum width of 48 columns regardless of terminal width, wrapped to at most two rows. When wrapping, it SHALL split near the middle at a word boundary so both rows stay balanced; when the description cannot fit two rows at the available width it SHALL clip the second row with an ellipsis without overflowing the terminal.
+
+#### Scenario: Description fits on one line
+- **WHEN** the selected description fits within the maximum width
+- **THEN** it shows as a single centered row beneath the selector
+
+#### Scenario: Description wraps within the maximum width
+- **WHEN** the selected description exceeds the maximum width but fits in two rows
+- **THEN** it wraps onto two centered rows split at a word boundary near the middle, with no ellipsis
 
 #### Scenario: Description on a narrow terminal
-- **WHEN** the selected description exceeds the available width
-- **THEN** the description remains on one line and ends with an ellipsis without overflowing
+- **WHEN** the terminal is narrower than the description's maximum width
+- **THEN** the description wraps within the reduced width, and its second row ends with an ellipsis when even two rows cannot fit it
+
+#### Scenario: Description overflows two rows
+- **WHEN** the selected description does not fit in two rows at the available width
+- **THEN** the second row ends with an ellipsis without overflowing

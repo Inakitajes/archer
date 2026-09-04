@@ -21,14 +21,14 @@ In non-graphics mode the Home launcher SHALL display a left-aligned three-line `
 
 #### Scenario: No footer
 - **WHEN** Home renders in any width or graphics mode
-- **THEN** no selection counter and no key hints appear anywhere on screen, one blank row pads the top of the screen, and two blank rows pad the bottom below the content
+- **THEN** no selection counter and no key hints appear anywhere on screen, one blank row pads the top of the screen, and two blank rows pad the bottom below the content; in poster mode the centered block keeps its equal top and bottom margins instead of a fixed bottom pad
 
 ### Requirement: Graphics-capable Home preserves the image experience
-When a valid Home image is available and Kitty Graphics is supported, the Home launcher SHALL display the selected destination image as a centered poster: the block `CONVOY` wordmark above the image separated from it by two blank rows, the pair centered horizontally in the terminal and vertically centered between the chrome row and the destination controls. In this mode the destination controls SHALL render as a centered column of the four destinations below the poster. The image SHALL be scaled with aspect-preserving contain fit — the whole image is visible and never cropped — and SHALL NOT exceed 60 columns wide or 50 rows tall. When the available space is smaller than the capped card, the image SHALL shrink to fit while keeping its aspect ratio. The poster MUST NOT overlap the chrome row or the destination controls and SHALL keep at least one blank row below the chrome and at least one blank row above the controls.
+When a valid Home image is available and Kitty Graphics is supported, the Home launcher SHALL display the selected destination image as a centered poster: the block `CONVOY` wordmark above the image separated from it by two blank rows, centered horizontally in the terminal. The wordmark, the image, the destination controls, and the description SHALL form one block that is vertically centered between the chrome row and the bottom of the terminal, so the controls always follow the image after two blank rows and the blank margin above the wordmark equals the blank margin below the description (each at least one row, within one row for odd leftovers). In this mode the destination controls SHALL render as a centered column of the four destinations. The image SHALL be scaled with aspect-preserving contain fit — the whole image is visible and never cropped — and SHALL NOT exceed 60 columns wide or 50 rows tall. When the available space is smaller than the capped card, the image SHALL shrink to fit while keeping its aspect ratio. The poster MUST NOT overlap the chrome row or the destination controls and SHALL keep at least one blank row below the chrome and at least two blank rows above the controls.
 
 #### Scenario: Kitty Graphics available
 - **WHEN** Home opens in a terminal that supports Kitty Graphics and the selected destination has a valid image
-- **THEN** the uncropped image is displayed centered with the block wordmark two rows above it and the destinations listed as a centered column below, at least one blank row under the chrome and one blank row above the controls
+- **THEN** the uncropped image is displayed centered with the block wordmark two rows above it and the destinations listed as a centered column two blank rows under the image, with the blank margin above the wordmark matching the margin below the description
 
 #### Scenario: Large terminal respects the cap
 - **WHEN** the space between the chrome and the controls is larger than the caps
@@ -43,15 +43,19 @@ When a valid Home image is available and Kitty Graphics is supported, the Home l
 - **THEN** the wordmark stays put and only the image changes, without moving the poster
 
 ### Requirement: Destination description wraps to at most two contextual lines
-The Home launcher SHALL show the selected destination description beneath the selector, separated from it by one blank row, centered, wrapped to at most two rows; when the description does not fit in two rows it SHALL clip the last row with an ellipsis without overflowing the terminal width.
+The Home launcher SHALL show the selected destination description beneath the selector, separated from it by one blank row, centered inside a fixed maximum width of 48 columns regardless of terminal width, wrapped to at most two rows. When wrapping, it SHALL split near the middle at a word boundary so both rows stay balanced; when the description cannot fit two rows at the available width it SHALL clip the second row with an ellipsis without overflowing the terminal.
 
 #### Scenario: Description fits on one line
-- **WHEN** the selected description fits the available width
+- **WHEN** the selected description fits within the maximum width
 - **THEN** it shows as a single centered row beneath the selector
 
+#### Scenario: Description wraps within the maximum width
+- **WHEN** the selected description exceeds the maximum width but fits in two rows
+- **THEN** it wraps onto two centered rows split at a word boundary near the middle, with no ellipsis
+
 #### Scenario: Description on a narrow terminal
-- **WHEN** the selected description exceeds the available width but fits in two rows
-- **THEN** it wraps onto a second centered row with no ellipsis
+- **WHEN** the terminal is narrower than the description's maximum width
+- **THEN** the description wraps within the reduced width, and its second row ends with an ellipsis when even two rows cannot fit it
 
 #### Scenario: Description overflows two rows
 - **WHEN** the selected description does not fit in two rows at the available width

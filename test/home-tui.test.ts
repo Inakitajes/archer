@@ -80,7 +80,10 @@ test("wide home puts destinations on one row followed by the selected descriptio
     expect(frame).not.toContain("╭")
     expect(frame).not.toContain("│")
     expect(lines[strip + 1]!.trim()).toBe("")
-    expect(lines[strip + 2]).toContain("Compose agents into a reviewed, repeatable path")
+    // The description caps at DESCRIPTION_MAX_COLS and wraps to two balanced
+    // centered rows even on this wide terminal.
+    expect(lines[strip + 2]).toContain("Compose agents into a reviewed, repeatable")
+    expect(lines[strip + 3]).toContain("path from intent to shipped code.")
     expect(frame).not.toContain("Explore,")
     expect(frame).not.toContain("Follow live")
     expect(frame).not.toContain("Tune models")
@@ -270,12 +273,13 @@ test("image selection and resize delete the old placement before drawing the nex
     writes.length = 0
     syncImage()
     const initial = writes.join("")
-    // 90x28 poster with the column dock (6 rows): slim chrome (2) + gap (1) +
-    // wordmark (3) + 2-row gap puts the contain card (37x10, height-bound) at
-    // row 8, centered at col 26 — and the full 800x436 source rect means
-    // nothing is cropped.
-    expect(initial).toContain("\x1b[9;27H")
-    expect(initial).toMatch(/\x1b_Ga=p,i=100[^;]*c=37,r=10,x=0,y=0,w=800,h=436/)
+    // 90x28 poster with the column dock (7 rows): slim chrome (2) + gap (1) +
+    // topPad (1) + wordmark (3) + 2-row gap puts the contain card (33x9,
+    // height-bound) at row 9, centered at col 28 — and the full 800x436
+    // source rect means nothing is cropped. The block centers with equal
+    // margins: 1 row above the wordmark, 1 below the description.
+    expect(initial).toContain("\x1b[10;29H")
+    expect(initial).toMatch(/\x1b_Ga=p,i=100[^;]*c=33,r=9,x=0,y=0,w=800,h=436/)
 
     writes.length = 0
     session.press("down")
@@ -285,8 +289,8 @@ test("image selection and resize delete the old placement before drawing the nex
     expect(switched.indexOf("\x1b_Ga=d,d=i,i=100")).toBeGreaterThanOrEqual(0)
     expect(switched.indexOf("\x1b_Ga=p,i=101")).toBeGreaterThan(switched.indexOf("\x1b_Ga=d,d=i,i=100"))
     // Selection swaps the picture but the poster geometry is identical.
-    expect(switched).toContain("\x1b[9;27H")
-    expect(switched).toMatch(/\x1b_Ga=p,i=101[^;]*c=37,r=10,x=0,y=0,w=800,h=436/)
+    expect(switched).toContain("\x1b[10;29H")
+    expect(switched).toMatch(/\x1b_Ga=p,i=101[^;]*c=33,r=9,x=0,y=0,w=800,h=436/)
 
     writes.length = 0
     session.resize(80, 24)
@@ -296,9 +300,9 @@ test("image selection and resize delete the old placement before drawing the nex
     expect(resized.indexOf("\x1b_Ga=d,d=i,i=101")).toBeGreaterThanOrEqual(0)
     expect(resized.indexOf("\x1b_Ga=p,i=101")).toBeGreaterThan(resized.indexOf("\x1b_Ga=d,d=i,i=101"))
     // Shorter canvas: the height budget binds harder, so the card shrinks to
-    // 22x6 while staying centered below the fixed wordmark rows.
-    expect(resized).toContain("\x1b[9;30H")
-    expect(resized).toMatch(/\x1b_Ga=p,i=101[^;]*c=22,r=6,x=0,y=0,w=800,h=436/)
+    // 18x5 while staying centered below the fixed wordmark rows (topPad 1).
+    expect(resized).toContain("\x1b[10;32H")
+    expect(resized).toMatch(/\x1b_Ga=p,i=101[^;]*c=18,r=5,x=0,y=0,w=800,h=436/)
   } finally {
     session.press("q")
     await session.home.result
@@ -321,7 +325,7 @@ async function openGraphicsHome(width = 120, height = 40) {
     ...session,
     writes,
     syncImage: () => (session.home as unknown as { syncImage(): void }).syncImage(),
-    posterLayout: () => (session.home as unknown as { posterLayout(): { cardRow: number; cardCol: number; cardCols: number; cardRows: number; topPad: number; wordmarkRows: number } | undefined }).posterLayout(),
+    posterLayout: () => (session.home as unknown as { posterLayout(): { cardRow: number; cardCol: number; cardCols: number; cardRows: number; topPad: number; bottomPad: number; wordmarkRows: number } | undefined }).posterLayout(),
     restore() {
       writeSpy.mockRestore()
       if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor)
@@ -340,6 +344,14 @@ test("graphics poster: card respects caps, sits below the wordmark, and keeps do
     expect(layout.cardRows).toBeLessThanOrEqual(homePosterMaxRows)
     // The placement rect starts strictly below the wordmark block (1 gap row).
     expect(layout.cardRow).toBeGreaterThan(layout.topPad + layout.wordmarkRows)
+    // The wordmark, card, and controls center as ONE block: the blank margin
+    // above the wordmark equals the margin below the description (±1 row for
+    // odd leftovers), so extra height never piles between image and selector.
+    expect(Math.abs(layout.topPad - layout.bottomPad)).toBeLessThanOrEqual(1)
+    // The controls sit exactly DOCK_GAP_ROWS (2) blank rows under the card.
+    const lines = session.captureCharFrame().split("\n")
+    const selectorRow = lines.findIndex((line) => line.includes("[P]  PIPELINES"))
+    expect(selectorRow).toBe(layout.cardRow + layout.cardRows + 2)
     // Dock clearance: at least 2 blank rows between the card bottom and the
     // destination controls (DOCK_GAP_ROWS) plus the 2 bottom pad rows.
     const cardBottom = layout.cardRow + layout.cardRows

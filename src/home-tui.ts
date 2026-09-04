@@ -18,7 +18,6 @@ import {
 import { tintPngToAccent } from "./png-tint"
 import {
   chunksLength,
-  clipChunks,
   displayWidth,
   joinLines,
   padBetween,
@@ -28,7 +27,7 @@ import {
   shortPath,
   terminalBackgroundHex,
   theme,
-  wrapStyled,
+  truncate,
 } from "./tui-theme"
 import { versionDetails } from "./version"
 import { homeRendererConfig, sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
@@ -57,10 +56,12 @@ const CHROME_PADDING_COLS = 1
 const TOP_PAD_ROWS = 1
 const BOTTOM_PAD_ROWS = 2
 const IMAGE_GAP_ROWS = 1
-/** One row keeps the destination column close under the poster without touching it. */
-const DOCK_GAP_ROWS = 1
+/** Two rows keep the destination column clearly separated under the poster. */
+const DOCK_GAP_ROWS = 2
 /** The contextual description wraps to at most this many centered rows. */
 const DESCRIPTION_LINES = 2
+/** Hard width ceiling for the centered description block, in cells. */
+const DESCRIPTION_MAX_COLS = 48
 const WORDMARK_GAP = "  "
 /** Blank rows separating the poster wordmark from the photo card. */
 const WORDMARK_IMAGE_GAP_ROWS = 2
@@ -80,8 +81,11 @@ const HOME_POSTER_MIN_CARD_ROWS = 4
  */
 type PosterLayout = {
   artTop: number
+  /** Content rows of the art canvas: top margin + wordmark + gap + card. */
   artHeight: number
   topPad: number
+  /** Blank rows under the description — mirrors `topPad` so the block centers. */
+  bottomPad: number
   wordmarkRows: number
   wordmarkCol: number
   cardCol: number
@@ -456,10 +460,14 @@ export class HomeLauncher {
     this.artBox.marginTop = hasPoster ? IMAGE_GAP_ROWS : 0
     this.artBox.marginBottom = hasPoster ? DOCK_GAP_ROWS : 0
     this.dockBox.flexGrow = hasPoster ? 0 : 1
-    this.dockBox.height = hasPoster ? dockHeight + BOTTOM_PAD_ROWS : availableBodyHeight
+    // Poster mode: the dock keeps its content height plus the block's bottom
+    // margin, so wordmark+card+controls center as one unit (topPad mirrors
+    // bottomPad). Fallback mode stretches over the body as before.
+    this.dockBox.height = hasPoster ? dockHeight + layout.bottomPad : availableBodyHeight
     // Deterministic centering: explicit top padding instead of flex centering,
     // whose sub-row rounding swallows spacer rows at odd terminal heights.
     this.dockBox.paddingTop = hasPoster ? 0 : Math.max(0, Math.floor((availableBodyHeight - BOTTOM_PAD_ROWS - dockHeight) / 2))
+    this.dockBox.paddingBottom = hasPoster ? layout.bottomPad : BOTTOM_PAD_ROWS
     this.destinationsBox.height = homeItems.length
 
     this.wordmarkText.content = hasPoster ? this.chromeContent(chromeWidth) : this.wordmarkContent(chromeWidth)
@@ -476,12 +484,14 @@ export class HomeLauncher {
   }
 
   /**
-   * One deterministic source of truth for the poster: slim chrome above,
-   * centered wordmark + contain-fit photo card centered inside the art area.
-   * Returns undefined when the selected kind has no valid photo or the art
-   * area cannot fit wordmark + gap + a useful (≥ HOME_POSTER_MIN_CARD_ROWS)
-   * card with its clearances — the kind then uses the centered
-   * navigation-only fallback.
+   * One deterministic source of truth for the poster: slim chrome above, and
+   * ONE centered block — wordmark, photo card, controls, description — that
+   * keeps equal blank margins above the wordmark and below the description.
+   * The controls always follow the image after the fixed dock gap, so extra
+   * height never piles up between the photo and the selector. Returns
+   * undefined when the selected kind has no valid photo or the canvas cannot
+   * fit wordmark + gap + a useful (≥ HOME_POSTER_MIN_CARD_ROWS) card with its
+   * clearances — the kind then uses the centered navigation-only fallback.
    */
   private posterLayout(): PosterLayout | undefined {
     if (!this.imageMode) return undefined
@@ -495,11 +505,11 @@ export class HomeLauncher {
     const wordmarkRows = width >= CONVOY_WORDMARK_WIDTH ? 3 : 1
     const wordmarkWidth = wordmarkRows === 3 ? CONVOY_WORDMARK_WIDTH : "CONVOY".length
     const chromeRows = TOP_PAD_ROWS + SLIM_CHROME_ROWS
-    const artHeight = Math.max(
-      1,
-      this.renderer.height - chromeRows - IMAGE_GAP_ROWS - DOCK_GAP_ROWS - this.dockRows() - BOTTOM_PAD_ROWS,
-    )
-    const cardAvailableRows = artHeight - wordmarkRows - WORDMARK_IMAGE_GAP_ROWS
+    const body = Math.max(1, this.renderer.height - chromeRows)
+    const fixedRows = IMAGE_GAP_ROWS + DOCK_GAP_ROWS + wordmarkRows + WORDMARK_IMAGE_GAP_ROWS + this.dockRows()
+    // One blank row reserved on each side of the block so it never touches
+    // an edge; the fit math matches the card budget of the dock clearance.
+    const cardAvailableRows = body - fixedRows - 2
     if (cardAvailableRows < HOME_POSTER_MIN_CARD_ROWS) return undefined
     const card = containCard({
       sourceWidth: dimensions.width,
@@ -513,12 +523,17 @@ export class HomeLauncher {
     // A narrow terminal can cap the card below the budget via the width axis;
     // that dither would be noise, so fall back instead.
     if (card.rows < HOME_POSTER_MIN_CARD_ROWS) return undefined
-    const topPad = Math.max(0, Math.floor((artHeight - wordmarkRows - WORDMARK_IMAGE_GAP_ROWS - card.rows) / 2))
+    // Center the whole block: leftover rows split into the margin above the
+    // wordmark and the margin below the description (card ≤ budget keeps
+    // this ≥ 2, so each margin gets at least one blank row).
+    const free = body - fixedRows - card.rows
+    const topPad = Math.floor(free / 2)
     const artTop = chromeRows + IMAGE_GAP_ROWS
     return {
       artTop,
-      artHeight,
+      artHeight: topPad + wordmarkRows + WORDMARK_IMAGE_GAP_ROWS + card.rows,
       topPad,
+      bottomPad: free - topPad,
       wordmarkRows,
       wordmarkCol: Math.max(0, Math.floor((width - wordmarkWidth) / 2)),
       cardCol: Math.max(0, Math.floor((width - card.cols) / 2)),
@@ -753,22 +768,53 @@ export class HomeLauncher {
   /** One centered, clipped line explaining the selected destination, preceded by
    *  its own blank spacer row (in-content, so flex rounding can't collapse it). */
   private descriptionContent(width: number): StyledText {
-    const available = Math.max(1, width - 4)
-    const wrapped = wrapStyled(new StyledText([fg(theme.dim)(homeItems[this.selected]!.description)]), available)
-    const lines = wrapped.slice(0, DESCRIPTION_LINES)
-    if (wrapped.length > lines.length && lines.length > 0) {
-      // Text spilled past the second row: mark the cut with an ellipsis, keeping
-      // the same dim style as the clipped tail chunk.
-      const last = lines[lines.length - 1]!
-      const clipped = clipChunks(last.chunks, Math.max(0, available - 1))
-      const style = clipped[clipped.length - 1] ?? last.chunks[last.chunks.length - 1]!
-      lines[lines.length - 1] = new StyledText([...clipped, { ...style, text: "…" }])
-    }
-    const centered = lines.map((line) => {
+    const available = Math.min(Math.max(1, width - 4), DESCRIPTION_MAX_COLS)
+    const lines = this.descriptionLines(homeItems[this.selected]!.description, available)
+    const centered = lines.map((text) => {
+      const line = new StyledText([fg(theme.dim)(text)])
       const indent = " ".repeat(Math.max(0, Math.floor((width - chunksLength(line.chunks)) / 2)))
       return new StyledText([raw(indent), ...line.chunks])
     })
     return joinLines([new StyledText([raw("")]), ...centered])
+  }
+
+  /**
+   * The description block never spans the terminal: it caps at `maxCols` and
+   * wraps to at most `DESCRIPTION_LINES` rows, splitting near the middle at a
+   * word boundary so the centered pair reads as a subtitle instead of a
+   * greedy line + orphan. When even two rows can't hold it, the first row
+   * greedy-fills and the rest ellipsis-clips.
+   */
+  private descriptionLines(text: string, maxCols: number): string[] {
+    if (displayWidth(text) <= maxCols) return [text]
+    const words = text.split(" ")
+    let best: [string, string] | undefined
+    let bestDiff = Number.POSITIVE_INFINITY
+    for (let index = 1; index < words.length; index++) {
+      const left = words.slice(0, index).join(" ")
+      const right = words.slice(index).join(" ")
+      const leftCells = displayWidth(left)
+      const rightCells = displayWidth(right)
+      if (leftCells > maxCols || rightCells > maxCols) continue
+      const diff = Math.abs(leftCells - rightCells)
+      if (diff < bestDiff) {
+        best = [left, right]
+        bestDiff = diff
+      }
+    }
+    if (best) return best
+    const head: string[] = []
+    let cells = 0
+    let index = 0
+    while (index < words.length) {
+      const add = displayWidth(words[index]!) + (head.length > 0 ? 1 : 0)
+      if (cells + add > maxCols) break
+      head.push(words[index]!)
+      cells += add
+      index++
+    }
+    if (head.length === 0) return [truncate(text, maxCols)]
+    return [head.join(" "), truncate(words.slice(index).join(" "), maxCols)]
   }
 
   /** `◆ [P]  PIPELINES ◆`; inactive items retain equal-width marker slots. */
