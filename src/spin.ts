@@ -1,5 +1,5 @@
-import { cp, mkdir, readdir, readFile, rename, rm, stat } from "node:fs/promises"
-import { dirname, join, relative } from "node:path"
+import { cp, mkdir, readFile, rename, rm, rmdir, stat } from "node:fs/promises"
+import { dirname, join, relative, sep } from "node:path"
 import { stdout } from "node:process"
 
 import { detectBaseRef, execFile, statusPorcelain } from "./git"
@@ -93,7 +93,10 @@ export async function runSpin(options: SpinOptions): Promise<SpinResult> {
   // "no untracked files": a change committed on some *other* branch has no
   // untracked files here, and the worktree's base ref would not carry it (SC-9).
   const seenOnBase = await changePresentAtRef(baseRef, changeID, targetDir)
-  const movedFiles = untracked.length > 0 ? await moveFilesIntoWorktree(targetDir, worktree.dir, untracked) : []
+  const movedFiles =
+    untracked.length > 0
+      ? await moveFilesIntoWorktree(targetDir, worktree.dir, untracked, join(targetDir, openspecDirName, "changes", changeID))
+      : []
   const committedOnBase = seenOnBase && movedFiles.length === 0
   if (!seenOnBase && untracked.length === 0) {
     throw new Error(
@@ -260,10 +263,16 @@ async function changePresentAtRef(ref: string, changeID: string, targetDir: stri
 
 /**
  * Moves the given repo-relative files into the worktree (same relative
- * layout), creating parent directories and pruning emptied source dirs.
- * Nothing is committed on either side.
+ * layout), creating parent directories, then prunes every emptied source
+ * ancestor through the selected change root. Nothing is committed on either
+ * side.
  */
-async function moveFilesIntoWorktree(sourceDir: string, worktreeDir: string, files: readonly string[]): Promise<string[]> {
+async function moveFilesIntoWorktree(
+  sourceDir: string,
+  worktreeDir: string,
+  files: readonly string[],
+  changeRoot: string,
+): Promise<string[]> {
   const moved: string[] = []
   for (const file of files) {
     const from = join(sourceDir, file)
@@ -272,14 +281,43 @@ async function moveFilesIntoWorktree(sourceDir: string, worktreeDir: string, fil
     await moveFile(from, to)
     moved.push(file)
   }
-  // Prune directories the move emptied (deepest first), so the base checkout's
-  // `git status` shows no trace of the change.
-  const dirs = [...new Set(files.map((file) => dirname(join(sourceDir, file))))].sort((a, b) => b.length - a.length)
-  for (const dir of dirs) {
-    if (!dir.startsWith(join(sourceDir, openspecDirName))) continue
-    await removeDirIfEmpty(dir)
-  }
+  await pruneEmptiedAncestors(sourceDir, files, changeRoot)
   return moved
+}
+
+/**
+ * Prunes the directories the move emptied: every former parent of each moved
+ * artifact walked upward to and including the selected change root,
+ * deduplicated and processed deepest first, so sibling artifact directories
+ * are removed before their shared parents — and the change root disappears
+ * only after its descendants are gone. Intermediate directories such as
+ * `openspec/changes/<id>/specs/` cannot survive as invisible residue, because
+ * git does not track empty directories.
+ *
+ * The boundary is explicit: artifacts outside the change root contribute no
+ * candidates, and no walk ever rises above the root, so another active change
+ * or a parent OpenSpec directory is never touched.
+ */
+async function pruneEmptiedAncestors(sourceDir: string, files: readonly string[], changeRoot: string): Promise<void> {
+  const candidates = new Set<string>()
+  for (const file of files) {
+    let dir = dirname(join(sourceDir, file))
+    if (!withinChangeRoot(dir, changeRoot)) continue
+    while (true) {
+      candidates.add(dir)
+      if (dir === changeRoot) break
+      const parent = dirname(dir)
+      if (parent === dir) break // filesystem root guard; unreachable past the boundary check
+      dir = parent
+    }
+  }
+  const dirs = [...candidates].sort((a, b) => b.length - a.length)
+  for (const dir of dirs) await removeDirIfEmpty(dir)
+}
+
+/** True when `dir` is `root` itself or strictly below it (no prefix false-positives like `<id>-2`). */
+function withinChangeRoot(dir: string, root: string): boolean {
+  return dir === root || dir.startsWith(`${root}${sep}`)
 }
 
 async function moveFile(from: string, to: string): Promise<void> {
@@ -295,13 +333,21 @@ async function moveFile(from: string, to: string): Promise<void> {
   }
 }
 
+/**
+ * Atomic empty-directory removal: `rmdir` succeeds only for an empty
+ * directory, closing the readdir-then-remove race and guaranteeing that a
+ * file, symlink, or other entry anchors its directory against deletion. An
+ * already-absent or non-empty directory is a valid cleanup outcome;
+ * unexpected filesystem errors are surfaced so spin never claims cleanup it
+ * could not satisfy.
+ */
 async function removeDirIfEmpty(dir: string): Promise<void> {
   try {
-    const entries = await readdir(dir)
-    if (entries.length > 0) return
-    await rm(dir, { recursive: true })
-  } catch {
-    // Already gone, or stat raced: nothing to prune.
+    await rmdir(dir)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" || code === "ENOTEMPTY" || code === "EEXIST") return
+    throw error
   }
 }
 
