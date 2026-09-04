@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { HomeLauncher, compactHomeMaxWidth, type HomeSelection } from "../src/home-tui"
+import { HomeLauncher, compactHomeMaxWidth, homePosterMaxCols, homePosterMaxRows, type HomeSelection } from "../src/home-tui"
 import { displayWidth } from "../src/tui-theme"
 import { versionDetails, versionInfo } from "../src/version"
 
@@ -148,7 +148,7 @@ test("the compact width still stacks; one column wider becomes a single row", as
   }
 })
 
-test("narrow home stacks destinations with balanced spacing and one description", async () => {
+test("narrow home stacks destinations with balanced spacing and a two-line description", async () => {
   const width = 44
   const session = await openHome(width, 20)
   try {
@@ -172,8 +172,9 @@ test("narrow home stacks destinations with balanced spacing and one description"
     expect(lines[config + 1]!.trim()).toBe("")
     expect(description).toBe(config + 2)
     expect(lines[p - 1]!.trim()).toBe("")
-    expect(Math.abs((p - (project + 1)) - ((lines.length - 3) - (description + 1)))).toBeLessThanOrEqual(1)
-    expect(lines[description]!.trimEnd()).toEndWith("…")
+    expect(Math.abs((p - (project + 1)) - ((lines.length - 3) - (description + 2)))).toBeLessThanOrEqual(1)
+    expect(lines[description]!.trimEnd()).not.toEndWith("…")
+    expect(lines[description + 1]!.trimEnd()).toEndWith("…")
     expect(session.captureCharFrame()).not.toContain("╭")
     for (const line of lines) expect(displayWidth(line)).toBeLessThanOrEqual(width)
   } finally {
@@ -182,7 +183,7 @@ test("narrow home stacks destinations with balanced spacing and one description"
   }
 })
 
-test("selection changes fixed-slot diamonds and the one-line description without shifting items", async () => {
+test("selection changes fixed-slot diamonds and the contextual description without shifting items", async () => {
   const session = await openHome()
   try {
     const first = session.captureCharFrame()
@@ -269,8 +270,12 @@ test("image selection and resize delete the old placement before drawing the nex
     writes.length = 0
     syncImage()
     const initial = writes.join("")
-    expect(initial).toContain("\x1b[6;2H")
-    expect(initial).toMatch(/\x1b_Ga=p,i=100[^;]*c=88,r=16/)
+    // 90x28 poster with the column dock (6 rows): slim chrome (2) + gap (1) +
+    // wordmark (3) + 2-row gap puts the contain card (37x10, height-bound) at
+    // row 8, centered at col 26 — and the full 800x436 source rect means
+    // nothing is cropped.
+    expect(initial).toContain("\x1b[9;27H")
+    expect(initial).toMatch(/\x1b_Ga=p,i=100[^;]*c=37,r=10,x=0,y=0,w=800,h=436/)
 
     writes.length = 0
     session.press("down")
@@ -279,8 +284,9 @@ test("image selection and resize delete the old placement before drawing the nex
     const switched = writes.join("")
     expect(switched.indexOf("\x1b_Ga=d,d=i,i=100")).toBeGreaterThanOrEqual(0)
     expect(switched.indexOf("\x1b_Ga=p,i=101")).toBeGreaterThan(switched.indexOf("\x1b_Ga=d,d=i,i=100"))
-    expect(switched).toContain("\x1b[6;2H")
-    expect(switched).toMatch(/\x1b_Ga=p,i=101[^;]*c=88,r=16/)
+    // Selection swaps the picture but the poster geometry is identical.
+    expect(switched).toContain("\x1b[9;27H")
+    expect(switched).toMatch(/\x1b_Ga=p,i=101[^;]*c=37,r=10,x=0,y=0,w=800,h=436/)
 
     writes.length = 0
     session.resize(80, 24)
@@ -289,16 +295,151 @@ test("image selection and resize delete the old placement before drawing the nex
     const resized = writes.join("")
     expect(resized.indexOf("\x1b_Ga=d,d=i,i=101")).toBeGreaterThanOrEqual(0)
     expect(resized.indexOf("\x1b_Ga=p,i=101")).toBeGreaterThan(resized.indexOf("\x1b_Ga=d,d=i,i=101"))
-    // The version-only masthead line lets the block wordmark fit at 80
-    // columns too, so the image keeps its row and only loses one row of height.
-    expect(resized).toContain("\x1b[6;2H")
-    expect(resized).toMatch(/\x1b_Ga=p,i=101[^;]*c=78,r=12/)
+    // Shorter canvas: the height budget binds harder, so the card shrinks to
+    // 22x6 while staying centered below the fixed wordmark rows.
+    expect(resized).toContain("\x1b[9;30H")
+    expect(resized).toMatch(/\x1b_Ga=p,i=101[^;]*c=22,r=6,x=0,y=0,w=800,h=436/)
   } finally {
     session.press("q")
     await session.home.result
     writeSpy.mockRestore()
     if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor)
     else delete (process.stdout as { isTTY?: boolean }).isTTY
+  }
+})
+
+async function openGraphicsHome(width = 120, height = 40) {
+  const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY")
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true })
+  const writes: string[] = []
+  const writeSpy = spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString())
+    return true
+  }) as typeof process.stdout.write)
+  const session = await openHome(width, height, "/work/acme/convoy", { kittyGraphics: true })
+  return {
+    ...session,
+    writes,
+    syncImage: () => (session.home as unknown as { syncImage(): void }).syncImage(),
+    posterLayout: () => (session.home as unknown as { posterLayout(): { cardRow: number; cardCol: number; cardCols: number; cardRows: number; topPad: number; wordmarkRows: number } | undefined }).posterLayout(),
+    restore() {
+      writeSpy.mockRestore()
+      if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor)
+      else delete (process.stdout as { isTTY?: boolean }).isTTY
+    },
+  }
+}
+
+test("graphics poster: card respects caps, sits below the wordmark, and keeps dock clearances", async () => {
+  const session = await openGraphicsHome(120, 40)
+  try {
+    const layout = session.posterLayout()!
+    expect(layout).toBeDefined()
+    // Caps: never wider/taller than the poster ceiling.
+    expect(layout.cardCols).toBeLessThanOrEqual(homePosterMaxCols)
+    expect(layout.cardRows).toBeLessThanOrEqual(homePosterMaxRows)
+    // The placement rect starts strictly below the wordmark block (1 gap row).
+    expect(layout.cardRow).toBeGreaterThan(layout.topPad + layout.wordmarkRows)
+    // Dock clearance: at least 2 blank rows between the card bottom and the
+    // destination controls (DOCK_GAP_ROWS) plus the 2 bottom pad rows.
+    const cardBottom = layout.cardRow + layout.cardRows
+    expect(session.renderer.height - cardBottom).toBeGreaterThanOrEqual(4)
+    // Horizontal centering of the card.
+    expect(layout.cardCol).toBe(Math.floor((120 - layout.cardCols) / 2))
+    // The emitted placement matches the layout rect and crops nothing.
+    session.writes.length = 0
+    session.syncImage()
+    const cmd = session.writes.join("")
+    expect(cmd).toMatch(new RegExp(`\\x1b_Ga=p,i=100[^;]*c=${layout.cardCols},r=${layout.cardRows},x=0,y=0,w=800,h=436`))
+    expect(cmd).toContain(`\x1b[${layout.cardRow + 1};${layout.cardCol + 1}H`)
+  } finally {
+    session.press("q")
+    await session.home.result
+    session.restore()
+  }
+})
+
+test("graphics poster: chrome is a slim project/version row and the wordmark centers in the art", async () => {
+  const session = await openGraphicsHome(120, 40)
+  try {
+    const lines = session.captureCharFrame().split("\n")
+    // Row 0 blank, row 1 is the faint chrome: project left + version right,
+    // no block wordmark up there anymore.
+    expect(lines[0]!.trim()).toBe("")
+    expect(lines[1]).toContain("project")
+    expect(lines[1]).toContain("/work/acme/convoy")
+    expect(lines[1]!.trimEnd()).toEndWith(versionDetails())
+    expect(lines[1]).not.toContain("█")
+    // The block wordmark now lives in the art canvas, centered horizontally.
+    const wordmarkRow = lines.findIndex((line) => line.includes("████"))
+    expect(wordmarkRow).toBeGreaterThan(1)
+    const leftPad = lines[wordmarkRow]!.length - lines[wordmarkRow]!.trimStart().length
+    const blockWidth = lines[wordmarkRow]!.trimEnd().length - leftPad
+    expect(Math.abs(leftPad - Math.floor((120 - blockWidth) / 2))).toBeLessThanOrEqual(1)
+    // Poster mode lists destinations as a centered column even at 120 cols:
+    // PIPELINES and SPECS never share a row, and the block is centered.
+    const p = lines.findIndex((line) => line.includes("[P]  PIPELINES"))
+    const s = lines.findIndex((line) => line.includes("[S]  SPECS"))
+    expect(p).toBeGreaterThan(0)
+    expect(s).toBe(p + 1)
+    expect(lines[p]!.indexOf("◆")).toBe(Math.floor((120 - lines[p]!.trim().length) / 2))
+    // No footer/key hints anywhere.
+    expect(session.captureCharFrame()).not.toContain("←→")
+  } finally {
+    session.press("q")
+    await session.home.result
+    session.restore()
+  }
+})
+
+test("graphics poster: selecting another destination keeps the wordmark row fixed", async () => {
+  const session = await openGraphicsHome(120, 40)
+  try {
+    const before = session.captureCharFrame().split("\n")
+    const rowBefore = before.findIndex((line) => line.includes("████"))
+    session.press("down")
+    await session.renderOnce()
+    const after = session.captureCharFrame().split("\n")
+    const rowAfter = after.findIndex((line) => line.includes("████"))
+    expect(rowAfter).toBe(rowBefore)
+    // And the chrome row is unchanged too.
+    expect(after[1]).toBe(before[1])
+  } finally {
+    session.press("q")
+    await session.home.result
+    session.restore()
+  }
+})
+
+test("graphics poster: a canvas too short for wordmark + card falls back to centered nav", async () => {
+  // 60x20: the column dock + wordmark + 2-row gap leave < 4 card rows — the
+  // dither would be noise, so the poster yields to navigation-only.
+  const squat = await openGraphicsHome(60, 20)
+  try {
+    expect(squat.posterLayout()).toBeUndefined()
+    expect(squat.captureCharFrame()).toContain("◆ [P]  PIPELINES ◆")
+  } finally {
+    squat.press("q")
+    await squat.home.result
+    squat.restore()
+  }
+  // Height that leaves no room for a useful card under the wordmark.
+  const session = await openGraphicsHome(120, 12)
+  const internals = session.home as unknown as { artBox: { visible: boolean } }
+  try {
+    expect(session.posterLayout()).toBeUndefined()
+    expect(internals.artBox.visible).toBeFalse()
+    const lines = session.captureCharFrame().split("\n")
+    // Navigation-only: the art canvas is gone and destinations are present.
+    expect(session.captureCharFrame()).toContain("◆ [P]  PIPELINES ◆")
+    // The full masthead is back on top: block wordmark rows with the project
+    // path on its second row (the slim chrome would sit on row 1).
+    expect(lines[1]).toContain("████")
+    expect(lines[2]).toContain("/work/acme/convoy")
+  } finally {
+    session.press("q")
+    await session.home.result
+    session.restore()
   }
 })
 

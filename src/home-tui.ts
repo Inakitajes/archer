@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from "node:fs"
 import { BoxRenderable, StyledText, TextRenderable, bold, createCliRenderer, fg } from "@opentui/core"
 
 import {
-  coverSourceRect,
+  containCard,
   deleteKittyImages,
   kittyGraphicsSupported,
   placeKittyImage,
@@ -28,7 +28,7 @@ import {
   shortPath,
   terminalBackgroundHex,
   theme,
-  truncate,
+  wrapStyled,
 } from "./tui-theme"
 import { versionDetails } from "./version"
 import { homeRendererConfig, sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
@@ -48,16 +48,49 @@ type HomeItem = {
   description: string
 }
 
-// Full-bleed photos, one per destination: assets/home/<kind>.png. A kind
-// without a valid file falls back to the centered navigation-only layout.
+// Poster photos, one per destination: assets/home/<kind>.png, shown as a
+// centered contain-fit card. A kind without a valid file falls back to the
+// centered navigation-only layout.
 const IMAGE_BASE_ID = 100
 const IMAGE_PADDING_COLS = 1
 const CHROME_PADDING_COLS = 1
 const TOP_PAD_ROWS = 1
 const BOTTOM_PAD_ROWS = 2
 const IMAGE_GAP_ROWS = 1
-const DOCK_GAP_ROWS = 2
+/** One row keeps the destination column close under the poster without touching it. */
+const DOCK_GAP_ROWS = 1
+/** The contextual description wraps to at most this many centered rows. */
+const DESCRIPTION_LINES = 2
 const WORDMARK_GAP = "  "
+/** Blank rows separating the poster wordmark from the photo card. */
+const WORDMARK_IMAGE_GAP_ROWS = 2
+/** Graphics-mode chrome is a single faint project/version row. */
+const SLIM_CHROME_ROWS = 1
+/** Hard ceiling on the centered photo card, in cells. */
+export const homePosterMaxCols = 60
+export const homePosterMaxRows = 50
+/** Below this many card rows the dither is noise: use the nav fallback. */
+const HOME_POSTER_MIN_CARD_ROWS = 4
+
+/**
+ * Shared geometry for the graphics-mode poster. `render()` paints the backing
+ * canvas from it and `syncImage()` places the photo from it, so the wordmark
+ * rows and the image rect are computed once and can never disagree. Undefined
+ * means "no poster": fall back to the centered navigation-only layout.
+ */
+type PosterLayout = {
+  artTop: number
+  artHeight: number
+  topPad: number
+  wordmarkRows: number
+  wordmarkCol: number
+  cardCol: number
+  cardRow: number
+  cardCols: number
+  cardRows: number
+  sourceWidth: number
+  sourceHeight: number
+}
 
 const CONVOY_WORDMARK: Readonly<Record<string, readonly [string, string, string]>> = {
   C: ["████", "██  ", "████"],
@@ -161,7 +194,7 @@ export class HomeLauncher {
   private readonly tintedPngByKind = new Map<string, Buffer>()
   /** Resolved photo path per kind; undefined means missing or a damaged PNG. */
   private readonly imagePathByKind = new Map<HomeDestination, string | undefined>()
-  /** Full-space backing canvases keep transparent photo pixels free of stale glyphs. */
+  /** Poster backing canvases keep transparent photo pixels free of stale glyphs. */
   private readonly blankArtBySize = new Map<string, StyledText>()
   private placedImage: { kind: HomeDestination; width: number; height: number } | undefined
 
@@ -405,30 +438,32 @@ export class HomeLauncher {
     const width = Math.max(1, this.renderer.width)
     const chromeWidth = Math.max(1, width - CHROME_PADDING_COLS * 2)
     const row = this.usesRowTabs()
-    const kind = homeItems[this.selected]!.id
-    const hasImage = this.imageFor(kind) !== undefined
+    const layout = this.posterLayout()
+    const hasPoster = layout !== undefined
     this.tabsText.visible = row
     this.destinationsBox.visible = !row
     const dockHeight = this.dockRows()
-    const wordmarkHeight = this.wordmarkGlyphRows(chromeWidth)
-    const availableBodyHeight = Math.max(1, this.renderer.height - this.mastheadRows(width))
-    const gap = hasImage ? IMAGE_GAP_ROWS + DOCK_GAP_ROWS : 0
-    const artHeight = Math.max(1, availableBodyHeight - dockHeight - BOTTOM_PAD_ROWS - gap)
-    this.wordmarkBox.height = wordmarkHeight + TOP_PAD_ROWS
-    this.artBox.visible = hasImage
-    this.artBox.flexGrow = hasImage ? 1 : 0
-    this.artBox.height = hasImage ? artHeight : 0
-    this.artBox.marginTop = hasImage ? IMAGE_GAP_ROWS : 0
-    this.artBox.marginBottom = hasImage ? DOCK_GAP_ROWS : 0
-    this.dockBox.flexGrow = hasImage ? 0 : 1
-    this.dockBox.height = hasImage ? dockHeight + BOTTOM_PAD_ROWS : availableBodyHeight
+    // Poster mode swaps the block-wordmark masthead for a slim chrome row;
+    // the wordmark itself moves into the centered art canvas.
+    const chromeRows = hasPoster ? TOP_PAD_ROWS + SLIM_CHROME_ROWS : this.mastheadRows(width)
+    const availableBodyHeight = Math.max(1, this.renderer.height - chromeRows)
+    const gap = hasPoster ? IMAGE_GAP_ROWS + DOCK_GAP_ROWS : 0
+    const artHeight = hasPoster ? layout.artHeight : Math.max(1, availableBodyHeight - dockHeight - BOTTOM_PAD_ROWS - gap)
+    this.wordmarkBox.height = chromeRows
+    this.artBox.visible = hasPoster
+    this.artBox.flexGrow = hasPoster ? 1 : 0
+    this.artBox.height = hasPoster ? artHeight : 0
+    this.artBox.marginTop = hasPoster ? IMAGE_GAP_ROWS : 0
+    this.artBox.marginBottom = hasPoster ? DOCK_GAP_ROWS : 0
+    this.dockBox.flexGrow = hasPoster ? 0 : 1
+    this.dockBox.height = hasPoster ? dockHeight + BOTTOM_PAD_ROWS : availableBodyHeight
     // Deterministic centering: explicit top padding instead of flex centering,
     // whose sub-row rounding swallows spacer rows at odd terminal heights.
-    this.dockBox.paddingTop = hasImage ? 0 : Math.max(0, Math.floor((availableBodyHeight - BOTTOM_PAD_ROWS - dockHeight) / 2))
+    this.dockBox.paddingTop = hasPoster ? 0 : Math.max(0, Math.floor((availableBodyHeight - BOTTOM_PAD_ROWS - dockHeight) / 2))
     this.destinationsBox.height = homeItems.length
 
-    this.wordmarkText.content = this.wordmarkContent(chromeWidth)
-    this.artText.content = hasImage ? this.blankArtContent(width, artHeight) : new StyledText([raw("")])
+    this.wordmarkText.content = hasPoster ? this.chromeContent(chromeWidth) : this.wordmarkContent(chromeWidth)
+    this.artText.content = hasPoster ? this.posterArtContent(width, layout) : new StyledText([raw("")])
     this.descriptionText.content = this.descriptionContent(width)
     if (row) {
       this.tabsText.content = this.tabsContent(width)
@@ -440,9 +475,112 @@ export class HomeLauncher {
     this.renderer.requestRender()
   }
 
+  /**
+   * One deterministic source of truth for the poster: slim chrome above,
+   * centered wordmark + contain-fit photo card centered inside the art area.
+   * Returns undefined when the selected kind has no valid photo or the art
+   * area cannot fit wordmark + gap + a useful (≥ HOME_POSTER_MIN_CARD_ROWS)
+   * card with its clearances — the kind then uses the centered
+   * navigation-only fallback.
+   */
+  private posterLayout(): PosterLayout | undefined {
+    if (!this.imageMode) return undefined
+    const kind = homeItems[this.selected]!.id
+    const path = this.imageFor(kind)
+    if (!path) return undefined
+    const png = this.photoPng(kind, path)
+    const dimensions = png ? pngDimensions(png) : undefined
+    if (!png || !dimensions) return undefined
+    const width = Math.max(1, this.renderer.width)
+    const wordmarkRows = width >= CONVOY_WORDMARK_WIDTH ? 3 : 1
+    const wordmarkWidth = wordmarkRows === 3 ? CONVOY_WORDMARK_WIDTH : "CONVOY".length
+    const chromeRows = TOP_PAD_ROWS + SLIM_CHROME_ROWS
+    const artHeight = Math.max(
+      1,
+      this.renderer.height - chromeRows - IMAGE_GAP_ROWS - DOCK_GAP_ROWS - this.dockRows() - BOTTOM_PAD_ROWS,
+    )
+    const cardAvailableRows = artHeight - wordmarkRows - WORDMARK_IMAGE_GAP_ROWS
+    if (cardAvailableRows < HOME_POSTER_MIN_CARD_ROWS) return undefined
+    const card = containCard({
+      sourceWidth: dimensions.width,
+      sourceHeight: dimensions.height,
+      availableCols: Math.max(1, width - IMAGE_PADDING_COLS * 2),
+      availableRows: cardAvailableRows,
+      cellAspect: this.cellAspectRatio,
+      maxCols: homePosterMaxCols,
+      maxRows: homePosterMaxRows,
+    })
+    // A narrow terminal can cap the card below the budget via the width axis;
+    // that dither would be noise, so fall back instead.
+    if (card.rows < HOME_POSTER_MIN_CARD_ROWS) return undefined
+    const topPad = Math.max(0, Math.floor((artHeight - wordmarkRows - WORDMARK_IMAGE_GAP_ROWS - card.rows) / 2))
+    const artTop = chromeRows + IMAGE_GAP_ROWS
+    return {
+      artTop,
+      artHeight,
+      topPad,
+      wordmarkRows,
+      wordmarkCol: Math.max(0, Math.floor((width - wordmarkWidth) / 2)),
+      cardCol: Math.max(0, Math.floor((width - card.cols) / 2)),
+      cardRow: artTop + topPad + wordmarkRows + WORDMARK_IMAGE_GAP_ROWS,
+      cardCols: card.cols,
+      cardRows: card.rows,
+      sourceWidth: dimensions.width,
+      sourceHeight: dimensions.height,
+    }
+  }
+
+  /** Backing canvas for the poster: blank everywhere (the photo's transparent
+   *  holes must never reveal stale glyphs) except the centered wordmark rows. */
+  private posterArtContent(width: number, layout: PosterLayout): StyledText {
+    const key = `poster:${width}x${layout.artHeight}x${layout.topPad}x${layout.wordmarkRows}`
+    const cached = this.blankArtBySize.get(key)
+    if (cached) return cached
+    const blankLine = " ".repeat(Math.max(1, width))
+    const lines: StyledText[] = Array.from({ length: Math.max(1, layout.artHeight) }, () => new StyledText([raw(blankLine)]))
+    this.posterWordmarkLines(width, layout.wordmarkCol, layout.wordmarkRows).forEach((line, index) => {
+      const row = layout.topPad + index
+      if (row >= 0 && row < lines.length) lines[row] = line
+    })
+    const content = joinLines(lines)
+    this.blankArtBySize.set(key, content)
+    return content
+  }
+
+  /** Block CONVOY centered for the poster; a text wordmark when too narrow. */
+  private posterWordmarkLines(width: number, col: number, rows: number): StyledText[] {
+    const indent = " ".repeat(Math.max(0, col))
+    const pad = (chunks: TextChunk[], used: number): TextChunk[] => {
+      const trailing = Math.max(0, width - used)
+      return trailing > 0 ? [...chunks, raw(" ".repeat(trailing))] : chunks
+    }
+    if (rows <= 1) {
+      return [new StyledText(pad([raw(indent), bold(fg(theme.text)("CONVOY"))], col + "CONVOY".length))]
+    }
+    return [0, 1, 2].map((glyphRow) => {
+      const chunks: TextChunk[] = [raw(indent)]
+      CONVOY_LETTERS.forEach((letter, index) => {
+        if (index > 0) chunks.push(raw(WORDMARK_GAP))
+        chunks.push(bold(fg(theme.text)(CONVOY_WORDMARK[letter]![glyphRow]!)))
+      })
+      return new StyledText(pad(chunks, col + CONVOY_WORDMARK_WIDTH))
+    })
+  }
+
+  /** Graphics-mode chrome: one faint row, labeled project left, version right. */
+  private chromeContent(width: number): StyledText {
+    const project = shortPath(this.targetDir, Math.max(1, width - 9))
+    return this.alignRight(
+      [fg(theme.faint)("project  "), fg(theme.faint)(project)],
+      [fg(theme.faint)(versionDetails())],
+      width,
+    )
+  }
+
   /** Destination row(s) + spacer + contextual description. */
   private dockRows() {
-    return (this.usesRowTabs() ? 1 : homeItems.length) + 2
+    // Selector rows + one blank spacer + the wrapped description block.
+    return (this.usesRowTabs() ? 1 : homeItems.length) + 1 + DESCRIPTION_LINES
   }
 
   private wordmarkGlyphRows(width: number) {
@@ -456,8 +594,14 @@ export class HomeLauncher {
     return this.wordmarkGlyphRows(chromeWidth) + TOP_PAD_ROWS
   }
 
-  /** Wide terminals put the four destinations on one centered row. */
+  /**
+   * Wide non-poster terminals put the four destinations on one centered row.
+   * The graphics poster always lists them as a centered column beneath the
+   * card, at any width. Keyed on photo validity (not the fitted layout) so
+   * `posterLayout` can consume `dockRows` without recursing.
+   */
   private usesRowTabs() {
+    if (this.imageMode && this.imageFor(homeItems[this.selected]!.id) !== undefined) return false
     return this.renderer.width > compactHomeMaxWidth
   }
 
@@ -494,16 +638,6 @@ export class HomeLauncher {
     return padBetween(left, right, width)
   }
 
-
-  private blankArtContent(width: number, height: number): StyledText {
-    const key = `${width}x${height}`
-    const cached = this.blankArtBySize.get(key)
-    if (cached) return cached
-    const line = " ".repeat(Math.max(1, width))
-    const content = new StyledText([raw(Array.from({ length: Math.max(1, height) }, () => line).join("\n"))])
-    this.blankArtBySize.set(key, content)
-    return content
-  }
 
   private imageFor(kind: HomeDestination): string | undefined {
     if (!this.imageMode) return undefined
@@ -555,16 +689,11 @@ export class HomeLauncher {
   private syncImage() {
     const kind = homeItems[this.selected]!.id
     const id = this.imageId(kind)
-    // Masthead and dock own their rows; the placement keeps one cell of
-    // horizontal inset.
-    const col = this.renderer.width > IMAGE_PADDING_COLS * 2 ? IMAGE_PADDING_COLS : 0
-    const row = this.mastheadRows() + IMAGE_GAP_ROWS
-    const cols = Math.max(1, this.renderer.width - col - IMAGE_PADDING_COLS)
-    const rows = Math.max(1, this.renderer.height - this.dockRows() - BOTTOM_PAD_ROWS - DOCK_GAP_ROWS - row)
-    const path = this.imageFor(kind)
-    if (!path) {
-      // No photo for this kind: clear any lingering placement before the
-      // centered navigation-only fallback is painted.
+    const layout = this.posterLayout()
+    if (!layout) {
+      // No displayable photo for this kind (missing, damaged, or the canvas
+      // is too small for the poster): clear any lingering placement before
+      // the centered navigation-only fallback is painted.
       this.clearPlacedImage()
       return
     }
@@ -572,19 +701,13 @@ export class HomeLauncher {
       this.transmittedImages.clear()
       this.transmittedAccent = theme.accent
     }
-    const png = this.photoPng(kind, path)
-    const dimensions = png ? pngDimensions(png) : undefined
-    if (!png || !dimensions) return
+    const png = this.photoPng(kind, this.imageFor(kind)!)
+    if (!png) return
     if (!this.transmittedImages.has(kind)) {
       if (!transmitKittyImage({ id, png })) return
       this.transmittedImages.add(kind)
     }
-    const source = coverSourceRect({
-      sourceWidth: dimensions.width,
-      sourceHeight: dimensions.height,
-      targetWidth: cols * this.cellAspectRatio,
-      targetHeight: rows,
-    })
+    const { cardCols: cols, cardRows: rows } = layout
     const changed =
       !this.placedImage || this.placedImage.kind !== kind || this.placedImage.width !== cols || this.placedImage.height !== rows
     if (changed) {
@@ -593,7 +716,16 @@ export class HomeLauncher {
       this.clearPlacedImage()
       this.placedImage = { kind, width: cols, height: rows }
     }
-    placeKittyImage({ id, col, row, cols, rows, source })
+    // Contain fit: the full source rect into the cell-correct centered card,
+    // so the illustration is never cropped.
+    placeKittyImage({
+      id,
+      col: layout.cardCol,
+      row: layout.cardRow,
+      cols,
+      rows,
+      source: { x: 0, y: 0, width: layout.sourceWidth, height: layout.sourceHeight },
+    })
   }
 
   /** The four destinations on one centered row, with fixed marker slots. */
@@ -622,9 +754,21 @@ export class HomeLauncher {
    *  its own blank spacer row (in-content, so flex rounding can't collapse it). */
   private descriptionContent(width: number): StyledText {
     const available = Math.max(1, width - 4)
-    const description = truncate(homeItems[this.selected]!.description, available)
-    const indent = " ".repeat(Math.max(0, Math.floor((width - displayWidth(description)) / 2)))
-    return joinLines([new StyledText([raw("")]), new StyledText([raw(indent), fg(theme.dim)(description)])])
+    const wrapped = wrapStyled(new StyledText([fg(theme.dim)(homeItems[this.selected]!.description)]), available)
+    const lines = wrapped.slice(0, DESCRIPTION_LINES)
+    if (wrapped.length > lines.length && lines.length > 0) {
+      // Text spilled past the second row: mark the cut with an ellipsis, keeping
+      // the same dim style as the clipped tail chunk.
+      const last = lines[lines.length - 1]!
+      const clipped = clipChunks(last.chunks, Math.max(0, available - 1))
+      const style = clipped[clipped.length - 1] ?? last.chunks[last.chunks.length - 1]!
+      lines[lines.length - 1] = new StyledText([...clipped, { ...style, text: "…" }])
+    }
+    const centered = lines.map((line) => {
+      const indent = " ".repeat(Math.max(0, Math.floor((width - chunksLength(line.chunks)) / 2)))
+      return new StyledText([raw(indent), ...line.chunks])
+    })
+    return joinLines([new StyledText([raw("")]), ...centered])
   }
 
   /** `◆ [P]  PIPELINES ◆`; inactive items retain equal-width marker slots. */

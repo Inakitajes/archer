@@ -1,7 +1,7 @@
 // Kitty graphics protocol: transmit-and-display a PNG at an exact cell
-// rectangle, and delete placements again. The home uses this to paint a full
-// -bleed photo above the destination dock, falling back to the ASCII
-// sculpture when the terminal can't speak the protocol.
+// rectangle, and delete placements again. The home uses this to paint a
+// centered poster card above the destination dock, falling back to the
+// navigation-only layout when the terminal can't speak the protocol.
 //
 // Support detection uses environment hints plus a terminal query before the
 // TUI renderer owns stdin. CONVOY_KITTY=1 forces the protocol on,
@@ -190,6 +190,34 @@ export function coverSourceRect(options: {
     width,
     height,
   }
+}
+
+/**
+ * The largest cell rect that shows the WHOLE image without distortion:
+ * contain-fit instead of cover-crop, bounded by the available space and the
+ * poster caps, centered by the caller. `cellAspect` is cell width/height, so
+ * the image's pixel aspect maps to `colsPerRow = aspect / cellAspect` cells
+ * per row; rounding keeps the rect within one cell of the true aspect.
+ * Always returns at least 1x1.
+ */
+export function containCard(options: {
+  sourceWidth: number
+  sourceHeight: number
+  availableCols: number
+  availableRows: number
+  cellAspect: number
+  maxCols: number
+  maxRows: number
+}): { cols: number; rows: number } {
+  const sourceWidth = Math.max(1, Math.floor(options.sourceWidth))
+  const sourceHeight = Math.max(1, Math.floor(options.sourceHeight))
+  const cellAspect = options.cellAspect > 0 ? options.cellAspect : DEFAULT_CELL_ASPECT_RATIO
+  const colsLimit = Math.max(1, Math.min(Math.floor(options.maxCols), Math.floor(options.availableCols)))
+  const rowsLimit = Math.max(1, Math.min(Math.floor(options.maxRows), Math.floor(options.availableRows)))
+  const colsPerRow = sourceWidth / sourceHeight / cellAspect
+  const rows = Math.max(1, Math.min(rowsLimit, Math.floor(colsLimit / colsPerRow)))
+  const cols = Math.max(1, Math.min(colsLimit, Math.round(rows * colsPerRow)))
+  return { cols, rows }
 }
 
 function readPng(path: string): Buffer | undefined {

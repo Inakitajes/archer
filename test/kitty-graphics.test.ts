@@ -4,6 +4,7 @@ import { crc32, deflateSync } from "node:zlib"
 import {
   base64Chunks,
   cellAspectRatioFromResponse,
+  containCard,
   coverSourceRect,
   kittyGraphicsSupported,
   kittyPlacementCommand,
@@ -100,6 +101,19 @@ test("coverSourceRect crops the long axis and stays centered", () => {
     width: 800,
     height: 400,
   })
+})
+
+test("containCard fits the whole image, honoring caps then the available box", () => {
+  // The 800x436 home photo on 2:1 cells: colsPerRow = 800/436/0.5 ~ 3.67.
+  const source = { sourceWidth: 800, sourceHeight: 436, cellAspect: 0.5, maxCols: 50, maxRows: 50 }
+  // Wide terminal: the 50-col cap binds first, so ~13 rows tall, never cropped.
+  expect(containCard({ ...source, availableCols: 160, availableRows: 50 })).toEqual({ cols: 48, rows: 13 })
+  // Narrow terminal: available width binds before the cap.
+  expect(containCard({ ...source, availableCols: 30, availableRows: 50 })).toEqual({ cols: 29, rows: 8 })
+  // Squat terminal: available height binds.
+  expect(containCard({ ...source, availableCols: 160, availableRows: 5 })).toEqual({ cols: 18, rows: 5 })
+  // Degenerate boxes still yield a visible 1x1 card.
+  expect(containCard({ ...source, availableCols: 0, availableRows: 0 })).toEqual({ cols: 1, rows: 1 })
 })
 
 test("kitty placement serializes the cover crop with its cell destination", () => {
