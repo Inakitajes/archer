@@ -236,7 +236,7 @@ async function runHomeSession(targetDir: string): Promise<void> {
   const { probeKittyGraphics } = await import("./kitty-graphics")
   const kittyGraphics = await probeKittyGraphics()
   const [{ launchHomeTui }, { createTuiSession }] = await Promise.all([import("./home-tui"), import("./tui-session")])
-  const session = await createTuiSession()
+  const session = await createTuiSession(kittyGraphics)
   let interrupted = false
   const route: TuiRoute = {
     session,

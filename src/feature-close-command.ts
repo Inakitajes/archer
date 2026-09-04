@@ -13,11 +13,17 @@ import {
   type CloseChecklistRowStatus,
   type CloseChecklistState,
 } from "./close-presentation"
-import { editMessageInEditor } from "./finish"
 import { branchUpstream, execFile, mainWorktreeDir, pushRefspec, removeWorktree } from "./git"
 import { log } from "./log"
 import { ask, isInteractiveTerminal } from "./terminal-input"
-import type { CloseFollowUpId, CloseFollowUpItem, CloseFollowUpStatus, CloseTui } from "./close-tui"
+import type {
+  CloseDeferredCleanup,
+  CloseDeferredStep,
+  CloseFollowUpId,
+  CloseFollowUpItem,
+  CloseFollowUpsView,
+  CloseTui,
+} from "./close-tui"
 import type { TuiRoute } from "./tui-session"
 
 export {
@@ -136,6 +142,10 @@ export function formatCloseEvents(events: readonly CloseEvent[], extra: { follow
       case "step-failed":
         stepState.set(event.step, `${event.step}: failed — ${strip(firstLine(event.message))}`)
         break
+      case "squash-phase":
+        // Intermediate squash sub-phases stay out of the stdout summary; the
+        // step's final state carries the same facts (design D1).
+        break
       case "merge-shape":
         break
       case "result":
@@ -186,9 +196,9 @@ export async function resolveCloseFollowUps(args: {
   const [remote, ...remoteRest] = (upstream ?? "").split("/")
   const remoteBranch = remoteRest.join("/")
   if (remote && remoteBranch) {
-    push = { remote, refspec: `${args.baseRef}:${remoteBranch}`, command: `${gitC} push ${remote} ${args.baseRef}:${remoteBranch}` }
+    push = { remote, refspec: `${args.baseRef}:${remoteBranch}`, command: `${gitC} push ${shq(remote)} ${shq(args.baseRef)}:${shq(remoteBranch)}` }
   } else {
-    pushRemediation = `${args.baseRef} has no configured upstream — set one first: ${gitC} branch --set-upstream-to=<remote>/<branch> ${args.baseRef}`
+    pushRemediation = `${shq(args.baseRef)} has no configured upstream — set one first: ${gitC} branch --set-upstream-to=<remote>/<branch> ${shq(args.baseRef)}`
   }
 
   let worktreeRemoval: string | undefined
@@ -203,7 +213,7 @@ export async function resolveCloseFollowUps(args: {
     ...(push ? { push } : {}),
     ...(pushRemediation ? { pushRemediation } : {}),
     ...(worktreeRemoval ? { worktreeRemoval } : {}),
-    branchDelete: `${gitC} branch -d ${args.branch}`,
+    branchDelete: `${gitC} branch -d ${shq(args.branch)}`,
   }
 }
 
@@ -233,23 +243,10 @@ export async function runCloseInteractive(input: CloseInput, io: CloseIO = {}, r
       ...input,
       onEvent: (event) => tui.onEvent(event),
       withTerminal: (action) => tui.withTerminal(action),
-      resolveMessage: async (proposal) => {
-        let notice: string | undefined
-        for (;;) {
-          const decision = await tui.confirmMessage(proposal, notice)
-          if (decision === "accept") return proposal.message
-          if (decision === "cancel") return undefined
-
-          // $EDITOR needs the real terminal; suspend OpenTUI's alternate
-          // screen/raw input and restore the same checklist afterward.
-          const edited = await tui.withTerminal(() => editMessageInEditor(proposal.message))
-          if (!edited) {
-            notice = "Editor cancelled; review the proposal again or cancel close."
-            continue
-          }
-          return edited.body.length === 0 ? edited.subject : `${edited.subject}\n\n${edited.body.map((line) => `- ${line}`).join("\n")}`
-        }
-      },
+      // The TUI owns the reviewed message and the inline editor (design D4):
+      // it returns only an explicitly accepted final string, or undefined to
+      // stop the sequence before the squash. No external editor participates.
+      resolveMessage: (proposal) => tui.confirmMessage(proposal),
     })
     const followUps = await resolveCloseFollowUps({
       targetDir: input.targetDir,
@@ -286,10 +283,10 @@ export type CloseIO = {
 }
 
 /**
- * The TTY side of the resolver gate (design D4): show the composed message,
- * accept or edit. Edit delegates verbatim to `editMessageInEditor` — the same
- * GIT_EDITOR/VISUAL/EDITOR resolution and comment stripping `finish` uses. An
- * emptied editor or a declined prompt returns undefined, which stops the
+ * The TTY side of the resolver gate (design D4), kept as a plain-prompt seam
+ * beside the OpenTUI surface. The operator accepts the composed proposal or
+ * declines; editing happens inline in the Close TUI, so no $EDITOR participates
+ * in Close anywhere. A declined prompt returns undefined, which stops the
  * sequence before the squash lands; nothing commits before the choice.
  */
 export async function confirmCloseMessage(
@@ -298,126 +295,138 @@ export async function confirmCloseMessage(
 ): Promise<string | undefined> {
   deps.renderer?.break()
   const out = deps.output ?? stdout
-  for (;;) {
-    out.write("\n")
-    if (proposal.error) out.write("(the writing model failed, so this message is derived from the proposal and the step commits)\n")
-    out.write(`${indent(strip(proposal.message))}\n\n`)
-    const answer = await ask("Commit with this message? [y/e/N] ", deps)
-    if (answer === "y") return proposal.message
-    if (answer === "e") {
-      const edited = await editMessageInEditor(proposal.message)
-      if (!edited) {
-        out.write("editor cancelled — nothing has landed\n")
-        continue
-      }
-      return edited.body.length === 0 ? edited.subject : `${edited.subject}\n\n${edited.body.map((line) => `- ${line}`).join("\n")}`
-    }
-    return undefined
-  }
+  out.write("\n")
+  if (proposal.error) out.write("(the writing model failed, so this message is derived from the proposal and the step commits)\n")
+  out.write(`${indent(strip(proposal.message))}\n\n`)
+  const answer = await ask("Commit with this message? [y/N] ", deps)
+  if (answer === "y") return proposal.message
+  return undefined
 }
 
 // -- follow-up offers -------------------------------------------------------------
 
-type FollowUpOffers = CloseFollowUps & { baseRef: string; branch: string; worktreeDir: string; targetDir: string }
+export type FollowUpOffers = CloseFollowUps & { baseRef: string; branch: string; worktreeDir: string; targetDir: string }
 
-type InteractiveFollowUpState = Partial<
-  Record<CloseFollowUpId, { status: Extract<CloseFollowUpStatus, "running" | "completed" | "failed">; error?: string }>
+/** In-session outcomes of actions the TUI already ran; drives the next view. */
+export type CloseInteractiveFollowUpState = Partial<
+  Record<CloseFollowUpId, { status: "running" | "completed" | "failed"; error?: string }>
 >
 
 /**
- * Optional cleanup in the OpenTUI surface. All three actions remain visible,
- * including disabled prerequisites, and a failed action stays selectable for
- * retry. Quitting is the deliberate "leave the rest for later" choice.
+ * Resolves the follow-up presentation (task 3.1, design D5): which cleanups
+ * are actions of the current session (runnable now, retryable after failure,
+ * or blocked behind another same-session action), which are a remediation
+ * notice, and which are deferred cleanup that requires the operator to leave
+ * the feature worktree — presented as a reason plus ordered copyable
+ * commands, never as actions that could become runnable in this session.
+ */
+export async function buildCloseFollowUpsView(args: {
+  followUps: FollowUpOffers
+  /** Injectable for tests; defaults to whether the process cwd is inside the worktree. */
+  cwdInside?: boolean
+  state?: CloseInteractiveFollowUpState
+}): Promise<CloseFollowUpsView> {
+  const { followUps } = args
+  const state = args.state ?? {}
+  const cwdInside = args.cwdInside ?? processCwdInside(followUps.worktreeDir)
+  const worktreeExists = await stat(followUps.worktreeDir).then(
+    () => true,
+    () => false,
+  )
+
+  const actions: CloseFollowUpItem[] = []
+  let notice: string | undefined
+
+  // Push is independent of the worktree (design D5) and remains an action in
+  // both launch locations. A missing upstream is a remediation, not a
+  // fabricated action.
+  if (followUps.push) {
+    actions.push({
+      id: "push",
+      label: `Push ${followUps.baseRef}`,
+      detail: `Push to ${followUps.push.remote} with the explicit refspec ${followUps.push.refspec}.`,
+      command: followUps.push.command,
+      status: state.push?.status ?? "available",
+      ...(state.push?.error ? { error: state.push.error } : {}),
+    })
+  } else if (followUps.pushRemediation) {
+    notice = followUps.pushRemediation
+  }
+
+  if (cwdInside) {
+    // The parent shell must leave the worktree before either cleanup can run:
+    // a process cannot remove the directory it sits in, so neither operation
+    // enters the action list (design D5).
+    const steps: CloseDeferredStep[] = []
+    if (followUps.worktreeRemoval && worktreeExists) {
+      steps.push({ label: "Remove the feature worktree", command: followUps.worktreeRemoval })
+    }
+    if (followUps.branchDelete) {
+      steps.push({ label: `Delete the local ${followUps.branch} branch`, command: followUps.branchDelete })
+    }
+    const deferred: CloseDeferredCleanup = {
+      reason:
+        `convoy close was launched from inside ${followUps.worktreeDir}. ` +
+        "A process cannot remove the directory its shell sits in — leave the worktree in your terminal, then run:",
+      steps,
+    }
+    return { actions, notice, deferred }
+  }
+
+  if (state.worktree?.status === "completed") {
+    actions.push({ id: "worktree", label: "Remove worktree", detail: followUps.worktreeDir, status: "completed" })
+  } else if (followUps.worktreeRemoval && worktreeExists) {
+    actions.push({
+      id: "worktree",
+      label: "Remove worktree",
+      detail: followUps.worktreeDir,
+      command: followUps.worktreeRemoval,
+      status: state.worktree?.status ?? "available",
+      ...(state.worktree?.error ? { error: state.worktree.error } : {}),
+    })
+  }
+  // A worktree that was already removed (by hand or between sessions) simply
+  // omits the removal action; the branch deletion below unlocks accordingly.
+
+  if (state.branch?.status === "completed") {
+    actions.push({ id: "branch", label: `Delete ${followUps.branch}`, detail: "Feature branch deleted.", status: "completed" })
+  } else if (worktreeExists) {
+    actions.push({
+      id: "branch",
+      label: `Delete ${followUps.branch}`,
+      detail: "Remove the feature worktree first; git cannot delete a checked-out branch.",
+      command: followUps.branchDelete,
+      status: "blocked",
+    })
+  } else {
+    actions.push({
+      id: "branch",
+      label: `Delete ${followUps.branch}`,
+      detail: "Delete the local feature branch after its worktree is gone.",
+      command: followUps.branchDelete,
+      status: state.branch?.status ?? "available",
+      ...(state.branch?.error ? { error: state.branch.error } : {}),
+    })
+  }
+  return { actions, notice }
+}
+
+/**
+ * Optional cleanup in the OpenTUI surface (task 3.2). Selectable actions stay
+ * keyboard-driven, failed actions retry, and deferred cleanup renders as
+ * guidance. Quitting is the deliberate "leave the rest for later" choice.
  */
 async function offerCloseFollowUpsTui(tui: CloseTui, followUps: FollowUpOffers): Promise<void> {
   const mainDir = (await mainWorktreeDir(followUps.targetDir).catch(() => undefined)) ?? followUps.targetDir
-  const state: InteractiveFollowUpState = {}
-
-  const items = async (): Promise<CloseFollowUpItem[]> => {
-    const worktreeExists = await stat(followUps.worktreeDir).then(
-      () => true,
-      () => false,
-    )
-    const cwdInside = processCwdInside(followUps.worktreeDir)
-
-    const push: CloseFollowUpItem = followUps.push
-      ? {
-          id: "push",
-          label: `Push ${followUps.baseRef}`,
-          detail: `Push to ${followUps.push.remote} with the explicit refspec ${followUps.push.refspec}.`,
-          command: followUps.push.command,
-          status: state.push?.status ?? "available",
-          ...(state.push?.error ? { error: state.push.error } : {}),
-        }
-      : {
-          id: "push",
-          label: `Push ${followUps.baseRef}`,
-          detail: followUps.pushRemediation ?? "No configured upstream is available.",
-          status: "unavailable",
-        }
-
-    let worktree: CloseFollowUpItem
-    if (state.worktree?.status === "completed") {
-      worktree = { id: "worktree", label: "Remove worktree", detail: followUps.worktreeDir, status: "completed" }
-    } else if (!followUps.worktreeRemoval || !worktreeExists) {
-      worktree = { id: "worktree", label: "Remove worktree", detail: "No separate feature worktree remains.", status: "unavailable" }
-    } else if (cwdInside) {
-      worktree = {
-        id: "worktree",
-        label: "Remove worktree",
-        detail: "Leave this worktree in your shell before removing it.",
-        command: followUps.worktreeRemoval,
-        status: "unavailable",
-      }
-    } else {
-      worktree = {
-        id: "worktree",
-        label: "Remove worktree",
-        detail: followUps.worktreeDir,
-        command: followUps.worktreeRemoval,
-        status: state.worktree?.status ?? "available",
-        ...(state.worktree?.error ? { error: state.worktree.error } : {}),
-      }
-    }
-
-    let branch: CloseFollowUpItem
-    if (state.branch?.status === "completed") {
-      branch = { id: "branch", label: `Delete ${followUps.branch}`, detail: "Feature branch deleted.", status: "completed" }
-    } else if (worktreeExists) {
-      branch = {
-        id: "branch",
-        label: `Delete ${followUps.branch}`,
-        detail: "Remove the feature worktree first; git cannot delete a checked-out branch.",
-        command: followUps.branchDelete,
-        status: "unavailable",
-      }
-    } else if (cwdInside) {
-      branch = {
-        id: "branch",
-        label: `Delete ${followUps.branch}`,
-        detail: "Leave the removed worktree path in your shell before deleting its branch.",
-        command: followUps.branchDelete,
-        status: "unavailable",
-      }
-    } else {
-      branch = {
-        id: "branch",
-        label: `Delete ${followUps.branch}`,
-        detail: "Delete the local feature branch after its worktree is gone.",
-        command: followUps.branchDelete,
-        status: state.branch?.status ?? "available",
-        ...(state.branch?.error ? { error: state.branch.error } : {}),
-      }
-    }
-    return [push, worktree, branch]
-  }
+  const state: CloseInteractiveFollowUpState = {}
+  const view = () => buildCloseFollowUpsView({ followUps, state })
 
   for (;;) {
-    const resolution = await tui.selectFollowUp(await items())
+    const resolution = await tui.selectFollowUp(await view())
     if (resolution.type === "done") return
     const id = resolution.id
     state[id] = { status: "running" }
-    tui.updateFollowUps(await items())
+    tui.updateFollowUps(await view())
     try {
       if (id === "push") {
         if (!followUps.push) continue
@@ -554,19 +563,31 @@ and merge the feature branch into the base branch from the main checkout.
 
 In a terminal the sequence renders in a full-screen TUI — each step's
 completion, skip (with reason), or failure visible as it happens, and the
-merge's shape (fast-forward or merge commit) narrated. The squashed commit's
-message is composed from the change's proposal and touched capabilities, with
-a deterministic fallback when no model answers; the scope is always the single
-touched capability, and the change id is named in the body. You confirm, edit,
-or cancel the message inside the TUI before it lands.
+merge's shape (fast-forward or merge commit) narrated. The squash row names
+its sub-phase as it works: composing the commit message, waiting for your
+review, creating the commit — and the running indicator keeps animating while
+the writer answers. The squashed commit's message is composed from the
+change's proposal and touched capabilities, with a deterministic fallback when
+no model answers; the scope is always the single touched capability, and the
+change id is named in the body.
 
-Once merged, push, worktree removal, and branch deletion stay in that TUI as
-separate, deliberate actions — never automatic. Push names the configured
-remote and refspec explicitly, and is unavailable (with the setup step) when
-the base branch has no upstream; branch deletion is only offered after the
-worktree has been removed, because git refuses to delete a checked-out branch.
-Headless (piped) runs print the same facts as a stdout summary plus executable
-commands, and attempt nothing interactive.
+The review screen is a vertical Accept / Edit / Cancel list: up/down (or j/k)
+moves the selection, Enter activates it, and the y/e/n shortcuts still work.
+Edit opens an inline multiline editor inside the TUI — Enter inserts a
+newline, Ctrl+S saves and returns to review, Esc discards the draft and keeps
+the previously reviewed message. Nothing lands until you explicitly accept,
+so saving an edit is not a confirmation.
+
+Once merged, current-session cleanup stays in that TUI as separate, deliberate
+actions — never automatic. Push names the configured remote and refspec
+explicitly, and is unavailable (with the setup step) when the base branch has
+no upstream; branch deletion is only offered after the worktree has been
+removed, because git refuses to delete a checked-out branch. When close was
+launched from inside the feature worktree, worktree and branch cleanup are
+shown instead as deferred cleanup — the reason (a process cannot remove the
+directory its shell sits in) plus the exact git -C commands to run after
+leaving the worktree. Headless (piped) runs print the same facts as a stdout
+summary plus executable commands, and attempt nothing interactive.
 
 The feature is resolved from the current worktree, or pass --branch <name> to
 target another feature's worktree.

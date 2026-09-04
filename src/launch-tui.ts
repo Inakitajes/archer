@@ -17,14 +17,14 @@ import { consensusStep } from "./quality-score"
 import { prdHistoryFile, prdHistoryPreviewCopy, readPrdHistoryIndex, resolvePrdHistoryPreview, type PrdHistoryEntry, type PrdHistoryPreview } from "./prd-history"
 import { listOpenSpecChanges, loadOpenSpecBundle, openSpecPromptFor, type OpenSpecChangeSummary } from "./openspec"
 import { runReviewLines } from "./review-tui"
-import { chunksLength, clipChunks, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
+import { chunksLength, clipChunks, displayWidth, fmtCountdown, formatMoney, hintsRow, joinLines, moreHintsMarker, padBetween, paletteForTerminal, plain, progressBar, raw, sectionLabel, setTheme, shortPath, spinnerFrame, terminalBackgroundHex, theme, truncate } from "./tui-theme"
 import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
 
 import type { ConvoyConfig } from "./config"
 import type { WorktreeDefault } from "./git"
 import type { BoxOptions, CliRenderer, KeyEvent, PasteEvent, TextChunk } from "@opentui/core"
 import type { LimitsSnapshot } from "./limits"
-import type { AgentSpec, AgentStep, HookSet, HookSpec, RunOptions, RunPlan, Step } from "./types"
+import type { AgentSpec, AgentStep, HookSet, HookSpec, ResolvedGoalPlan, RunOptions, RunPlan, Step } from "./types"
 import type { Hint, PaletteColor } from "./tui-theme"
 
 export type LaunchRunSelection = {
@@ -157,6 +157,22 @@ type HookNode = {
   when?: "failure" | "always"
 }
 
+// The goal cycle a scored pipeline will run, flattened for the preview the
+// way the review screen summarizes it: the stopping policy plus the improve
+// and measure fragments as step trees, so the launcher shows the loop's full
+// mutation/cost envelope before the operator ever leaves the pipeline list.
+export type GoalPreview = {
+  target: number
+  maxIterations: number
+  plateau: number
+  /** The improve step that alone receives the sanitized score brief. */
+  briefRecipient: string
+  /** The measure step whose deliverable contract is the authoritative machine-readable score. */
+  scoreProducer: string
+  improve: StepNode[]
+  measure: StepNode[]
+}
+
 export type PipelineChoice = {
   name: string
   description: string
@@ -166,8 +182,8 @@ export type PipelineChoice = {
   hooks: HookNode[]
   valid: boolean
   advisedSteps: number
-  /** True when the pipeline declares a valid terminal goal step: the only way a pipeline enters goal execution. */
-  scored: boolean
+  /** Present when the pipeline declares a valid terminal goal step: the goal cycle the preview and review both summarize. */
+  goal?: GoalPreview
   error?: string
   /** Prompt text to prefill when launching this pipeline without a prompt; undefined when the prompt stays mandatory. */
   defaultPrompt?: string
@@ -477,9 +493,10 @@ export function pipelineChoices(config: ConvoyConfig | undefined, agents: readon
         hooks,
         valid: true,
         advisedSteps: pipeline.steps.filter((step) => step.type === "agent" && Boolean(step.resolvedAdvisor ?? step.advisor)).length,
-        // Pipelines are classified directly by the presence of a valid terminal
-        // goal step: the resolver already validated its structure and roles.
-        scored: Boolean(pipeline.goalPlan),
+        // The goal cycle rides along when the pipeline declares a valid
+        // terminal goal step — the resolver already validated its structure
+        // and roles — so the preview can show the loop, not just the prefix.
+        ...(pipeline.goalPlan ? { goal: goalPreview(pipeline.goalPlan) } : {}),
         defaultPrompt: pipeline.defaultPrompt,
         suggestedPrompts: pipeline.suggestedPrompts,
         attachesPrdHistory: pipeline.steps.some((step) => step.type === "agent" && step.prdHistory),
@@ -494,7 +511,6 @@ export function pipelineChoices(config: ConvoyConfig | undefined, agents: readon
         hooks,
         valid: false,
         advisedSteps: 0,
-        scored: false,
         error: error instanceof Error ? error.message : String(error),
       }
     }
@@ -520,6 +536,19 @@ function stepNode(step: Step): StepNode {
     kind: "agent",
     modelLabel: launcherStepModelLabel(step),
     advisorLabel: advisor ? `${shortModelLabel(advisor)} advisor ×${cap}` : "",
+  }
+}
+
+/** Flattens a resolved goal plan into the preview shape: policy plus both fragments' step trees. */
+function goalPreview(plan: ResolvedGoalPlan): GoalPreview {
+  return {
+    target: plan.target,
+    maxIterations: plan.maxIterations,
+    plateau: plan.plateau,
+    briefRecipient: plan.briefRecipient,
+    scoreProducer: plan.scoreProducer,
+    improve: plan.improve.steps.map(stepNode),
+    measure: plan.measure.steps.map(stepNode),
   }
 }
 
@@ -1714,7 +1743,7 @@ export class LaunchPicker {
     this.render()
   }
 
-  /** Number of selectable rows in the options step: the gateway selector, the built-in toggles, and the goal row when the pipeline is scored. */
+  /** Number of selectable rows in the options step: the gateway selector and the built-in toggles. */
   private optionCount(): number {
     return 1 + toggles.length
   }
@@ -1781,19 +1810,30 @@ export class LaunchPicker {
     this.usageBox.visible = usageVisible
 
     this.bodyBox.flexDirection = compact ? "column" : "row"
+    // Stacked panels sit flush (the shell's own chrome has no gaps either);
+    // keeping the row layout's 1-column gap here would spend a body row on a
+    // blank separator above the setup panel and push its bottom border under
+    // the footer.
+    this.bodyBox.gap = compact ? 0 : 1
     if (compact) {
+      const pipelineHeight = this.compactPipelineHeight(this.compactBodyHeight())
       this.leftBox.width = "100%"
-      this.leftBox.height = this.compactPipelineHeight(this.compactBodyHeight())
+      this.leftBox.height = pipelineHeight
       this.pipelineBox.width = "100%"
       this.pipelineBox.height = "100%"
+      // Review owns the whole body (the sidebar is display:none, so it takes
+      // no rows); otherwise the setup panel takes exactly the rows the
+      // pipeline list leaves, so its bottom border always lands on the body's
+      // last row instead of "auto"-sizing past it when the content runs long.
+      this.detailBox.height = reviewing ? "100%" : Math.max(3, bodyHeight - pipelineHeight)
     } else {
       this.leftBox.width = pipelineWidth
       this.leftBox.height = bodyHeight
       this.pipelineBox.width = "100%"
       this.pipelineBox.height = usageVisible ? bodyHeight - usageHeight : bodyHeight
+      this.detailBox.height = "100%"
     }
     this.detailBox.width = compact || reviewing ? "100%" : detailWidth
-    this.detailBox.height = compact ? "auto" : "100%"
 this.detailBox.title = reviewing ? " review " : " run setup "
      // The pipeline sidebar never borrows the accent: the steps are uniform,
      // dimmed containers, and the selected pipeline's own row carries the
@@ -1997,10 +2037,17 @@ this.detailBox.title = reviewing ? " review " : " run setup "
       lines.push(t`${fg(theme.red)("invalid pipeline")}`)
       for (const line of wrapWords(choice.error ?? "unknown error", width)) lines.push(t`${fg(theme.dim)(line)}`)
     } else {
-      lines.push(t`${fg(theme.faint)("steps")}`)
+      lines.push(new StyledText([sectionLabel("steps")]))
       for (const line of stepTree(choice.steps, width)) lines.push(line)
       const agentSteps = choice.steps.filter((step) => step.kind === "agent").length
       lines.push(plain(""), t`${fg(theme.teal)(`Advisors: ${choice.advisedSteps}/${agentSteps} steps advised`)}`)
+      // The pipeline preview continues where the prefix ends: a scored
+      // pipeline's remaining shape is the goal loop, and this is the only
+      // launcher surface that shows it before Review.
+      if (choice.goal) {
+        lines.push(plain(""))
+        for (const line of goalLines(choice.goal, width)) lines.push(line)
+      }
     }
     this.pushHistoryNotice(lines, width, "picker")
     this.pushOpenSpecNotice(lines, width)
@@ -2151,7 +2198,7 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     const spec = this.selectedSpec()
     if (spec) {
       const label = spec.title === spec.id ? spec.id : `${spec.id} · ${spec.title}`
-      lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.teal)(truncate(label, Math.max(10, width - 9)))]))
+      lines.push(new StyledText([sectionLabel("openspec "), fg(theme.teal)(truncate(label, Math.max(10, width - 9)))]))
     }
     // The continue handoff shows what is being reused, so "no new worktree"
     // is a visible fact of the options step rather than an assumption.
@@ -2368,13 +2415,13 @@ this.detailBox.title = reviewing ? " review " : " run setup "
     lines.push(plain(""))
     if (auto.length > 0) {
       const titled = auto.filter((spec) => spec.title !== spec.id)
-      lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.teal)(truncate(`${auto.map((spec) => spec.id).join(", ")} · bundle attaches to every step`, value))]))
+      lines.push(new StyledText([sectionLabel("openspec "), fg(theme.teal)(truncate(`${auto.map((spec) => spec.id).join(", ")} · bundle attaches to every step`, value))]))
       if (titled.length > 0) {
         lines.push(new StyledText([raw("         "), fg(theme.dim)(truncate(titled.map((spec) => spec.title).join(" · "), value))]))
       }
       return
     }
-    lines.push(new StyledText([fg(theme.faint)("openspec "), fg(theme.dim)(truncate(`${this.specs.length} active changes · pick one when writing the prompt`, value))]))
+    lines.push(new StyledText([sectionLabel("openspec "), fg(theme.dim)(truncate(`${this.specs.length} active changes · pick one when writing the prompt`, value))]))
   }
 
   /**
@@ -2521,8 +2568,11 @@ this.detailBox.title = reviewing ? " review " : " run setup "
 
   private detailContentHeight() {
     if (!this.usesCompactLayout()) return this.listHeight()
-    const bodyHeight = this.compactBodyHeight()
-    return bodyHeight - this.compactPipelineHeight(bodyHeight) - 1
+    // compactBodyHeight already discounts the header, footer, and the detail
+    // panel's own borders, so the setup panel's text budget is what remains
+    // after the pipeline list's share — exactly the rows the stacked,
+    // gap-free box shows.
+    return Math.max(1, this.compactBodyHeight() - this.compactPipelineHeight(this.compactBodyHeight()))
   }
 
   private reviewVisibleRows() {
@@ -2904,9 +2954,9 @@ function relationshipLabel(node: StepNode): string {
 // `○ <stage>  · <label>`, with an extra annotation for non-default post-hook
 // `when` values. Stages pad to the same width so labels align across rows.
 export function hookLines(hooks: readonly HookNode[], width: number): StyledText[] {
-  if (hooks.length === 0) return [new StyledText([fg(theme.faint)("hooks  · none")])]
+  if (hooks.length === 0) return [new StyledText([sectionLabel("hooks"), fg(theme.faint)("  · none")])]
 
-  const lines: StyledText[] = [t`${fg(theme.faint)("hooks")}`]
+  const lines: StyledText[] = [new StyledText([sectionLabel("hooks")])]
   for (const hook of hooks) {
     const stage = hook.stage.padEnd(4)
     const annotation = hook.when === "failure" ? "on failure" : hook.when === "always" ? "always" : ""
@@ -2917,6 +2967,74 @@ export function hookLines(hooks: readonly HookNode[], width: number): StyledText
     lines.push(new StyledText(chunks))
   }
   return lines
+}
+
+// Previews the selected scored pipeline's goal cycle as a scannable loop:
+// a distinct section, three policy chips (target, improve-round cap, plateau),
+// then measure and improve as subsections — teal fragment headers one indent
+// in, their step trees one indent deeper still — measurement zero first,
+// improve rounds that re-measure after. Exported pure, like stepTree and
+// hookLines beside it, for direct unit tests.
+export function goalLines(goal: GoalPreview, width: number): StyledText[] {
+  const indent = "  "
+  // Fragment headers sit at `indent`; their step trees one level deeper, so
+  // the loop's fragments read as subsections of goal rather than peers of it.
+  const child = indent + indent
+  const inner = Math.max(1, width - indent.length)
+  const target = `${goal.target}/100`
+  const rounds = `↺ ≤${counted(goal.maxIterations, "round")}`
+  const plateau = `plateau ${goal.plateau}`
+  const sep = "  · "
+  const policyWidth = displayWidth(target) + displayWidth(sep) + displayWidth(rounds) + displayWidth(sep) + displayWidth(plateau)
+  const lines: StyledText[] = []
+  if (policyWidth <= inner) {
+    lines.push(new StyledText([sectionLabel("goal")]))
+    lines.push(
+      new StyledText([
+        raw(indent),
+        fg(theme.text)(target),
+        fg(theme.faint)(sep),
+        fg(theme.dim)(rounds),
+        fg(theme.faint)(sep),
+        fg(theme.dim)(plateau),
+      ]),
+    )
+  } else {
+    const compact = `${target} · ↺${goal.maxIterations} · p${goal.plateau}`
+    lines.push(new StyledText([sectionLabel("goal"), fg(theme.faint)("  · "), fg(theme.faint)(truncate(compact, Math.max(0, width - 8)))]))
+  }
+
+  const fragment = (label: string, role: string, extra: string | undefined, steps: readonly StepNode[]) => {
+    lines.push(fragmentHeader(indent, label, role, extra, width))
+    // The fragment tree renders against the narrower child width so the
+    // branch indent keeps every row inside the panel.
+    for (const line of stepTree(steps, Math.max(1, width - child.length))) lines.push(new StyledText([raw(child), ...line.chunks]))
+  }
+  fragment("measure", `score ← ${goal.scoreProducer}`, undefined, goal.measure)
+  fragment("improve", `brief → ${goal.briefRecipient}`, "then re-measure", goal.improve)
+  return lines
+}
+
+function fragmentHeader(indent: string, label: string, role: string, extra: string | undefined, width: number): StyledText {
+  const prefix = indent + label
+  const clauses = extra ? [role, extra] : [role]
+  const fits = (parts: string[]) => displayWidth(parts.length === 0 ? prefix : `${prefix}  · ${parts.join("  · ")}`) <= width
+  let parts = clauses
+  if (!fits(parts) && extra) parts = [extra]
+  if (!fits(parts) && extra) parts = ["↺"]
+  if (!fits(parts)) parts = role && fits([role]) ? [role] : []
+  if (!fits(parts)) parts = []
+  const chunks: TextChunk[] = [fg(theme.faint)(indent), fg(theme.teal)(label)]
+  if (parts.length > 0) {
+    // Join with the same "  · " the rest of the preview uses. `truncate`
+    // would collapse those spaces, and `fits` already guaranteed the row.
+    chunks.push(fg(theme.faint)("  · "), fg(theme.dim)(parts.join("  · ")))
+  }
+  return new StyledText(chunks)
+}
+
+function counted(n: number, noun: string) {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`
 }
 
 function fitNameWithModel(stepName: string, model: string, width: number) {

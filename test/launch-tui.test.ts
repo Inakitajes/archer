@@ -1,8 +1,8 @@
 import { describe, expect, test, afterAll } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 
-import { LaunchPicker, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultDirtyStatus, dirtReading, emptyPromptField, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, pipelineRow, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, trimPromptField, typedText, wrapPromptLines } from "../src/launch-tui"
-import type { LaunchRunTuiOptions } from "../src/launch-tui"
+import { LaunchPicker, branchActionForKey, branchProposalNote, compactLaunchMaxWidth, cursorPosition, defaultDirtyStatus, dirtReading, emptyPromptField, goalLines, hookLines, launcherStepModelLabel, markPromptEdited, nextPromptSuggestion, pipelineChoices, pipelineRow, prefillPromptField, promptAfterPipelineSwitch, promptEnterAction, reviewActionForKey, sanitizePaste, stepTree, trimPromptField, typedText, wrapPromptLines } from "../src/launch-tui"
+import type { GoalPreview, LaunchRunTuiOptions } from "../src/launch-tui"
 import { ensureRepoReady, statusPorcelain } from "../src/git"
 import type { OpenSpecChangeSummary } from "../src/openspec"
 
@@ -54,7 +54,6 @@ function launcherChoices(count = 1) {
     hooks: [],
     valid: true,
     advisedSteps: 0,
-    scored: false,
   }))
 }
 
@@ -152,6 +151,37 @@ describe("launch TUI compact layout", () => {
     } finally {
       await closeLauncher(compact)
       await closeLauncher(wide)
+    }
+  })
+
+  test("stacked compact panels sit flush and keep the setup panel's bottom border", async () => {
+    const launcher = await createLauncher(80, 30)
+    try {
+      await launcher.renderOnce()
+      const rows = launcher.captureCharFrame().split("\n")
+      const pipelines = panelRow(rows.join("\n"), "pipelines")
+      const setup = panelRow(rows.join("\n"), "run setup")
+      const footer = rows.findIndex((line) => line.includes("↑/↓ select"))
+
+      // Flush stacking: the pipelines bottom border sits directly above the
+      // setup panel — no blank separator row spent on the row layout's gap.
+      expect(rows[setup - 1]).toContain("╰")
+      // The setup panel closes on the body's last row, right above the footer.
+      expect(rows[footer - 2]).toContain("╰")
+
+      // Options content is taller than the panel's compact share; the box
+      // must clip it inside its budget instead of auto-sizing past the body
+      // and losing the bottom border under the footer.
+      launcher.mockInput.pressEnter()
+      await launcher.mockInput.typeText("ship it")
+      launcher.mockInput.pressEnter()
+      await launcher.renderOnce()
+      const optionsRows = launcher.captureCharFrame().split("\n")
+      const optionsFooter = optionsRows.findIndex((line) => line.includes("space toggle"))
+      expect(optionsFooter).toBeGreaterThanOrEqual(0)
+      expect(optionsRows[optionsFooter - 2]).toContain("╰")
+    } finally {
+      await closeLauncher(launcher)
     }
   })
 
@@ -359,6 +389,30 @@ describe("launch TUI narrow-width row budgets", () => {
       for (const line of hookLines(hooks, width)) {
         const lineText = line.chunks.map((chunk) => chunk.text).join("")
         expect(displayWidth(lineText), `hookLines width ${width} line=${JSON.stringify(lineText)}`).toBeLessThanOrEqual(width)
+      }
+    }
+  })
+
+  test("goalLines never exceeds its panel width across the supported range", () => {
+    const goal = {
+      target: 85,
+      maxIterations: 3,
+      plateau: 3,
+      briefRecipient: "fix",
+      scoreProducer: "score-report-with-a-long-name",
+      measure: [
+        { stepName: "score", groupId: "g1", kind: "agent" as const, modelLabel: "x-ai-grok-5", advisorLabel: "" },
+        { stepName: "score", groupId: "g1", kind: "agent" as const, modelLabel: "glm-5.3-high", advisorLabel: "" },
+        { stepName: "score-report", groupId: "g2", kind: "agent" as const, modelLabel: "x-ai-grok-5", advisorLabel: "" },
+      ],
+      improve: [
+        { stepName: "fix", groupId: "g3", kind: "agent" as const, modelLabel: "deepseek-v4-flash", advisorLabel: "x-ai-grok-5 advisor ×3" },
+      ],
+    } satisfies GoalPreview
+    for (const width of widths) {
+      for (const line of goalLines(goal, width)) {
+        const lineText = line.chunks.map((chunk) => chunk.text).join("")
+        expect(displayWidth(lineText), `goalLines width ${width} line=${JSON.stringify(lineText)}`).toBeLessThanOrEqual(width)
       }
     }
   })
@@ -643,6 +697,56 @@ describe("launch TUI pipeline preview", () => {
     ], 15))
     expect(lines.length).toBeGreaterThan(0)
   })
+
+  const scoredGoal = {
+    target: 85,
+    maxIterations: 3,
+    plateau: 3,
+    briefRecipient: "fix",
+    scoreProducer: "score-report",
+    measure: [
+      { stepName: "score", groupId: "g1", kind: "agent", modelLabel: "x-ai-grok-5", advisorLabel: "" },
+      { stepName: "score", groupId: "g1", kind: "agent", modelLabel: "glm-5.3-high", advisorLabel: "" },
+      { stepName: "score-report", groupId: "g2", kind: "agent", modelLabel: "x-ai-grok-5", advisorLabel: "" },
+    ],
+    improve: [
+      { stepName: "fix", groupId: "g3", kind: "agent", modelLabel: "deepseek-v4-flash", advisorLabel: "x-ai-grok-5 advisor ×3" },
+    ],
+  } satisfies GoalPreview
+
+  test("goalLines previews the policy and both fragments with their models", () => {
+    const lines = plainLines(goalLines(scoredGoal, 100))
+
+    // A distinct section, then the three policy facts as separate chips —
+    // target, improve-round cap (not a derived measurement count), plateau.
+    expect(lines[0]).toBe("goal")
+    expect(lines[1]).toContain("85/100")
+    expect(lines[1]).toContain("↺ ≤3 rounds")
+    expect(lines[1]).toContain("plateau 3")
+    expect(lines[1]).not.toContain("target 85/100")
+    expect(lines.join("\n")).not.toContain("4 measurements")
+    // Measurement zero runs first; improve names the loop-back.
+    expect(lines).toContain("  measure  · score ← score-report")
+    expect(lines).toContain("  improve  · brief → fix  · then re-measure")
+    // Fragment steps render as subsections: one indent deeper than their
+    // fragment header, including the fan-out and the fixer's advisor
+    // relationship, with their resolved models.
+    expect(lines).toContain("    ○ score  · 2 models")
+    expect(lines).toContain("    ○ score-report  · x-ai-grok-5")
+    expect(lines).toContain("    ○ fix  · deepseek-v4-flash → x-ai-grok-5 advisor ×3")
+  })
+
+  test("goalLines collapses policy chips and fragment roles when the panel is narrow", () => {
+    const lines = plainLines(goalLines(scoredGoal, 24))
+    const joined = lines.join("\n")
+    expect(joined).toContain("85/100")
+    expect(joined).toContain("↺3")
+    expect(joined).toContain("p3")
+    expect(joined).toContain("measure")
+    expect(joined).toContain("improve")
+    expect(lines.some((line) => line.includes("then re-measure"))).toBe(false)
+    expect(lines.every((line) => displayWidth(line) <= 24)).toBe(true)
+  })
 })
 
 describe("launch TUI pipeline choices", () => {
@@ -662,6 +766,20 @@ describe("launch TUI pipeline choices", () => {
     expect(implement?.defaultPrompt).toBeUndefined()
     expect(implement?.suggestedPrompts).toBeUndefined()
     expect(implement?.attachesPrdHistory).toBe(false)
+  })
+
+  test("carries the goal cycle for scored pipelines so the preview can show it", () => {
+    const choices = pipelineChoices(undefined, builtInAgents)
+    const ship = choices.find((choice) => choice.name === "ship")
+    expect(ship?.goal).toMatchObject({ target: 85, maxIterations: 3, plateau: 3, briefRecipient: "fix", scoreProducer: "score-report" })
+    expect(ship?.goal?.improve.map((step) => step.stepName)).toEqual(["fix"])
+    expect(ship?.goal?.measure.map((step) => step.stepName)).toEqual(["score", "score", "score-report"])
+  })
+
+  test("carries no goal preview for pipelines without a terminal goal step", () => {
+    const choices = pipelineChoices(undefined, builtInAgents)
+    expect(choices.find((choice) => choice.name === "implement")?.goal).toBeUndefined()
+    expect(choices.find((choice) => choice.name === "review")?.goal).toBeUndefined()
   })
 
   test("configured pipelines carry their defaultPrompt and suggestedPrompts", () => {
@@ -706,7 +824,6 @@ describe("launch TUI historical PRD notice", () => {
       hooks: [],
       valid: true,
       advisedSteps: 0,
-      scored: false,
       attachesPrdHistory: true,
     }
   }
@@ -1073,6 +1190,93 @@ describe("launch TUI goal classification", () => {
     expect(hasGoal("review")).toBe(false)
     expect(hasGoal("review-lite")).toBe(false)
     expect(hasGoal("implement")).toBe(false)
+  })
+
+  // Spec: goal-subflows — a pipeline without a goal step previews as an
+  // ordinary pipeline: prefix steps only, no goal-cycle section.
+  test("the pipeline detail preview shows no goal section for ordinary pipelines", async () => {
+    const testRenderer = await createTestRenderer({ width: 100, height: 40 })
+    const picker = new LaunchPicker(
+      testRenderer.renderer,
+      process.cwd(),
+      [{
+        name: "implement",
+        description: "Implement the change.",
+        source: "built-in" as const,
+        isDefault: true,
+        steps: [{ stepName: "implementer", groupId: "g1", kind: "agent", modelLabel: "gpt-5.6", advisorLabel: "" }],
+        hooks: [],
+        valid: true,
+        advisedSteps: 0,
+      }],
+      "configured",
+      { isolate: false, reason: "test" },
+      { readDirtyStatus: async () => "" } as never,
+      { enabled: true, entries: [] },
+    )
+    const launcher = { ...testRenderer, picker }
+    try {
+      const detail = launchView(picker).pipelineDetail(80).chunks.map((chunk) => chunk.text).join("")
+      expect(detail).toContain("○ implementer  · gpt-5.6")
+      expect(detail).not.toContain("goal")
+      expect(detail).not.toContain("↺")
+      expect(detail).not.toContain("measure  ·")
+      expect(detail).not.toContain("improve  ·")
+    } finally {
+      await closeLauncher(launcher)
+    }
+  })
+
+  // The pipeline preview continues where the prefix steps end: a scored
+  // pipeline's remaining shape is the goal loop, shown in the list itself
+  // rather than first appearing at Review.
+  test("the pipeline detail preview shows the goal cycle's fragments", async () => {
+    const testRenderer = await createTestRenderer({ width: 100, height: 40 })
+    const picker = new LaunchPicker(
+      testRenderer.renderer,
+      process.cwd(),
+      [{
+        name: "ship",
+        description: "Sync the branch with its base and iterate until it clears the bar.",
+        source: "built-in" as const,
+        isDefault: true,
+        steps: [{ stepName: "sync", groupId: "g1", kind: "agent", modelLabel: "glm-5.3-high", advisorLabel: "" }],
+        hooks: [],
+        valid: true,
+        advisedSteps: 0,
+        goal: {
+          target: 85,
+          maxIterations: 3,
+          plateau: 3,
+          briefRecipient: "fix",
+          scoreProducer: "score-report",
+          measure: [
+            { stepName: "score", groupId: "g1", kind: "agent", modelLabel: "x-ai-grok-5", advisorLabel: "" },
+            { stepName: "score", groupId: "g1", kind: "agent", modelLabel: "glm-5.3-high", advisorLabel: "" },
+            { stepName: "score-report", groupId: "g2", kind: "agent", modelLabel: "x-ai-grok-5", advisorLabel: "" },
+          ],
+          improve: [{ stepName: "fix", groupId: "g3", kind: "agent", modelLabel: "deepseek-v4-flash", advisorLabel: "" }],
+        },
+      }],
+      "configured",
+      { isolate: false, reason: "test" },
+      { readDirtyStatus: async () => "" } as never,
+      { enabled: true, entries: [] },
+    )
+    const launcher = { ...testRenderer, picker }
+    try {
+      const detail = launchView(picker).pipelineDetail(80).chunks.map((chunk) => chunk.text).join("")
+      expect(detail).toContain("goal")
+      expect(detail).toContain("85/100")
+      expect(detail).toContain("↺ ≤3 rounds")
+      expect(detail).toContain("plateau 3")
+      expect(detail).not.toContain("4 measurements")
+      expect(detail).toContain("measure  · score ← score-report")
+      expect(detail).toContain("improve  · brief → fix  · then re-measure")
+      expect(detail).toContain("○ fix  · deepseek-v4-flash")
+    } finally {
+      await closeLauncher(launcher)
+    }
   })
 })
 

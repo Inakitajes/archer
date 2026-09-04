@@ -2,7 +2,23 @@ import { BoxRenderable, createCliRenderer } from "@opentui/core"
 
 import { paletteForTerminal, setTheme, terminalBackgroundHex } from "./tui-theme"
 
-import type { CliRenderer } from "@opentui/core"
+import type { CliRenderer, CliRendererConfig } from "@opentui/core"
+
+/**
+ * Renderer options for any session that can host Home. When Kitty images are
+ * active, Home writes placements through stdout from the frame callback; on
+ * macOS OpenTUI otherwise writes the frame on a background thread, so the two
+ * ANSI streams can interleave before the frame reaches the terminal.
+ */
+export function homeRendererConfig(kittyGraphics: boolean): CliRendererConfig {
+  const config: CliRendererConfig = {
+    screenMode: "alternate-screen",
+    consoleMode: "console-overlay",
+    exitOnCtrlC: false,
+  }
+  if (kittyGraphics) config.useThread = false
+  return config
+}
 
 /** A destination opened inside the zero-argument home session. */
 export type TuiRoute = {
@@ -75,12 +91,8 @@ export class TuiSession {
   }
 }
 
-export async function createTuiSession(): Promise<TuiSession> {
-  const renderer = await createCliRenderer({
-    screenMode: "alternate-screen",
-    consoleMode: "console-overlay",
-    exitOnCtrlC: false,
-  })
+export async function createTuiSession(kittyGraphics: boolean): Promise<TuiSession> {
+  const renderer = await createCliRenderer(homeRendererConfig(kittyGraphics))
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
   return new TuiSession(renderer)

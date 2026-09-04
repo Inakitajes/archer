@@ -63,7 +63,6 @@ function launcherChoices() {
       hooks: [],
       valid: true,
       advisedSteps: 0,
-      scored: false,
     },
   ]
 }

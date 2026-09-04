@@ -8,7 +8,7 @@ import { prdHistoryPreviewCopy } from "./prd-history"
 import { plannedStepAdvisor, plannedStepModel } from "./run-plan"
 import { sanitizeReviewInline, sanitizeReviewText } from "./run-review"
 import { stepRunnerFor } from "./step-runners"
-import { plain, raw, theme, truncate } from "./tui-theme"
+import { plain, raw, sectionLabel, theme, truncate } from "./tui-theme"
 
 import type { TextChunk } from "@opentui/core"
 import type { AgentStep, HookSpec, RunPlan } from "./types"
@@ -67,7 +67,7 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   }
   rows.push(plain(""))
 
-  rows.push(labelRow("pipeline", [fg(theme.text)(truncate(`${sanitizeReviewInline(plan.pipeline.name)} · ${pipelineSummary(plan)}`, value))]))
+  rows.push(sectionRow("pipeline", [fg(theme.text)(truncate(`${sanitizeReviewInline(plan.pipeline.name)} · ${pipelineSummary(plan)}`, value))]))
   pushStepRows(rows, plan, width)
   rows.push(plain(""))
 
@@ -77,15 +77,17 @@ export function runReviewLines(plan: RunPlan, width: number, options: RunReviewR
   // explicit in the TUI review, not just the headless plan.
   if (plan.goal) {
     const measurements = 1 + plan.goal.maxIterations
-    rows.push(labelRow("goal", [fg(theme.text)(`target ${plan.goal.target}/100 · up to ${counted(measurements, "measurement")} · plateau ${plan.goal.plateau}`)]))
-    rows.push(continuation([fg(theme.faint)("improve "), fg(theme.dim)(`${counted(plan.goal.improve.steps.length, "step")} · brief goes to ${sanitizeReviewInline(plan.goal.briefRecipient)}`)]))
-    rows.push(continuation([fg(theme.faint)("measure "), fg(theme.dim)(`${counted(plan.goal.measure.steps.length, "step")} · score from ${sanitizeReviewInline(plan.goal.scoreProducer)}`)]))
+    rows.push(sectionRow("goal", [fg(theme.text)(`target ${plan.goal.target}/100 · up to ${counted(measurements, "measurement")} · plateau ${plan.goal.plateau}`)]))
+    // The fragments are subsections of the goal block, so they sit one indent
+    // deeper than a plain continuation row under the label column.
+    rows.push(continuation([fg(theme.faint)("improve "), fg(theme.dim)(`${counted(plan.goal.improve.steps.length, "step")} · brief goes to ${sanitizeReviewInline(plan.goal.briefRecipient)}`)], labelWidth + 2))
+    rows.push(continuation([fg(theme.faint)("measure "), fg(theme.dim)(`${counted(plan.goal.measure.steps.length, "step")} · score from ${sanitizeReviewInline(plan.goal.scoreProducer)}`)], labelWidth + 2))
     rows.push(plain(""))
   }
 
   const hooks = [...plan.hooks.pre.map((hook) => hookChunks("pre", hook, value)), ...plan.hooks.post.map((hook) => hookChunks("post", hook, value))]
   if (hooks.length > 0) {
-    rows.push(labelRow("hooks", hooks[0]!))
+    rows.push(sectionRow("hooks", hooks[0]!))
     for (const chunks of hooks.slice(1)) rows.push(continuation(chunks))
     rows.push(plain(""))
   }
@@ -117,13 +119,13 @@ function pushContractRows(rows: StyledText[], plan: RunPlan, value: number) {
 function pushOpenSpecRows(rows: StyledText[], plan: RunPlan, value: number) {
   if (!plan.openspec) return
   if (plan.openspec.changeIds.length === 0) {
-    rows.push(labelRow("openspec", [fg(theme.dim)(truncate("no active change · scope will infer from the diff", value))]))
+    rows.push(sectionRow("openspec", [fg(theme.dim)(truncate("no active change · scope will infer from the diff", value))]))
     return
   }
   const ids = sanitizeReviewInline(plan.openspec.changeIds.join(", "))
   const count = plan.openspec.specFiles.length
   const headline = `${ids} · contract attached (${count} spec file${count === 1 ? "" : "s"})`
-  rows.push(labelRow("openspec", [fg(theme.teal)(truncate(headline, value))]))
+  rows.push(sectionRow("openspec", [fg(theme.teal)(truncate(headline, value))]))
 }
 
 function pushHistoryRows(rows: StyledText[], plan: RunPlan, value: number) {
@@ -235,6 +237,14 @@ function hookChunks(stage: "pre" | "post", hook: HookSpec, value: number): TextC
 
 function labelRow(label: string, value: TextChunk[]): StyledText {
   return new StyledText([fg(theme.faint)(label.padEnd(labelWidth)), ...value])
+}
+
+// The run-shape sections — pipeline steps, goal, openspec, hooks — headline
+// the review; their label column renders accent-bold so they scan as the
+// plan's structure next to the faint metadata labels (prompt, target,
+// gateway, runtime).
+function sectionRow(label: string, value: TextChunk[]): StyledText {
+  return new StyledText([sectionLabel(label.padEnd(labelWidth)), ...value])
 }
 
 function continuation(value: TextChunk[], indent = labelWidth): StyledText {

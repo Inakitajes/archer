@@ -1,10 +1,4 @@
-# home-launcher Specification
-
-## Purpose
-
-Defines a clear, responsive Home launcher that communicates product identity, project context, active navigation, and graphics fallback behavior consistently across terminals.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Home presents a unified masthead
 In non-graphics mode the Home launcher SHALL display a left-aligned three-line `CONVOY` wordmark in one uniform neutral tone. To its right, the masthead SHALL show the complete version string right-aligned on the first row and the project path right-aligned on the second row. The version string SHALL include any prerelease and build metadata already present in the build's version, including local-build metadata, and SHALL NOT append a parenthetical suffix or separately display the commit or platform. Compact widths SHALL fall back to a text wordmark with the version string right-aligned and a labeled project row below, without overflowing the terminal width. In graphics mode the masthead SHALL instead be a single slim chrome row below one blank top-padding row: the labeled project path on the left and the complete version string right-aligned, both in a faint tone; the block wordmark is rendered as part of the centered destination poster instead. The launcher MUST NOT render a footer and SHALL keep one blank row between the masthead region and the body content.
@@ -29,17 +23,6 @@ In non-graphics mode the Home launcher SHALL display a left-aligned three-line `
 - **WHEN** Home renders in any width or graphics mode
 - **THEN** no selection counter and no key hints appear anywhere on screen, one blank row pads the top of the screen, and two blank rows pad the bottom below the content; in poster mode the centered block keeps its equal top and bottom margins instead of a fixed bottom pad
 
-### Requirement: Active destination is visibly bracketed by diamonds
-The Home launcher SHALL render the selected destination with one filled diamond before and one filled diamond after its shortcut and label. Inactive destinations SHALL reserve equivalent marker width so changing selection does not shift the destination layout.
-
-#### Scenario: Selected destination in stacked layout
-- **WHEN** destinations are stacked and Pipelines is selected
-- **THEN** the selected row reads visually as `◆ [P]  PIPELINES ◆` while inactive rows remain aligned with it
-
-#### Scenario: Selected destination in row layout
-- **WHEN** destinations share one row and selection moves between them
-- **THEN** the selected item gains both diamonds without changing the positions of the other items
-
 ### Requirement: Graphics-capable Home preserves the image experience
 When a valid Home image is available and Kitty Graphics is supported, the Home launcher SHALL display the selected destination image as a centered poster: the block `CONVOY` wordmark above the image separated from it by two blank rows, centered horizontally in the terminal. The wordmark, the image, the destination controls, and the description SHALL form one block that is vertically centered between the chrome row and the bottom of the terminal, so the controls always follow the image after two blank rows and the blank margin above the wordmark equals the blank margin below the description (each at least one row, within one row for odd leftovers). In this mode the destination controls SHALL render as a centered column of the four destinations. The image SHALL be scaled with aspect-preserving contain fit — the whole image is visible and never cropped — and SHALL NOT exceed 60 columns wide or 50 rows tall. When the available space is smaller than the capped card, the image SHALL shrink to fit while keeping its aspect ratio. The poster MUST NOT overlap the chrome row or the destination controls and SHALL keep at least one blank row below the chrome and at least two blank rows above the controls.
 
@@ -59,17 +42,6 @@ When a valid Home image is available and Kitty Graphics is supported, the Home l
 - **WHEN** the selection moves to another destination with a valid image
 - **THEN** the wordmark stays put and only the image changes, without moving the poster
 
-### Requirement: Non-graphics Home prioritizes navigation
-When Kitty Graphics is unavailable or no valid image can be displayed, the Home launcher SHALL display neither an image nor an ASCII sculpture. It SHALL vertically center the destination selector together with its selected destination description in the available body.
-
-#### Scenario: Kitty Graphics unavailable
-- **WHEN** Home opens in a terminal without Kitty Graphics support
-- **THEN** no image or ASCII artwork is shown and the destination-and-description block is vertically centered
-
-#### Scenario: Selected image unavailable
-- **WHEN** Kitty Graphics is supported but the selected destination has no valid displayable image
-- **THEN** Home uses the same vertically centered navigation-only fallback without showing ASCII artwork
-
 ### Requirement: Destination description wraps to at most two contextual lines
 The Home launcher SHALL show the selected destination description beneath the selector, separated from it by one blank row, centered inside a fixed maximum width of 48 columns regardless of terminal width, wrapped to at most two rows. When wrapping, it SHALL split near the middle at a word boundary so both rows stay balanced; when the description cannot fit two rows at the available width it SHALL clip the second row with an ellipsis without overflowing the terminal.
 
@@ -88,3 +60,8 @@ The Home launcher SHALL show the selected destination description beneath the se
 #### Scenario: Description overflows two rows
 - **WHEN** the selected description does not fit in two rows at the available width
 - **THEN** the second row ends with an ellipsis without overflowing
+
+## RENAMED Requirements
+
+- FROM: `### Requirement: Destination description remains a single contextual line`
+- TO: `### Requirement: Destination description wraps to at most two contextual lines`

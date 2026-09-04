@@ -5,7 +5,7 @@ import { ConfigEditor } from "../src/config-tui"
 import { HomeLauncher } from "../src/home-tui"
 import { browseSpecsTui } from "../src/specs-browser"
 import { createTuiProgress } from "../src/tui"
-import { TuiSession, type TuiRoute } from "../src/tui-session"
+import { homeRendererConfig, TuiSession, type TuiRoute } from "../src/tui-session"
 
 import type { KeyEvent } from "@opentui/core"
 import type { SpecsView } from "../src/specs"
@@ -33,6 +33,15 @@ const view: SpecsView = {
   changes: [{ kind: "change", id: "add-login", title: "Add login", artifacts: [] }],
   specs: [],
 }
+
+test("home renderers serialize frames with Kitty image writes", () => {
+  expect(homeRendererConfig(true)).toMatchObject({
+    screenMode: "alternate-screen",
+    exitOnCtrlC: false,
+    useThread: false,
+  })
+  expect(homeRendererConfig(false).useThread).toBeUndefined()
+})
 
 test("Home and a destination swap scenes without destroying the shared renderer", async () => {
   const testRenderer = await createTestRenderer({ width: 100, height: 30, exitOnCtrlC: false })
