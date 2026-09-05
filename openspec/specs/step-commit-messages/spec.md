@@ -91,14 +91,15 @@ Commit-message composition MUST NOT prevent otherwise valid repository changes f
 #### Scenario: Human iteration has only change evidence
 - **WHEN** a human iteration has no report description but changed-file evidence is available
 - **THEN** Convoy derives a bounded summary or detail from that evidence rather than using the fixed `apply manual iteration` message
+### Requirement: Compaction and closing preserve run-linked commit compatibility
+Run-linked semantic messages SHALL remain valid inputs to automatic run compaction and feature closing despite multiline bodies and trailers. Automatic compaction MUST use the originating run's durable boundary and commit provenance rather than selecting all consecutive commits by authorship alone. Feature close SHALL include the complete feature-exclusive change regardless of authorship or intermediate trailers. The resulting operator-authored commits SHALL NOT be required to retain intermediate `Convoy-Run` trailers; their replacement relationship MUST remain recoverable through durable run/close evidence. The retired `convoy finish` command SHALL NOT remain an execution path.
 
-### Requirement: Existing squash behavior remains compatible
-Run-linked semantic messages MUST NOT change the authorship rule used to find Convoy's intermediate commit range. `convoy finish` and `convoy close` SHALL continue to squash eligible commits despite multiline bodies and trailers. The resulting user-authored squashed commit is not required to retain intermediate `Convoy-Run` trailers.
+#### Scenario: Automatic compaction sees run-linked commits
 
-#### Scenario: Finish sees run-linked commits
-- **WHEN** the branch tip contains consecutive `convoy@local` commits with semantic subjects, detail bodies, and `Convoy-Run` trailers
-- **THEN** `convoy finish` selects the same authorship-bounded range it would have selected for legacy one-line step commits
+- **WHEN** the verified current-run interval contains `convoy@local` commits with semantic subjects, multiline detail bodies, and authoritative `Convoy-Run` trailers
+- **THEN** automatic finalization selects that interval without admitting older runs solely because their author is also Convoy
 
 #### Scenario: Close replaces intermediate history
-- **WHEN** `convoy close` successfully composes and applies its user-authored squash commit
-- **THEN** it may replace the intermediate trailers without copying them into the final commit
+
+- **WHEN** `convoy close` lands a feature containing operator commits and run-linked intermediate commits
+- **THEN** the base gains one operator-authored squash-merge commit without needing to copy the intermediate trailers or rewrite the feature commits
