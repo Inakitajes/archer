@@ -2809,11 +2809,11 @@ export class TuiProgress implements ProgressUI {
     this.feedBox.borderColor = this.contentFocused ? theme.accent : theme.borderDim
 
     // Detail panel: either one concrete phase or an aggregate for a selected
-    // parallel/multi-model header.
+    // parallel/multi-model/goal-invocation header.
     const detailLines = group
       ? this.groupDetailContent(group.selection, group.members, now, rightWidth)
       : this.detailContent(focus, now, rightWidth)
-    this.stepBox.title = group ? (group.selection.stepName === undefined ? " parallel group " : " step group ") : " step "
+    this.stepBox.title = group ? groupPanelTitle(group.selection) : " step "
     this.stepBox.height = detailLines.length + 2
     this.stepText.content = joinLines(detailLines)
 
@@ -3149,11 +3149,13 @@ export class TuiProgress implements ProgressUI {
     // A group / sub-group header: the aggregate status icon, a label, and an
     // `×N` count, carrying the group's aggregate elapsed/cost. `count` is the
     // number of visible branches — distinct steps under a `parallel:` header,
-    // models under a fan-out header — not always the raw member total. When
-    // the focused phase is one of this header's members (directly or via a
-    // nested sub-header), the label picks up the same accent as the focused
-    // leaf so the whole ancestor chain reads as one highlighted path down the
-    // tree, instead of only the leaf itself carrying any indication.
+    // models under a fan-out header — not always the raw member total. A count
+    // of one (a single-step goal invocation) omits the suffix: the iteration
+    // label is the information, `×1` would be noise. When the focused phase is
+    // one of this header's members (directly or via a nested sub-header), the
+    // label picks up the same accent as the focused leaf so the whole ancestor
+    // chain reads as one highlighted path down the tree, instead of only the
+    // leaf itself carrying any indication.
     const emitHeader = (
       members: PhaseState[],
       labelText: string,
@@ -3172,7 +3174,7 @@ export class TuiProgress implements ProgressUI {
         labelText,
         labelStatus: status,
         color: onPath ? (text) => bold(fg(theme.accent)(text)) : kind === "parallel" ? (text) => fg(theme.teal)(text) : undefined,
-        suffix: [fg(theme.faint)(` ×${count}`)],
+        suffix: count > 1 ? [fg(theme.faint)(` ×${count}`)] : undefined,
         badges,
         right: groupMetaChunks(members, now),
       })
@@ -4646,6 +4648,15 @@ function goalInvocationLabel(groupId: string | undefined): string | undefined {
   return parsed ? `${parsed.stage} #${parsed.iteration}` : undefined
 }
 
+// Border title for a selected tree group. Goal invocations reuse the launcher's
+// fragment word (`measure` / `improve`) instead of the leftover "parallel group"
+// chrome; numbered instance stays in the panel body (`measure #0`).
+function groupPanelTitle(selection: GroupSelection): string {
+  if (selection.stepName !== undefined) return " step group "
+  const goal = parseGoalInvocationId(selection.groupId)
+  return goal ? ` ${goal.stage} ` : " parallel group "
+}
+
 // A compact model label for a fanned-out member: provider prefix dropped, and
 // the redundant `claude-` vendor token trimmed, so `security__…opus-4-7`
 // reads as just `opus-4-7`. Falls back to the live/planned model once known.
@@ -4658,9 +4669,11 @@ function modelLabel(phase: PhaseState): string {
 
 // A phase's name for use outside the pipeline tree (pane titles, the feed):
 // a fanned-out member reads as `step · model` instead of its `step__slug` id.
+// Goal reconstruction qualifies every physical name (`goal-measure-0-fix`), so
+// `stepName !== name` is no longer a fan-out signal — only the `__` slug is.
 function phaseDisplayName(phase: PhaseState): string {
-  if (phase.stepName && phase.stepName !== phase.name) return `${phase.stepName} · ${modelLabel(phase)}`
-  return phase.name
+  if (phase.stepName && phase.name.includes(`${phase.stepName}__`)) return `${phase.stepName} · ${modelLabel(phase)}`
+  return phase.stepName ?? phase.name
 }
 
 // One row per todo, windowed around the first unfinished item when the list
