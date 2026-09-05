@@ -266,6 +266,16 @@ export async function finalizeNetZeroInterval(input: RunFinalizationInput, inter
     } catch (error) {
       return record("blocked", `the branch moved during finalization; no history was changed (${String(error)})`, { now })
     }
+    // The trees are identical, so the hard reset below only clears residual
+    // staged state from the removed commits. If the index changed since the
+    // interval check — a concurrent staged edit landing during the potentially
+    // long publication probe above — restore the branch pointer and refuse
+    // rather than hard-reset work Convoy does not own (design D4).
+    const stagedBeforeReset = await indexTree(cwd)
+    if (stagedBeforeReset !== interval.headTree) {
+      await execFile("git", ["reset", "--soft", interval.headSha], { cwd }).catch(() => {})
+      return record("blocked", "the index changed during finalization; the branch was restored and no history was rewritten", { now })
+    }
     // Align index/worktree with the restored branch (trees are identical, so
     // this only cleans any residual staged state from the removed commits).
     await execFile("git", ["reset", "--hard", interval.startHead], { cwd })
