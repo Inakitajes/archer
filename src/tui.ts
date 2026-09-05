@@ -17,6 +17,7 @@ import { defaultAdvisorMaxCalls } from "./advisor"
 import { openClaudeSessionWindow } from "./claude-code"
 import { aggregateAdvisorEvents, type AdvisorEvent } from "./advisor-events"
 import { copyReportToClipboard, writeClipboardOSC52, type ClipboardResult } from "./clipboard"
+import { parseGoalInvocationId } from "./goal-scheduler"
 import { openRouterLowBalance, startLimitsPoller } from "./limits"
 import { log } from "./log"
 import { markdownInlineChunks, markdownLines, parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
@@ -2808,11 +2809,11 @@ export class TuiProgress implements ProgressUI {
     this.feedBox.borderColor = this.contentFocused ? theme.accent : theme.borderDim
 
     // Detail panel: either one concrete phase or an aggregate for a selected
-    // parallel/multi-model header.
+    // parallel/multi-model/goal-invocation header.
     const detailLines = group
       ? this.groupDetailContent(group.selection, group.members, now, rightWidth)
       : this.detailContent(focus, now, rightWidth)
-    this.stepBox.title = group ? (group.selection.stepName === undefined ? " parallel group " : " step group ") : " step "
+    this.stepBox.title = group ? groupPanelTitle(group.selection) : " step "
     this.stepBox.height = detailLines.length + 2
     this.stepText.content = joinLines(detailLines)
 
@@ -3148,11 +3149,13 @@ export class TuiProgress implements ProgressUI {
     // A group / sub-group header: the aggregate status icon, a label, and an
     // `×N` count, carrying the group's aggregate elapsed/cost. `count` is the
     // number of visible branches — distinct steps under a `parallel:` header,
-    // models under a fan-out header — not always the raw member total. When
-    // the focused phase is one of this header's members (directly or via a
-    // nested sub-header), the label picks up the same accent as the focused
-    // leaf so the whole ancestor chain reads as one highlighted path down the
-    // tree, instead of only the leaf itself carrying any indication.
+    // models under a fan-out header — not always the raw member total. A count
+    // of one (a single-step goal invocation) omits the suffix: the iteration
+    // label is the information, `×1` would be noise. When the focused phase is
+    // one of this header's members (directly or via a nested sub-header), the
+    // label picks up the same accent as the focused leaf so the whole ancestor
+    // chain reads as one highlighted path down the tree, instead of only the
+    // leaf itself carrying any indication.
     const emitHeader = (
       members: PhaseState[],
       labelText: string,
@@ -3171,7 +3174,7 @@ export class TuiProgress implements ProgressUI {
         labelText,
         labelStatus: status,
         color: onPath ? (text) => bold(fg(theme.accent)(text)) : kind === "parallel" ? (text) => fg(theme.teal)(text) : undefined,
-        suffix: [fg(theme.faint)(` ×${count}`)],
+        suffix: count > 1 ? [fg(theme.faint)(` ×${count}`)] : undefined,
         badges,
         right: groupMetaChunks(members, now),
       })
@@ -3186,14 +3189,62 @@ export class TuiProgress implements ProgressUI {
     const namePart = this.pipelineName ? ` · ${this.pipelineName}` : ""
     this.pipelineBox.title = allReadOnly ? ` pipeline${namePart} · read-only ` : ` pipeline${namePart} `
 
+    // The step-level children every multi-phase group shares: singleton steps
+    // render one leaf row, fanned-out steps nest a step header over model rows.
+    const emitStepGroups = (stepGroups: PhaseState[][], memberBadges: (phase: PhaseState) => readonly string[]) => {
+      stepGroups.forEach((members, stepIndex) => {
+        const lastStep = stepIndex === stepGroups.length - 1
+        if (members.length === 1) {
+          emitRow(members[0]!, [lastStep], stepLabel(members[0]!), phaseMetaChunks(members[0]!, now), memberBadges(members[0]!))
+          return
+        }
+        emitHeader(
+          members,
+          stepLabel(members[0]!),
+          "step",
+          members.length,
+          [lastStep],
+          {
+            kind: "group",
+            groupId: members[0]!.groupId!,
+            stepName: stepLabel(members[0]!),
+          },
+          memberBadges(members[0]!),
+        )
+        members.forEach((phase, index) => emitModelRow(phase, [lastStep, index === members.length - 1]))
+      })
+    }
+
     for (const group of groupPhases(this.phases)) {
-      if (group.length === 1) {
+      // A goal invocation's display group id (`goal-measure-0`) names the tree
+      // group by stage and round instead of the literal `parallel`, so
+      // iteration boundaries stay visible — even when the fragment is a
+      // single step, which still renders its header over one child.
+      const goalLabel = goalInvocationLabel(group[0]!.groupId)
+      if (group.length === 1 && !goalLabel) {
         const phase = group[0]!
-        emitRow(phase, [], phase.name, phaseMetaChunks(phase, now), allReadOnly ? [] : phaseCapabilityBadges(phase))
+        emitRow(phase, [], stepLabel(phase), phaseMetaChunks(phase, now), allReadOnly ? [] : phaseCapabilityBadges(phase))
         continue
       }
 
       const stepGroups = chunkByStepName(group)
+
+      if (goalLabel) {
+        const groupReadOnly = group.every((phase) => phase.readOnly)
+        emitHeader(
+          group,
+          goalLabel,
+          "parallel",
+          stepGroups.length,
+          [],
+          { kind: "group", groupId: group[0]!.groupId! },
+          allReadOnly || !groupReadOnly ? [] : phaseCapabilityBadges(group[0]!),
+        )
+        const memberBadges = (phase: PhaseState) => (allReadOnly || groupReadOnly ? [] : phaseCapabilityBadges(phase))
+        emitStepGroups(stepGroups, memberBadges)
+        continue
+      }
+
       if (stepGroups.length === 1) {
         // A single step fanned out across models: the header names the step,
         // each member names just its model. All members share the step's
@@ -3229,27 +3280,7 @@ export class TuiProgress implements ProgressUI {
         allReadOnly || !groupReadOnly ? [] : phaseCapabilityBadges(group[0]!),
       )
       const memberBadges = (phase: PhaseState) => (allReadOnly || groupReadOnly ? [] : phaseCapabilityBadges(phase))
-      stepGroups.forEach((members, stepIndex) => {
-        const lastStep = stepIndex === stepGroups.length - 1
-        if (members.length === 1) {
-          emitRow(members[0]!, [lastStep], stepLabel(members[0]!), phaseMetaChunks(members[0]!, now), memberBadges(members[0]!))
-          return
-        }
-        emitHeader(
-          members,
-          stepLabel(members[0]!),
-          "step",
-          members.length,
-          [lastStep],
-          {
-            kind: "group",
-            groupId: members[0]!.groupId!,
-            stepName: stepLabel(members[0]!),
-          },
-          memberBadges(members[0]!),
-        )
-        members.forEach((phase, index) => emitModelRow(phase, [lastStep, index === members.length - 1]))
-      })
+      emitStepGroups(stepGroups, memberBadges)
     }
 
     // Pinned header (progress bar + spacer) over a scrolled window of the step
@@ -3276,7 +3307,7 @@ export class TuiProgress implements ProgressUI {
   private groupDetailContent(selection: GroupSelection, members: PhaseState[], now: number, width: number): StyledText[] {
     const status = groupStatus(members)
     const logicalSteps = new Set(members.map(stepLabel)).size
-    const label = selection.stepName ?? "parallel"
+    const label = selection.stepName ?? goalInvocationLabel(selection.groupId) ?? "parallel"
     const countLabel = selection.stepName
       ? `${members.length} model${members.length === 1 ? "" : "s"}`
       : `${logicalSteps} step${logicalSteps === 1 ? "" : "s"} · ${members.length} run${members.length === 1 ? "" : "s"}`
@@ -4428,6 +4459,9 @@ export function pipelineSelectionTargets(phases: readonly ProgressPhase[]): Pipe
   const targets: PipelineSelectionTarget[] = []
   for (const group of groupPhases(phases)) {
     if (group.length === 1) {
+      // A one-step goal invocation still renders its iteration header, so the
+      // header is a real target ahead of its single child row.
+      if (goalInvocationLabel(group[0]!.groupId)) targets.push({ kind: "group", groupId: group[0]!.groupId! })
       targets.push({ kind: "phase", name: group[0]!.name })
       continue
     }
@@ -4605,6 +4639,24 @@ function stepLabel(phase: Pick<ProgressPhase, "name" | "stepName">): string {
   return phase.stepName ?? phase.name
 }
 
+// A goal invocation's display group id (`goal-measure-0`, the shared
+// `goal-<stage>-<n>` qualification prefix) renders as an iteration label
+// instead of the literal `parallel`; undefined for every prefix group. Built on
+// the shared parser so the label can never drift from the qualification rule.
+function goalInvocationLabel(groupId: string | undefined): string | undefined {
+  const parsed = groupId ? parseGoalInvocationId(groupId) : undefined
+  return parsed ? `${parsed.stage} #${parsed.iteration}` : undefined
+}
+
+// Border title for a selected tree group. Goal invocations reuse the launcher's
+// fragment word (`measure` / `improve`) instead of the leftover "parallel group"
+// chrome; numbered instance stays in the panel body (`measure #0`).
+function groupPanelTitle(selection: GroupSelection): string {
+  if (selection.stepName !== undefined) return " step group "
+  const goal = parseGoalInvocationId(selection.groupId)
+  return goal ? ` ${goal.stage} ` : " parallel group "
+}
+
 // A compact model label for a fanned-out member: provider prefix dropped, and
 // the redundant `claude-` vendor token trimmed, so `security__…opus-4-7`
 // reads as just `opus-4-7`. Falls back to the live/planned model once known.
@@ -4617,9 +4669,11 @@ function modelLabel(phase: PhaseState): string {
 
 // A phase's name for use outside the pipeline tree (pane titles, the feed):
 // a fanned-out member reads as `step · model` instead of its `step__slug` id.
+// Goal reconstruction qualifies every physical name (`goal-measure-0-fix`), so
+// `stepName !== name` is no longer a fan-out signal — only the `__` slug is.
 function phaseDisplayName(phase: PhaseState): string {
-  if (phase.stepName && phase.stepName !== phase.name) return `${phase.stepName} · ${modelLabel(phase)}`
-  return phase.name
+  if (phase.stepName && phase.name.includes(`${phase.stepName}__`)) return `${phase.stepName} · ${modelLabel(phase)}`
+  return phase.stepName ?? phase.name
 }
 
 // One row per todo, windowed around the first unfinished item when the list

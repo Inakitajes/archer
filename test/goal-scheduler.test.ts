@@ -4,9 +4,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 
-import { promoteScoreReport, runGoalCycle, qualifyInvocation, type GoalCycleDeps, type GoalInvocation } from "../src/goal-scheduler"
+import { goalInvocationId, parseGoalInvocationId, parseGoalPhaseName, promoteScoreReport, runGoalCycle, qualifyInvocation, type GoalCycleDeps, type GoalInvocation } from "../src/goal-scheduler"
 import { emitSummaryLogs, flushDeferredLogs, goalBriefFor, sanitizeFinding, type DeferredLog } from "../src/goal-policy"
 import { UserAbortError } from "../src/runner"
+import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 import type { RepoSnapshot } from "../src/git"
 import type { GoalRunState } from "../src/metadata"
 import type { QualityScore } from "../src/quality-score"
@@ -523,5 +524,34 @@ describe("summary logs", () => {
     emitSummaryLogs({ scores: [71, 84], reached: false, reason: "plateau", bestScore: 84, restored: false }, logs)
     const text = logs.map((entry) => entry.message).join("\n")
     expect(text).toContain("The branch was NOT restored")
+  })
+})
+
+describe("qualification round-trip", () => {
+  test("parseGoalPhaseName inverts qualifyInvocation for the built-in ship fragments", () => {
+    const plan = resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents }).goalPlan!
+    for (const stage of ["improve", "measure"] as const) {
+      for (const iteration of [0, 1, 4]) {
+        for (const step of plan[stage].steps) {
+          // Fan-out members qualify their physical name (`score__<slug>`), so
+          // the parse recovers the pre-qualification name, from which the
+          // fragment's logical stepName is a plain suffix lookup.
+          const qualified = qualifyInvocation(stage, iteration, [step])[0]!
+          expect(parseGoalPhaseName(qualified.name)).toEqual({ stage, iteration, stepName: step.name })
+        }
+      }
+    }
+  })
+
+  test("goalInvocationId and parseGoalInvocationId round-trip; non-goal names do not parse", () => {
+    for (const id of ["goal-measure-0", "goal-improve-12"]) {
+      const parsed = parseGoalInvocationId(id)!
+      expect(goalInvocationId(parsed.stage, parsed.iteration)).toBe(id)
+    }
+    expect(parseGoalInvocationId("goal-measure-0-score")).toBeUndefined()
+    expect(parseGoalInvocationId("measure-g1")).toBeUndefined()
+    expect(parseGoalPhaseName("sync")).toBeUndefined()
+    expect(parseGoalPhaseName("pre-hook-1")).toBeUndefined()
+    expect(parseGoalPhaseName("goal-measure-x-score")).toBeUndefined()
   })
 })
