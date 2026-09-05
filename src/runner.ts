@@ -3075,7 +3075,7 @@ function rawString(value: unknown): string {
 // neither duplicated nor truncated. The TUI's transcript cap bounds memory.
 // ---------------------------------------------------------------------------
 
-type SessionHistoryMessage = { info: { id: string; role: string; time?: { completed?: number } | null }; parts: Part[] }
+type SessionHistoryMessage = { info: AssistantMessage; parts: Part[] }
 
 type SessionHistory = {
   /** History as transcript blocks, in message/part order. */
@@ -3153,6 +3153,23 @@ function overlapLength(buffered: string, historyText: string): number {
     if (buffered.startsWith(historyText.slice(historyText.length - k))) return k
   }
   return 0
+}
+
+/**
+ * Fetches a session's transcript from the live server and maps it onto the
+ * transcript channels. A server that cannot answer (gone, or the request
+ * failed) yields `undefined`, so every caller keeps its honest placeholder —
+ * `createBackfillTranscript` then merges only the live buffer, and the lazy
+ * backfill emits nothing.
+ */
+async function readSessionHistory(client: OpencodeClient, sessionID: string, directory: string): Promise<SessionHistory | undefined> {
+  try {
+    const response = await client.session.messages({ sessionID, directory })
+    if (response.error || !response.data) return undefined
+    return historyTranscript(response.data)
+  } catch {
+    return undefined
+  }
 }
 
 type BackfillTranscript = {
@@ -3234,18 +3251,9 @@ function createBackfillTranscript(
   }
 
   void (async () => {
-    try {
-      const response = await client.session.messages({ sessionID: input.sessionID, directory: input.directory })
-      if (!response.error && response.data) {
-        history = historyTranscript(response.data)
-        for (const chunk of history.chunks) emit(chunk)
-      }
-    } catch {
-      // Server unreachable or the request failed: no history to merge, and the
-      // live stream (if any) flows on untouched.
-    } finally {
-      release()
-    }
+    history = await readSessionHistory(client, input.sessionID, input.directory)
+    if (history) for (const chunk of history.chunks) emit(chunk)
+    release()
   })()
 
   return {
@@ -3278,14 +3286,11 @@ export async function backfillSessionTranscript(
   client: OpencodeClient,
   input: { directory: string; phaseName: string; sessionID: string; progress: ProgressUI },
 ): Promise<void> {
-  try {
-    const response = await client.session.messages({ sessionID: input.sessionID, directory: input.directory })
-    if (response.error || !response.data) return
-    const { chunks } = historyTranscript(response.data)
-    for (const chunk of chunks) input.progress.phaseMessage(input.phaseName, chunk)
-  } catch {
-    // Honest placeholder stays; nothing is fabricated for an unreachable server.
-  }
+  // A server that cannot answer leaves the caller's placeholder untouched;
+  // nothing is fabricated for an unreachable server.
+  const history = await readSessionHistory(client, input.sessionID, input.directory)
+  if (!history) return
+  for (const chunk of history.chunks) input.progress.phaseMessage(input.phaseName, chunk)
 }
 
 function describeSessionStatus(value: unknown): SessionSignal | undefined {
