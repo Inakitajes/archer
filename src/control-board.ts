@@ -12,6 +12,7 @@ import {
   titleFromProposal,
 } from "./openspec"
 import { listRuns } from "./runs"
+import { verifiedCloseReceipt } from "./feature-close"
 
 /**
  * The control board's data layer: a live join over git, OpenSpec state, and
@@ -68,6 +69,8 @@ export type FeatureRow = {
   synced?: boolean
   /** Patch-equivalent with the base (`git cherry`): reported as probability, never certainty (design D6). */
   probablyMerged: boolean
+  /** Set only when a verified close receipt exists — definite local close state (design D7). */
+  landing?: { sha: string }
   stage: FeatureStage
 }
 
@@ -235,8 +238,15 @@ async function buildRow(
     : runs.filter((run) => run.branch && branchIdFromBranch(run.branch) === id)
 
   const synced = branch && baseBranch ? await reads.contains(branch, baseBranch) : undefined
-  const probablyMerged =
+  // Landing receipts are definite local close state (design D7, task 6.2): a
+  // verified receipt (landing still reachable from the base) settles a close
+  // even though a squash landing left no merge ancestry for `git cherry` to
+  // find. Probable patch-equivalence without a receipt stays probabilistic —
+  // never upgraded to certainty, and never claimed as a hosted PR state.
+  const receipt = branch ? await verifiedCloseReceipt(dir, branch, id).catch(() => undefined) : undefined
+  const patchEquivalent =
     branch && baseBranch && synced === false ? await reads.patchEquivalent(baseBranch, branch) : false
+  const probablyMerged = patchEquivalent || receipt !== undefined
 
   const stage = deriveStage({ id, worktree: worktree !== undefined, runs: linkedRuns, tasks: taskMap.get(id), probablyMerged })
 
@@ -252,6 +262,9 @@ async function buildRow(
     uncommittedProposal,
     ...(synced === undefined ? {} : { synced }),
     probablyMerged,
+    // A verified receipt is definite local close state; patch equivalence is
+    // never upgraded to certainty, and neither claims a hosted PR merged.
+    ...(receipt ? { landing: { sha: receipt.landingSha } } : {}),
     stage,
   }
 }

@@ -626,7 +626,9 @@ describe("openRunMetadata", () => {
     })
     try {
       const raw = await readRunMetadata(`${dir}/metadata.json`)
-      expect(raw!.schemaVersion).toBe(4)
+      // New runs persist schema v5 (boundary/ledger/finalization era) while
+      // goal records from the v4 era remain readable unchanged.
+      expect(raw!.schemaVersion).toBe(5)
       expect(raw!.goal).toBeDefined()
       expect(raw!.goal!.stage).toBe("measure")
       expect(raw!.goal!.iteration).toBe(1)
@@ -792,6 +794,12 @@ describe("recordProgress", () => {
       phaseStatus: () => undefined,
       goalState: () => undefined,
       checkpointGoal: () => Promise.resolve(),
+      boundary: () => undefined,
+      recordBoundary: () => Promise.resolve(),
+      ledger: () => [],
+      appendLedgerEntry: () => Promise.resolve(),
+      finalization: () => undefined,
+      setFinalization: () => Promise.resolve(),
       serverStarted: (url: string) => { storeCalls.push(`serverStarted(${url})`) },
       serverStopped: () => Promise.resolve(),
       phaseStarted: (name: string) => { storeCalls.push(`phaseStarted(${name})`); return Promise.resolve() },

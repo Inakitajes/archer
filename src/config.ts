@@ -70,7 +70,7 @@ export type ConvoyDefaults = {
   autoAcceptJudgeModel?: string
   /** Model that names worktree branches; falls back to the built-in cheap default when unset. */
   branchNameModel?: string
-  /** Model that writes the squashed commit message for `convoy finish`; falls back to the built-in cheap default. */
+  /** Model that writes the conventional commit message for automatic run compaction and close's squash-merge; falls back to the built-in cheap default. */
   commitMessageModel?: string
   /**
    * Force worktree isolation on (true) or off (false) for every run. Unset is
@@ -275,7 +275,7 @@ defaults:
   # baseRef: main # optional: when unset, convoy auto-detects (origin default branch, else main/master/develop/trunk, else current branch)
   # pipeline: implement
   # branchNameModel: openrouter/deepseek/deepseek-v4-flash-0731 # optional: model that names worktree branches
-  # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the squashed commit message for "convoy finish"
+  # commitMessageModel: anthropic/claude-haiku-4-5 # optional: model that writes the conventional commit message for automatic run compaction and close's squash-merge commit
   # worktree: true # optional: force a fresh branch + worktree for every run; false always runs in the current tree. Unset decides per branch: isolate on a trunk (main/master/develop/trunk or the detected base), run in place on any other branch
   # worktreeLocation: ~/dev/worktrees/{repo}/{branch} # optional: where isolated worktrees are created ({repo}/{branch} placeholders, ~ = home; the branch slug is appended when {branch} is missing). A marker in the repo's AGENTS.md/README.md outranks this; unusable locations fall back to ~/.convoy/worktrees
   # prdHistory: true # optional: store a git-ignored copy of each run's prompt in .convoy/prd-history; false disables history writes and scope attachments

@@ -165,6 +165,19 @@ export type HumanReviewPromptInfo = {
   canRetry?: boolean
 }
 
+/**
+ * The automatic run-compaction outcome as the finish surfaces show it
+ * (capability run-finalization, design D8): deliberately separate from the
+ * pipeline status, so a blocked or failed compaction never reads as an
+ * unqualified clean finish. Serialized over the control channel, too.
+ */
+export type RunFinalizationView = {
+  state: "pending" | "running" | "completed" | "skipped" | "blocked" | "failed"
+  reason?: string
+  /** The single operator-authored commit compaction produced, when any. */
+  producedSha?: string
+}
+
 export type RunOutcome = {
   status: "completed" | "failed"
   error?: string
@@ -179,47 +192,40 @@ export type RunOutcome = {
    * the verdict and trajectory the header painted. Absent outside goal mode.
    */
   goalLoop?: GoalLoopView
+  /** The run-finalization outcome, when finalization has reported one. */
+  finalization?: RunFinalizationView
 }
 
 export type RunControlState = "running" | "pausing" | "paused"
 
-/** The proposed squash, as the finish screen shows it. */
-export type FinishProposal = {
-  branch: string
-  /** How many convoy commits would be replaced. */
-  commitCount: number
-  subject: string
-  body: string[]
-  /** Caveats worth showing above the editor: a user commit the walk stopped at, a fallback message. */
-  notes: string[]
-}
-
-export type FinishOutcome = {
-  sha: string
-  branch: string
-  /** Ref holding the pre-squash tip, so the user can undo. */
-  backupRef: string
-  replaced: number
-}
-
 /**
- * Lets the finish screen offer [f] without importing git or opencode: the host
- * (runner.ts for a live run, attach.ts for a reopened one) supplies both halves,
- * exactly as the launcher receives its branch-naming callbacks.
+ * The deliberate publication seam behind the finish screen's `Create pull request`
+ * action (capability run-finalization, design D5): the host (runner.ts
+ * for a live run, attach.ts for a reopened one) supplies the Git + `gh` halves,
+ * exactly as the launcher receives its branch-naming callbacks. There is no
+ * manual squash anymore — automatic compaction owns the branch rewrite — so
+ * this seam only ever publishes: a normal push, then PR location/creation.
  */
-export type FinishSeam = {
-  /** Gathers the commits to replace plus a proposed message, or explains why it can't. */
-  prepare(): Promise<{ ok: true; proposal: FinishProposal } | { ok: false; message: string }>
-  /** Rewrites the branch. Called with the TUI suspended, so signing can prompt on the terminal. */
-  apply(message: { subject: string; body: string[] }): Promise<FinishOutcome>
-  /** Opens the user's editor on the full message, returning the edited text. TUI suspended. */
-  edit(message: { subject: string; body: string[] }): Promise<{ subject: string; body: string[] } | undefined>
-  /** Pushes the finished branch and sets its upstream. TUI suspended, for credential prompts. */
-  push(branch: string): Promise<void>
-  /** Whether `gh` is installed, so the finish screen only offers a PR when one can be opened. */
-  canOpenPullRequest(): boolean
-  /** Opens a pull request with the squashed message as title and body. TUI suspended. */
-  openPullRequest(message: { subject: string; body: string[] }): Promise<void>
+export type PublishPlan = {
+  branch: string
+  /** The resolved destination remote. */
+  remote: string
+  /** The PR base branch, resolved from the destination's default. */
+  base: string
+}
+
+export type PublishOutcome = {
+  /** Whether the push landed (a retry after a PR failure has nothing to re-push). */
+  pushed: boolean
+  /** The pull request URL, when one was located or created. */
+  url?: string
+}
+
+export type PublishSeam = {
+  /** Resolves and discloses the publication context, or explains why it is unavailable. */
+  prepare(): Promise<{ ok: true; plan: PublishPlan } | { ok: false; message: string }>
+  /** Normal push to the disclosed destination, then locate/create the PR. Called with the TUI suspended. */
+  apply(plan: PublishPlan): Promise<{ ok: true; outcome: PublishOutcome } | { ok: false; message: string }>
 }
 
 /** Host-local screen/idle sleep assertion, intentionally never persisted with a run. */
@@ -231,8 +237,8 @@ export type KeepAwakeState = {
 /**
  * Host callbacks a live UI can be pointed at per run. The runner refreshes them
  * on every hosted run (each iteration gets its own workspace/run-control pair),
- * so the dashboard's pause / keep-awake keys and the [f] finish seam always act
- * on the run currently on screen.
+ * so the dashboard's pause / keep-awake keys and the Create pull request action
+ * always act on the run currently on screen.
  */
 export type ProgressHostControls = {
   onPauseToggle?: () => void
@@ -252,7 +258,7 @@ export type ProgressHostControls = {
    * that session after the finish hold.
    */
   onKeepRunDirRequested?: () => void
-  finish?: FinishSeam
+  publish?: PublishSeam
 }
 
 /**

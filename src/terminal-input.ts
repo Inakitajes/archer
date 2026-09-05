@@ -5,7 +5,7 @@ import { log } from "./log"
 
 /** The injectable terminal I/O a single-key confirmation can target, kept
  * structurally compatible with the process streams so key-driver tests can
- * feed answers and capture prompts (shared by `convoy finish` and `close`). */
+ * feed answers and capture prompts (shared by automatic compaction and `close`). */
 export type AskIo = {
   input?: NodeJS.ReadableStream
   output?: {

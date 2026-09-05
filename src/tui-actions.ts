@@ -51,7 +51,7 @@ export type ActionID =
   | "abort"
   | "iterate"
   | "lazygit"
-  | "finish"
+  | "create-pr"
   | "close"
   | "permission-choose"
   | "permission-confirm"
@@ -111,7 +111,8 @@ export type DashboardActionState = {
   canKeepAwake: boolean
   /** Whether the host wired a background handler (a controller attach has one; a bare in-process dashboard does not). */
   canBackground: boolean
-  finishSeam: boolean
+  /** Whether the host wired the publication seam (a deliberate Create pull request action). */
+  canPublish: boolean
   interactiveArmed: boolean
   reportCopyable: boolean
   /** Rendered by the caller, which owns the auto-accept colors. */
@@ -376,14 +377,16 @@ export function dashboardActions(state: DashboardActionState): Action[] {
       priority: 6,
     },
     {
-      id: "finish",
+      // The sole publication action (capability run-finalization, design D5):
+      // the manual finish and its standalone push/PR follow-ups are gone.
+      id: "create-pr",
       group: "finish",
-      available: state.finished && navigable && state.finishSeam,
+      available: state.finished && navigable && state.canPublish,
       keys: "f",
-      hint: "finish",
-      label: "Squash into one commit",
-      detail: "sign it with your own git identity",
-      help: "squash the run into one signed commit",
+      hint: "pr",
+      label: "Create pull request",
+      detail: "push the branch and open a PR",
+      help: "create a pull request",
       priority: 3,
     },
     {

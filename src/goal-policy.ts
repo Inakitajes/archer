@@ -151,7 +151,7 @@ export async function restoreBestEffort(
   }
   // Guard 1 — branch advance: if the current HEAD is not the HEAD the cycle's
   // last phase left behind, commits were made on the branch outside the cycle
-  // (operator, git pull, cron, convoy finish). The restore would force-move
+  // (operator, git pull, cron, or an external tool — automatic compaction only runs inside the guarded finalization). The restore would force-move
   // the branch and discard them; refuse instead, same spirit as the dirty-tree
   // guard. Recovery is reflog-only, so warn loudly.
   if (expectedHead !== undefined) {

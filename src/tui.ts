@@ -67,9 +67,6 @@ import type {
   ActivityKind,
   AutoAccept,
   AutoAcceptMode,
-  FinishOutcome,
-  FinishProposal,
-  FinishSeam,
   GoalLoopView,
   PermissionPromptInfo,
   PermissionReply,
@@ -91,6 +88,8 @@ import type {
   RunControlState,
   RunOutcome,
   RunStatus,
+  PublishPlan,
+  PublishSeam,
 } from "./progress"
 import type { Pipeline } from "./types"
 
@@ -171,28 +170,17 @@ type CommandPalette = {
 type CommandItem = Action & { label: string }
 
 /**
- * The [f] flow on the finish screen. "working" covers both halves that take the
- * terminal away (the model writing a message, and the commit itself); while it
- * is up every key is swallowed, so a stray keystroke can't start a second
- * rewrite of the same branch.
+ * The `Create pull request` flow on the finish screen (capability
+ * run-finalization, design D5): the sole publication action, replacing the
+ * removed finish modal. "working" covers the push and the `gh` calls, which
+ * run with the terminal handed back so credential prompts can answer; while it
+ * is up every key is swallowed, so a stray keystroke can't start a second push.
  */
-type FinishModal =
+type PublishModal =
   | { kind: "working"; message: string }
   | { kind: "blocked"; message: string }
-  | { kind: "edit"; proposal: FinishProposal; subject: string; cursor: number }
-  | {
-      kind: "done"
-      outcome: FinishOutcome
-      message: { subject: string; body: string[] }
-      /**
-       * What the screen still offers. "choose" is the fork right after the
-       * commit; "retry-pr" is the push having landed with `gh` having failed;
-       * "settled" is terminal — the branch has left the machine and there is
-       * nothing left to press.
-       */
-      stage: "choose" | "retry-pr" | "settled"
-      note?: string
-    }
+  | { kind: "confirm"; plan: PublishPlan }
+  | { kind: "done"; plan: PublishPlan; outcome: { pushed: boolean; url?: string }; note?: string }
 
 function clipboardStatusLabel(status?: ClipboardResult): string {
   if (status === "copied-native" || status === "copied-osc52") return " · copied"
@@ -361,7 +349,7 @@ export async function createTuiProgress(
       options.onBackground,
       options.onCycleAutoAccept,
       options.ctrlC,
-      options.finish,
+      options.publish,
       scene,
     )
   }
@@ -391,7 +379,7 @@ export async function createTuiProgress(
     options?.onBackground,
     options?.onCycleAutoAccept,
     options?.ctrlC,
-    options?.finish,
+    options?.publish,
   )
 }
 
@@ -526,7 +514,7 @@ export class TuiProgress implements ProgressUI {
   private keepAwake?: KeepAwakeState
   private commandPalette?: CommandPalette
   private usageModal = false
-  private finishModal?: FinishModal
+  private publishModal?: PublishModal
   // The palette's "Abort the run" confirm on a menu-opened controller. Default
   // No — a stray key must never kill the coordinator.
   private abortConfirm = false
@@ -662,10 +650,10 @@ export class TuiProgress implements ProgressUI {
       }
       return
     }
-    // Above the palette: [f] is a branch rewrite, and it must not be possible to
-    // stack another modal (or a second [f]) on top of one in flight.
-    if (this.finishModal) {
-      this.handleFinishKey(key)
+    // Above the palette: publication is a deliberate act, and it must not be
+    // possible to stack another modal (or a second [f]) on top of one in flight.
+    if (this.publishModal) {
+      this.handlePublishKey(key)
       return
     }
     // Read-only info modal: anything closes it; [u] toggles, esc also exits
@@ -786,9 +774,9 @@ export class TuiProgress implements ProgressUI {
       if (key.name === "g") {
         consume()
         void this.openGitSubshell()
-      } else if (key.name === "f" && this.hostControls.finish) {
+      } else if (key.name === "f" && this.hostControls.publish) {
         consume()
-        void this.openFinishModal()
+        void this.openPublishModal()
       } else if (key.name === "q" || key.name === "escape") {
         consume()
         finished.resolve()
@@ -952,7 +940,7 @@ export class TuiProgress implements ProgressUI {
     onBackground?: () => void | Promise<void>,
     onCycleAutoAccept?: (mode: AutoAcceptMode) => void,
     private readonly ctrlC: "abort" | "detach" = "abort",
-    finishSeam?: FinishSeam,
+    publishSeam?: PublishSeam,
     private readonly scene?: TuiScene,
   ) {
     this.contentTab = initialTab
@@ -961,7 +949,7 @@ export class TuiProgress implements ProgressUI {
       onKeepAwakeToggle,
       ...(onBackground ? { onBackground } : {}),
       ...(onCycleAutoAccept ? { onCycleAutoAccept } : {}),
-      finish: finishSeam,
+      publish: publishSeam,
     }
     const mount = this.scene?.root ?? renderer.root
     this.phases = pendingPhases(phases)
@@ -1614,7 +1602,7 @@ export class TuiProgress implements ProgressUI {
     this.pipelineScroll = 0
     this.fullscreen = undefined
     this.commandPalette = undefined
-    this.finishModal = undefined
+    this.publishModal = undefined
     this.finished = undefined
     this.contentFocused = false
     this.resetContentScroll()
@@ -1921,7 +1909,7 @@ export class TuiProgress implements ProgressUI {
       canPause: this.hostControls.onPauseToggle !== undefined,
       canKeepAwake: this.hostControls.onKeepAwakeToggle !== undefined && this.keepAwake?.status !== "unavailable",
       canBackground: this.hostControls.onBackground !== undefined,
-      finishSeam: this.hostControls.finish !== undefined,
+      canPublish: this.hostControls.publish !== undefined,
       interactiveArmed: this.interactiveTakeover.has(this.focusedPhase()?.name ?? ""),
       reportCopyable: fullscreen !== undefined && Array.isArray(this.reports.get(fullscreen.phase)),
       autoAcceptChunk: this.autoAccept ? autoAcceptStatusChunk(this.autoAccept.mode) : undefined,
@@ -2092,9 +2080,9 @@ export class TuiProgress implements ProgressUI {
         close()
         void this.openGitSubshell()
         return
-      case "finish":
+      case "create-pr":
         close()
-        void this.openFinishModal()
+        void this.openPublishModal()
         return
       case "close":
         close()
@@ -2111,202 +2099,80 @@ export class TuiProgress implements ProgressUI {
   }
 
   /**
-   * [f] on the finish screen: collapse the run's convoy commits into one
-   * conventional commit made with the user's own git identity, so the branch
-   * lands signed and attributed instead of as a stack of machine commits.
+   * [f] on the finish screen: the deliberate `Create pull request` publication
+   * action (capability run-finalization, design D5). Nothing is squashed here —
+   * automatic compaction owns the branch rewrite; this only publishes.
    */
-  private async openFinishModal() {
-    const seam = this.hostControls.finish
-    if (!seam || this.finishModal) return
-    this.finishModal = { kind: "working", message: "reading the branch and writing a commit message…" }
+  private async openPublishModal() {
+    const seam = this.hostControls.publish
+    if (!seam || this.publishModal) return
+    this.publishModal = { kind: "working", message: "resolving the branch and destination…" }
     this.render()
 
     try {
       const prepared = await seam.prepare()
-      this.finishModal = prepared.ok
-        ? { kind: "edit", proposal: prepared.proposal, subject: prepared.proposal.subject, cursor: prepared.proposal.subject.length }
+      this.publishModal = prepared.ok
+        ? { kind: "confirm", plan: prepared.plan }
         : { kind: "blocked", message: prepared.message }
     } catch (error) {
-      this.finishModal = { kind: "blocked", message: error instanceof Error ? error.message : String(error) }
+      this.publishModal = { kind: "blocked", message: error instanceof Error ? error.message : String(error) }
     }
     this.render()
   }
 
-  private handleFinishKey(key: KeyEvent) {
-    const modal = this.finishModal
+  private handlePublishKey(key: KeyEvent) {
+    const modal = this.publishModal
     if (!modal) return
     key.preventDefault()
     key.stopPropagation()
-    // Both halves that take the terminal away swallow input rather than queueing
-    // it: whatever is typed here would otherwise land in the editor or the
-    // signing prompt that owns the screen.
+    // The push and the gh calls own the terminal while they run; input typed
+    // here would otherwise land in whatever credential prompt they surfaced.
     if (modal.kind === "working") return
 
-    if (modal.kind === "blocked") {
-      this.finishModal = undefined
+    if (modal.kind !== "confirm") {
+      // Blocked and done states are read-only: any key dismisses.
+      this.publishModal = undefined
       this.render()
       return
     }
-
-    if (modal.kind === "done") {
-      // The commit is already made; these only offer what comes after it, and
-      // anything else closes the modal. Once settled nothing matches, so `r`
-      // closes rather than asking gh for a pull request that already exists.
-      const canPr = this.hostControls.finish?.canOpenPullRequest() ?? false
-      if (key.name === "p" && modal.stage === "choose") void this.runFinishFollowUp(modal, "push")
-      else if (key.name === "r" && canPr && modal.stage !== "settled") void this.runFinishFollowUp(modal, "pr")
-      else this.finishModal = undefined
-      this.render()
+    // Enter is the deliberate publication act; every other key — including
+    // reflexive ones — cancels, same philosophy as the abort confirm.
+    if (key.name === "return" || key.name === "linefeed") {
+      void this.applyPublish(modal.plan)
       return
     }
+    this.publishModal = undefined
+    this.render()
+  }
 
-    switch (key.name) {
-      case "escape":
-        this.finishModal = undefined
-        break
-      case "return":
-      case "linefeed":
-        if (modal.subject.trim()) void this.applyFinish(modal.proposal, modal.subject.trim())
-        break
-      case "left":
-        modal.cursor = Math.max(0, modal.cursor - 1)
-        break
-      case "right":
-        modal.cursor = Math.min(modal.subject.length, modal.cursor + 1)
-        break
-      case "home":
-        modal.cursor = 0
-        break
-      case "end":
-        modal.cursor = modal.subject.length
-        break
-      case "backspace":
-        if (modal.cursor > 0) {
-          modal.subject = modal.subject.slice(0, modal.cursor - 1) + modal.subject.slice(modal.cursor)
-          modal.cursor--
-        }
-        break
-      case "delete":
-        modal.subject = modal.subject.slice(0, modal.cursor) + modal.subject.slice(modal.cursor + 1)
-        break
-      default: {
-        if (key.ctrl && key.name === "a") {
-          modal.cursor = 0
-          break
-        }
-        if (key.ctrl && key.name === "e") {
-          // A multi-line body can't be edited in a one-line field, so ctrl+E
-          // hands the whole message to the user's editor instead.
-          void this.editFinishMessage(modal)
-          break
-        }
-        if (key.ctrl && key.name === "u") {
-          modal.subject = modal.subject.slice(modal.cursor)
-          modal.cursor = 0
-          break
-        }
-        const char = typedCharacter(key)
-        if (char !== undefined) {
-          modal.subject = modal.subject.slice(0, modal.cursor) + char + modal.subject.slice(modal.cursor)
-          modal.cursor += char.length
-        }
+  private async applyPublish(plan: PublishPlan) {
+    const seam = this.hostControls.publish
+    if (!seam || this.inSubshell) return
+    this.publishModal = { kind: "working", message: `pushing ${plan.branch} to ${plan.remote} and opening a pull request…` }
+    this.render()
+
+    // Suspended with the terminal handed back: push and gh credential prompts
+    // write to, and may prompt on, the real terminal.
+    this.inSubshell = true
+    this.suspend()
+    try {
+      const result = await seam.apply(plan)
+      if (result.ok) {
+        const detail = result.outcome.url ? `pull request: ${result.outcome.url}` : "pull request opened"
+        this.publishModal = { kind: "done", plan, outcome: result.outcome, note: detail }
+        this.addEvent("convoy", "system", `pushed ${plan.branch} to ${plan.remote}${result.outcome.url ? ` · ${detail}` : ""}`)
+      } else {
+        this.publishModal = { kind: "blocked", message: result.message }
+        this.addEvent("convoy", "error", `publication stopped: ${result.message.split("\n")[0]}`)
       }
-    }
-    this.render()
-  }
-
-  private async editFinishMessage(modal: Extract<FinishModal, { kind: "edit" }>) {
-    const seam = this.hostControls.finish
-    if (!seam || this.inSubshell) return
-    const current = { subject: modal.subject.trim(), body: modal.proposal.body }
-    this.finishModal = { kind: "working", message: "waiting for your editor…" }
-    this.render()
-
-    this.inSubshell = true
-    this.suspend()
-    let edited: { subject: string; body: string[] } | undefined
-    try {
-      edited = await seam.edit(current)
-    } catch (error) {
-      this.addEvent("convoy", "error", `couldn't open the editor: ${error instanceof Error ? error.message : String(error)}`)
-    } finally {
-      this.inSubshell = false
-      this.resume()
-    }
-
-    const next = edited ?? current
-    const proposal = { ...modal.proposal, body: next.body }
-    this.finishModal = { kind: "edit", proposal, subject: next.subject, cursor: next.subject.length }
-    this.render()
-  }
-
-  private async applyFinish(proposal: FinishProposal, subject: string) {
-    const seam = this.hostControls.finish
-    if (!seam || this.inSubshell) return
-    this.finishModal = { kind: "working", message: "committing — your signing key may prompt…" }
-    this.render()
-
-    // Suspended with the terminal handed back: the signer (1Password/gpg-agent)
-    // and any commit hook write to, and may prompt on, the real terminal.
-    this.inSubshell = true
-    this.suspend()
-    try {
-      const message = { subject, body: proposal.body }
-      const outcome = await seam.apply(message)
-      this.finishModal = { kind: "done", outcome, message, stage: "choose" }
-      this.addEvent("convoy", "system", `finished ${outcome.branch} as ${outcome.sha.slice(0, 8)} (${outcome.replaced} commits squashed)`)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      this.finishModal = { kind: "blocked", message: `${message}\n\nthe branch was left exactly as it was.` }
-      this.addEvent("convoy", "error", `finish failed: ${message}`)
+      this.publishModal = { kind: "blocked", message: `${message}\n\nnothing was published beyond what the push itself landed.` }
+      this.addEvent("convoy", "error", `publication failed: ${message}`)
     } finally {
       this.inSubshell = false
       this.resume()
     }
-    this.render()
-  }
-
-  /**
-   * Push and pull request, chosen once after the commit exists. Neither ever
-   * runs as part of [f] itself: the squash is local and undoable, while these
-   * leave the machine. "pr" is the whole trip — the push it needs and then the
-   * pull request — so the two are one decision rather than two prompts.
-   */
-  private async runFinishFollowUp(modal: Extract<FinishModal, { kind: "done" }>, action: "push" | "pr") {
-    const seam = this.hostControls.finish
-    if (!seam || this.inSubshell) return
-    const needsPush = modal.stage === "choose"
-    const working = action === "push" ? `pushing ${modal.outcome.branch}…` : needsPush ? "pushing and opening a pull request…" : "opening a pull request…"
-    this.finishModal = { kind: "working", message: working }
-    this.render()
-
-    this.inSubshell = true
-    this.suspend()
-    const notes: string[] = []
-    // The stage reached is also what says where a throw came from, and it never
-    // advances to "settled" on failure: the action row stays up to be retried.
-    let stage = modal.stage
-    try {
-      if (needsPush) {
-        await seam.push(modal.outcome.branch)
-        notes.push(`pushed to origin/${modal.outcome.branch}`)
-        stage = action === "push" ? "settled" : "retry-pr"
-      }
-      if (action === "pr") {
-        await seam.openPullRequest(modal.message)
-        notes.push("pull request opened")
-        stage = "settled"
-      }
-    } catch (error) {
-      notes.push(`${stage === "choose" ? "push" : "gh pr create"} failed: ${error instanceof Error ? error.message : String(error)}`)
-    } finally {
-      this.inSubshell = false
-      this.resume()
-    }
-
-    for (const note of notes) this.addEvent("convoy", "system", note)
-    const note = notes.join(" · ")
-    this.finishModal = { ...modal, stage, ...(note ? { note } : {}) }
     this.render()
   }
 
@@ -2744,9 +2610,9 @@ export class TuiProgress implements ProgressUI {
   }
 
   private isAnimating() {
-    // The finish modal is the one thing on a finished run that still animates:
-    // its spinner covers the message-writing call and the signing commit.
-    if (this.finishModal?.kind === "working") return true
+    // The publish modal is the one thing on a finished run that still animates:
+    // its spinner covers the push and the gh calls.
+    if (this.publishModal?.kind === "working") return true
     if (this.finished) return false
     if (this.permissionQueue[0]?.explain?.status === "loading") return true
     return this.phases.some((phase) => phase.status === "running")
@@ -3025,6 +2891,19 @@ export class TuiProgress implements ProgressUI {
     const trajectory = finished?.goalTrajectory
     if (trajectory && trajectory.length > 1 && finished && !finished.goalLoop) {
       segments.push(trajectorySegment(trajectory))
+    }
+    // The run-finalization outcome reads next to the pipeline result, never
+    // instead of it (capability run-finalization): a blocked or failed
+    // compaction must stay visible on an execution-successful finish screen.
+    const finalization = finished?.finalization
+    if (finalization) {
+      const label =
+        finalization.state === "completed"
+          ? finalization.producedSha
+            ? `compacted into ${finalization.producedSha.slice(0, 8)}`
+            : "run compacted"
+          : `compaction ${finalization.state}${finalization.reason ? `: ${finalization.reason.slice(0, 80)}` : ""}`
+      segments.push({ priority: 4, chunks: [fg(finalization.state === "completed" ? theme.green : theme.yellow)(label)] })
     }
     return segments
   }
@@ -3900,8 +3779,8 @@ export class TuiProgress implements ProgressUI {
       this.renderPermissionModal(pending)
       return
     }
-    if (this.finishModal) {
-      this.renderFinishModal(this.finishModal)
+    if (this.publishModal) {
+      this.renderPublishModal(this.publishModal)
       return
     }
     if (this.abortConfirm) {
@@ -4003,9 +3882,9 @@ export class TuiProgress implements ProgressUI {
     this.modalText.content = joinLines(lines)
   }
 
-  private renderFinishModal(modal: FinishModal) {
+  private renderPublishModal(modal: PublishModal) {
     this.overlay.visible = true
-    this.modal.title = " ⑂ finish run "
+    this.modal.title = " ⇪ create pull request "
 
     const boxWidth = Math.max(48, Math.min(76, this.renderer.width - 8))
     const width = boxWidth - 6
@@ -4017,61 +3896,28 @@ export class TuiProgress implements ProgressUI {
       for (const line of wrapLines(modal.message.split("\n"), width)) lines.push(t`${fg(theme.yellow)(line)}`)
       lines.push(plain(""))
       lines.push(t`${fg(theme.faint)("press any key to dismiss")}`)
-    } else if (modal.kind === "done") {
-      const { outcome } = modal
-      lines.push(new StyledText([fg(theme.green)("✓ "), fg(theme.text)(`${outcome.sha.slice(0, 8)} on ${truncate(outcome.branch, width - 14)}`)]))
-      lines.push(t`${fg(theme.dim)(`${outcome.replaced} convoy commit${outcome.replaced === 1 ? "" : "s"} replaced by one commit of your own`)}`)
-      if (modal.note) {
-        for (const line of wrapLines([modal.note], width)) lines.push(t`${fg(theme.dim)(line)}`)
-      }
-      lines.push(plain(""))
-      lines.push(t`${fg(theme.faint)("undo  ")}${fg(theme.dim)(truncate(`git reset --hard ${outcome.backupRef}`, width - 6))}`)
-      lines.push(plain(""))
-
-      const actions: TextChunk[] = []
-      const canPr = this.hostControls.finish?.canOpenPullRequest() ?? false
-      if (modal.stage === "choose") {
-        actions.push(fg(theme.accent)("p"), fg(theme.dim)(" push"))
-        if (canPr) actions.push(fg(theme.dim)(" · "), fg(theme.accent)("r"), fg(theme.dim)(" push and PR"))
-      } else if (modal.stage === "retry-pr" && canPr) {
-        actions.push(fg(theme.accent)("r"), fg(theme.dim)(" retry pull request"))
-      } else {
-        // Settled: the branch is where the user asked for it, so the only thing
-        // left is dismissing the modal.
-        actions.push(fg(theme.faint)("press any key to close"))
-      }
-      // The row is one unwrapped line, so the hint — not an action — is what
-      // gives way when the terminal is too narrow to hold both.
-      const keysWidth = actions.reduce((total, chunk) => total + chunk.text.length, 0)
-      if (modal.stage !== "settled" && keysWidth + 23 <= width) actions.push(fg(theme.dim)(" · "), fg(theme.faint)("any other key closes"))
-      lines.push(new StyledText(actions))
-    } else {
-      const { proposal } = modal
-      lines.push(t`${fg(theme.dim)(`${proposal.commitCount} convoy commit${proposal.commitCount === 1 ? "" : "s"} on `)}${fg(theme.text)(truncate(proposal.branch, Math.max(8, width - 28)))}${fg(theme.dim)(" → 1")}`)
-      for (const note of proposal.notes) {
-        for (const line of wrapLines([note], width - 2)) lines.push(new StyledText([fg(theme.yellow)("⚠ "), fg(theme.yellow)(line)]))
-      }
-      lines.push(plain(""))
-      lines.push(t`${fg(theme.faint)("subject")}`)
-      lines.push(...textInput(modal.subject, modal.cursor, width))
-      if (proposal.body.length > 0) {
-        lines.push(plain(""))
-        lines.push(t`${fg(theme.faint)("body")}`)
-        for (const entry of proposal.body) {
-          for (const line of wrapLines([`- ${entry}`], width)) lines.push(t`${fg(theme.dim)(line)}`)
-        }
-      }
+    } else if (modal.kind === "confirm") {
+      lines.push(new StyledText([fg(theme.text)(`push ${modal.plan.branch} to ${modal.plan.remote}/${modal.plan.branch}`)]))
+      lines.push(t`${fg(theme.dim)(`normal push (never forced), then locate or create a pull request onto ${modal.plan.base}`)}`)
       lines.push(plain(""))
       lines.push(
         new StyledText([
           fg(theme.accent)("enter"),
-          fg(theme.dim)(" commit · "),
-          fg(theme.accent)("ctrl+e"),
-          fg(theme.dim)(" editor · "),
+          fg(theme.dim)(" publish · "),
           fg(theme.accent)("esc"),
           fg(theme.dim)(" cancel"),
         ]),
       )
+    } else {
+      const { outcome } = modal
+      lines.push(new StyledText([fg(theme.green)("✓ "), fg(theme.text)(`${modal.plan.branch} pushed to ${modal.plan.remote}`)]))
+      if (outcome.url) {
+        for (const line of wrapLines([outcome.url], width)) lines.push(t`${fg(theme.dim)(line)}`)
+      } else if (modal.note) {
+        for (const line of wrapLines([modal.note], width)) lines.push(t`${fg(theme.dim)(line)}`)
+      }
+      lines.push(plain(""))
+      lines.push(t`${fg(theme.faint)("press any key to close")}`)
     }
 
     this.modal.width = boxWidth

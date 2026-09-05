@@ -22,7 +22,6 @@ import { isValidRunID, resumeWorkspace } from "./workspace"
 import { readRunMetadata, type RunMetadata } from "./metadata"
 import { preflightRunPlan } from "./preflight"
 import type { LaunchBranchCheck, LaunchBranchProposal, LaunchRunPreparation, LaunchRunSelection } from "./launch-tui"
-import type { FinishOptions } from "./finish-command"
 import type { SpinOptions } from "./spin"
 import type { CloseOptions } from "./feature-close-command"
 import { formatVersion } from "./version"
@@ -96,7 +95,7 @@ export type CliCommand =
   | { type: "config"; targetDir: string }
   | { type: "init"; options: InitOptions }
   | { type: "agents"; action: "eject"; agentName: string; options: InitOptions }
-  | { type: "finish"; options: FinishOptions }
+  | { type: "retired-finish" }
   | { type: "auth"; provider: "openrouter"; action: "set" | "remove" | "status" }
   | { type: "version" }
   | { type: "update"; checkOnly: boolean }
@@ -163,9 +162,9 @@ export async function parseAndRun(argv: string[]) {
     await runAuthCommand(command.action)
     return
   }
-  if (command.type === "finish") {
-    const { runFinishCommand } = await import("./finish-command")
-    await runFinishCommand(command.options)
+  if (command.type === "retired-finish") {
+    process.stderr.write(`${retiredFinishDiagnostic()}\n`)
+    process.exitCode = 1
     return
   }
   if (command.type === "init") {
@@ -886,10 +885,11 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     return { type: "agents", action: "eject", agentName: name, options: parsed }
   }
   if (argv[0] === "finish") {
-    const { finishHelp, parseFinishArgs } = await import("./finish-command")
-    const parsed = parseFinishArgs(argv.slice(1))
-    if (parsed.help) return { type: "help", text: finishHelp() }
-    return { type: "finish", options: parsed }
+    // The retired command is recognized by spelling alone — before any option
+    // parsing that could mistake it for a new prompt — and fails non-zero with
+    // no repository or run side effects. It is not a compatibility command
+    // (capability run-finalization: manual finish was removed).
+    return { type: "retired-finish" }
   }
   if (argv[0] === "opencode") {
     const rest = argv.slice(1)
@@ -1367,6 +1367,24 @@ function listValue(value: string) {
     .filter(Boolean)
 }
 
+/**
+ * The retired-command diagnostic (capability run-finalization): `convoy finish`
+ * fails non-zero before any prompt, repository, or run side effect, and points
+ * at the replacements — automatic run compaction and close's squash landing.
+ */
+function retiredFinishDiagnostic(): string {
+  return [
+    "convoy finish was removed.",
+    "",
+    "Successful runs now compact their commits automatically: the run's work",
+    "becomes one conventional operator-authored commit as part of completion,",
+    "with no manual step and nothing to confirm.",
+    "",
+    "To land a whole feature's content as one commit on the base branch, run",
+    "`convoy close`. To publish, use Create pull request on the run dashboard.",
+  ].join("\n")
+}
+
 function help() {
   return `convoy [prompt]
 
@@ -1379,7 +1397,6 @@ Usage:
   convoy --pipeline bug-fix --prompt-file bug.md
   convoy init
   convoy agents eject <agent>
-  convoy finish
   convoy update [--check]
   convoy runs [run-id]
   convoy specs
@@ -1396,9 +1413,6 @@ Commands:
   init --global            Create ~/.convoy/config.yaml
   agents eject <agent>     Copy one built-in agent prompt to agents/<agent>.md to
                            override it ("convoy agents" lists the available ones)
-  finish                   Squash this branch's convoy commits into one conventional commit
-                           created with your own git identity, so it lands signed and attributed
-                           ("convoy finish --help" for options; [f] on the run dashboard does the same)
   update [--check]         Check GitHub Releases for a newer official binary, or install it
                            (source checkouts are never modified)
   runs [run-id]            Browse run history: resume a run, read its summary/reports,

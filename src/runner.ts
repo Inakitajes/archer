@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs"
-import { link, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises"
+import { appendFile, link, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
 import { stdin, stdout } from "node:process"
@@ -17,6 +17,9 @@ import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
 import { ensureClaudeAvailable, openClaudeSessionWindow, promptClaudePhase } from "./claude-code"
 import { addAllAndCommit, createCleanRepoSnapshot, currentBranch, currentHead, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
+import { gitCommonDir, protectAttemptTip, runRefPrefix } from "./finalization/refs"
+import { recordLedgeredCommit } from "./finalization/ledger"
+import type { RunBoundary } from "./finalization/types"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
 import { getSessionEventHub, payloadProperties } from "./event-hub"
 import { askHumanAction, phaseGatePrompt, runHumanReviewGate } from "./human"
@@ -526,6 +529,12 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     pipelineNameForHooks = pipeline.name
     hookSet = options.plan?.hooks ?? hooksForPipeline(options.hooks, pipeline.name)
     validateStepFilters(pipeline, options)
+    // The run boundary (capability run-finalization, design D2) is persisted
+    // before pre-hooks or any writable execution, so automatic compaction has
+    // a durable run-start HEAD and branch identity to verify against. A
+    // boundary that cannot be persisted refuses to start writable execution;
+    // a pipeline with only read-only steps never rewrites history and may run.
+    await persistRunBoundary(metadata, options, pipeline)
     // Parallel/multi-model steps are forced read-only and point at a synthesized
     // "<agent>__ro" variant when their base agent isn't already read-only;
     // verifying steps that share an agent with a non-verifying use get
@@ -582,9 +591,9 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     // tab back to whatever owned it, rather than leaving Convoy's last title up.
     if (notificationSettings.terminalTitle) titleSaved = pushTerminalTitle()
 
-    // Imported lazily: finish pulls in the commit-message writer (and through it
-    // opencode), which a run that never reaches its finish screen shouldn't pay for.
-    const { createFinishSeam } = await import("./finish")
+    // Imported lazily: publish pulls in the summary readers, which a run that
+    // never reaches its finish screen shouldn't pay for.
+    const { createPublishSeam } = await import("./publish")
     const hostControls: ProgressHostControls = {
       onPauseToggle: () => {
         void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
@@ -592,7 +601,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       onKeepAwakeToggle: () => {
         void caffeinate?.toggle().catch((error) => log.warn(`couldn't toggle Caffeinate: ${formatSdkError(error)}`))
       },
-      finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: workspace.dir }),
+      publish: createPublishSeam({ cwd: options.targetDir, runDir: workspace.dir }),
     }
     if (options.progress) {
       // Hosted by the coordinator (or the goal loop): reuse its dashboard or
@@ -793,7 +802,25 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
         parseScore: async (invocation) => (await readRunQualityScore({ name: pipeline.name, steps: invocation.steps }, workspace.dir, rubricWeights))?.score,
         promoteScore: (invocation) => promoteScoreReport(workspace.dir, invocation),
         captureSnapshot: createCleanRepoSnapshot,
-        restoreSnapshot: restoreRepoSnapshot,
+        // A goal-discarded attempt tip is protected with a create-only ref
+        // before the best measured state is restored (capability
+        // run-finalization, task 1.4), so the discarded work stays inspectable
+        // even after the restore and ordinary garbage collection. A protection
+        // failure refuses the restoration (design D3): restoreBestEffort
+        // discloses the refusal and the branch stays where the last iteration
+        // left it, instead of the tip being reset away unprotected.
+        restoreSnapshot: async (snapshot, cwd) => {
+          const head = await currentHead(cwd)
+          if (head) {
+            const protectedTip = await protectAttemptTip(`${runRefPrefix(workspace.runID)}/goal-attempts/${head.slice(0, 12)}`, head, cwd)
+            if (!protectedTip) {
+              throw new Error(
+                `couldn't protect the goal attempt tip ${head.slice(0, 12)} behind its evidence ref; refusing to restore the best measured state`,
+              )
+            }
+          }
+          await restoreRepoSnapshot(snapshot, cwd)
+        },
         isCleanRepo: async (cwd) => (await statusPorcelain(cwd)).trim() === "",
         currentHead,
         checkpoint: (state) => runMetadata.checkpointGoal(state),
@@ -855,6 +882,54 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
           }
         : {}),
     })
+
+    // Automatic run finalization (capability run-finalization): the terminal
+    // `Compact run` lifecycle row. It runs once, after phases, goal settlement,
+    // and successful post-hooks, before completion is announced. It is not a
+    // configurable step, cannot be filtered, and its outcome is persisted
+    // independently of the pipeline result — a safely blocked or failed
+    // compaction leaves this execution successful.
+    const { runFinalization } = await import("./finalization/compact")
+    progress.phaseStarted(compactRunRowName, "compacting this run's commits")
+    const finalizationRecord = await (async () => {
+      try {
+        return await runFinalization({
+          runID: workspace.runID,
+          targetDir: options.targetDir,
+          runDir: workspace.dir,
+          boundary: metadata.boundary(),
+          ledger: metadata.ledger(),
+          ...(identity.branch ? { branch: identity.branch } : {}),
+          signal: shutdown.signal,
+          progress: {
+            activity: (detail, kind) => progress.phaseActivity(compactRunRowName, detail, kind),
+          },
+        })
+      } catch (error) {
+        // A crash inside finalization is itself a failed attempt, not a
+        // pipeline failure: record it and keep the run's success intact.
+        return {
+          schemaVersion: 1 as const,
+          state: "failed" as const,
+          reason: `finalization crashed: ${error instanceof Error ? error.message : String(error)}`,
+          updatedAt: Date.now(),
+        }
+      }
+    })()
+    await metadata.setFinalization(finalizationRecord).catch((error) => log.warn(`couldn't persist finalization outcome: ${String(error)}`))
+    if (finalizationRecord.state === "completed") {
+      progress.phaseCompleted(compactRunRowName, finalizationRecord.producedSha ? `compacted into ${finalizationRecord.producedSha.slice(0, 8)}` : finalizationRecord.reason)
+    } else {
+      const detail = [finalizationRecord.reason, finalizationRecord.state].filter(Boolean).join(" — ")
+      if (finalizationRecord.state === "failed") progress.phaseFailed(compactRunRowName, detail)
+      else progress.phaseSkipped(compactRunRowName)
+      const line = `run compaction ${finalizationRecord.state}${finalizationRecord.reason ? `: ${finalizationRecord.reason}` : ""}`
+      progress.message(line)
+      log.warn(line)
+    }
+    const finalizationSection = renderFinalizationSummarySection(finalizationRecord)
+    await appendSummarySection(workspace, finalizationSection).catch((error) => log.warn(`couldn't append finalization summary: ${String(error)}`))
+
     await caffeinate.stop()
     await holdFinishScreen(progress, shutdown, {
       status: "completed",
@@ -862,6 +937,18 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       ...(runScoreResult ? { qualityScore: runScoreResult.score.score } : {}),
       // The finish screen freezes the verdict and the full measured trajectory.
       ...(goalView ? { goalLoop: goalView } : {}),
+      // The compaction outcome rides the finish screen separately from the
+      // pipeline result (capability run-finalization, design D8): blocked or
+      // failed compaction stays visible without turning execution into failure.
+      ...(finalizationRecord
+        ? {
+            finalization: {
+              state: finalizationRecord.state,
+              ...(finalizationRecord.reason ? { reason: finalizationRecord.reason } : {}),
+              ...(finalizationRecord.producedSha ? { producedSha: finalizationRecord.producedSha } : {}),
+            },
+          }
+        : {}),
     }, Boolean(options.progress))
     // Hosted runs skip the finish hold, so the tracker's runFinished wrapper
     // never fires here. Publish the terminal snapshot now so Herdr shows
@@ -1053,7 +1140,7 @@ export async function executePhaseGroups(ctx: PhaseGroupContext, steps: readonly
         await control.checkpointAfterBatch(shutdown.signal)
         continue
       }
-      await runHumanReviewGate(workspace, options, serverUrl, progress, permissions, first.name)
+      await runHumanReviewGate(workspace, options, serverUrl, progress, permissions, first.name, undefined, metadata)
       await control.checkpointAfterBatch(shutdown.signal)
       continue
     }
@@ -1228,6 +1315,65 @@ async function confirmRecovery(phaseName: string, porcelain: string): Promise<bo
   }
 }
 
+/** The terminal lifecycle row's stable identity (capability run-finalization, design D1/D8). */
+export const compactRunRowName = "Compact run"
+
+/** Renders the finalization outcome as a summary section; always present so a blocked attempt is as durable as a success. */
+function renderFinalizationSummarySection(record: {
+  state: string
+  reason?: string
+  producedSha?: string
+  producedMessage?: string
+  recoveryRef?: string
+}): string | undefined {
+  const lines = ["## Run finalization", "", `- State: ${record.state}`]
+  if (record.producedSha) lines.push(`- Compacted into ${record.producedSha.slice(0, 8)}`)
+  if (record.recoveryRef) lines.push(`- Pre-compaction history protected at ${record.recoveryRef}`)
+  if (record.reason) lines.push(`- Reason: ${record.reason}`)
+  return `${lines.join("\n")}\n`
+}
+
+async function appendSummarySection(workspace: Workspace, section: string | undefined) {
+  if (!section) return
+  await appendFile(join(workspace.dir, "SUMMARY.md"), section)
+}
+
+/**
+ * Persists the run boundary before pre-hooks or any writable execution
+ * (capability run-finalization, task 1.2). The store ignores repeat calls, so
+ * a same-run resume keeps the original boundary. A persist failure refuses to
+ * start writable execution — without a durable boundary, automatic compaction
+ * could not verify what it owns — while a read-only-only pipeline may proceed.
+ */
+export async function persistRunBoundary(metadata: RunMetadataStore, options: RunOptions, pipeline: Pipeline): Promise<void> {
+  const head = await currentHead(options.targetDir)
+  if (!head) {
+    // A repository with no commits has no boundary to record; the first
+    // writable commit will fail long before compaction could matter.
+    log.warn("no run boundary recorded: the repository has no commits yet")
+    return
+  }
+  const boundary: RunBoundary = {
+    schemaVersion: 1,
+    worktreeDir: options.targetDir,
+    branch: await currentBranch(options.targetDir),
+    startHead: head,
+    commonDir: (await gitCommonDir(options.targetDir)) ?? "",
+    includeDirty: options.includeDirty === true,
+    recordedAt: Date.now(),
+  }
+  try {
+    await metadata.recordBoundary(boundary)
+  } catch (error) {
+    const writable = pipeline.steps.some((step) => step.type === "agent" && !step.readOnly)
+    if (!writable) {
+      log.warn(`couldn't persist the run boundary; continuing because no step is writable: ${formatSdkError(error)}`)
+      return
+    }
+    throw new Error(`couldn't persist the run boundary before execution; refusing to start writable work: ${formatSdkError(error)}`)
+  }
+}
+
 // Treats the dirty tree as the interrupted phase's output: writes a recovery
 // report if the phase never wrote one, commits everything as that phase, and
 // marks it completed so the resume loop skips it and runs the rest.
@@ -1246,9 +1392,14 @@ export async function commitRecoveredPhase(
     await writeFile(reportAbs, recoveryReport(phase.name))
   }
 
-  const committed = await addAllAndCommit(
-    stepCommitMessageFactory({ workspace, step: phase.name, mode: "recovery", phaseName: phase.agentName, reportPath: reportAbs }),
-    targetDir,
+  const committed = await recordLedgeredCommit(
+    (entry) => metadata.appendLedgerEntry(entry).catch((error) => log.warn(`couldn't persist commit ledger entry: ${String(error)}`)),
+    { mode: "recovery", step: phase.name, cwd: targetDir },
+    () =>
+      addAllAndCommit(
+        stepCommitMessageFactory({ workspace, step: phase.name, mode: "recovery", phaseName: phase.agentName, reportPath: reportAbs }),
+        targetDir,
+      ),
   )
   if (committed) log.info(`[${phase.name}] recovered uncommitted changes into a run-linked commit; continuing from the next phase`)
   else log.warn(`[${phase.name}] nothing to commit during recovery`)
@@ -1316,7 +1467,18 @@ async function runPhase(
       const candidate = await runPhaseUntilResolved(client, workspace, phase, options.targetDir, prepared, baseline, progress, shutdown, gitLock, takeover, undefined, advisors, reports, rubricWeights)
       return persistPhaseReport(workspace, phase, candidate, contract, rubricWeights)
     })
-    await gitLock(() => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline, undefined, workspace))
+    // The phase commit is ledgered (capability run-finalization): before/after
+    // endpoints land in durable metadata so compaction can verify run
+    // ownership by provenance instead of authorship. A failed ledger write
+    // leaves the commit unaccounted for, which blocks compaction — fails
+    // closed, never over-includes.
+    await gitLock(() =>
+      recordLedgeredCommit(
+        (entry) => metadata.appendLedgerEntry(entry).catch((error) => log.warn(`couldn't persist commit ledger entry: ${String(error)}`)),
+        { mode: "phase", step: phase.name, cwd: options.targetDir },
+        () => finalizePhaseRepository(phase, reportAbs, options.targetDir, baseline, undefined, workspace),
+      ),
+    )
     progress.phaseCompleted(phase.name, "report saved and commit checked")
   } catch (error) {
     progress.phaseFailed(phase.name, formatSdkError(error))
@@ -3374,12 +3536,23 @@ export function progressPhases(pipeline: Pipeline, hooks?: HookSet): ProgressPha
         }
       : { name: step.name, description: step.description },
   )
-  if (!hooks) return steps
+  // The terminal `Compact run` lifecycle row (capability run-finalization,
+  // design D1/D8): it always executes as the epilogue, so it is always a
+  // dashboard row — not a configurable step and never a filter target. It
+  // must appear in every phase list handed to `resetPipeline` (live) and
+  // `reconstructedPhases` (attach/history), or dashboards silently drop the
+  // finalization row's started/completed/failed events as unknown phases.
+  const compactRow: ProgressPhase = {
+    name: compactRunRowName,
+    description: "compacts this run's commits into one operator-authored conventional commit",
+  }
+  if (!hooks) return [...steps, compactRow]
   // Hooks are dashboard rows too, so their execution is watchable like any
-  // step: pre-hooks ahead of the pipeline, post-hooks after it.
+  // step: pre-hooks ahead of the pipeline, post-hooks after it, and the
+  // lifecycle row last — it runs after the final post-hook.
   const hookPhase = (stage: HookStage, specs: readonly HookSpec[]) =>
     hookPhaseNames(stage, specs).map((name, index) => ({ name, description: specs[index]!.command }))
-  return [...hookPhase("pre", hooks.pre), ...steps, ...hookPhase("post", hooks.post)]
+  return [...hookPhase("pre", hooks.pre), ...steps, ...hookPhase("post", hooks.post), compactRow]
 }
 
 /** The goal-cycle section embedded in SUMMARY.md: policy, trajectory, verdict, and restore status. */

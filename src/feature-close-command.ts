@@ -3,7 +3,7 @@ import { stat } from "node:fs/promises"
 import { resolve } from "node:path"
 import type { Readable } from "node:stream"
 
-import { archiveChangeOnMain, runClose, type CloseEvent, type CloseInput, type CloseMessageProposal, type CloseResult, type CloseStep } from "./feature-close"
+import { archiveChangeOnMain, runClose, verifiedCloseReceipt, type CloseEvent, type CloseInput, type CloseMessageProposal, type CloseResult, type CloseStep } from "./feature-close"
 import { stripControlBytes } from "./commit-text"
 import {
   applyCloseEvent,
@@ -61,7 +61,7 @@ export type CloseOptions = {
 
 export async function runCloseCommand(options: CloseOptions, route?: TuiRoute): Promise<void> {
   if (options.dryRun) {
-    stdout.write(`close would run: preflight → sync → archive → squash → merge${options.resume ? " (resuming)" : ""}\n`)
+    stdout.write(`close would run: preflight → sync → archive → squash-merge${options.resume ? " (resuming)" : ""}\n`)
     return
   }
   const input: CloseInput = {
@@ -98,11 +98,13 @@ export async function runCloseHeadless(input: CloseInput): Promise<void> {
     process.exitCode = 1
   }
   if (result) {
+    const evidence = await verifiedCloseReceipt(input.targetDir, result.branch, result.changeID)
     const followUps = await resolveCloseFollowUps({
       targetDir: input.targetDir,
       baseRef: result.baseRef,
       branch: result.branch,
       worktreeDir: result.worktreeDir,
+      ...(evidence ? { evidence: { landingSha: evidence.landingSha, featureTip: evidence.postArchiveTip } } : {}),
     })
     stdout.write(formatCloseEvents(events, { followUps }))
     return
@@ -143,14 +145,12 @@ export function formatCloseEvents(events: readonly CloseEvent[], extra: { follow
         stepState.set(event.step, `${event.step}: failed — ${strip(firstLine(event.message))}`)
         break
       case "squash-phase":
-        // Intermediate squash sub-phases stay out of the stdout summary; the
-        // step's final state carries the same facts (design D1).
-        break
-      case "merge-shape":
+        // Intermediate squash-merge sub-phases stay out of the stdout summary;
+        // the step's final state carries the same facts (design D8).
         break
       case "result":
         lines.push(...stepState.values())
-        lines.push(`closed ${event.result.changeID}: ${event.result.branch} → ${event.result.baseRef}`)
+        lines.push(closeResultLine(event.result))
         if (extra.followUps) lines.push(...formatCloseFollowUps(extra.followUps))
         break
     }
@@ -170,6 +170,8 @@ export type CloseFollowUps = {
   /** The worktree-removal command, present while the worktree still exists. */
   worktreeRemoval?: string
   branchDelete?: string
+  /** Why branch deletion is unavailable; never an unguarded delete command. */
+  branchDeleteRemediation?: string
 }
 
 /**
@@ -178,11 +180,24 @@ export type CloseFollowUps = {
  * isn't the main checkout gets a removal command; branch deletion follows the
  * worktree's dependency.
  */
+/**
+ * The verified landing evidence cleanup requires (design D7, task 6.3):
+ * produced by `verifiedCloseReceipt` in feature-close — a receipt naming the
+ * exact feature tip and a landing commit still reachable from the base.
+ * A squash landing leaves no merge ancestry, so nothing else is evidence.
+ */
+export type CloseLandingEvidence = {
+  landingSha: string
+  featureTip: string
+}
+
 export async function resolveCloseFollowUps(args: {
   targetDir: string
   baseRef: string
   branch: string
   worktreeDir: string
+  /** Present only when a verified receipt authorizes branch deletion. */
+  evidence?: CloseLandingEvidence
 }): Promise<CloseFollowUps> {
   const mainDir = (await mainWorktreeDir(args.targetDir).catch(() => undefined)) ?? args.targetDir
   // Every printed command is prefixed `git -C <mainDir>` and quotes only the
@@ -209,12 +224,56 @@ export async function resolveCloseFollowUps(args: {
   )
   if (!isMainCheckout && worktreeExists) worktreeRemoval = `${gitC} worktree remove ${shq(args.worktreeDir)}`
 
+  // Branch deletion is evidence-gated (design D7, task 6.3): a locally
+  // squash-landed branch has no merge ancestry, so plain `branch -d` refuses
+  // it and force deletion is permitted ONLY behind a verified receipt naming
+  // the exact current feature tip and a landing still reachable from the
+  // base. The printed command re-checks both facts immediately before the
+  // deletion, so a branch that moved between close and cleanup refuses
+  // instead of deleting new work; shell quoting covers branch names with
+  // unusual characters. Without a receipt there is no deletion command at
+  // all — only the inspection guidance.
+  let branchDelete: string | undefined
+  let branchDeleteRemediation: string | undefined
+  if (args.evidence) {
+    const tipNow = await execFile("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${args.branch}`], {
+      cwd: mainDir,
+      allowFailure: true,
+    })
+    if (tipNow.exitCode === 0 && tipNow.stdout.trim() === args.evidence.featureTip) {
+      branchDelete =
+        `${gitC} rev-parse --verify refs/heads/${shq(args.branch)} | grep -qx ${shq(args.evidence.featureTip)} && ` +
+        `${gitC} merge-base --is-ancestor ${shq(args.evidence.landingSha)} ${shq(args.baseRef)} && ` +
+        `${gitC} branch -D ${shq(args.branch)}`
+    } else if (tipNow.exitCode === 0) {
+      branchDeleteRemediation = `${args.branch}'s tip moved past the landed state (${tipNow.stdout.trim().slice(0, 8)}) — inspect the branch before deleting anything`
+    } else {
+      branchDeleteRemediation = `${args.branch} no longer exists locally — nothing to delete`
+    }
+  } else {
+    branchDeleteRemediation =
+      "no verified landing receipt names this branch — deletion needs the receipt close recorded (landing commit reachable from the base and an unchanged feature tip)"
+  }
+
   return {
     ...(push ? { push } : {}),
     ...(pushRemediation ? { pushRemediation } : {}),
     ...(worktreeRemoval ? { worktreeRemoval } : {}),
-    branchDelete: `${gitC} branch -d ${shq(args.branch)}`,
+    ...(branchDelete ? { branchDelete } : {}),
+    ...(branchDeleteRemediation ? { branchDeleteRemediation } : {}),
   }
+}
+
+/**
+ * The one landing line (design D8): one result, named base, named commit —
+ * never a fast-forward/merge-commit shape narration, which described the old
+ * ordinary merge this landing replaced.
+ */
+export function closeResultLine(result: CloseResult): string {
+  const base = `closed ${result.changeID}: ${result.branch} → ${result.baseRef}`
+  if (result.disposition === "landed" && result.landing) return `${base} (one commit ${result.landing.sha.slice(0, 8)})`
+  if (result.disposition === "already-landed" && result.landing) return `${base} (already landed as ${result.landing.sha.slice(0, 8)})`
+  return `${base} (no content to land)`
 }
 
 /** The printed follow-up block, in the order a safe execution would run. */
@@ -224,6 +283,7 @@ export function formatCloseFollowUps(followUps: CloseFollowUps): string[] {
   else if (followUps.pushRemediation) lines.push(`  push unavailable — ${followUps.pushRemediation}`)
   if (followUps.worktreeRemoval) lines.push(`  ${followUps.worktreeRemoval}`)
   if (followUps.branchDelete) lines.push(`  ${followUps.branchDelete}`)
+  else if (followUps.branchDeleteRemediation) lines.push(`  branch deletion unavailable — ${followUps.branchDeleteRemediation}`)
   return lines
 }
 
@@ -248,11 +308,13 @@ export async function runCloseInteractive(input: CloseInput, io: CloseIO = {}, r
       // stop the sequence before the squash. No external editor participates.
       resolveMessage: (proposal) => tui.confirmMessage(proposal),
     })
+    const evidence = await verifiedCloseReceipt(input.targetDir, result.branch, result.changeID)
     const followUps = await resolveCloseFollowUps({
       targetDir: input.targetDir,
       baseRef: result.baseRef,
       branch: result.branch,
       worktreeDir: result.worktreeDir,
+      ...(evidence ? { evidence: { landingSha: evidence.landingSha, featureTip: evidence.postArchiveTip } } : {}),
     })
     await offerCloseFollowUpsTui(tui, {
       ...followUps,
@@ -305,7 +367,34 @@ export async function confirmCloseMessage(
 
 // -- follow-up offers -------------------------------------------------------------
 
-export type FollowUpOffers = CloseFollowUps & { baseRef: string; branch: string; worktreeDir: string; targetDir: string }
+export type FollowUpOffers = CloseFollowUps & {
+  baseRef: string
+  branch: string
+  worktreeDir: string
+  targetDir: string
+  /** The verified receipt the deletion offer is gated on, when present. */
+  evidence?: CloseLandingEvidence
+}
+
+/**
+ * The action-time recheck (task 6.3): the guards are re-verified immediately
+ * before a deletion runs, not just when the offer was printed — a branch that
+ * advanced (or a landing that left the base) between offer and action refuses
+ * instead of deleting new work.
+ */
+async function assertLandingEvidenceIntact(mainDir: string, followUps: FollowUpOffers): Promise<void> {
+  const evidence = followUps.evidence
+  if (!evidence) throw new Error("branch deletion needs a verified landing receipt; none exists")
+  const tip = await execFile("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${followUps.branch}`], { cwd: mainDir, allowFailure: true })
+  if (tip.exitCode !== 0) throw new Error(`${followUps.branch} no longer exists locally; nothing to delete`)
+  if (tip.stdout.trim() !== evidence.featureTip) {
+    throw new Error(`${followUps.branch}'s tip moved past the landed state — inspect the branch before deleting it`)
+  }
+  const reachable = await execFile("git", ["merge-base", "--is-ancestor", evidence.landingSha, followUps.baseRef], { cwd: mainDir, allowFailure: true })
+  if (reachable.exitCode !== 0) {
+    throw new Error(`the landing commit ${evidence.landingSha.slice(0, 8)} is no longer reachable from ${followUps.baseRef} — inspect the history before deleting anything`)
+  }
+}
 
 /** In-session outcomes of actions the TUI already ran; drives the next view. */
 export type CloseInteractiveFollowUpState = Partial<
@@ -435,8 +524,12 @@ async function offerCloseFollowUpsTui(tui: CloseTui, followUps: FollowUpOffers):
         if (!followUps.worktreeRemoval) continue
         await removeWorktree(followUps.worktreeDir, mainDir)
       } else {
-        const result = await execFile("git", ["branch", "-d", followUps.branch], { cwd: mainDir, allowFailure: true })
-        if (result.exitCode !== 0) throw new Error(result.stderr || `git branch -d ${followUps.branch} failed`)
+        // Evidence is rechecked at action time (design D7), then the
+        // evidence-gated force delete runs: the squash landing left no
+        // merge ancestry, so plain `branch -d` would refuse a landed branch.
+        await assertLandingEvidenceIntact(mainDir, followUps)
+        const result = await execFile("git", ["branch", "-D", followUps.branch], { cwd: mainDir, allowFailure: true })
+        if (result.exitCode !== 0) throw new Error(result.stderr || `git branch -D ${followUps.branch} failed`)
       }
       state[id] = { status: "completed" }
     } catch (error) {
@@ -492,22 +585,26 @@ export async function offerCloseFollowUps(followUps: FollowUpOffers, io: CloseIO
     () => true,
     () => false,
   )
+  // The deletion offer is evidence-gated at print time and rechecked at
+  // action time (design D7); without a receipt the guarded command is the
+  // only thing shown, and when no command exists the remediation is.
   if (worktreeRemoved) {
     const deleted = await offerAction(
       "branch deletion",
       `Delete the branch ${followUps.branch}? [y/N] `,
       async () => {
-        const result = await execFile("git", ["branch", "-d", followUps.branch], { cwd: mainDir, allowFailure: true })
-        if (result.exitCode !== 0) throw new Error(result.stderr || `git branch -d ${followUps.branch} failed`)
+        await assertLandingEvidenceIntact(mainDir, followUps)
+        const result = await execFile("git", ["branch", "-D", followUps.branch], { cwd: mainDir, allowFailure: true })
+        if (result.exitCode !== 0) throw new Error(result.stderr || `git branch -D ${followUps.branch} failed`)
       },
       io,
     )
     if (deleted) out.write(`branch ${followUps.branch} deleted\n`)
-    else out.write(`next: ${followUps.branchDelete}\n`)
+    else out.write(`next: ${followUps.branchDelete ?? followUps.branchDeleteRemediation}\n`)
   } else if (!worktreeStillExists && !processCwdInside(followUps.worktreeDir)) {
-    out.write(`next: ${followUps.branchDelete}\n`)
+    out.write(`next: ${followUps.branchDelete ?? followUps.branchDeleteRemediation}\n`)
   } else if (worktreeStillExists && !processCwdInside(followUps.worktreeDir)) {
-    out.write(`next (after the worktree is removed): ${followUps.branchDelete}\n`)
+    out.write(`next (after the worktree is removed): ${followUps.branchDelete ?? followUps.branchDeleteRemediation}\n`)
   }
 }
 
@@ -557,19 +654,22 @@ export function closeHelp(): string {
   return `convoy close
 
 Close a feature in one resumable sequence: preflight, sync the base branch
-into the feature branch, archive the change through the OpenSpec CLI, squash
-convoy's commits into one conventional commit (your identity, your signature),
-and merge the feature branch into the base branch from the main checkout.
+into the feature branch, archive the change through the OpenSpec CLI, then
+squash-merge the whole feature as exactly one regular conventional commit on
+the base branch (your identity, your signature). The feature branch's history
+is never rewritten — every author's work reaches the base as content of the
+one landing commit, and the landing is a guarded fast-forward-only update of
+the base ref that refuses if the base moved.
 
 In a terminal the sequence renders in a full-screen TUI — each step's
 completion, skip (with reason), or failure visible as it happens, and the
-merge's shape (fast-forward or merge commit) narrated. The squash row names
-its sub-phase as it works: composing the commit message, waiting for your
-review, creating the commit — and the running indicator keeps animating while
-the writer answers. The squashed commit's message is composed from the
-change's proposal and touched capabilities, with a deterministic fallback when
-no model answers; the scope is always the single touched capability, and the
-change id is named in the body.
+base plus landing commit named. The squash-merge row names its sub-phase as
+it works: composing the commit message, waiting for your review, creating
+the one-parent landing commit — and the running indicator keeps animating
+while the writer answers. The landing commit's message is composed from the
+change's proposal and touched capabilities, with a deterministic fallback
+when no model answers; the scope is always the single touched capability,
+and the change id is named in the body.
 
 The review screen is a vertical Accept / Edit / Cancel list: up/down (or j/k)
 moves the selection, Enter activates it, and the y/e/n shortcuts still work.
@@ -578,11 +678,14 @@ newline, Ctrl+S saves and returns to review, Esc discards the draft and keeps
 the previously reviewed message. Nothing lands until you explicitly accept,
 so saving an edit is not a confirmation.
 
-Once merged, current-session cleanup stays in that TUI as separate, deliberate
-actions — never automatic. Push names the configured remote and refspec
-explicitly, and is unavailable (with the setup step) when the base branch has
-no upstream; branch deletion is only offered after the worktree has been
-removed, because git refuses to delete a checked-out branch. When close was
+Once landed, current-session cleanup stays in that TUI as separate, deliberate
+actions — never automatic. Push is a normal push that names the configured
+remote and refspec explicitly, and is unavailable (with the setup step) when
+the base branch has no upstream; branch deletion is evidence-gated: it is
+offered only when close's verified landing receipt still names the branch's
+exact tip and a landing commit reachable from the base, the worktree has been
+removed first, and the printed command re-checks both facts immediately
+before the deletion runs. When close was
 launched from inside the feature worktree, worktree and branch cleanup are
 shown instead as deferred cleanup — the reason (a process cannot remove the
 directory its shell sits in) plus the exact git -C commands to run after
