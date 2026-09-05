@@ -18,6 +18,7 @@ import type { Pipeline } from "./types"
 import type { ModelGateway } from "./model-routing"
 import { PhaseUsage } from "./usage"
 import { aggregateAdvisorEvents, type AdvisorEvent, type AdvisorPhaseAggregate } from "./advisor-events"
+import { readCommitLedger, readFinalizationRecord, readRunBoundary, type CommitLedgerEntry, type FinalizationRecord, type RunBoundary } from "./finalization/types"
 import type { Workspace } from "./workspace"
 
 export type PhaseMetadataStatus = "pending" | "running" | "completed" | "skipped" | "failed"
@@ -74,7 +75,7 @@ export type GoalRunState = {
 }
 
 export type RunMetadata = {
-  schemaVersion: 3 | 4
+  schemaVersion: 3 | 4 | 5
   runID: string
   targetDir: string
   createdAt: number
@@ -88,6 +89,12 @@ export type RunMetadata = {
   phases: Record<string, PhaseMetadata>
   /** The durable goal-cycle record, present when the pipeline declares a terminal goal step (schema v4). */
   goal?: GoalRunState
+  /** The run boundary persisted before any run-owned mutation (schema v5; capability run-finalization). */
+  boundary?: RunBoundary
+  /** The ordered ledger of Convoy-created commits, recorded as each commit lands (schema v5). */
+  commitLedger?: CommitLedgerEntry[]
+  /** The automatic compaction outcome, independent of the pipeline result (schema v5). */
+  finalization?: FinalizationRecord
 }
 
 export type RunMetadataStore = {
@@ -99,6 +106,18 @@ export type RunMetadataStore = {
   goalState(): GoalRunState | undefined
   /** Persists a goal checkpoint after a stage boundary, score promotion, or settlement. */
   checkpointGoal(state: GoalRunState): Promise<void>
+  /** The run boundary persisted before any run-owned mutation; undefined on legacy runs. */
+  boundary(): RunBoundary | undefined
+  /** Persists the run boundary once, before pre-hooks and writable execution; a resume never replaces it. */
+  recordBoundary(boundary: RunBoundary): Promise<void>
+  /** The ordered ledger of Convoy-created commits, oldest first. */
+  ledger(): CommitLedgerEntry[]
+  /** Appends one ledgered commit endpoint to the ordered commit ledger. */
+  appendLedgerEntry(entry: CommitLedgerEntry): Promise<void>
+  /** The automatic compaction outcome, when finalization has reported one. */
+  finalization(): FinalizationRecord | undefined
+  /** Persists the finalization outcome (pending/running/completed/skipped/blocked/failed). */
+  setFinalization(record: FinalizationRecord): Promise<void>
   /** Records the run's live opencode server URL so `convoy runs` can attach; cleared by serverStopped. */
   serverStarted(url: string): void
   serverStopped(): Promise<void>
@@ -250,6 +269,30 @@ export async function openRunMetadata(
     },
     async checkpointGoal(state) {
       data.goal = state
+      await persist({ throwOnError: true })
+    },
+    boundary() {
+      return readRunBoundary(data.boundary)
+    },
+    async recordBoundary(boundary) {
+      // A same-run resume must find the original boundary it was started
+      // with: once recorded, the boundary is immutable for this run.
+      if (data.boundary) return
+      data.boundary = boundary
+      await persist({ throwOnError: true })
+    },
+    ledger() {
+      return readCommitLedger(data.commitLedger)
+    },
+    async appendLedgerEntry(entry) {
+      ;(data.commitLedger ??= []).push(entry)
+      await persist({ throwOnError: true })
+    },
+    finalization() {
+      return readFinalizationRecord(data.finalization)
+    },
+    async setFinalization(record) {
+      data.finalization = record
       await persist({ throwOnError: true })
     },
     serverStarted(url) {
@@ -440,16 +483,17 @@ export async function readRunMetadata(path: string): Promise<RunMetadata | undef
     // v1 predates the frozen pipeline; v1/v2/v3 predate cooperative run control
     // and durable goal state. Schema-v3 records (including historical goal-fix
     // child runs) stay readable as plain runs; the goal record only exists
-    // from v4 onward.
-    if (![1, 2, 3, 4].includes(parsed.schemaVersion ?? 0) || typeof parsed.phases !== "object" || !parsed.phases) {
+    // from v4 onward, and boundary/ledger/finalization from v5.
+    if (![1, 2, 3, 4, 5].includes(parsed.schemaVersion ?? 0) || typeof parsed.phases !== "object" || !parsed.phases) {
       log.warn(`ignoring run metadata with unknown shape at ${path}`)
       return undefined
     }
     const state = parsed.control?.state
     const control = state === "running" || state === "pausing" || state === "paused" ? parsed.control! : { state: "running" as const }
-    // Normalize: old records without a goal record stay schema-v3, so their
-    // readers never guess that a goal cycle existed.
-    return { ...parsed, schemaVersion: parsed.schemaVersion === 4 ? 4 : 3, control, phases: parsed.phases } as RunMetadata
+    // Normalize: old records without newer-era fields keep their own schema
+    // version, so their readers never guess that those eras existed.
+    const normalized = parsed.schemaVersion === 5 ? 5 : parsed.schemaVersion === 4 ? 4 : 3
+    return { ...parsed, schemaVersion: normalized, control, phases: parsed.phases } as RunMetadata
   } catch {
     log.warn(`ignoring corrupt run metadata at ${path}`)
     return undefined
@@ -458,5 +502,5 @@ export async function readRunMetadata(path: string): Promise<RunMetadata | undef
 
 function newMetadata(runID: string, targetDir: string): RunMetadata {
   const now = Date.now()
-  return { schemaVersion: 4, runID, targetDir, createdAt: now, updatedAt: now, control: { state: "running" }, phases: {} }
+  return { schemaVersion: 5, runID, targetDir, createdAt: now, updatedAt: now, control: { state: "running" }, phases: {} }
 }

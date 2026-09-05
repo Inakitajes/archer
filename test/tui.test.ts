@@ -13,7 +13,7 @@ import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipelin
 
 import type { ClipboardResult } from "../src/clipboard"
 import type { LimitsSnapshot } from "../src/limits"
-import type { FinishSeam, ProgressPhase } from "../src/progress"
+import type { PublishSeam, ProgressPhase } from "../src/progress"
 import type { AdvisorEvent } from "../src/advisor-events"
 import type { RunMetadata } from "../src/metadata"
 
@@ -31,7 +31,7 @@ async function createDashboard(
     ctrlC?: "abort" | "detach"
     autoAccept?: { mode: "off" | "all" | "smart" }
     copyResult?: ClipboardResult
-    finishSeam?: FinishSeam
+    publishSeam?: PublishSeam
   } = {},
 ) {
   const testRenderer = await createTestRenderer({ width, height })
@@ -39,7 +39,7 @@ async function createDashboard(
   const dashboard = new TuiProgress(testRenderer.renderer, phases, options.onAbort, options.autoAccept, false, options.observer ?? false, "session", async (text) => {
     copied.push(text)
     return options.copyResult ?? "copied-native"
-  }, options.onPauseToggle, options.onKeepAwakeToggle, options.onBackground, options.onCycleAutoAccept, options.ctrlC, options.finishSeam)
+  }, options.onPauseToggle, options.onKeepAwakeToggle, options.onBackground, options.onCycleAutoAccept, options.ctrlC, options.publishSeam)
   testRenderer.renderer.copyToClipboardOSC52 = (text) => {
     copied.push(text)
     return true
@@ -569,26 +569,20 @@ describe("footer hints and the command palette", () => {
     }
   })
 
-  test("setHostControls without a finish field keeps the existing [f] seam", async () => {
-    // Live attach wires pause/background after construction and used to replace
-    // the whole hostControls object, dropping the finish seam so a coordinated
-    // finish screen never offered [f].
-    const seam: FinishSeam = {
+  test("setHostControls without a publish field keeps the existing publication seam", async () => {
+    // Live attach wires pause/background after construction and must not
+    // replace the whole hostControls object, dropping the publish seam so a
+    // coordinated finish screen never offers Create pull request.
+    const seam: PublishSeam = {
       async prepare() {
-        return { ok: false, message: "nothing to squash" }
+        return { ok: false, message: "no remote configured" }
       },
       async apply() {
         throw new Error("apply should not run")
       },
-      async edit() {
-        return undefined
-      },
-      async push() {},
-      canOpenPullRequest: () => false,
-      async openPullRequest() {},
     }
     const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(120, 40, [{ name: "implement", description: "" }], {
-      finishSeam: seam,
+      publishSeam: seam,
       onPauseToggle: () => {},
       onBackground: () => {},
     })
@@ -601,7 +595,7 @@ describe("footer hints and the command palette", () => {
       })
       mockInput.pressKey("p", { ctrl: true })
       await renderOnce()
-      expect(captureCharFrame()).toContain("Squash into one commit")
+      expect(captureCharFrame()).toContain("Create pull request")
     } finally {
       dashboard.stop()
     }
@@ -1025,493 +1019,108 @@ describe("dashboard content selection", () => {
   })
 })
 
-describe("finish modal follow-ups", () => {
-  type SeamOptions = { canPr?: boolean; pushFails?: boolean; prFails?: boolean }
+describe("publish modal", () => {
+  type SeamOptions = { pushFails?: boolean; prFails?: boolean; prUrl?: string; existingUrl?: string }
 
   function fakeSeam(options: SeamOptions = {}) {
-    const calls = { push: 0, pr: 0 }
-    const seam: FinishSeam = {
+    const calls = { apply: 0, pushed: 0 }
+    const seam: PublishSeam = {
       async prepare() {
-        return {
-          ok: true as const,
-          proposal: { branch: "convoy/run", commitCount: 3, subject: "feat: a thing", body: ["did a thing"], notes: [] },
+        return { ok: true as const, plan: { branch: "convoy/run", remote: "origin", base: "main" } }
+      },
+      async apply(plan) {
+        calls.apply++
+        if (options.pushFails) {
+          return { ok: false as const, message: "push to origin/convoy/run was rejected; nothing was published: no write access" }
         }
-      },
-      async apply() {
-        return { sha: "abcdef1234567890", branch: "convoy/run", backupRef: "refs/convoy/finish-backup", replaced: 3 }
-      },
-      async edit() {
-        return undefined
-      },
-      async push() {
-        calls.push++
-        if (options.pushFails) throw new Error("no write access")
-      },
-      canOpenPullRequest: () => options.canPr ?? true,
-      async openPullRequest() {
-        calls.pr++
-        if (options.prFails) throw new Error("gh pr create didn't complete")
+        calls.pushed++
+        if (options.prFails) {
+          return { ok: false as const, message: `the branch was pushed to ${plan.remote}/${plan.branch}, but creating the pull request failed: gh pr create didn't complete; retry to locate or create it without pushing again unnecessarily` }
+        }
+        return { ok: true as const, outcome: { pushed: true, ...(options.existingUrl || options.prUrl ? { url: options.existingUrl ?? options.prUrl! } : {}) } }
       },
     }
     return { seam, calls }
   }
 
-  /** Drives [f] through prepare and the commit, landing on the "done" screen. */
-  async function commit(options: SeamOptions & { width?: number } = {}) {
+  /** Drives [f] through prepare, landing on the confirm screen. */
+  async function confirm(options: SeamOptions & { width?: number } = {}) {
     const { seam, calls } = fakeSeam(options)
-    const harness = await createDashboard(options.width ?? 120, 40, [{ name: "implement", description: "" }], { finishSeam: seam })
+    const harness = await createDashboard(options.width ?? 120, 40, [{ name: "implement", description: "" }], { publishSeam: seam })
     harness.dashboard.start("run", process.cwd())
     void harness.dashboard.runFinished({ status: "completed", runDir: "" })
     harness.mockInput.pressKey("f")
-    await harness.waitForFrame((frame) => frame.includes("feat: a thing"))
-    harness.mockInput.pressEnter()
-    await harness.waitForFrame((frame) => frame.includes("abcdef12 on convoy/run"))
-    return { ...harness, calls }
+    await harness.waitForFrame((frame) => frame.includes("create pull request"))
+    return { ...harness, calls, seam }
   }
 
-  test("offers push and push-and-PR as one fork after the commit", async () => {
-    const { dashboard, captureCharFrame, calls } = await commit()
+  test("the confirm modal discloses the destination before anything is published", async () => {
+    const { dashboard, captureCharFrame, calls } = await confirm()
     try {
       const text = captureCharFrame()
-      // Both branches are visible at once rather than push unlocking the PR.
-      expect(text).toContain("p push")
-      expect(text).toContain("r push and PR")
-      expect(calls).toEqual({ push: 0, pr: 0 })
+      expect(text).toContain("convoy/run")
+      expect(text).toContain("origin")
+      expect(text).toContain("never forced")
+      expect(calls).toEqual({ apply: 0, pushed: 0 })
     } finally {
       dashboard.stop()
     }
   })
 
-  test("push alone settles without ever offering a pull request", async () => {
-    const { dashboard, mockInput, waitForFrame, calls } = await commit()
+  test("any key other than enter cancels without pushing", async () => {
+    const { dashboard, mockInput, waitForFrame, calls } = await confirm()
     try {
-      mockInput.pressKey("p")
-      const text = await waitForFrame((frame) => frame.includes("pushed to origin/convoy/run"))
-
-      expect(calls).toEqual({ push: 1, pr: 0 })
-      expect(text).toContain("pushed to origin/convoy/run")
-      expect(text).toContain("press any key to close")
-      expect(text).not.toContain("pull request")
+      mockInput.pressKey("x")
+      await waitForFrame((frame) => !frame.includes("create pull request"))
+      expect(calls).toEqual({ apply: 0, pushed: 0 })
     } finally {
       dashboard.stop()
     }
   })
 
-  test("push and PR settles, and a second r closes instead of re-creating it", async () => {
-    const { dashboard, mockInput, waitForFrame, calls } = await commit()
+  test("acceptance pushes and opens the pull request, showing its URL", async () => {
+    const { dashboard, mockInput, waitForFrame, captureCharFrame, calls } = await confirm({ prUrl: "https://github.com/acme/repo/pull/7" })
     try {
-      mockInput.pressKey("r")
-      const text = await waitForFrame((frame) => frame.includes("pull request opened"))
-
-      expect(calls).toEqual({ push: 1, pr: 1 })
-      expect(text).toContain("pull request opened")
-      expect(text).toContain("press any key to close")
-
-      // The regression: the settled screen used to keep offering the PR, so a
-      // second r ran `gh pr create` again on a branch that already had one.
-      mockInput.pressKey("r")
-      await waitForFrame((frame) => !frame.includes("finish run"))
-      expect(calls).toEqual({ push: 1, pr: 1 })
+      mockInput.pressEnter()
+      const text = await waitForFrame((frame) => frame.includes("github.com/acme/repo/pull/7"))
+      expect(calls).toEqual({ apply: 1, pushed: 1 })
+      expect(text).toContain("pushed to origin")
     } finally {
       dashboard.stop()
     }
   })
 
-  test("a failed push keeps the fork up and never reaches the pull request", async () => {
-    const { dashboard, mockInput, waitForFrame, calls } = await commit({ pushFails: true })
+  test("a rejected push stops before the pull request and offers no force", async () => {
+    const { dashboard, mockInput, waitForFrame, calls } = await confirm({ pushFails: true })
     try {
-      mockInput.pressKey("r")
-      const text = await waitForFrame((frame) => frame.includes("push failed: no write access"))
-
-      expect(calls).toEqual({ push: 1, pr: 0 })
-      expect(text).toContain("push failed: no write access")
-      expect(text).toContain("p push")
-      expect(text).toContain("r push and PR")
+      mockInput.pressEnter()
+      const text = await waitForFrame((frame) => frame.includes("push to origin/convoy/run was rejected"))
+      expect(calls).toEqual({ apply: 1, pushed: 0 })
+      expect(text).toContain("nothing was published")
+      expect(text.toLowerCase()).not.toContain("force")
     } finally {
       dashboard.stop()
     }
   })
 
-  test("a failed gh keeps the push and offers just the retry", async () => {
-    const { dashboard, mockInput, waitForFrame, calls } = await commit({ prFails: true })
+  test("a PR failure after the push preserves the outcome and can be retried", async () => {
+    const { dashboard, mockInput, waitForFrame, captureCharFrame, calls, seam } = await confirm({ prFails: true })
     try {
-      mockInput.pressKey("r")
-      const text = await waitForFrame((frame) => frame.includes("r retry pull request"))
-      const flattened = text.replace(/\s+/g, " ")
+      mockInput.pressEnter()
+      await waitForFrame((frame) => frame.includes("press any key to dismiss"))
+      const failed = captureCharFrame().replace(/\s+/g, " ")
+      expect(failed).toContain("pushed to origin/convoy/run")
+      expect(failed).toContain("gh pr create didn't complete")
+      expect(calls).toEqual({ apply: 1, pushed: 1 })
 
-      expect(calls).toEqual({ push: 1, pr: 1 })
-      expect(flattened).toContain("pushed to origin/convoy/run")
-      expect(flattened).toContain("gh pr create failed")
-      expect(flattened).toContain("gh pr create didn't")
-      expect(text).toContain("r retry pull request")
-      // The push is done, so re-offering it would only fail on an up-to-date ref.
-      expect(text).not.toContain("p push")
-
-      mockInput.pressKey("r")
-      await waitForFrame((frame) => frame.includes("r retry pull request"))
-      expect(calls).toEqual({ push: 1, pr: 2 })
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("keeps both follow-up keys visible on a compact terminal", async () => {
-    const { dashboard, captureCharFrame } = await commit({ width: 70 })
-    try {
-      const frame = captureCharFrame()
-      expect(frame).toContain("p push")
-      expect(frame).toContain("r push and PR")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("without gh the fork is push only", async () => {
-    const { dashboard, mockInput, captureCharFrame, waitForFrame, calls } = await commit({ canPr: false })
-    try {
-      const text = captureCharFrame()
-      expect(text).toContain("p push")
-      expect(text).not.toContain("push and PR")
-
-      // r is not on offer, so it falls through to closing the modal.
-      mockInput.pressKey("r")
-      await waitForFrame((frame) => !frame.includes("finish run"))
-      expect(calls).toEqual({ push: 0, pr: 0 })
-    } finally {
-      dashboard.stop()
-    }
-  })
-})
-
-describe("iterate prompt", () => {
-  test("names the run, lists every context file, and stays on one line", () => {
-    const files = ["/runs/x/prd.md", "/runs/x/reports/plan.md", "/runs/x/reports/implement.md"]
-    const prompt = iteratePrompt("20260713-101010-abcd", files)
-
-    expect(prompt).toContain("20260713-101010-abcd")
-    for (const file of files) expect(prompt).toContain(file)
-    // The command travels through `zsh -lc`; a newline would break quoting assumptions.
-    expect(prompt).not.toContain("\n")
-    // The agent must know to wait instead of acting on the reports alone.
-    expect(prompt.toLowerCase()).toContain("wait")
-  })
-})
-
-describe("header limits row", () => {
-  const now = Date.now()
-  const full: LimitsSnapshot = {
-    gpt: { sessionPct: 42, sessionResetsAt: now + 130 * 60_000, weeklyPct: 18 },
-    openrouter: { kind: "remaining", amount: 12.34 },
-    fetchedAt: now,
-  }
-  const text = (snapshot: LimitsSnapshot | undefined, width: number) =>
-    limitsRow(snapshot, now, width)
-      .chunks.map((chunk) => chunk.text)
-      .join("")
-
-  test("wide row shows the bar, reset countdown, weekly percent, and credits", () => {
-    const row = text(full, 100)
-
-    expect(row).toContain("OpenAI ")
-    expect(row).toContain("█")
-    expect(row).toContain("42%")
-    expect(row).toContain("resets 2h 10m")
-    expect(row).toContain("wk 18%")
-    expect(row).toContain("OpenRouter $12.34 left")
-    expect(row.length).toBeGreaterThanOrEqual(100)
-  })
-
-  test("narrow widths drop weekly first, then the countdown", () => {
-    // Bar segment (18) + countdown (16) + weekly (9) + credits (22+1 gap):
-    // at 60 the weekly text no longer fits, at 40 the countdown goes too.
-    const at60 = text(full, 60)
-    expect(at60).toContain("resets")
-    expect(at60).not.toContain("wk 18%")
-
-    const at40 = text(full, 40)
-    expect(at40).toContain("42%")
-    expect(at40).not.toContain("resets")
-    expect(at40).toContain("OpenRouter $12.34 left")
-  })
-
-  test("monthly fallback labels the amount as spend, not balance", () => {
-    const row = text({ ...full, openrouter: { kind: "monthly", amount: 4.2 } }, 100)
-
-    expect(row).toContain("OpenRouter $4.20/mo")
-  })
-
-  test("auth problems surface a dim hint instead of a meter", () => {
-    const row = text({ gptHint: "codex login", fetchedAt: now }, 80)
-
-    expect(row).toContain("OpenAI — codex login")
-    expect(row).not.toContain("█")
-  })
-
-  test("no data renders a quiet placeholder, never a crash", () => {
-    expect(text(undefined, 80)).toBe("…")
-    expect(text({ fetchedAt: now }, 80)).toBe("…")
-  })
-})
-
-describe("cost formatting", () => {
-  test("always shows exactly two decimal places", () => {
-    expect(formatMoney(12)).toBe("$12.00")
-    expect(formatMoney(0.004)).toBe("$0.00")
-    expect(formatMoney(0.126)).toBe("$0.13")
-  })
-})
-
-describe("pipeline group selection", () => {
-  test("includes model and parallel headers in the same order as their child rows", () => {    const phases: ProgressPhase[] = [
-      { name: "prepare", description: "" },
-      { name: "review__opus", description: "", groupId: "models", stepName: "review", plannedModel: "anthropic/claude-opus" },
-      { name: "review__gpt", description: "", groupId: "models", stepName: "review", plannedModel: "openai/gpt" },
-      { name: "lint", description: "", groupId: "parallel", stepName: "lint" },
-      { name: "test__fast", description: "", groupId: "parallel", stepName: "test", plannedModel: "provider/fast" },
-      { name: "test__deep", description: "", groupId: "parallel", stepName: "test", plannedModel: "provider/deep" },
-      { name: "finish", description: "" },
-    ]
-
-    expect(pipelineSelectionTargets(phases)).toEqual([
-      { kind: "phase", name: "prepare" },
-      { kind: "group", groupId: "models", stepName: "review" },
-      { kind: "phase", name: "review__opus" },
-      { kind: "phase", name: "review__gpt" },
-      { kind: "group", groupId: "parallel" },
-      { kind: "phase", name: "lint" },
-      { kind: "group", groupId: "parallel", stepName: "test" },
-      { kind: "phase", name: "test__fast" },
-      { kind: "phase", name: "test__deep" },
-      { kind: "phase", name: "finish" },
-    ])
-  })
-
-  test("auto-follow rests on the group header while any member of a concurrent group is active", () => {
-    const phases: ProgressPhase[] = [
-      { name: "prepare", description: "", groupId: "g1" },
-      { name: "review__opus", description: "", groupId: "models", stepName: "review", plannedModel: "anthropic/claude-opus" },
-      { name: "review__gpt", description: "", groupId: "models", stepName: "review", plannedModel: "openai/gpt" },
-      { name: "lint", description: "", groupId: "parallel", stepName: "lint" },
-      { name: "test__fast", description: "", groupId: "parallel", stepName: "test", plannedModel: "provider/fast" },
-      { name: "test__deep", description: "", groupId: "parallel", stepName: "test", plannedModel: "provider/deep" },
-      { name: "finish", description: "" },
-    ]
-
-    // Sequential steps (unique or missing groupId) follow the leaf itself.
-    expect(autoFollowGroup(phases, phases[0]!)).toBeUndefined()
-    expect(autoFollowGroup(phases, phases[6]!)).toBeUndefined()
-
-    // A pure models: fan-out follows its step header, whichever member emits.
-    expect(autoFollowGroup(phases, phases[1]!)).toEqual({ kind: "group", groupId: "models", stepName: "review" })
-    expect(autoFollowGroup(phases, phases[2]!)).toEqual({ kind: "group", groupId: "models", stepName: "review" })
-
-    // A parallel block of distinct steps follows its top header — the same
-    // stable node no matter which child (plain or fanned-out) was active last.
-    expect(autoFollowGroup(phases, phases[3]!)).toEqual({ kind: "group", groupId: "parallel" })
-    expect(autoFollowGroup(phases, phases[4]!)).toEqual({ kind: "group", groupId: "parallel" })
-    expect(autoFollowGroup(phases, phases[5]!)).toEqual({ kind: "group", groupId: "parallel" })
-  })
-
-  test("uses readable adaptive comparison columns", () => {
-    expect(comparisonColumnCount(40, 3)).toBe(1)
-    expect(comparisonColumnCount(70, 3)).toBe(2)
-    expect(comparisonColumnCount(100, 3)).toBe(3)
-    expect(comparisonColumnCount(200, 5)).toBe(3)
-  })
-})
-
-describe("goal loop header", () => {
-  test("paints the live goal, iteration, and pending trajectory", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
-    try {
-      dashboard.setGoalLoop({ target: 90, iteration: 2, maxRuns: 4, plateau: 3, scores: [71] })
-      await renderOnce()
-      const frame = captureCharFrame()
-      expect(frame).toContain("goal 90")
-      expect(frame).toContain("iter 2/4")
-      // The current iteration hasn't scored yet: the trajectory trails off.
-      expect(frame).toContain("71 → …")
-      expect(frame).not.toContain("run completed")
-      // The clock keeps its bottom-left spot in goal mode too; the loop's
-      // readout follows it on the same row.
-      const goalRow = lineContaining(frame, "goal 90")
-      expect(goalRow).toMatch(/\d+:\d{2} {2}· {2}goal 90/)
-      // The totals row carries cost and tokens, never the clock.
-      const statusRow = lineContaining(frame, "tokens")
-      expect(statusRow).not.toMatch(/\d+:\d{2}/)
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("a scored iteration shows the trajectory and the signed delta", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
-    try {
-      dashboard.setGoalLoop({ target: 90, iteration: 2, maxRuns: 4, plateau: 3, scores: [71, 84] })
-      await renderOnce()
-      expect(captureCharFrame()).toContain("71 → 84")
-      expect(captureCharFrame()).toContain("+13")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("without setGoalLoop the header never mentions goal or iteration", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
-    try {
-      dashboard.phaseStarted("implement")
-      await renderOnce()
-      const frame = captureCharFrame()
-      expect(frame).not.toContain("goal ")
-      expect(frame).not.toContain("iter ")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("the first iteration shows no trajectory at all", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
-    try {
-      dashboard.setGoalLoop({ target: 90, iteration: 1, maxRuns: 4, plateau: 3, scores: [] })
-      await renderOnce()
-      const frame = captureCharFrame()
-      expect(frame).toContain("goal 90")
-      expect(frame).toContain("iter 1/4")
-      expect(frame).not.toContain(" → ")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("a falling score paints a negative delta", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
-    try {
-      dashboard.setGoalLoop({ target: 90, iteration: 2, maxRuns: 4, plateau: 3, scores: [84, 82] })
-      await renderOnce()
-      expect(captureCharFrame()).toContain("-2")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("finish verdicts: goal, plateau, cap, and no-score", async () => {
-    const cases: Array<{ outcome: NonNullable<Parameters<TuiProgress["setGoalLoop"]>[0]["outcome"]>; scores: number[]; verdict: string; trajectory: string }> = [
-      { outcome: { reason: "goal", reached: true, restored: false }, scores: [71, 84, 92], verdict: "✓ goal 92/100", trajectory: "71 → 84 → 92" },
-      { outcome: { reason: "plateau", reached: false, restored: true }, scores: [71, 86, 70], verdict: "plateau 86/100", trajectory: "71 → 86 → 70" },
-      { outcome: { reason: "max-iterations", reached: false, restored: false }, scores: [71, 80, 85, 88], verdict: "cap 88/100", trajectory: "71 → 80 → 85 → 88" },
-      { outcome: { reason: "no-score", reached: false, restored: true }, scores: [71], verdict: "no score", trajectory: "71" },
-    ]
-    for (const testCase of cases) {
-      const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
-      try {
-        void dashboard.runFinished({
-          status: "completed",
-          runDir: "",
-          goalLoop: { target: 90, iteration: 3, maxRuns: 4, plateau: 3, scores: testCase.scores, outcome: testCase.outcome },
-        })
-        await renderOnce()
-        const frame = captureCharFrame()
-        expect(frame, testCase.outcome.reason).toContain(testCase.verdict)
-        expect(frame, testCase.outcome.reason).toContain(testCase.trajectory)
-        // The status row still names the run's end state; the verdict is the
-        // goal row's job, not a replacement for it.
-        expect(frame, testCase.outcome.reason).toContain("✓ run completed")
-      } finally {
-        dashboard.stop()
-      }
-    }
-  })
-
-  test("a restored plateau announces restored to best", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
-    try {
-      void dashboard.runFinished({
-        status: "completed",
-        runDir: "",
-        goalLoop: { target: 90, iteration: 3, maxRuns: 4, plateau: 3, scores: [71, 86, 70], outcome: { reason: "plateau", reached: false, restored: true } },
-      })
-      await renderOnce()
-      const frame = captureCharFrame()
-      expect(frame).toContain("plateau 86/100")
-      expect(frame).toContain("restored to best")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("a failed goal run keeps the failed indicator and the trajectory", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40)
-    try {
-      void dashboard.runFinished({
-        status: "failed",
-        runDir: "",
-        error: "boom",
-        goalLoop: { target: 90, iteration: 3, maxRuns: 4, plateau: 3, scores: [71, 84] },
-      })
-      await renderOnce()
-      const frame = captureCharFrame()
-      expect(frame).toContain("✗ run failed")
-      expect(frame).toContain("71 → 84")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("resetPipeline swaps phases and the pipeline title to the new pipeline name", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40, [{ name: "plan", description: "" }])
-    try {
-      dashboard.phaseStarted("plan")
-      await renderOnce()
-      expect(captureCharFrame()).toContain("plan")
-
-      dashboard.resetPipeline(
-        [
-          { name: "fix", description: "" },
-          { name: "score__gpt", description: "" },
-        ],
-        { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "fixer", steps: [] } },
-      )
-      await renderOnce()
-      const frame = captureCharFrame()
-      expect(frame).toContain("pipeline · fixer")
-      expect(frame).toContain("fix")
-      expect(frame).toContain("score__gpt")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("prior usage survives resetPipeline in the header totals", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40, [{ name: "implement", description: "" }])
-    try {
-      dashboard.phaseStarted("implement")
-      dashboard.phaseUsageTotal("implement", { cost: 1.82, tokens: { input: 120000, output: 40000, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 160000 }, model: "openai/gpt-5" })
-      await renderOnce()
-      expect(captureCharFrame()).toContain("$1.82")
-
-      dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "fixer", steps: [] } })
-      await renderOnce()
-      const frame = captureCharFrame()
-      expect(frame).toContain("$1.82")
-      expect(frame).toContain("↑120.0k ↓40.0k")
-    } finally {
-      dashboard.stop()
-    }
-  })
-
-  test("elapsed does not reset to zero when resetPipeline swaps the iteration", async () => {
-    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(160, 40, [{ name: "implement", description: "" }])
-    try {
-      dashboard.phaseStarted("implement")
-      await Bun.sleep(1100)
-      await renderOnce()
-      // The header clock (under the status word) has advanced past zero.
-      expect(captureCharFrame()).not.toContain("0:00")
-
-      dashboard.resetPipeline([{ name: "fix", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "fixer", steps: [] } })
-      await renderOnce()
-      // The clock kept running from the loop's start rather than the new run's.
-      expect(captureCharFrame()).not.toContain("0:00")
+      // The retry locates the existing PR instead of pushing/creating again.
+      seam.apply = async () => ({ ok: true as const, outcome: { pushed: false, url: "https://github.com/acme/repo/pull/9" } })
+      mockInput.pressKey("x")
+      mockInput.pressKey("f")
+      await waitForFrame((frame) => frame.includes("never forced"))
+      mockInput.pressEnter()
+      const text = await waitForFrame((frame) => frame.includes("acme/repo/pull/9"))
+      expect(text).toContain("pushed to origin")
     } finally {
       dashboard.stop()
     }

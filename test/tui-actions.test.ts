@@ -17,7 +17,7 @@ function state(overrides: Partial<DashboardActionState> = {}): DashboardActionSt
     canPause: true,
     canKeepAwake: true,
     canBackground: true,
-    finishSeam: true,
+    canPublish: true,
     interactiveArmed: false,
     reportCopyable: false,
     autoAccept: "off",
@@ -108,14 +108,15 @@ describe("dashboard action registry", () => {
     const ids = commands({ finished: true })
     expect(ids).toContain("iterate")
     expect(ids).toContain("lazygit")
-    expect(ids).toContain("finish")
+    expect(ids).toContain("create-pr")
     expect(ids).toContain("close")
     expect(ids).toContain("session")
     expect(ids.length).toBeGreaterThan(5)
   })
 
-  test("a finished run without a finish seam cannot squash", () => {
-    expect(commands({ finished: true, finishSeam: false })).not.toContain("finish")
+  test("publication is the only branch-mutating offer and it needs the publish seam", () => {
+    expect(commands({ finished: true, canPublish: false })).not.toContain("create-pr")
+    expect(commands({ finished: true })).not.toContain("finish")
   })
 
   test("a finished run drops the live-only controls", () => {

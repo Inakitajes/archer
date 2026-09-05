@@ -15,7 +15,7 @@
 
 import { goalInvocationId, qualifyInvocation, type GoalInvocationId } from "./goal-scheduler"
 import type { GoalRunState } from "./metadata"
-import { progressPhases } from "./runner"
+import { compactRunRowName, progressPhases } from "./runner"
 import type { ProgressPhase } from "./progress"
 import type { Pipeline } from "./types"
 
@@ -77,7 +77,15 @@ export function goalProgressPhases(
     // which every measurement round shares — the display id is the qualified
     // invocation id, so two rounds can never merge into one tree group.
     const groupId = goalInvocationId(invocation.stage, invocation.iteration)
-    rows.push(...progressPhases({ ...pipeline, steps }).map((phase) => ({ ...phase, groupId })))
+    rows.push(
+      ...progressPhases({ ...pipeline, steps })
+        // The pseudo-pipeline here is one goal invocation, not a whole run:
+        // the terminal Compact run row belongs to the epilogue of the single
+        // logical run, never to a goal fragment (design D1 — fragments do not
+        // finalize separately).
+        .filter((phase) => phase.name !== compactRunRowName)
+        .map((phase) => ({ ...phase, groupId })),
+    )
   }
   return rows
 }

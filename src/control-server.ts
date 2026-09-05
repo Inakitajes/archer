@@ -11,6 +11,7 @@ import type {
   PermissionReply,
   ProgressPhase,
   RunControlState,
+  RunFinalizationView,
 } from "./progress"
 import type { Pipeline } from "./types"
 
@@ -76,6 +77,8 @@ export type PendingFinishView = {
   status: "completed" | "failed"
   error?: string
   goalLoop?: GoalLoopView
+  /** The run-finalization outcome, transported so attached dashboards show it (design D8). */
+  finalization?: RunFinalizationView
 }
 
 export type PendingSnapshot = {

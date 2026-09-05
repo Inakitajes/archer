@@ -21,8 +21,18 @@ function listen(): Promise<{ port: number; close: () => void }> {
 }
 
 let root: string
+let savedHome: string | undefined
+let convoyHomeDir: string
 
 beforeAll(async () => {
+  // Isolate the cleanup-surviving run-record index. listRuns merges workspace
+  // runs with the index under <convoy-home>/run-records, so a parallel
+  // finalization test writing a real record would otherwise leak that run into
+  // this listing and make these assertions platform/timing dependent.
+  savedHome = process.env.CONVOY_HOME
+  convoyHomeDir = await mkdtemp(join(tmpdir(), "convoy-home-"))
+  process.env.CONVOY_HOME = convoyHomeDir
+
   root = await mkdtemp(join(tmpdir(), "convoy-runs-test-"))
 
   // Newer run with metadata: gets targetDir, phase summary, and cost.
@@ -53,6 +63,9 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await rm(root, { recursive: true, force: true })
+  await rm(convoyHomeDir, { recursive: true, force: true })
+  if (savedHome === undefined) delete process.env.CONVOY_HOME
+  else process.env.CONVOY_HOME = savedHome
 })
 
 describe("run history listing", () => {

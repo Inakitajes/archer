@@ -34,7 +34,7 @@ const statusArgs = ["status", "--porcelain=v1", "--untracked-files=all"]
 //
 // `commitAsUser` below is the deliberate exception, and the asymmetry is the
 // point: step commits are machine commits and stay unsigned, while the single
-// squashed commit `convoy finish` creates belongs to the user and inherits
+// squashed commit automatic compaction creates belongs to the user and inherits
 // their entire git config, signature included.
 const commitArgs = ["commit", "--no-gpg-sign"]
 
@@ -412,7 +412,7 @@ const convoyGitEnv = {
   GIT_COMMITTER_EMAIL: "convoy@local",
 }
 
-/** The identity every convoy step commit carries; `convoy finish` finds its own commits by it. */
+/** The identity every convoy step commit carries; automatic run compaction verifies its own commits by it. */
 export const convoyAuthorEmail = convoyGitEnv.GIT_AUTHOR_EMAIL
 
 /**
@@ -438,7 +438,7 @@ export type CommitAsUserOptions = {
 /**
  * Commits whatever is already staged **as the user**: no convoyGitEnv, no
  * `--no-gpg-sign`, and deliberately no `git add -A`. This is the one commit
- * convoy makes on the user's behalf (`convoy finish`), so it must inherit their
+ * convoy makes on the user's behalf (automatic compaction, close's squash-merge), so it must inherit their
  * whole git config — user.name, commit.gpgsign, gpg.format, hooks — and land in
  * history signed and attributed exactly like a hand-written commit.
  *
@@ -479,7 +479,7 @@ export async function removeWorktree(dir: string, cwd: string) {
  * The checkout of `<branch>` among the repo's worktrees, or undefined when no
  * worktree has that branch checked out. With configurable worktree locations
  * the branch name alone can't reconstruct a path, so `git worktree list` is the
- * source of truth for lookups (`convoy finish --branch`).
+ * source of truth for lookups (`convoy close --branch`).
  */
 export async function findWorktreeDirForBranch(branch: string, cwd: string): Promise<string | undefined> {
   const result = await execFile("git", ["worktree", "list", "--porcelain"], { cwd, allowFailure: true })

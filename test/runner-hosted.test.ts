@@ -7,7 +7,7 @@ import { join } from "node:path"
 import type { PermissionPromptInfo, PermissionReply, ProgressUI, RunOutcome } from "../src/progress"
 import type { RunOptions } from "../src/types"
 
-import { preparePhaseRun, run as realRun, hostedTeardownFromError, UserAbortError, type RunDeps } from "../src/runner"
+import { preparePhaseRun, run as realRun, hostedTeardownFromError, UserAbortError, compactRunRowName, type RunDeps } from "../src/runner"
 import { buildRunPlan } from "../src/run-plan"
 import { noopProgress } from "../src/progress"
 import { builtInAgents } from "../src/pipeline"
@@ -786,6 +786,140 @@ describe("run() with a hosted progress", () => {
       } finally {
         await result.release?.()
       }
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("automatic run finalization lifecycle", () => {
+  // Records only the terminal `Compact run` lifecycle row the runner emits
+  // (task 3.1/3.3/3.5): the row is separate from configurable steps, cannot be
+  // filtered, and its outcome is persisted independently of pipeline success.
+  function finalizationTrackingProgress() {
+    const finalizationEvents: string[] = []
+    const progress: ProgressUI = {
+      ...noopProgress,
+      phaseStarted: (name, detail) => {
+        if (name === compactRunRowName) finalizationEvents.push(`started${detail ? `:${detail}` : ""}`)
+      },
+      phaseCompleted: (name, detail) => {
+        if (name === compactRunRowName) finalizationEvents.push(`completed${detail ? `:${detail}` : ""}`)
+      },
+      phaseSkipped: (name) => {
+        if (name === compactRunRowName) finalizationEvents.push("skipped")
+      },
+      phaseFailed: (name, detail) => {
+        if (name === compactRunRowName) finalizationEvents.push(`failed${detail ? `:${detail}` : ""}`)
+      },
+    }
+    return { progress, finalizationEvents }
+  }
+
+  // The runner emits the lifecycle row through the persisted-progress adapter
+  // (`recordProgress`), whose phase calls are awaited internally but not by
+  // run() itself, so the events can land a tick after run() resolves.
+  async function waitForEvents(events: string[], count: number, timeoutMs = 5_000): Promise<string[]> {
+    const deadline = Date.now() + timeoutMs
+    while (events.length < count && Date.now() < deadline) await Bun.sleep(10)
+    return events
+  }
+
+  test("a successful run records the Compact run lifecycle row as skipped and persists its summary section", async () => {
+    // A pipeline that creates no commits still gets the lifecycle row exactly
+    // once, after its phases and success hooks, and the durable outcome says
+    // skipped (not a hidden block).
+    const repo = await cleanRepo()
+    const tracking = finalizationTrackingProgress()
+    try {
+      const result = await run(makeOptions(repo, { progress: tracking.progress }))
+      try {
+        expect(await waitForEvents(tracking.finalizationEvents, 2)).toEqual(["started:compacting this run's commits", "skipped"])
+
+        const metadata = JSON.parse(await readFile(join(result.dir, "metadata.json"), "utf8"))
+        expect(metadata.finalization).toMatchObject({ state: "skipped" })
+        expect(metadata.finalization.reason).toContain("no commits")
+
+        // The durable summary carries the same fact.
+        const summary = await readFile(join(result.dir, "SUMMARY.md"), "utf8")
+        expect(summary).toContain("## Run finalization")
+        expect(summary).toContain("- State: skipped")
+
+        // The skip is honest: the execution tree is clean, so the zero-commit
+        // verdict is not a silent block on uncommitted changes.
+        expect((await git(["status", "--porcelain"], repo)).trim()).toBe("")
+      } finally {
+        await result.release?.()
+      }
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("a success post-hook that mutates the repository blocks compaction but keeps the run successful", async () => {
+    // Design D1 ordering: finalization runs after success hooks, so a hook
+    // that mutates/publishes the tree must make the compaction refuse (the
+    // dirty-tree guard fires before any rewrite) without failing the run.
+    const repo = await cleanRepo()
+    const tracking = finalizationTrackingProgress()
+    try {
+      const result = await run(
+        makeOptions(repo, {
+          progress: tracking.progress,
+          hooks: { pre: [], post: [{ name: "publish-artifact", command: "printf 'hook\n' >> hook.txt" }], pipelines: {} },
+        }),
+      )
+      try {
+        expect((await waitForEvents(tracking.finalizationEvents, 1))[0]).toBe("started:compacting this run's commits")
+
+        const metadata = JSON.parse(await readFile(join(result.dir, "metadata.json"), "utf8"))
+        // Blocked (not skipped): the hook left an uncommitted change, and the
+        // lifecycle row must not present that as a clean no-commit skip.
+        expect(metadata.finalization).toMatchObject({ state: "blocked" })
+        expect(metadata.finalization.reason).toMatch(/uncommitted changes|working tree/)
+
+        const summary = await readFile(join(result.dir, "SUMMARY.md"), "utf8")
+        expect(summary).toContain("## Run finalization")
+        expect(summary).toContain("- State: blocked")
+
+        // The run itself remained successful despite the blocked compaction.
+        expect(result.dir).toBeTruthy()
+      } finally {
+        await result.release?.()
+      }
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("a failing run never reaches finalization and persists no compaction outcome", async () => {
+    // A fatal success-hook failure must still count as failed execution and
+    // must prevent automatic compaction entirely (design D1).
+    const repo = await cleanRepo()
+    const tracking = finalizationTrackingProgress()
+    try {
+      let failure: unknown
+      try {
+        await run(
+          makeOptions(repo, {
+            progress: tracking.progress,
+            hooks: { pre: [], post: [{ name: "boom", command: "exit 1" }], pipelines: {} },
+          }),
+        )
+        throw new Error("the failing run should have rejected")
+      } catch (error) {
+        failure = error
+      }
+      expect(String(failure)).toContain("exited with code 1")
+      expect(tracking.finalizationEvents).toEqual([])
+
+      const teardown = hostedTeardownFromError(failure)
+      expect(teardown).toBeDefined()
+      if (!teardown) return
+      expect(teardown.runDir).not.toBe("")
+      const metadata = JSON.parse(await readFile(join(teardown.runDir, "metadata.json"), "utf8"))
+      expect(metadata.finalization).toBeUndefined()
+      await teardown.release()
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
