@@ -2027,6 +2027,32 @@ describe("session tab backfill request", () => {
     }
   })
 
+  test("resetPipeline lets a reused phase name ask for a backfill again", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40, [{ name: "implement", description: "" }])
+    try {
+      const requested: string[] = []
+      dashboard.setHostControls({ requestSessionBackfill: (name) => void requested.push(name) })
+
+      // Iteration one: the operator views the completed step's empty session
+      // tab, spending its one backfill attempt.
+      dashboard.phaseRestored("implement", { status: "completed", sessionID: "ses_1" })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("no streamed messages captured for this step")
+      expect(requested).toEqual(["implement"])
+
+      // The hosted loop resets into the next iteration, which reuses the phase
+      // name; its own completed step gets a fresh attempt, like the report
+      // cache does.
+      dashboard.resetPipeline([{ name: "implement", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "fixer", steps: [] } })
+      dashboard.phaseRestored("implement", { status: "completed", sessionID: "ses_2" })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("no streamed messages captured for this step")
+      expect(requested).toEqual(["implement", "implement"])
+    } finally {
+      dashboard.stop()
+    }
+  })
+
   test("a phase with streamed content never asks, and without the seam nothing is requested", async () => {
     const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
     try {

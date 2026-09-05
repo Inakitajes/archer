@@ -2625,6 +2625,16 @@ export function watchSession(
      * birth); only the attach path does.
      */
     backfill?: boolean
+    /**
+     * Attach-level teardown, consulted only when `backfill` is set: when the
+     * attach that owns this watcher is stopped (a reset replaced the
+     * dashboard's view), a backfill fetch still in flight must not deliver the
+     * previous run's history into a phase name the next run reuses. A
+     * same-run watcher stop — the phase finalized while its fetch was in
+     * flight — deliberately does not flip this: that completed phase still
+     * wants its history.
+     */
+    isCancelled?: () => boolean
   },
 ): SessionWatcher {
   const controller = new AbortController()
@@ -2637,6 +2647,7 @@ export function watchSession(
         directory: input.directory,
         phaseName: input.phaseName,
         progress: input.progress,
+        ...(input.isCancelled ? { isCancelled: input.isCancelled } : {}),
       })
     : undefined
 
@@ -3186,12 +3197,16 @@ type BackfillTranscript = {
  */
 function createBackfillTranscript(
   client: OpencodeClient,
-  input: { sessionID: string; directory: string; phaseName: string; progress: ProgressUI },
+  input: { sessionID: string; directory: string; phaseName: string; progress: ProgressUI; isCancelled?: () => boolean },
 ): BackfillTranscript {
   type Pending = { chunk: ProgressMessage; messageID?: string; callID?: string }
   const pending: Pending[] = []
   let history: SessionHistory | undefined
   let released = false
+  // Set when the owning attach was torn down while the fetch was in flight:
+  // the previous run's history must not land in a phase name the next run
+  // reuses, so the buffer is dropped and later live chunks are ignored.
+  let cancelled = false
   const emit = (chunk: ProgressMessage) => input.progress.phaseMessage(input.phaseName, chunk)
 
   const release = () => {
@@ -3251,13 +3266,20 @@ function createBackfillTranscript(
   }
 
   void (async () => {
-    history = await readSessionHistory(client, input.sessionID, input.directory)
+    const fetched = await readSessionHistory(client, input.sessionID, input.directory)
+    if (input.isCancelled?.()) {
+      cancelled = true
+      pending.length = 0
+      return
+    }
+    history = fetched
     if (history) for (const chunk of history.chunks) emit(chunk)
     release()
   })()
 
   return {
     live(chunk, identity) {
+      if (cancelled) return
       if (released) {
         // Post-release guards: history already holds complete messages whole,
         // and a tool call history recorded (by callID) must not double-post.
@@ -3284,11 +3306,15 @@ function createBackfillTranscript(
  */
 export async function backfillSessionTranscript(
   client: OpencodeClient,
-  input: { directory: string; phaseName: string; sessionID: string; progress: ProgressUI },
+  input: { directory: string; phaseName: string; sessionID: string; progress: ProgressUI; isCancelled?: () => boolean },
 ): Promise<void> {
   // A server that cannot answer leaves the caller's placeholder untouched;
   // nothing is fabricated for an unreachable server.
   const history = await readSessionHistory(client, input.sessionID, input.directory)
+  // The owning attach stopped while the fetch was in flight (a reset replaced
+  // the view): the previous run's history must not land in a phase name the
+  // next run reuses.
+  if (input.isCancelled?.()) return
   if (!history) return
   for (const chunk of history.chunks) input.progress.phaseMessage(input.phaseName, chunk)
 }

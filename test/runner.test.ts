@@ -3734,4 +3734,76 @@ describe("watchSession transcript backfill", () => {
       await watcher.stop()
     }
   })
+
+  test("a cancelled attach's in-flight backfill delivers nothing, even when history resolves late", async () => {
+    // The owning attach was torn down while the fetch was pending (a reset
+    // replaced the view): neither the fetched history nor the buffered live
+    // deltas may reach the dashboard — the next run can reuse the phase name,
+    // and stale transcript content would suppress its correct backfill.
+    let resolveMessages: (value: { data: unknown[] }) => void = () => {}
+    const chunks: { channel: string; text: string; partID?: string }[] = []
+    let cancelled = false
+    async function* stream() {
+      yield textDelta("msg_2", "p2", "live delta")
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: { messages: () => new Promise<{ data: unknown[] }>((resolve) => { resolveMessages = resolve }), status: async () => ({ data: {} }) },
+    } as never
+    const progress: ProgressUI = { ...noopProgress, phaseMessage: (_name, message) => void chunks.push(message) }
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress,
+      signal: new AbortController().signal,
+      backfill: true,
+      isCancelled: () => cancelled,
+    })
+    try {
+      // The live delta is buffered while the fetch is pending; nothing emits.
+      await Bun.sleep(20)
+      expect(chunks).toEqual([])
+
+      cancelled = true
+      resolveMessages({ data: [assistantMessage("msg_1", "stale history")] })
+      await Bun.sleep(40)
+      // The late-arriving history and the dropped buffer both stay silent.
+      expect(chunks).toEqual([])
+    } finally {
+      await watcher.stop()
+    }
+  })
+
+  test("a same-run watcher stop does not cancel the in-flight backfill", async () => {
+    // The phase finalized while its fetch was in flight — the common eager
+    // case — and the attach never stopped: the history still delivers.
+    let resolveMessages: (value: { data: unknown[] }) => void = () => {}
+    const chunks: { channel: string; text: string; partID?: string }[] = []
+    async function* stream() {
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: { messages: () => new Promise<{ data: unknown[] }>((resolve) => { resolveMessages = resolve }), status: async () => ({ data: {} }) },
+    } as never
+    const progress: ProgressUI = { ...noopProgress, phaseMessage: (_name, message) => void chunks.push(message) }
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress,
+      signal: new AbortController().signal,
+      backfill: true,
+      isCancelled: () => false,
+    })
+    try {
+      resolveMessages({ data: [assistantMessage("msg_1", "late but wanted")] })
+      await until(chunks, 1)
+      expect(chunks).toEqual([{ channel: "response", text: "late but wanted", partID: "msg_1_p" }])
+    } finally {
+      await watcher.stop()
+    }
+  })
 })

@@ -112,6 +112,11 @@ export class LiveAttach {
       // history, and merge the two without duplication so a re-attach shows
       // the step's earlier output.
       backfill: true,
+      // This attach being stopped is a view change (a reset replaced the
+      // dashboard): a fetch still in flight must not deliver the previous
+      // run's history into a phase name the next run reuses. A same-run
+      // watcher stop — the phase finalized mid-fetch — keeps delivering.
+      isCancelled: () => this.stopped,
     })
     this.watchers.set(name, watcher)
     watcher.result.then(
@@ -139,6 +144,9 @@ export class LiveAttach {
       phaseName: name,
       sessionID,
       progress: this.tui,
+      // The entry check above ran before the fetch; if this attach is torn
+      // down while the fetch is in flight, the stale history is discarded.
+      isCancelled: () => this.stopped,
     })
   }
 

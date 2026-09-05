@@ -293,6 +293,63 @@ describe("LiveAttach follows a goal cycle", () => {
       await attach.stop()
     }
   })
+
+  test("a stopped attach's in-flight eager backfill never delivers into the reused view", async () => {
+    // A hosted reset replaces the dashboard's view and stops the old attach;
+    // its backfill fetch is still in flight. When the old server finally
+    // answers, the stale history must not land in a phase name the next run
+    // reuses — that would both show wrong content and suppress the new run's
+    // correct lazy backfill.
+    const dir = await scratch()
+    const pipeline = resolvePipeline({ name: "fixer", spec: builtInPipelines.fixer!, agents: builtInAgents })
+    await writeMeta(dir, { ...baseMeta(pipeline), phases: { fix: { status: "running", sessionID: "ses_1" } } })
+    const state = fakeTui()
+    let resolveMessages: (value: { data: unknown[] }) => void = () => {}
+    const client = {
+      event: { subscribe: async () => ({ stream: (async function* () { await new Promise<void>(() => {}) })() }) },
+      session: { messages: () => new Promise<{ data: unknown[] }>((resolve) => { resolveMessages = resolve }), status: async () => ({ data: {} }) },
+    } as never
+    const attach = new LiveAttach(client, state.tui, "/repo", join(dir, "metadata.json"), new Set(), 10)
+    await attach.start()
+    await Bun.sleep(20) // the watcher subscribed; its backfill fetch is pending
+    await attach.stop()
+    resolveMessages({
+      data: [
+        {
+          info: { id: "msg_1", role: "assistant", time: { created: 1, completed: 2 } },
+          parts: [{ id: "mp1", type: "text", text: "stale history" }],
+        },
+      ],
+    })
+    await Bun.sleep(40)
+    expect(state.messages).toEqual([])
+  })
+
+  test("a stopped attach's lazy backfill never delivers into the reused view", async () => {
+    const dir = await scratch()
+    const pipeline = resolvePipeline({ name: "fixer", spec: builtInPipelines.fixer!, agents: builtInAgents })
+    await writeMeta(dir, { ...baseMeta(pipeline), phases: { fix: { status: "completed", sessionID: "ses_9" } } })
+    const state = fakeTui()
+    let resolveMessages: (value: { data: unknown[] }) => void = () => {}
+    const client = {
+      event: { subscribe: async () => ({ stream: (async function* () { await new Promise<void>(() => {}) })() }) },
+      session: { messages: () => new Promise<{ data: unknown[] }>((resolve) => { resolveMessages = resolve }), status: async () => ({ data: {} }) },
+    } as never
+    const attach = new LiveAttach(client, state.tui, "/repo", join(dir, "metadata.json"), new Set(), 10)
+    await attach.start()
+    attach.requestSessionBackfill("fix") // the fetch is issued
+    await attach.stop() // the view is replaced before the server answers
+    resolveMessages({
+      data: [
+        {
+          info: { id: "msg_1", role: "assistant", time: { created: 1, completed: 2 } },
+          parts: [{ id: "mp1", type: "text", text: "stale history" }],
+        },
+      ],
+    })
+    await Bun.sleep(40)
+    expect(state.messages).toEqual([])
+  })
 })
 
 /**

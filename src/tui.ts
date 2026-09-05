@@ -481,6 +481,9 @@ export class TuiProgress implements ProgressUI {
   // runtime for a transcript backfill — one attempt per phase, mirroring
   // loadReport's laziness, so an attached dashboard can read steps that ran
   // before it attached without bursting a fetch per phase at open time.
+  // resetPipeline clears it with the rest of the per-run state: a hosted run's
+  // next iteration may reuse a phase name, and its completed steps deserve a
+  // fresh backfill attempt of their own.
   private readonly sessionBackfillRequested = new Set<string>()
   private permissionChoice = 0
   // Suspension nests: outer scopes (human-review gate) and inner prompts may
@@ -1595,6 +1598,9 @@ export class TuiProgress implements ProgressUI {
     this.serverUrl = ""
     this.transcripts.clear()
     this.reports.clear()
+    // A hosted run's next iteration can reuse phase names; each one gets a
+    // fresh lazy-backfill attempt, exactly like the report cache above.
+    this.sessionBackfillRequested.clear()
     // The feed is emptied except for the loop's iteration announcement. When
     // the caller passes retainMessage explicitly, the matching entry is kept
     // rather than guessing that the last feed entry is the announcement — a
