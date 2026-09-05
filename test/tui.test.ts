@@ -1985,9 +1985,58 @@ describe("phase report path resolution", () => {
         mockInput.pressKey("2")
         await waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("Round zero consensus"))
 
+        // The fullscreen reader shares the same row-carried resolution.
+        mockInput.pressKey("v")
+        await renderOnce()
+        const fullscreen = captureCharFrame()
+        expect(fullscreen).toContain("report · goal-measure-0-score-report")
+        expect(fullscreen).toContain("Round zero consensus")
+        mockInput.pressEscape()
+        await Bun.sleep(20)
+        await renderOnce()
+
         // Select the prefix row: its report still resolves canonically.
         dashboard.phaseStarted("plan")
         await waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("Prefix report"))
+      } finally {
+        dashboard.stop()
+      }
+    } finally {
+      await rm(runDir, { recursive: true, force: true })
+    }
+  })
+
+  test("two completed rounds stay separately browsable in the panel", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "convoy-tui-rounds-"))
+    try {
+      const round0 = "reports/goal/iteration-0/measure/scorer.md"
+      const round1 = "reports/goal/iteration-1/measure/scorer.md"
+      await mkdir(join(runDir, "reports", "goal", "iteration-0", "measure"), { recursive: true })
+      await mkdir(join(runDir, "reports", "goal", "iteration-1", "measure"), { recursive: true })
+      await writeFile(join(runDir, round0), "# Round zero consensus\n\n- score 71")
+      await writeFile(join(runDir, round1), "# Round one consensus\n\n- score 92")
+
+      const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(140, 40, [
+        { name: "plan", description: "" },
+        { name: "goal-measure-0-scorer", description: "score", stepName: "scorer", reportPath: round0 },
+        { name: "goal-measure-1-scorer", description: "score", stepName: "scorer", reportPath: round1 },
+      ])
+      try {
+        dashboard.start("run", process.cwd(), runDir)
+        dashboard.phaseCompleted("plan")
+        dashboard.phaseCompleted("goal-measure-0-scorer")
+        dashboard.phaseCompleted("goal-measure-1-scorer")
+
+        // The reports tab opens on the last completed row: round one's report.
+        mockInput.pressKey("2")
+        await waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("Round one consensus"))
+        expect(captureCharFrame()).not.toContain("Round zero consensus")
+
+        // Move up to the round-zero row: it resolves round zero's report, never
+        // the round-one one shown a moment ago.
+        mockInput.pressKey("k")
+        await waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("Round zero consensus"))
+        expect(captureCharFrame()).not.toContain("Round one consensus")
       } finally {
         dashboard.stop()
       }
