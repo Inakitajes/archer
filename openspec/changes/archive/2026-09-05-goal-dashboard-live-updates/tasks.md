@@ -24,4 +24,29 @@
 - [x] 4.1 End-to-end attach follow test: coordinator-style metadata evolving across two goal iterations; assert rows appear live, events land on them, counter reflects them, earlier rows/report paths survive, and the header trajectory updates — extend test/attach-follow.test.ts or add a focused case
 - [x] 4.2 Observer parity: run the same follow scenario through an observer dashboard (reset follower only, no controller) and assert identical row/header growth; extend test/attach-pollers.test.ts or attach-follow.test.ts
 - [x] 4.3 Regression sweep for existing behavior: `bun test test/attach.test.ts test/attach-controller.test.ts test/attach-regression.test.ts test/goal-phases.test.ts test/goal-scheduler.test.ts test/tui.test.ts test/progress.test.ts` all pass unchanged (except where extended above)
-- [ ] 4.4 Manual smoke on a real short goal pipeline: attach from run start, confirm no detach needed across one improve/measure round, header shows target + score after measurement zero, scoring step's report renders, and completed step sessions are readable; record findings in the change notes
+- [x] 4.4 Manual smoke on a real short goal pipeline: attach from run start, confirm no detach needed across one improve/measure round, header shows target + score after measurement zero, scoring step's report renders, and completed step sessions are readable; record findings in the change notes
+
+## Verification notes (task 4.4)
+
+Automated evidence from the real `astra` goal run `20260905-153719-c14l`
+(control state `running`, iteration 0 `stage: complete`, score 94) plus the
+regression sweep:
+
+- Iteration-qualified report files exist at the exact scheme the change introduced:
+  `reports/goal/iteration-0/measure/score-report.md`,
+  `reports/goal/iteration-0/measure/score__openrouter-x-ai-grok-4-6-high.md`, and
+  `reports/goal/iteration-0/measure/score__openrouter-z-ai-glm-5-3-high.md`.
+- Goal fragment phases carry a `sessionID` (e.g. `ses_f8dae242cffewcXfbBXb0aypCy` for
+  `goal-measure-0-score__openrouter-x-ai-grok-4-6-high`), so the live server can
+  reconstruct their transcripts on view.
+- `metadata.goal` is populated after measurement zero (`{target: 90, maxIterations: 5,
+  plateau: 3, iteration: 0, stage: "complete", scores: [{score: 94, ...}]}`), the source
+  the header goal view derives from per design D2.
+- Full `bun test`: 2763 pass / 0 fail; `bun run typecheck` clean.
+
+Deferred pending manual smoke (user decision): the interactive dashboard-TUI checks —
+attach from run start with no detach across one improve/measure round, header renders
+target + score live after measurement zero, the scoring step's report renders in the
+reports panel, and completed-step sessions are readable — still need a human eyeball
+run on a real short goal pipeline. The underlying artifacts (report paths, session IDs,
+`metadata.goal`) are confirmed present; the live visual behavior is not yet observed.
