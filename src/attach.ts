@@ -5,6 +5,7 @@ import { LiveAttach, goalLoopViewFrom, overallStatus, reconcileAdvisorJournal, r
 import { createControlClient, readControlFile, type ControlClient } from "./control-client"
 import type { ControlReset, ControlRole, PendingSnapshot } from "./control-server"
 import { goalProgressPhases } from "./goal-phases"
+import { compactRunRowName } from "./runner"
 import { readRunMetadata, type RunMetadata } from "./metadata"
 import { connectOpencode } from "./opencode"
 import type { AutoAccept, PermissionPromptInfo, ProgressPhase, ProgressUI, RunFinalizationView } from "./progress"
@@ -88,7 +89,11 @@ export function reconstructedPhases(metadata: RunMetadata, live: boolean): Progr
   // disappearing, so unknown or legacy names degrade rather than fail.
   const placed = new Set(phases.map((phase) => phase.name))
   phases.push(...extras.filter((name) => !placed.has(name)).map((name) => ({ name, description: "" })))
-  return phases
+  // The terminal lifecycle row always closes the reconstructed list, exactly
+  // as the live runner's phase list does (SC-2): progressPhases emits it with
+  // the prefix rows, but its execution position is the run's epilogue.
+  const compact = phases.filter((phase) => phase.name === compactRunRowName)
+  return [...phases.filter((phase) => phase.name !== compactRunRowName), ...compact]
 }
 
 /**

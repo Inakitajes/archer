@@ -17,7 +17,7 @@ export type CloseChecklistState = {
   result?: CloseResult
 }
 
-const closeSteps: readonly CloseStep[] = ["sync", "archive", "squash", "merge"]
+const closeSteps: readonly CloseStep[] = ["sync", "archive", "squash-merge"]
 
 export function initialCloseChecklistState(): CloseChecklistState {
   return { rows: closeSteps.map((step) => ({ step, status: "pending" as const })) }
@@ -51,12 +51,11 @@ export function applyCloseEvent(state: CloseChecklistState, event: CloseEvent): 
       return withRow(event.step, { status: "failed", detail })
     }
     case "squash-phase":
-      // A running squash names its sub-phase (design D1); the copy lives here
-      // so every renderer narrates the same state from the same identifiers.
-      return withRow("squash", { status: "running", detail: squashPhaseDetail(event.phase) })
-    case "merge-shape":
-      // The merge row's completed detail already narrates the shape.
-      return state
+      // A running squash-merge names its sub-phase (design D8); the copy lives
+      // here so every renderer narrates the same state from the same
+      // identifiers: composing the message, awaiting review, creating the
+      // one-parent landing commit.
+      return withRow("squash-merge", { status: "running", detail: squashPhaseDetail(event.phase) })
     case "result":
       return { ...state, result: event.result }
   }
@@ -97,11 +96,11 @@ function firstLine(value: string): string {
   return value.split("\n")[0]?.trim() ?? value
 }
 
-/** The human-readable row detail for each typed squash phase (design D1). */
+/** The human-readable row detail for each typed squash-merge phase (design D8). */
 function squashPhaseDetail(phase: CloseSquashPhase): string {
   if (phase === "composing-message") return "composing the commit message"
   if (phase === "awaiting-message-review") return "awaiting message review"
-  return "creating the squashed commit"
+  return "creating the one-parent landing commit"
 }
 
 function strip(value: string | undefined): string {

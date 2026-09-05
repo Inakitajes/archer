@@ -26,6 +26,12 @@ import type { CloseEvent, ClosePreflightBlocker } from "../src/feature-close"
 
 const dirs: string[] = []
 
+/** Verified-receipt fixture for deletion offers: the tip is its own landing. */
+async function evidenceFor(mainDir: string) {
+  const tip = await git(mainDir, "rev-parse", "feat/add-widget")
+  return { evidence: { landingSha: tip, featureTip: tip } }
+}
+
 /** git reports repo paths in the kernel's canonical form (/private/var on macOS). */
 async function realPath(path: string): Promise<string> {
   const { realpath } = await import("node:fs/promises")
@@ -176,8 +182,7 @@ describe("renderCloseChecklist", () => {
       "preflight: clean tree · 2/2 tasks · no live runs",
       "  ⊘ sync — skipped: main is already an ancestor of feat/add-widget",
       "  ▸ archive…",
-      "  ○ squash",
-      "  ○ merge",
+      "  ○ squash-merge",
     ])
   })
 
@@ -187,16 +192,14 @@ describe("renderCloseChecklist", () => {
         preflight,
         { type: "step-skipped", step: "sync", reason: "main is already an ancestor" },
         { type: "step-completed", step: "archive", detail: "archived add-widget" },
-        { type: "step-completed", step: "squash", detail: "2 commits → abcd1234" },
-        { type: "merge-shape", shape: "fast-forward" },
-        { type: "step-completed", step: "merge", detail: "merged (fast-forward)" },
+        { type: "step-completed", step: "squash-merge", detail: "landed abcd1234 on main" },
         {
           type: "result",
-          result: { changeID: "add-widget", branch: "feat/add-widget", worktreeDir: "/wt", baseRef: "main", squashed: { sha: "abcd1234", replaced: 2 }, merged: true, mergeShape: "fast-forward" },
+          result: { changeID: "add-widget", branch: "feat/add-widget", worktreeDir: "/wt", baseRef: "main", disposition: "landed", landing: { sha: "abcd1234" } },
         },
       ]),
     )
-    expect(frame.at(-3)).toContain("✓ merge — merged (fast-forward)")
+    expect(frame.at(-3)).toContain("✓ squash-merge — landed abcd1234 on main")
     expect(frame.at(-2)).toBe("")
     expect(frame.at(-1)).toBe("closed add-widget: feat/add-widget → main")
     expect(frame.some((line) => line.includes("⊘ sync — skipped:"))).toBe(true)
@@ -222,23 +225,23 @@ describe("renderCloseChecklist", () => {
   })
 
   test("a squash phase names the sub-phase on a running squash row", () => {
-    const frame = renderCloseChecklist(stateThrough([preflight, { type: "step-started", step: "squash" }, { type: "squash-phase", phase: "composing-message" }]))
-    expect(frame).toContain("  ▸ squash — composing the commit message")
-    const review = renderCloseChecklist(stateThrough([{ type: "step-started", step: "squash" }, { type: "squash-phase", phase: "awaiting-message-review" }]))
-    expect(review).toContain("  ▸ squash — awaiting message review")
-    const creating = renderCloseChecklist(stateThrough([{ type: "step-started", step: "squash" }, { type: "squash-phase", phase: "creating-commit" }]))
-    expect(creating).toContain("  ▸ squash — creating the squashed commit")
+    const frame = renderCloseChecklist(stateThrough([preflight, { type: "step-started", step: "squash-merge" }, { type: "squash-phase", phase: "composing-message" }]))
+    expect(frame).toContain("  ▸ squash-merge — composing the commit message")
+    const review = renderCloseChecklist(stateThrough([{ type: "step-started", step: "squash-merge" }, { type: "squash-phase", phase: "awaiting-message-review" }]))
+    expect(review).toContain("  ▸ squash-merge — awaiting message review")
+    const creating = renderCloseChecklist(stateThrough([{ type: "step-started", step: "squash-merge" }, { type: "squash-phase", phase: "creating-commit" }]))
+    expect(creating).toContain("  ▸ squash-merge — creating the one-parent landing commit")
   })
 
   test("a step-failed squash replaces the phase detail with the remediation", () => {
     const frame = renderCloseChecklist(
       stateThrough([
-        { type: "step-started", step: "squash" },
+        { type: "step-started", step: "squash-merge" },
         { type: "squash-phase", phase: "awaiting-message-review" },
-        { type: "step-failed", step: "squash", message: "squash: signature declined" },
+        { type: "step-failed", step: "squash-merge", message: "squash-merge: signature declined" },
       ]),
     )
-    expect(frame).toContain("  ✗ squash — signature declined")
+    expect(frame).toContain("  ✗ squash-merge — signature declined")
     expect(frame.some((line) => line.includes("awaiting message review"))).toBe(false)
   })
 })
@@ -250,12 +253,10 @@ describe("formatCloseEvents", () => {
     { type: "preflight", summary: "clean tree · 2/2 tasks · no live runs" },
     { type: "step-skipped", step: "sync", reason: "main is already an ancestor of feat/add-widget" },
     { type: "step-completed", step: "archive", detail: "archived add-widget" },
-    { type: "step-completed", step: "squash", detail: "2 commits → abcd1234" },
-    { type: "merge-shape", shape: "fast-forward" },
-    { type: "step-completed", step: "merge", detail: "merged (fast-forward)" },
+    { type: "step-completed", step: "squash-merge", detail: "landed abcd1234 on main" },
     {
       type: "result",
-      result: { changeID: "add-widget", branch: "feat/add-widget", worktreeDir: "/wt", baseRef: "main", merged: true, mergeShape: "fast-forward" },
+      result: { changeID: "add-widget", branch: "feat/add-widget", worktreeDir: "/wt", baseRef: "main", disposition: "landed", landing: { sha: "abcd1234" } },
     },
   ]
 
@@ -268,8 +269,11 @@ describe("formatCloseEvents", () => {
     const text = formatCloseEvents(successEvents, { followUps })
     expect(text).toContain("preflight: clean tree · 2/2 tasks · no live runs")
     expect(text).toContain("sync: skipped — main is already an ancestor of feat/add-widget")
-    expect(text).toContain("merge: merged (fast-forward)")
-    expect(text).toContain("closed add-widget: feat/add-widget → main")
+    expect(text).toContain("squash-merge: landed abcd1234 on main")
+    // One landing result, named base and commit — never a merge shape (design D8).
+    expect(text).toContain("closed add-widget: feat/add-widget → main (one commit abcd1234)")
+    expect(text).not.toContain("fast-forward")
+    expect(text).not.toContain("merge commit")
     // Push names remote and refspec explicitly, and worktree removal is
     // printed before branch deletion (design D7's safe execution order).
     const pushAt = text.indexOf("git push origin main:main")
@@ -309,13 +313,13 @@ describe("formatCloseEvents", () => {
   test("intermediate squash phases never reach the stdout summary", () => {
     const text = formatCloseEvents([
       { type: "preflight", summary: "clean tree" },
-      { type: "step-started", step: "squash" },
+      { type: "step-started", step: "squash-merge" },
       { type: "squash-phase", phase: "composing-message" },
       { type: "squash-phase", phase: "awaiting-message-review" },
       { type: "squash-phase", phase: "creating-commit" },
-      { type: "step-completed", step: "squash", detail: "2 commits → abcd1234" },
+      { type: "step-completed", step: "squash-merge", detail: "landed abcd1234 on main" },
     ])
-    expect(text).toContain("squash: 2 commits → abcd1234")
+    expect(text).toContain("squash-merge: landed abcd1234 on main")
     expect(text).not.toContain("composing")
     expect(text).not.toContain("awaiting message review")
   })
@@ -333,14 +337,47 @@ describe("resolveCloseFollowUps", () => {
     await git(fixture.mainDir, "config", "branch.main.remote", "origin")
     await git(fixture.mainDir, "config", "branch.main.merge", "refs/heads/main")
     await git(fixture.mainDir, "update-ref", "refs/remotes/origin/main", "HEAD")
-    const followUps = await resolveCloseFollowUps({ targetDir: fixture.mainDir, baseRef: "main", branch: "feat/add-widget", worktreeDir: fixture.worktreeDir })
+    // Without a verified receipt there is no delete command at all — only the
+    // remediation (design D7, task 6.3).
+    const unevidenced = await resolveCloseFollowUps({ targetDir: fixture.mainDir, baseRef: "main", branch: "feat/add-widget", worktreeDir: fixture.worktreeDir })
+    expect(unevidenced.branchDelete).toBeUndefined()
+    expect(unevidenced.branchDeleteRemediation).toContain("receipt")
+    // With the receipt the deletion is offered as a guarded command that
+    // re-checks the exact tip and landing reachability right before `branch -D`.
+    const tip = await git(fixture.mainDir, "rev-parse", "feat/add-widget")
+    const followUps = await resolveCloseFollowUps({
+      targetDir: fixture.mainDir,
+      baseRef: "main",
+      branch: "feat/add-widget",
+      worktreeDir: fixture.worktreeDir,
+      evidence: { landingSha: tip, featureTip: tip },
+    })
     // The printed commands carry git -C <main-repo> and only quote unsafe paths,
     // so they stay executable from inside the feature worktree (SC-2).
     const main = await realPath(fixture.mainDir)
     expect(followUps.push).toEqual({ remote: "origin", refspec: "main:main", command: `git -C ${main} push origin main:main` })
     expect(followUps.pushRemediation).toBeUndefined()
     expect(followUps.worktreeRemoval).toBe(`git -C ${main} worktree remove ${fixture.worktreeDir}`)
-    expect(followUps.branchDelete).toBe(`git -C ${main} branch -d feat/add-widget`)
+    expect(followUps.branchDelete).toBe(
+      `git -C ${main} rev-parse --verify refs/heads/feat/add-widget | grep -qx ${tip} && ` +
+      `git -C ${main} merge-base --is-ancestor ${tip} main && ` +
+      `git -C ${main} branch -D feat/add-widget`,
+    )
+  })
+
+  test("a feature tip that moved past the landing withdraws the deletion command", async () => {
+    const fixture = await makeFixture()
+    const tip = await git(fixture.mainDir, "rev-parse", "feat/add-widget")
+    await git(fixture.worktreeDir, "commit", "--allow-empty", "-m", "feat: new work after the landing")
+    const followUps = await resolveCloseFollowUps({
+      targetDir: fixture.mainDir,
+      baseRef: "main",
+      branch: "feat/add-widget",
+      worktreeDir: fixture.worktreeDir,
+      evidence: { landingSha: tip, featureTip: tip },
+    })
+    expect(followUps.branchDelete).toBeUndefined()
+    expect(followUps.branchDeleteRemediation).toContain("moved past the landed state")
   })
 
   test("a missing upstream yields the remediation and no push", async () => {
@@ -485,7 +522,8 @@ describe("offerCloseFollowUps", () => {
     const io = createIO(["n"])
     await offerCloseFollowUps(
       {
-        branchDelete: "git branch -d feat/add-widget",
+        branchDelete: "git branch -D feat/add-widget",
+        ...(await evidenceFor(fixture.mainDir)),
         worktreeRemoval: `git worktree remove ${fixture.worktreeDir}`,
         baseRef: "main",
         branch: "feat/add-widget",
@@ -496,7 +534,7 @@ describe("offerCloseFollowUps", () => {
     )
     const text = cleaned(io.chunks)
     expect(text).toContain(`next: git worktree remove ${fixture.worktreeDir}`)
-    expect(text).toContain("next (after the worktree is removed): git branch -d feat/add-widget")
+    expect(text).toContain("next (after the worktree is removed): git branch -D feat/add-widget")
     // The branch still exists and still has its worktree.
     expect((await stat(fixture.worktreeDir)).isDirectory()).toBe(true)
     expect(await git(fixture.mainDir, "rev-parse", "--verify", "feat/add-widget")).toBeTruthy()
@@ -507,7 +545,8 @@ describe("offerCloseFollowUps", () => {
     const io = createIO(["y", "n"])
     await offerCloseFollowUps(
       {
-        branchDelete: "git branch -d feat/add-widget",
+        branchDelete: "git branch -D feat/add-widget",
+        ...(await evidenceFor(fixture.mainDir)),
         worktreeRemoval: `git worktree remove ${fixture.worktreeDir}`,
         baseRef: "main",
         branch: "feat/add-widget",
@@ -520,16 +559,20 @@ describe("offerCloseFollowUps", () => {
     expect(text).toContain("worktree removed")
     // The worktree is gone, so the branch-delete offer appeared (declined here).
     await expect(stat(fixture.worktreeDir)).rejects.toThrow()
-    expect(text).toContain("next: git branch -d feat/add-widget")
+    expect(text).toContain("next: git branch -D feat/add-widget")
     expect(await git(fixture.mainDir, "rev-parse", "--verify", "feat/add-widget")).toBeTruthy()
   })
 
   test("branch deletion runs only after the worktree removal succeeded", async () => {
     const fixture = await makeFixture()
+    // Simulate the landing: the feature tip reaches main (a fast-forward of
+    // the base onto the one candidate), so the evidence gate can pass.
+    await git(fixture.mainDir, "merge", "--ff-only", "feat/add-widget")
     const io = createIO(["y", "y"])
     await offerCloseFollowUps(
       {
-        branchDelete: "git branch -d feat/add-widget",
+        branchDelete: "git branch -D feat/add-widget",
+        ...(await evidenceFor(fixture.mainDir)),
         worktreeRemoval: `git worktree remove ${fixture.worktreeDir}`,
         baseRef: "main",
         branch: "feat/add-widget",
@@ -552,7 +595,8 @@ describe("offerCloseFollowUps", () => {
     const io = createIO([])
     await offerCloseFollowUps(
       {
-        branchDelete: "git branch -d feat/add-widget",
+        branchDelete: "git branch -D feat/add-widget",
+        ...(await evidenceFor(fixture.mainDir)),
         baseRef: "main",
         branch: "feat/add-widget",
         worktreeDir: fixture.worktreeDir,
@@ -562,7 +606,7 @@ describe("offerCloseFollowUps", () => {
     )
     const text = cleaned(io.chunks)
     // The branch is deletable now — the immediate command, not a wait.
-    expect(text).toContain("next: git branch -d feat/add-widget")
+    expect(text).toContain("next: git branch -D feat/add-widget")
     expect(text).not.toContain("after the worktree is removed")
   })
 })

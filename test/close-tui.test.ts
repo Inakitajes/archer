@@ -97,7 +97,7 @@ describe("close TUI render ticker", () => {
     try {
       // A deferred writer holds close in `composing-message`: no further
       // operation events arrive, yet the running row must stay visibly alive.
-      session.instance.onEvent({ type: "step-started", step: "squash" })
+      session.instance.onEvent({ type: "step-started", step: "squash-merge" })
       session.instance.onEvent({ type: "squash-phase", phase: "composing-message" })
       await session.renderOnce()
       now = 0
@@ -121,14 +121,14 @@ describe("close TUI render ticker", () => {
     try {
       // Idle rows have no ticker.
       expect(session.instance.ticking).toBe(false)
-      session.instance.onEvent({ type: "step-started", step: "squash" })
+      session.instance.onEvent({ type: "step-started", step: "squash-merge" })
       expect(session.instance.ticking).toBe(true)
       // Completion stops it; no render cadence survives its work.
-      session.instance.onEvent({ type: "step-completed", step: "squash", detail: "done" })
+      session.instance.onEvent({ type: "step-completed", step: "squash-merge", detail: "done" })
       expect(session.instance.ticking).toBe(false)
 
       // A second activation survives a suspend/resume cycle (design D2).
-      session.instance.onEvent({ type: "step-started", step: "merge" })
+      session.instance.onEvent({ type: "step-started", step: "archive" })
       expect(session.instance.ticking).toBe(true)
       await session.instance.withTerminal(async () => {})
       expect(session.instance.ticking).toBe(true)

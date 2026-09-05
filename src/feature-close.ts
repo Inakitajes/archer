@@ -1,23 +1,33 @@
-import { readdir, readFile, stat } from "node:fs/promises"
+import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
   commitAsUser,
-  convoyAuthorEmail,
   currentBranch,
   detectBaseRef,
   diffStat,
   execFile,
-  findWorktreeDirForBranch,
+  findSuspiciousStagedFiles,
   isAncestor,
   mainWorktreeDir,
+  findWorktreeDirForBranch,
   mergeBase,
   resolveCommit,
   statusPorcelain,
-  type CommitInfo,
 } from "./git"
 import { branchIdFromBranch, isOpenSpecChangeId, openspecDirName } from "./openspec"
-import { applySquash, resolveSquashRange, type SquashRange } from "./finish"
+import {
+  clearCloseJournal,
+  closeCommonDir,
+  closeCandidateRef,
+  closeFeatureTipRef,
+  protectCloseRef,
+  isLandingReachable,
+  readCloseJournal,
+  writeCloseJournal,
+  type CloseJournal,
+} from "./close-journal"
 import {
   closeFallbackCommitMessage,
   formatCommitMessage,
@@ -30,31 +40,44 @@ import { listRuns } from "./runs"
 
 /**
  * `convoy close` — the death of a feature, one resumable sequence (capability
- * `feature-close`, design D5): preflight → sync (merge the base branch into
+ * `feature-close`, design D6): preflight → sync (merge the base branch into
  * the feature branch) → archive (through the OpenSpec CLI, the tool that owns
- * that state) → squash (the same authorship-anchored walk `convoy finish`
- * uses) → merge into the base branch from the main checkout. Each step checks
- * its own precondition, so `close --resume` after a mid-sequence stop — a
- * conflicting sync, a manual archive — continues from the first incomplete
- * step without redoing completed ones. Push, branch delete, and worktree
- * removal are offered separately and never happen automatically.
+ * that state) → squash-merge (stage a one-parent candidate commit in a private
+ * integration worktree at the captured base, then advance the base onto it
+ * with a guarded fast-forward-only ref update). Each step checks its own
+ * precondition, so `close --resume` after a mid-sequence stop continues from
+ * the first incomplete step without redoing completed ones.
  *
- * The sequence narrates itself through one-way `CloseEvent`s (design D3) and
- * gates the squashed commit behind a separate `resolveMessage` resolver, so
+ * The landing is always exactly one regular commit on the base branch whose
+ * tree is the feature's post-archive tree. The feature branch is never
+ * rewritten — its history (operator proposal commits, run-compaction commits,
+ * sync/archive work) survives untouched — and published history is never
+ * rewritten by construction: the candidate's parent is the captured base, so
+ * landing is a pure fast-forward of the base ref, guarded by an expected-old
+ * value that refuses when the base moved.
+ *
+ * The sequence narrates itself through one-way `CloseEvent`s (design D8) and
+ * gates the candidate commit behind a separate `resolveMessage` resolver, so
  * the TTY checklist and the headless formatter consume the same stream.
  */
 
-export type CloseStep = "sync" | "archive" | "squash" | "merge"
+export type CloseStep = "sync" | "archive" | "squash-merge"
 
 /**
- * The squash step's typed sub-phases (design D1): stable identifiers the
+ * The squash-merge step's typed sub-states (design D8): stable identifiers the
  * renderers map to their own copy, so semantic operation state stays in the
  * orchestrator instead of being inferred from which renderer is waiting.
  */
 export type CloseSquashPhase = "composing-message" | "awaiting-message-review" | "creating-commit"
 
-/** How the feature branch landed on the base branch (design D5: derived from git state, narrated). */
-export type CloseMergeShape = "fast-forward" | "merge-commit" | "already-up-to-date"
+/** How the close ended, stated once (design D8: no dual merge-shape narration). */
+export type CloseDisposition =
+  /** The base advanced onto the one candidate commit. */
+  | "landed"
+  /** The feature's post-archive tree equals the captured base tree — nothing to land, no empty commit. */
+  | "no-content-to-land"
+  /** A verified receipt shows this exact feature already landed; nothing was redone. */
+  | "already-landed"
 
 export type CloseEvent =
   | { type: "preflight"; summary: string }
@@ -64,7 +87,6 @@ export type CloseEvent =
   | { type: "step-skipped"; step: CloseStep; reason: string }
   | { type: "step-failed"; step: CloseStep; message: string }
   | { type: "squash-phase"; phase: CloseSquashPhase }
-  | { type: "merge-shape"; shape: CloseMergeShape }
   | { type: "result"; result: CloseResult }
 
 /** What the message gate hands the operator: the normalized proposal, and where it came from. */
@@ -86,15 +108,15 @@ export type CloseInput = {
   changeID?: string
   /** Continue a previously stopped sequence: completed steps are detected, not repeated. */
   resume?: boolean
-  /** Override for the squashed conventional commit's message; wins verbatim and bypasses composition. */
+  /** Override for the landing commit's message; wins verbatim and bypasses composition. */
   message?: string
-  /** One-way narration of the sequence (design D3); safe to ignore for scripted calls. */
+  /** One-way narration of the sequence (design D8); safe to ignore for scripted calls. */
   onEvent?: (event: CloseEvent) => void
   /**
-   * The two-way gate before the squash lands: receives the composed message and
-   * returns the message to commit, or undefined to stop the sequence before the
-   * squash. Headless callers omit it (the proposal is accepted unchanged);
-   * `--message` never reaches it.
+   * The two-way gate before the candidate commit is created: receives the
+   * composed message and returns the message to commit, or undefined to stop
+   * the sequence before the landing. Headless callers omit it (the proposal is
+   * accepted unchanged); `--message` never reaches it.
    */
   resolveMessage?: (proposal: CloseMessageProposal) => Promise<string | undefined>
   /**
@@ -108,13 +130,13 @@ export type CloseInput = {
 }
 
 export type ClosePreflightBlocker = {
-  check: "clean-tree" | "tasks" | "live-run"
+  check: "clean-tree" | "tasks" | "live-run" | "main-checkout" | "unrelated-base"
   message: string
 }
 
 export type CloseStop = {
   /** The step the sequence stopped at, so --resume knows where to pick up. */
-  step: "sync" | "archive" | "squash" | "merge"
+  step: CloseStep
   message: string
 }
 
@@ -123,11 +145,9 @@ export type CloseResult = {
   branch: string
   worktreeDir: string
   baseRef: string
-  /** The squash outcome; skipped when the branch carried no convoy commits. */
-  squashed?: { sha: string; replaced: number }
-  merged: boolean
-  /** How the merge landed (design D5); "already-up-to-date" when nothing moved. */
-  mergeShape: CloseMergeShape
+  disposition: CloseDisposition
+  /** Present when the disposition is "landed" or "already-landed". */
+  landing?: { sha: string }
 }
 
 export type CloseTarget = {
@@ -139,9 +159,11 @@ export type CloseTarget = {
 /**
  * Resolves the feature the close sequence operates on. Explicit worktree and
  * branch (the board's handoff) win; a bare `--branch` resolves its worktree
- * from the repo's worktree list (the same lookup `finish --branch` uses);
- * running inside the worktree is enough on its own. The change id follows the
- * shared branch↔change rule unless `--change` pins it.
+ * from the repo's worktree list; running inside the worktree is enough on its
+ * own. The change id follows the shared branch↔change rule unless `--change`
+ * pins it. A completed receipt lets cleanup-only resumes proceed without a
+ * worktree (design D7): the caller names the branch, the receipt supplies the
+ * rest, and no worktree is demanded.
  */
 export async function resolveCloseTarget(input: CloseInput): Promise<CloseTarget> {
   const { targetDir } = input
@@ -149,7 +171,7 @@ export async function resolveCloseTarget(input: CloseInput): Promise<CloseTarget
   let branch = input.branch
 
   if (!worktreeDir && branch) worktreeDir = (await findWorktreeDirForBranch(branch, targetDir)) ?? undefined
-  if (!worktreeDir) {
+  if (!worktreeDir && !input.resume) {
     // Running inside the feature worktree is the natural `convoy close` cwd.
     const main = await mainWorktreeDir(targetDir).catch(() => undefined)
     if (main && (await resolveSame(main, targetDir)) === false) {
@@ -183,8 +205,9 @@ async function resolveSame(a: string, b: string): Promise<boolean> {
 
 /**
  * The preflight state: the blocking conditions (each with its concrete
- * remediation) plus the one-line summary the checklist renders (design D6:
- * `clean tree · 24/24 tasks · no live runs`).
+ * remediation) plus the one-line summary the checklist renders (design D8:
+ * `clean tree · 24/24 tasks · no live runs`, plus the factual remote context
+ * when the feature is published).
  */
 export type ClosePreflightState = {
   blockers: ClosePreflightBlocker[]
@@ -192,9 +215,13 @@ export type ClosePreflightState = {
 }
 
 /**
- * The three blocking preflight conditions, each with its concrete remediation.
+ * The blocking preflight conditions, each with its concrete remediation.
  * Returned (not thrown) so the caller can print them all at once; an empty
- * list means the sequence may start.
+ * list means the sequence may start. Both worktrees are checked before any
+ * mutation: the feature tree must be clean, and the main checkout must sit
+ * clean and on the base branch the landing will advance (design D6, task 5.2).
+ * A published feature branch is disclosed factually, never treated as a
+ * blocker — and an upstream alone is never described as proof of anything.
  */
 export async function closePreflight(input: CloseInput, target: CloseTarget): Promise<ClosePreflightBlocker[]> {
   return (await closePreflightState(input, target)).blockers
@@ -202,10 +229,11 @@ export async function closePreflight(input: CloseInput, target: CloseTarget): Pr
 
 export async function closePreflightState(input: CloseInput, target: CloseTarget): Promise<ClosePreflightState> {
   const blockers: ClosePreflightBlocker[] = []
+  const baseRef = await closeBaseRef(input.targetDir)
 
   // Fail closed: a git status that cannot be read must not be read as "clean",
-  // because the sequence that follows rewrites history (squash) and merges it
-  // onto the base. If we cannot verify the tree, we refuse (SC-6).
+  // because the sequence that follows moves the base branch. If we cannot
+  // verify the tree, we refuse (SC-6).
   let porcelain: string
   let treeVerifiable = true
   try {
@@ -215,7 +243,7 @@ export async function closePreflightState(input: CloseInput, target: CloseTarget
     treeVerifiable = false
     blockers.push({
       check: "clean-tree",
-      message: `couldn't verify the worktree at ${target.worktreeDir} is clean (${error instanceof Error ? error.message : error}) — refusing to rewrite history under an unverifiable tree`,
+      message: `couldn't verify the worktree at ${target.worktreeDir} is clean (${error instanceof Error ? error.message : error}) — refusing to move history under an unverifiable tree`,
     })
   }
   if (porcelain.trim() !== "") {
@@ -260,24 +288,101 @@ export async function closePreflightState(input: CloseInput, target: CloseTarget
     blockers.push({ check: "live-run", message: `${liveCount} live run${liveCount === 1 ? " is" : "s are"} attached to ${target.branch} — wait for or stop ${liveCount === 1 ? "it" : "them"} first` })
   }
 
+  // The landing advances the base branch from the main checkout (design D6,
+  // task 5.2): that checkout must be verifiably clean and already on the base
+  // branch — close never moves the operator's own checkout out from under
+  // them. This check lives in preflight so a stop happens before any sync or
+  // archive mutation, not after the feature work has been prepared.
+  const mainDir = (await mainWorktreeDir(input.targetDir).catch(() => undefined)) ?? input.targetDir
+  const mainBranch = await currentBranch(mainDir).catch(() => undefined)
+  if (mainBranch !== baseRef) {
+    blockers.push({
+      check: "main-checkout",
+      message: `the main checkout is on ${mainBranch ?? "a detached HEAD"}, not ${baseRef} — check out ${baseRef} there, then run \`convoy close --resume\``,
+    })
+  } else {
+    const mainStatus = await statusPorcelain(mainDir).catch(() => "unreadable")
+    if (mainStatus.trim() !== "") {
+      blockers.push({ check: "main-checkout", message: "the main checkout has uncommitted changes — commit or stash them first, then run `convoy close --resume`" })
+    }
+  }
+
+  // The fork relationship is derived from git, never from a branch timestamp
+  // or a configurable boundary (design D6, task 5.2): unrelated or ambiguous
+  // histories are refused rather than falling back to HEAD.
+  const related = await mergeBase(baseRef, target.branch, target.worktreeDir).catch(() => undefined)
+  if (!related) {
+    blockers.push({
+      check: "unrelated-base",
+      message: `${target.branch} and ${baseRef} share no merge-base — close refuses to land across unrelated histories`,
+    })
+  }
+
   const parts: string[] = [treeVerifiable ? "clean tree" : "tree unverifiable"]
   if (taskSummary) parts.push(taskSummary)
   parts.push(liveCount === 0 ? "no live runs" : `${liveCount} live run${liveCount === 1 ? "" : "s"}`)
+  // Factual remote disclosure (design D7): an upstream is reported, never
+  // interpreted — close neither blocks on it nor claims a PR exists.
+  const upstream = await import("./git").then((git) => git.branchUpstream(target.branch, target.worktreeDir).catch(() => undefined))
+  if (upstream) parts.push(`${target.branch} tracks ${upstream}`)
   return { blockers, summary: parts.join(" · ") }
 }
 
 /**
  * The full closing sequence. Throws `Error` on every stop (preflight
- * blockers, sync conflict, archive failure, declined message, merge conflict);
- * the error message names the step and the remediation, and `close --resume`
- * picks up from the first incomplete step. Every state change the renderers
- * need travels through `input.onEvent` (design D3) — the TTY checklist and the
- * headless formatter consume the same stream, so narration has one source.
+ * blockers, sync conflict, archive failure, declined message, stale base,
+ * landing failure); the error message names the step and the remediation, and
+ * `close --resume` picks up from the first incomplete step. Every state
+ * change the renderers need travels through `input.onEvent` (design D8) — the
+ * TTY checklist and the headless formatter consume the same stream, so
+ * narration has one source.
  */
 export async function runClose(input: CloseInput): Promise<CloseResult> {
   const emit = (event: CloseEvent) => input.onEvent?.(event)
-  const target = await resolveCloseTarget(input)
   const baseRef = await closeBaseRef(input.targetDir)
+  const mainDir = (await mainWorktreeDir(input.targetDir).catch(() => undefined)) ?? input.targetDir
+  const commonDir = await closeCommonDir(input.targetDir)
+
+  // Receipt fast path (design D7, task 5.1): a resume against a completed
+  // receipt skips completed work before any worktree is demanded, even when
+  // the worktree was already removed and cleanup is all that remains.
+  if (input.resume && input.branch && commonDir) {
+    const receipt = await readCloseJournal(commonDir, input.branch, input.changeID ?? branchIdFromBranch(input.branch) ?? "")
+    if (receipt?.phase === "landed" && receipt.landingSha && receipt.postArchiveTip) {
+      const reachable = await isLandingReachable(receipt.landingSha, baseRef, mainDir)
+      const tip = await resolveCommit(receipt.branch, mainDir).catch(() => undefined)
+      const tipUnchanged = tip === undefined || tip === receipt.postArchiveTip
+      if (reachable && tipUnchanged) {
+        const summary = `landing ${receipt.landingSha.slice(0, 8)} already recorded for ${receipt.branch} → ${baseRef}`
+        emit({ type: "preflight", summary: `${summary} · nothing to redo` })
+        for (const step of ["sync", "archive", "squash-merge"] as const) {
+          emit({ type: "step-skipped", step, reason: "a verified landing receipt covers this sequence" })
+        }
+        const result: CloseResult = {
+          changeID: receipt.changeID,
+          branch: receipt.branch,
+          worktreeDir: input.worktreeDir ?? (await findWorktreeDirForBranch(receipt.branch, input.targetDir)) ?? mainDir,
+          baseRef,
+          disposition: "already-landed",
+          landing: { sha: receipt.landingSha },
+        }
+        emit({ type: "result", result })
+        return result
+      }
+      if (!reachable) {
+        throw new Error(
+          `close receipt invalid: landing ${receipt.landingSha.slice(0, 8)} is no longer reachable from ${baseRef} — ` +
+            "inspect the branch history before closing again; a revert is an explicit git revert, never a re-land",
+        )
+      }
+      throw new Error(
+        `close receipt invalid: ${receipt.branch}'s tip moved past the landed state (${receipt.postArchiveTip.slice(0, 8)}) — ` +
+          "inspect the branch, then plan a new close",
+      )
+    }
+  }
+
+  const target = await resolveCloseTarget(input)
 
   // Preflight: refuse to touch anything until the feature is ready to close.
   const preflight = await closePreflightState(input, target)
@@ -287,38 +392,38 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
   }
   emit({ type: "preflight", summary: preflight.summary })
 
+  const journalState = await openJournal(commonDir, target, baseRef, input)
+  const journal = journalState.record
+
   // Sync: bring the base branch's tip in before archiving, so the canonical
-  // specs the archive produces land against a fresh base.
-  let syncMergeSha: string | undefined
+  // specs the archive produces land against a fresh base. The base revision
+  // is captured (pinned) here and revalidated before the landing (task 5.6).
+  const baseSha = journal.baseSha
+  let preSyncTip: string | undefined
   if (await isAncestor(baseRef, target.branch, target.worktreeDir)) {
     emit({ type: "step-skipped", step: "sync", reason: `${baseRef} is already an ancestor of ${target.branch}` })
-    // A resume arrives here after the sync merge already landed, so this step
-    // is detected as done rather than redone. That merge is an operator-identity
-    // commit the squash below must fold (design D5); it isn't persisted, so
-    // re-discover it — without it the plain walk would leave the sync merge and
-    // the raw convoy commits to leak onto the base branch (SC-1).
-    if (input.resume) syncMergeSha = await detectPendingSyncMerge(target.worktreeDir)
   } else {
     emit({ type: "step-started", step: "sync" })
-    const merge = await execFile("git", ["merge", "--no-edit", baseRef], { cwd: target.worktreeDir, allowFailure: true })
+    preSyncTip = (await resolveCommit(target.branch, target.worktreeDir)) ?? undefined
+    const merge = await execFile("git", ["merge", "--no-edit", baseSha], { cwd: target.worktreeDir, allowFailure: true })
     if (merge.exitCode !== 0) {
       const message = `sync: merging ${baseRef} into ${target.branch} conflicted — resolve the conflicts and commit inside the worktree, then run \`convoy close --resume\`\n${merge.stderr || merge.stdout}`
       emit({ type: "step-failed", step: "sync", message })
       throw new Error(message)
     }
-    // The clean sync just wrote an operator-identity merge commit. The squash
-    // below must fold it (plus the convoy commits beneath it) into the one
-    // conventional commit, or the raw `convoy(...)` steps leak onto the base
-    // branch unchanged.
-    syncMergeSha = (await resolveCommit("HEAD", target.worktreeDir)) ?? undefined
-    emit({ type: "step-completed", step: "sync", detail: `merged ${baseRef} into ${target.branch}` })
+    emit({ type: "step-completed", step: "sync", detail: `merged ${baseSha.slice(0, 8)} into ${target.branch}` })
+    if (journal.phase === "prepared" && !journal.postArchiveTip) await persistJournal(journalState, { preSyncTip })
   }
 
-  // Snapshot the message inputs before the first archive mutation (design D1):
+  // Snapshot the message inputs before the first archive mutation (design D6):
   // the archive moves the live change, and the archive layout's naming is an
-  // implementation detail the message must never discover.
+  // implementation detail the message must never discover. A resume reuses the
+  // persisted context so a retry never degrades to archive-only text.
   const archiveSubject = `chore(openspec): archive ${target.changeID}`
-  const snapshot = await snapshotCloseContext(target, baseRef, { syncMergeSha, archiveSubject })
+  const snapshot: CloseContextSnapshot = journal.messageContext
+    ? { ...journal.messageContext, changeID: target.changeID }
+    : await snapshotCloseContext(target, baseSha, { archiveSubject })
+  if (!journal.messageContext) await persistJournal(journalState, { messageContext: snapshot })
 
   // Archive: through the OpenSpec CLI only — convoy never edits openspec/.
   const changeDir = join(target.worktreeDir, openspecDirName, "changes", target.changeID)
@@ -326,7 +431,7 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
     emit({ type: "step-started", step: "archive" })
     const archive = await execFile("openspec", ["archive", target.changeID, "--yes"], { cwd: target.worktreeDir, allowFailure: true })
     if (archive.exitCode !== 0) {
-      const message = `archive: openspec archive ${target.changeID} failed — the sequence stops before any squash or merge\n${archive.stderr || archive.stdout}`
+      const message = `archive: openspec archive ${target.changeID} failed — the sequence stops before any squash-merge\n${archive.stderr || archive.stdout}`
       emit({ type: "step-failed", step: "archive", message })
       throw new Error(message)
     }
@@ -350,28 +455,66 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
     emit({ type: "step-skipped", step: "archive", reason: `change ${target.changeID} is already archived` })
   }
 
-  // Squash: the same authorship-anchored walk `convoy finish` uses, so the
-  // operator's own commits (the proposal commit) survive while convoy's — and
-  // close's own archive commit, made under the operator identity — collapse
-  // into one conventional commit. A branch with no convoy commits skips the
-  // squash and merges as-is.
-  let squashed: CloseResult["squashed"]
-  const range = syncMergeSha
-    ? await closeSyncSquashRange(target.worktreeDir, baseRef, { syncMergeSha, archiveSubject })
-    : await resolveSquashRange(target.worktreeDir, baseRef, { extraSquashable: (commit) => commit.subject === archiveSubject })
-  if (range.ok) {
-    emit({ type: "step-started", step: "squash" })
+  // The post-archive feature tip is the squash-merge source (design D6): the
+  // candidate folds sync resolutions, archive output, and every author's
+  // feature content by tree, not by walking authors. Protect it create-only
+  // before anything else happens to the branch (design D7).
+  const postArchiveTip = (await resolveCommit(target.branch, target.worktreeDir)) ?? ""
+  if (!postArchiveTip) {
+    const message = `squash-merge: ${target.branch} has no commits — nothing to land`
+    emit({ type: "step-failed", step: "squash-merge", message })
+    throw new Error(message)
+  }
+  try {
+    await protectCloseRef(closeFeatureTipRef(target.branch, journal.attemptID), postArchiveTip, mainDir)
+  } catch (error) {
+    const message = `squash-merge: couldn't protect the feature tip ref (${error instanceof Error ? error.message : String(error)}) — the sequence stops before the landing`
+    emit({ type: "step-failed", step: "squash-merge", message })
+    throw new Error(message)
+  }
+  const preparedTree = (await treeOf(postArchiveTip, target.worktreeDir)) ?? ""
+  await persistJournal(journalState, { postArchiveTip, preparedTree })
+
+  // Squash-merge: stage the one-parent candidate on the captured base in a
+  // private detached integration worktree, then advance the base onto it. The
+  // main checkout's index is never left half-staged by a failed signature or
+  // hook, because the staging happens away from it (design D6, task 5.4).
+  emit({ type: "step-started", step: "squash-merge" })
+  await assertBaseUnchanged(baseSha, baseRef, mainDir)
+
+  if (preparedTree === (await treeOf(baseSha, mainDir))) {
+    // Identical trees: nothing to land, no empty commit, and no cleanup
+    // authorization from that fact alone (design D6/D7).
+    emit({ type: "step-skipped", step: "squash-merge", reason: "the archived feature's tree equals the captured base tree — no content to land" })
+    await clearCloseJournal(commonDir ?? "", target.branch, target.changeID)
+    const result: CloseResult = { changeID: target.changeID, branch: target.branch, worktreeDir: target.worktreeDir, baseRef, disposition: "no-content-to-land" }
+    emit({ type: "result", result })
+    return result
+  }
+
+  // A crash after candidate creation resumes the landing without a new
+  // compose/review round-trip (design D6, task 5.7): the candidate is
+  // verified against the journal before it is trusted.
+  const reconciled = await reconcileCandidate(journal, baseSha, preparedTree, mainDir)
+  let message: string | undefined
+  let candidateSha: string | undefined
+  if (reconciled.ok && reconciled.candidateSha) {
+    candidateSha = reconciled.candidateSha
+    message = journal.message ?? reconciled.message
+    if (message) emit({ type: "squash-phase", phase: "creating-commit" })
+  }
+
+  if (!candidateSha) {
     // `--message ""` is still an explicit override and must win verbatim, so
     // presence is `!== undefined`, never truthiness (SC-8). The override
     // bypasses composition, normalization, and the review gate entirely.
-    let message: string | undefined
     if (input.message !== undefined) {
       message = input.message
     } else {
       // The composition await is real work the renderer must see as such
-      // (design D1): a slow model produces no intermediate event of its own.
+      // (design D8): a slow model produces no intermediate event of its own.
       emit({ type: "squash-phase", phase: "composing-message" })
-      const proposal = await composeCloseMessage({ target, snapshot, diffStat: range.diffStat }, input.writer)
+      const proposal = await composeCloseMessage({ target, snapshot, baseSha, diffStat: await diffStat(baseSha, postArchiveTip, target.worktreeDir) }, input.writer)
       if (input.resolveMessage) {
         emit({ type: "squash-phase", phase: "awaiting-message-review" })
         message = await input.resolveMessage(proposal)
@@ -381,89 +524,256 @@ export async function runClose(input: CloseInput): Promise<CloseResult> {
       }
     }
     if (message === undefined) {
-      const stop = "close stopped: the squashed commit message wasn't confirmed — rerun `convoy close --resume` to retry the squash"
-      emit({ type: "step-failed", step: "squash", message: stop })
+      const stop = "close stopped: the landing commit's message wasn't confirmed — rerun `convoy close --resume` to retry the squash-merge"
+      emit({ type: "step-failed", step: "squash-merge", message: stop })
+      await persistJournal(journalState, { message: undefined })
       throw new Error(stop)
     }
     const confirmedMessage = message
+    await persistJournal(journalState, { message: confirmedMessage })
     emit({ type: "squash-phase", phase: "creating-commit" })
     try {
-      const squash = () => applySquash({ cwd: target.worktreeDir, plan: range, message: confirmedMessage })
-      const result = input.withTerminal ? await input.withTerminal(squash) : await squash()
-      squashed = { sha: result.sha, replaced: result.replaced }
-      emit({ type: "step-completed", step: "squash", detail: `${result.replaced} commit${result.replaced === 1 ? "" : "s"} → ${result.sha.slice(0, 8)}` })
+      candidateSha = await createCandidate(journalState, target, confirmedMessage, baseSha, postArchiveTip, mainDir, input.withTerminal)
     } catch (error) {
-      // A failed rewrite (declined signature, rejected hook) must still mark
-      // the squash row failed; the failed event carries the remediation (SC-5).
+      // A failed candidate (declined signature, rejected hook) must still mark
+      // the squash-merge row failed; the failed event carries the remediation (SC-5).
       const detail = error instanceof Error ? error.message : String(error)
-      emit({ type: "step-failed", step: "squash", message: `squash: ${detail}` })
+      emit({ type: "step-failed", step: "squash-merge", message: `squash-merge: ${detail}` })
       throw error
     }
-  } else if (range.reason === "no-commits") {
-    emit({ type: "step-skipped", step: "squash", reason: "no convoy commits to squash" })
-  } else {
-    const message = `squash: ${range.message}`
-    emit({ type: "step-failed", step: "squash", message })
-    throw new Error(message)
   }
 
-  // Merge: into the base branch from the main checkout. The main checkout
-  // must already sit on the base branch and be clean — close never moves the
-  // operator's own checkout out from under them.
-  const mainDir = (await mainWorktreeDir(input.targetDir)) ?? input.targetDir
-  const mainBranch = await currentBranch(mainDir)
-  if (mainBranch !== baseRef) {
-    const message = `merge: the main checkout is on ${mainBranch ?? "a detached HEAD"}, not ${baseRef} — check out ${baseRef} there, then run \`convoy close --resume\``
-    emit({ type: "step-failed", step: "merge", message })
+  // Land: advance the base branch onto the verified candidate. The candidate's
+  // parent is the captured base, so this is a pure fast-forward of the base
+  // ref — guarded by the expected old value, so a base that moved after the
+  // candidate was built refuses instead of merging or forcing (task 5.5/5.6).
+  const baseNow = (await resolveCommit(baseRef, mainDir)) ?? ""
+  if (baseNow !== baseSha) {
+    const message = `squash-merge: ${baseRef} moved to ${baseNow.slice(0, 8)} while the close was in progress — run \`convoy close\` to re-sync against the new base`
+    emit({ type: "step-failed", step: "squash-merge", message })
     throw new Error(message)
   }
-  const mainStatus = await statusPorcelain(mainDir).catch(() => "dirty")
+  const mainStatus = await statusPorcelain(mainDir).catch(() => "unreadable")
   if (mainStatus.trim() !== "") {
-    const message = "merge: the main checkout has uncommitted changes — commit or stash them first, then run `convoy close --resume`"
-    emit({ type: "step-failed", step: "merge", message })
+    const message = "squash-merge: the main checkout has uncommitted changes — commit or stash them first, then run `convoy close --resume`"
+    emit({ type: "step-failed", step: "squash-merge", message })
     throw new Error(message)
   }
-
-  let mergeShape: CloseMergeShape
-  if (await isAncestor(target.branch, baseRef, mainDir)) {
-    emit({ type: "step-skipped", step: "merge", reason: `${target.branch} is already contained in ${baseRef}` })
-    mergeShape = "already-up-to-date"
-    emit({ type: "merge-shape", shape: mergeShape })
-  } else {
-    emit({ type: "step-started", step: "merge" })
-    const baseBefore = (await resolveCommit(baseRef, mainDir)) ?? ""
-    const merge = await execFile("git", ["merge", "--no-edit", target.branch], { cwd: mainDir, allowFailure: true })
-    if (merge.exitCode !== 0) {
-      const message = `merge: merging ${target.branch} into ${baseRef} failed — resolve in the main checkout, then run \`convoy close --resume\`\n${merge.stderr || merge.stdout}`
-      emit({ type: "step-failed", step: "merge", message })
-      throw new Error(message)
-    }
-    mergeShape = await deriveMergeShape(baseBefore, baseRef, mainDir)
-    emit({ type: "merge-shape", shape: mergeShape })
-    emit({ type: "step-completed", step: "merge", detail: mergeShapeDetail(mergeShape) })
+  try {
+    // The guarded fast-forward-only update (design D6, task 5.5): the
+    // candidate's parent is the captured base, so this can only fast-forward
+    // the base branch — and it updates the main checkout's index and working
+    // tree together with the ref. A base that moved between candidate
+    // creation and landing makes this refuse (no merge, no force); the
+    // clean-tree preflight guarantees the checkout has nothing to lose.
+    const land = await execFile("git", ["merge", "--ff-only", candidateSha], { cwd: mainDir, allowFailure: true })
+    if (land.exitCode !== 0) throw new Error(land.stderr || land.stdout || "git merge --ff-only refused the landing")
+  } catch (error) {
+    const message = `squash-merge: landing ${baseRef} at ${candidateSha.slice(0, 8)} failed (${error instanceof Error ? error.message : String(error)}) — the base is unadvanced; run \`convoy close --resume\``
+    emit({ type: "step-failed", step: "squash-merge", message })
+    throw new Error(message)
   }
+  await persistJournal(journalState, { phase: "landed", landingSha: candidateSha })
 
+  emit({ type: "step-completed", step: "squash-merge", detail: `landed ${candidateSha.slice(0, 8)} on ${baseRef}` })
   const result: CloseResult = {
     changeID: target.changeID,
     branch: target.branch,
     worktreeDir: target.worktreeDir,
     baseRef,
-    ...(squashed ? { squashed } : {}),
-    merged: true,
-    mergeShape,
+    disposition: "landed",
+    landing: { sha: candidateSha },
   }
   emit({ type: "result", result })
   return result
 }
 
+// --- journal handling ---------------------------------------------------------
+
 /**
- * Snapshot + final diffstat → normalized message proposal (design D1). The
+ * Opens (or starts) the close journal for this attempt. A fresh close starts
+ * a new attempt; a resume with a matching base continues the recorded one so
+ * completed work and the reviewed message survive. A resume whose recorded
+ * base differs stops — the base moved, and the sequence must re-sync against
+ * the new base rather than land a stale candidate (task 5.6).
+ */
+type CloseJournalState = { record: CloseJournal; commonDir?: string }
+
+async function openJournal(
+  commonDir: string | undefined,
+  target: CloseTarget,
+  baseRef: string,
+  input: CloseInput,
+): Promise<CloseJournalState> {
+  const mainDir = (await mainWorktreeDir(input.targetDir).catch(() => undefined)) ?? input.targetDir
+  const baseSha = (await resolveCommit(baseRef, mainDir)) ?? (await resolveCommit(baseRef, input.targetDir)) ?? ""
+  if (!baseSha) throw new Error(`close: couldn't resolve the base branch ${baseRef}`)
+
+  if (commonDir && input.resume) {
+    const existing = await readCloseJournal(commonDir, target.branch, target.changeID)
+    if (existing) {
+      if (existing.baseSha !== baseSha) {
+        throw new Error(
+          `close resume: the base moved since this attempt was recorded (${existing.baseSha.slice(0, 8)} → ${baseSha.slice(0, 8)}) — ` +
+            "run `convoy close` without --resume to re-sync against the new base",
+        )
+      }
+      return { record: existing, commonDir }
+    }
+  }
+
+  const attemptID = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`
+  const journal: CloseJournal = {
+    schemaVersion: 1,
+    attemptID,
+    branch: target.branch,
+    changeID: target.changeID,
+    baseRef,
+    baseSha,
+    phase: "prepared",
+    recordedAt: Date.now(),
+    updatedAt: Date.now(),
+  }
+  const record: CloseJournal = {
+    schemaVersion: 1,
+    attemptID,
+    branch: target.branch,
+    changeID: target.changeID,
+    baseRef,
+    baseSha,
+    phase: "prepared",
+    recordedAt: Date.now(),
+    updatedAt: Date.now(),
+  }
+  return { record, commonDir }
+}
+
+async function persistJournal(state: CloseJournalState, patch: Partial<CloseJournal>): Promise<void> {
+  Object.assign(state.record, patch, { updatedAt: Date.now() })
+  if (!state.commonDir) return
+  await writeCloseJournal(state.commonDir, { ...state.record })
+}
+
+/**
+ * Verifies the recorded candidate still exists with exactly the journal's
+ * parent (the captured base) and tree. Anything else is not trusted (task
+ * 5.7): a stale or foreign commit is never reused, and the caller falls back
+ * to building a fresh candidate.
+ */
+async function reconcileCandidate(
+  journal: CloseJournal,
+  baseSha: string,
+  preparedTree: string,
+  cwd: string,
+): Promise<{ ok: true; candidateSha?: string; message?: string } | { ok: false }> {
+  if (journal.phase !== "candidate" || !journal.candidateSha) return { ok: true }
+  const sha = await resolveCommit(journal.candidateSha, cwd).catch(() => undefined)
+  if (!sha) return { ok: true }
+  const parents = await commitParents(sha, cwd)
+  const tree = await treeOf(sha, cwd)
+  if (parents.length !== 1 || parents[0] !== baseSha || tree !== preparedTree) return { ok: true }
+  return { ok: true, candidateSha: sha, ...(journal.message ? { message: journal.message } : {}) }
+}
+
+async function commitParents(sha: string, cwd: string): Promise<string[]> {
+  const result = await execFile("git", ["rev-list", "--parents", "-n", "1", sha], { cwd, allowFailure: true })
+  if (result.exitCode !== 0) return []
+  return result.stdout.trim().split(/\s+/).slice(1)
+}
+
+async function treeOf(sha: string, cwd: string): Promise<string | undefined> {
+  const result = await execFile("git", ["rev-parse", "--verify", "--quiet", `${sha}^{tree}`], { cwd, allowFailure: true })
+  return result.exitCode === 0 ? result.stdout.trim() || undefined : undefined
+}
+
+async function assertBaseUnchanged(baseSha: string, baseRef: string, mainDir: string): Promise<void> {
+  const baseNow = (await resolveCommit(baseRef, mainDir)) ?? ""
+  if (baseNow !== baseSha) {
+    throw new Error(
+      `squash-merge: ${baseRef} moved to ${baseNow.slice(0, 8)} (captured ${baseSha.slice(0, 8)}) — run \`convoy close\` to re-sync against the new base`,
+    )
+  }
+}
+
+/**
+ * Builds the one-parent candidate commit in a private detached integration
+ * worktree at the captured base (design D6, task 5.4): `git merge --squash`
+ * stages the feature's post-archive tree, the staged content is scanned for
+ * secrets exactly like step commits, and the commit is made under the
+ * operator's identity — signing and hooks effective — with the terminal
+ * released for interactive close. The worktree is always removed afterwards.
+ */
+async function createCandidate(
+  state: CloseJournalState,
+  target: CloseTarget,
+  message: string,
+  baseSha: string,
+  postArchiveTip: string,
+  mainDir: string,
+  withTerminal?: CloseInput["withTerminal"],
+): Promise<string> {
+  const scratch = await mkdtemp(join(tmpdir(), "convoy-close-integration-"))
+  try {
+    await execFile("git", ["worktree", "add", "--detach", scratch, baseSha], { cwd: mainDir })
+    try {
+      const squash = await execFile("git", ["merge", "--squash", postArchiveTip], { cwd: scratch, allowFailure: true })
+      if (squash.exitCode !== 0) {
+        throw new Error(
+          `staging the feature tree onto ${state.record.baseRef} failed — the feature and the captured base diverged unexpectedly\n${squash.stderr || squash.stdout}`,
+        )
+      }
+
+      // The candidate commit must not be the one path that bypasses secret
+      // scanning (the same protection step commits get).
+      const porcelain = await statusPorcelain(scratch)
+      const suspicious = findSuspiciousStagedFiles(porcelain)
+      if (suspicious.length > 0) {
+        throw new Error(
+          `refusing to land: the following files look like they contain secrets: ${suspicious.join(", ")}. ` +
+            `Add them to .gitignore (or remove them) and re-run \`convoy close\`.`,
+        )
+      }
+
+      const commitCandidate = () => commitAsUser(message, scratch)
+      if (withTerminal) await withTerminal(commitCandidate)
+      else await commitCandidate()
+
+      const candidateSha = (await resolveCommit("HEAD", scratch)) ?? ""
+      if (!candidateSha) throw new Error("the candidate commit could not be resolved after creation")
+      const parents = await commitParents(candidateSha, scratch)
+      const tree = await treeOf(candidateSha, scratch)
+      if (parents.length !== 1 || parents[0] !== baseSha) {
+        throw new Error(`the candidate commit must have exactly one parent, the captured base ${baseSha.slice(0, 8)} (got ${parents.length})`)
+      }
+      if (tree !== state.record.preparedTree) {
+        throw new Error(`the candidate commit's tree does not match the prepared feature tree (${tree?.slice(0, 8)} vs ${state.record.preparedTree?.slice(0, 8)})`)
+      }
+
+      // Protect the candidate create-only, then record it in the journal
+      // before the base is advanced (design D6/D7, task 5.5) — a crash after
+      // this point resumes the landing instead of rebuilding the commit.
+      await protectCloseRef(closeCandidateRef(state.record.branch, state.record.attemptID), candidateSha, mainDir)
+      await persistJournal(state, { phase: "candidate", candidateSha })
+      return candidateSha
+    } finally {
+      await execFile("git", ["worktree", "remove", "--force", scratch], { cwd: mainDir, allowFailure: true })
+    }
+  } catch (error) {
+    // The scratch dir is removed by `git worktree remove`; a failure before
+    // registration leaves only the empty mkdtemp dir behind.
+    await rm(scratch, { recursive: true, force: true }).catch(() => {})
+    throw error
+  }
+}
+
+/**
+ * Snapshot + final diffstat → normalized message proposal (design D6). The
  * writer's answer is a proposal, not authority: the scope rule is enforced
  * here, and a writer that answered nothing usable degrades to the
  * deterministic close fallback without blocking the sequence.
  */
 async function composeCloseMessage(
-  context: { target: CloseTarget; snapshot: CloseContextSnapshot; diffStat: string },
+  context: { target: CloseTarget; snapshot: CloseContextSnapshot; baseSha: string; diffStat: string },
   writer?: CloseInput["writer"],
 ): Promise<CloseMessageProposal> {
   const writerInput = {
@@ -492,21 +802,21 @@ async function composeCloseMessage(
   return { message: stripControlBytes(formatCommitMessage(normalized)), source: "model" }
 }
 
-/** The message inputs, captured before archive moves the live change (task 2.1, design D1). */
+/** The message inputs, captured before archive moves the live change (design D6). */
 export type CloseContextSnapshot = {
   changeID: string
   /** The proposal document's content, read while the live path still existed. */
   proposalExcerpt?: string
   /** The capability names under the change's delta specs — the scope rule's candidates. */
   scopeCandidates: string[]
-  /** The collapsible commit subjects, captured before the archive commit exists. */
+  /** The feature-exclusive commit subjects, captured before the archive commit exists. */
   commitSubjects: string[]
 }
 
 async function snapshotCloseContext(
   target: CloseTarget,
-  baseRef: string,
-  opts: { syncMergeSha?: string; archiveSubject: string },
+  baseSha: string,
+  opts: { archiveSubject: string },
 ): Promise<CloseContextSnapshot> {
   const changeDir = join(target.worktreeDir, openspecDirName, "changes", target.changeID)
   let proposalExcerpt: string | undefined
@@ -520,7 +830,7 @@ async function snapshotCloseContext(
     changeID: target.changeID,
     ...(proposalExcerpt ? { proposalExcerpt } : {}),
     scopeCandidates: await listChangeCapabilities(changeDir),
-    commitSubjects: await collapsibleCommitSubjects(target, baseRef, opts),
+    commitSubjects: await featureCommitSubjects(target, baseSha),
   }
 }
 
@@ -535,50 +845,28 @@ async function listChangeCapabilities(changeDir: string): Promise<string[]> {
 }
 
 /**
- * The pre-archive walk of what will collapse. The archive commit doesn't exist
- * yet, so the plain authorship-anchored walk already lists every convoy commit;
- * the sync-aware first-parent walk covers a branch that just synced. A failure
- * here only costs the message its commit summaries.
+ * The feature-exclusive commit subjects (base-exclusive reachability, design
+ * D6): every commit on the branch not reachable from the base — operator
+ * commits, run-compaction commits, sync merge resolutions — because the
+ * landing includes all authors' content. A failure here only costs the
+ * message its commit summaries.
  */
-async function collapsibleCommitSubjects(
-  target: CloseTarget,
-  baseRef: string,
-  opts: { syncMergeSha?: string; archiveSubject: string },
-): Promise<string[]> {
+async function featureCommitSubjects(target: CloseTarget, baseSha: string): Promise<string[]> {
   try {
-    const range = opts.syncMergeSha
-      ? await closeSyncSquashRange(target.worktreeDir, baseRef, { syncMergeSha: opts.syncMergeSha, archiveSubject: opts.archiveSubject })
-      : await resolveSquashRange(target.worktreeDir, baseRef)
-    return range.ok ? range.commits.map((commit) => commit.subject) : []
+    const head = (await resolveCommit(target.branch, target.worktreeDir)) ?? ""
+    if (!head) return []
+    const result = await execFile("git", ["log", "--format=%s", `${baseSha}..${head}`], { cwd: target.worktreeDir, allowFailure: true })
+    if (result.exitCode !== 0) return []
+    return result.stdout.split("\n").filter(Boolean)
   } catch {
     return []
   }
 }
 
-/** The merge shape from git state alone (design D5): SHA movement plus parent count. */
-async function deriveMergeShape(baseBefore: string, baseRef: string, cwd: string): Promise<CloseMergeShape> {
-  const baseAfter = (await resolveCommit(baseRef, cwd)) ?? ""
-  if (!baseBefore || !baseAfter || baseAfter === baseBefore) return "already-up-to-date"
-  const parents = await commitParentCount(baseAfter, cwd)
-  return parents > 1 ? "merge-commit" : "fast-forward"
-}
-
-async function commitParentCount(sha: string, cwd: string): Promise<number> {
-  const result = await execFile("git", ["rev-list", "--parents", "-n", "1", sha], { cwd, allowFailure: true })
-  if (result.exitCode !== 0) return 1
-  return Math.max(1, result.stdout.trim().split(/\s+/).length - 1)
-}
-
-function mergeShapeDetail(shape: CloseMergeShape): string {
-  if (shape === "fast-forward") return "merged (fast-forward)"
-  if (shape === "merge-commit") return "merged (merge commit)"
-  return "already up to date"
-}
-
 /**
  * The remediation for a probably-merged-but-unarchived change: archive in the
  * main checkout, commit on the base branch, and nothing else — there is
- * nothing left to sync, squash, or merge (design D6).
+ * nothing left to sync, squash-merge, or land (design D7).
  */
 export async function archiveChangeOnMain(input: { targetDir: string; changeID: string }): Promise<{ committed: boolean }> {
   const { changeID } = input
@@ -612,7 +900,7 @@ export async function archiveChangeOnMain(input: { targetDir: string; changeID: 
   return { committed: true }
 }
 
-/** The base ref the close sequence syncs and merges against. */
+/** The base ref the close sequence syncs and lands against. */
 export async function closeBaseRef(targetDir: string): Promise<string> {
   const mainDir = (await mainWorktreeDir(targetDir).catch(() => undefined)) ?? targetDir
   const detected = await detectBaseRef(mainDir).catch(() => undefined)
@@ -620,95 +908,23 @@ export async function closeBaseRef(targetDir: string): Promise<string> {
 }
 
 /**
- * The squash range for a branch that just cleanly synced — the one
- * `resolveSquashRange` can't serve, because its `commitsBetween` walk crosses
- * the sync merge's second parent and stops at the operator-identity merge
- * commit, leaving the merge and the raw convoy commits unsquashed. This walks
- * the first-parent line instead (the base side of the merge never appears on
- * it) and folds everything from the operator's own proposal commit up through
- * the sync merge, the archive commit, and convoy's step commits into one
- * conventional commit (design D5: operator commits survive, convoy's collapse).
+ * The verified landing receipt for a branch/change, resolved by callers that
+ * gate cleanup on evidence (design D7, task 6.3): a receipt counts only when
+ * its landing commit is still reachable from the base branch. Everything else
+ * (no receipt, stale tip, unreachable landing) is no evidence at all.
  */
-async function closeSyncSquashRange(
-  cwd: string,
-  baseRef: string,
-  opts: { syncMergeSha: string; archiveSubject: string },
-): Promise<SquashRange> {
-  const branch = await currentBranch(cwd)
-  if (!branch) {
-    return { ok: false, reason: "detached", message: "HEAD is detached; check out the feature branch before closing it" }
-  }
-
-  const head = (await resolveCommit("HEAD", cwd)) ?? ""
-  if (!head) return { ok: false, reason: "no-commits", message: "this branch has no commits yet" }
-
-  const firstParent = await firstParentLog(head, cwd)
-  const floor = (await mergeBase(baseRef, "HEAD", cwd)) ?? ""
-
-  const isFoldable = (commit: CommitInfo) =>
-    commit.sha === opts.syncMergeSha || commit.authorEmail === convoyAuthorEmail || commit.subject === opts.archiveSubject
-
-  const commits: CommitInfo[] = []
-  let anchor: string | undefined
-  for (const commit of firstParent) {
-    if (commit.sha === floor) {
-      // Never descend below the branch's fork from the base.
-      anchor = commit.sha
-      break
-    }
-    if (isFoldable(commit)) {
-      commits.push(commit)
-      continue
-    }
-    // The operator's own commit — the surviving proposal commit.
-    anchor = commit.sha
-    break
-  }
-  if (!anchor) anchor = floor
-
-  if (commits.length === 0) {
-    return { ok: false, reason: "no-commits", message: `nothing to squash above the operator's commit` }
-  }
-  if (!anchor) {
-    return { ok: false, reason: "no-base", message: `couldn't find a commit to squash onto (no merge-base with "${baseRef}")` }
-  }
-
-  return { ok: true, branch, base: anchor, head, commits, diffStat: await diffStat(anchor, head, cwd) }
-}
-
-/** The branch's first-parent history, newest first — base-side commits from a sync merge never appear. */
-async function firstParentLog(head: string, cwd: string): Promise<CommitInfo[]> {
-  const result = await execFile("git", ["log", "--first-parent", "--format=%H%x1f%ae%x1f%s", head], { cwd, allowFailure: true })
-  if (result.exitCode !== 0) return []
-  return result.stdout
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => {
-      const [sha = "", authorEmail = "", ...rest] = line.split("\x1f")
-      return { sha, authorEmail, subject: rest.join("\x1f") }
-    })
-    .filter((commit) => commit.sha !== "")
-}
-
-/**
- * Re-discovers close's sync merge after a resume (SC-1). The sync step creates
- * exactly one operator-identity merge commit; nothing close added above it
- * (the archive commit) is a merge, so the newest first-parent merge is that
- * merge. The branch's own first-parent line descends into the base's history,
- * so a merge there — which the squash never reaches (the walk anchors below
- * the operator's surviving commit) — wouldn't fold anyway; returning one is
- * harmless. Returns undefined when no first-parent merge exists at all.
- */
-async function detectPendingSyncMerge(cwd: string): Promise<string | undefined> {
-  const head = (await resolveCommit("HEAD", cwd)) ?? ""
-  if (!head) return undefined
-  const result = await execFile("git", ["log", "--first-parent", "--format=%H %P", head], { cwd, allowFailure: true })
-  if (result.exitCode !== 0) return undefined
-  for (const line of result.stdout.split("\n")) {
-    const [sha = "", ...parents] = line.trim().split(/\s+/)
-    if (sha && parents.length > 1) return sha
-  }
-  return undefined
+export async function verifiedCloseReceipt(
+  targetDir: string,
+  branch: string,
+  changeID: string,
+): Promise<{ landingSha: string; postArchiveTip: string } | undefined> {
+  const commonDir = await closeCommonDir(targetDir)
+  if (!commonDir) return undefined
+  const journal = await readCloseJournal(commonDir, branch, changeID)
+  if (!journal || journal.phase !== "landed" || !journal.landingSha || !journal.postArchiveTip) return undefined
+  const mainDir = (await mainWorktreeDir(targetDir).catch(() => undefined)) ?? targetDir
+  if (!(await isLandingReachable(journal.landingSha, journal.baseRef, mainDir))) return undefined
+  return { landingSha: journal.landingSha, postArchiveTip: journal.postArchiveTip }
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -719,3 +935,6 @@ async function exists(path: string): Promise<boolean> {
     return false
   }
 }
+
+/** Re-exported so cleanup surfaces can quote guarded commands from the same evidence. */
+export { isLandingReachable, readCloseJournal, closeCandidateRef, closeFeatureTipRef }

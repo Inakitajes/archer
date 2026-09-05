@@ -3536,12 +3536,23 @@ export function progressPhases(pipeline: Pipeline, hooks?: HookSet): ProgressPha
         }
       : { name: step.name, description: step.description },
   )
-  if (!hooks) return steps
+  // The terminal `Compact run` lifecycle row (capability run-finalization,
+  // design D1/D8): it always executes as the epilogue, so it is always a
+  // dashboard row — not a configurable step and never a filter target. It
+  // must appear in every phase list handed to `resetPipeline` (live) and
+  // `reconstructedPhases` (attach/history), or dashboards silently drop the
+  // finalization row's started/completed/failed events as unknown phases.
+  const compactRow: ProgressPhase = {
+    name: compactRunRowName,
+    description: "compacts this run's commits into one operator-authored conventional commit",
+  }
+  if (!hooks) return [...steps, compactRow]
   // Hooks are dashboard rows too, so their execution is watchable like any
-  // step: pre-hooks ahead of the pipeline, post-hooks after it.
+  // step: pre-hooks ahead of the pipeline, post-hooks after it, and the
+  // lifecycle row last — it runs after the final post-hook.
   const hookPhase = (stage: HookStage, specs: readonly HookSpec[]) =>
     hookPhaseNames(stage, specs).map((name, index) => ({ name, description: specs[index]!.command }))
-  return [...hookPhase("pre", hooks.pre), ...steps, ...hookPhase("post", hooks.post)]
+  return [...hookPhase("pre", hooks.pre), ...steps, ...hookPhase("post", hooks.post), compactRow]
 }
 
 /** The goal-cycle section embedded in SUMMARY.md: policy, trajectory, verdict, and restore status. */

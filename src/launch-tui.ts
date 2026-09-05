@@ -338,7 +338,7 @@ const toggles: readonly ToggleSpec[] = [
     label: "Isolate in a worktree",
     flag: "--worktree / --no-worktree",
     description:
-      "Create a new branch + git worktree (named from your prompt) and run Convoy there, leaving the current branch untouched. Finish the run with [f] to squash its commits into one signed conventional commit.",
+      "Create a new branch + git worktree (named from your prompt) and run Convoy there, leaving the current branch untouched. When the run completes, its commits compact automatically into one conventional commit of your own.",
   },
 ]
 

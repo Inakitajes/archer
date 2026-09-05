@@ -70,7 +70,7 @@ export type ConvoyDefaults = {
   autoAcceptJudgeModel?: string
   /** Model that names worktree branches; falls back to the built-in cheap default when unset. */
   branchNameModel?: string
-  /** Model that writes the squashed commit message for `convoy finish`; falls back to the built-in cheap default. */
+  /** Model that writes the conventional commit message for automatic run compaction and close's squash-merge; falls back to the built-in cheap default. */
   commitMessageModel?: string
   /**
    * Force worktree isolation on (true) or off (false) for every run. Unset is

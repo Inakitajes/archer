@@ -167,6 +167,8 @@ describe("reconstructedPhases", () => {
       "sync",
       ...qualified("measure", 0),
       ...qualified("improve", 1),
+      // The terminal lifecycle row closes every phase list (SC-2).
+      "Compact run",
     ])
     // Display groups are per-invocation ids, never the shared fragment groupId.
     expect(new Set(rows.map((row) => row.groupId))).toEqual(new Set([undefined, "g1", "goal-measure-0", "goal-improve-1"]))
@@ -181,6 +183,8 @@ describe("reconstructedPhases", () => {
       "g1",
       ...qualified("measure", 0).map(() => "goal-measure-0"),
       ...qualified("improve", 1).map(() => "goal-improve-1"),
+      // The lifecycle row is not a goal invocation; it has no group.
+      undefined,
     ])
     // The same metadata on a settled (non-live) view lists no pending improve.
     expect(reconstructedPhases(metadata, false).map((row) => row.groupId)).not.toContain("goal-improve-1")
@@ -199,7 +203,8 @@ describe("reconstructedPhases", () => {
       "fixes",
       "validation",
       "goal-measure-0-score-report",
+      // The lifecycle row still closes the list even for a legacy pipeline.
+      "Compact run",
     ])
-    expect(reconstructedPhases(legacy, false).at(-1)).toEqual({ name: "goal-measure-0-score-report", description: "" })
   })
 })

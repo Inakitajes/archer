@@ -2073,7 +2073,7 @@ export function describeDefault(key: keyof ConvoyDefaults): string {
     case "branchNameModel":
       return "Model that names worktree branches (default: openrouter/deepseek/deepseek-v4-flash-0731)."
     case "commitMessageModel":
-      return "Model that writes the squashed commit message for finish (default: anthropic/claude-haiku-4-5)."
+      return "Model that writes the conventional commit message for automatic run compaction and close (default: anthropic/claude-haiku-4-5)."
     case "worktree":
       return "Run each job on a fresh branch in its own worktree. Unset decides per branch: on for a trunk, off once you're on a branch."
     case "worktreeLocation":

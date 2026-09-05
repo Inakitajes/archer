@@ -158,12 +158,14 @@ describe("HN-018: advisor token leaked via process.env", () => {
   })
 })
 
-// ===== HN-020: finish skips secret scanning =====
+// ===== HN-020: the landing path skips no secret scan =====
 //
-// addAllAndCommit (git.ts:269) calls findSuspiciousStagedFiles before committing.
-// commitAsUser (git.ts:333) does NOT. The finish.ts path (applySquash → commitAsUser)
-// bypassed the secret scan entirely. The fix adds the scan in applySquash (finish.ts)
-// before calling commitAsUser.
+// addAllAndCommit (git.ts) calls findSuspiciousStagedFiles before committing.
+// commitAsUser does NOT. Close's squash-merge candidate is committed through
+// commitAsUser in the integration worktree, so feature-close.ts scans the
+// staged files itself before the commit runs — the candidate commit must not
+// become a secret-scan bypass merely because it no longer goes through a
+// finish-time rewrite.
 describe("HN-020: finish skips secret scanning", () => {
   test("addAllAndCommit calls findSuspiciousStagedFiles (reference behavior)", async () => {
     // findSuspiciousStagedFiles exists and works
@@ -181,20 +183,16 @@ describe("HN-020: finish skips secret scanning", () => {
     expect(fnStr).toContain("git commit")
   })
 
-  test("applySquash calls findSuspiciousStagedFiles before committing (fix)", async () => {
-    // The fix adds the secret scan in applySquash (finish.ts) before the
-    // commitAsUser call. Verify the source contains the scan.
+  test("close's candidate commit scans the staged files before committing (fix)", async () => {
+    // The scan lives in feature-close.ts's candidate creation, before the
+    // commitAsUser call in the integration worktree.
     const source = await readFile(
-      join(import.meta.dir, "..", "src", "finish.ts"),
+      join(import.meta.dir, "..", "src", "feature-close.ts"),
       "utf8",
     )
 
-    // The applySquash function should call findSuspiciousStagedFiles
     expect(source).toContain("findSuspiciousStagedFiles")
-    // It should also check for suspicious files and throw if found
     expect(source).toContain("suspicious.length > 0")
-    // And it should restore the branch on finding secrets
-    expect(source).toContain("resetSoft(plan.head")
   })
 })
 

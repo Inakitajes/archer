@@ -229,23 +229,31 @@ describe("runClose", () => {
   // type-appropriate verb, and the change id first in the body.
   const fallbackSubject = "feat(cli): improve add widget"
 
-  test("the full sequence: archive via the CLI, one conventional commit, operator commit survives, merged", async () => {
+  test("the full sequence: archive via the CLI, exactly one landing commit on the base, feature history intact", async () => {
     const fixture = await makeFixture()
+    const featureCommitsBefore = await git(fixture.worktreeDir, undefined, "rev-list", "--count", "feat/add-widget")
     const result = await runTestClose(fixture)
 
-    expect(result.merged).toBe(true)
-    // The archive commit and the convoy implement commit collapse into one;
-    // the operator's proposal commit survives the walk.
-    expect(result.squashed?.replaced).toBe(2)
+    expect(result.disposition).toBe("landed")
+    expect(result.landing).toBeDefined()
+    // The base gains exactly one regular commit: the landing. The proposal
+    // commit is included as content, not as base history.
+    expect(await git(fixture.mainDir, undefined, "rev-list", "--count", "main")).toBe("2")
+    // The feature branch's history is only ever added to (the archive
+    // commit) — never rewritten by the landing.
+    expect(await git(fixture.worktreeDir, undefined, "rev-list", "--count", "feat/add-widget")).toBe(String(Number(featureCommitsBefore) + 1))
     // The change dir moved into the archive layout inside the worktree.
     await expect(stat(join(fixture.worktreeDir, "openspec", "changes", "add-widget"))).rejects.toThrow()
     expect((await stat(join(fixture.worktreeDir, "openspec", "changes", "archive", "add-widget"))).isDirectory()).toBe(true)
-    // The base branch gained the squashed conventional commit and the operator's proposal commit.
-    const log = await git(fixture.mainDir, undefined, "log", "--format=%s", "main")
-    expect(log).toContain(fallbackSubject)
-    expect(log).toContain("feat(openspec): propose add-widget")
+    // The base's only new commit is the landing; the operator's proposal
+    // commit is not duplicated into base history.
+    const subjects = await git(fixture.mainDir, undefined, "log", "--format=%s", "main")
+    expect(subjects).toContain(fallbackSubject)
+    expect(subjects).not.toContain("feat(openspec): propose add-widget")
     const body = await git(fixture.mainDir, undefined, "log", "--format=%B", "-n", "1", "main")
     expect(body).toContain("change add-widget")
+    // The landing commit carries the proposal's content.
+    expect((await stat(join(fixture.mainDir, "src.ts"))).isFile()).toBe(true)
     // The worktree still exists until the operator accepts its removal.
     expect((await stat(fixture.worktreeDir)).isDirectory()).toBe(true)
   })
@@ -266,28 +274,47 @@ describe("runClose", () => {
     )
 
     const result = await runTestClose(fixture)
-    expect(result.merged).toBe(true)
-    // Operator proposal + one-line convoy commit + run-linked commit + archive commit.
-    expect(result.squashed?.replaced).toBe(3)
+    expect(result.disposition).toBe("landed")
+    // The base still gains exactly one commit, whatever the intermediate
+    // commit shapes were.
+    expect(await git(fixture.mainDir, undefined, "rev-list", "--count", "main")).toBe("2")
 
     const log = await git(fixture.mainDir, undefined, "log", "--format=%s", "main")
     expect(log).toContain(fallbackSubject)
-    expect(log).toContain("feat(openspec): propose add-widget")
+    expect(log).not.toContain("feat(openspec): propose add-widget")
     expect(log).not.toContain("convoy(implementer): preserve report sessions across human gates")
     // The intermediate trailer is not copied into the user-authored commit.
     const bodies = await git(fixture.mainDir, undefined, "log", "--format=%B", "main")
     expect(bodies).not.toContain("Convoy-Run:")
   })
 
-  test("the sequence is resumable: completed steps are not redone", async () => {
+  test("a resume after a completed close resolves the receipt instead of landing again", async () => {
     const fixture = await makeFixture()
-    await runTestClose(fixture)
-    // A resume finds nothing left to do: the change dir is gone (archive done)
-    // and the branch is contained in the base (merge done).
+    const first = await runTestClose(fixture)
+    expect(first.disposition).toBe("landed")
+    const count = await git(fixture.mainDir, undefined, "rev-list", "--count", "main")
+    // A resume finds the verified receipt: nothing is redone, no duplicate
+    // landing is created (design D7, task 5.7).
     const result = await runTestClose(fixture, { resume: true })
-    expect(result.merged).toBe(true)
-    expect(result.squashed).toBeUndefined()
-    expect(result.mergeShape).toBe("already-up-to-date")
+    expect(result.disposition).toBe("already-landed")
+    expect(result.landing?.sha).toBe(first.landing?.sha)
+    expect(await git(fixture.mainDir, undefined, "rev-list", "--count", "main")).toBe(count)
+  })
+
+  test("a resume resolves the receipt before requiring a worktree", async () => {
+    const fixture = await makeFixture()
+    const first = await runTestClose(fixture)
+    // Cleanup got as far as removing the worktree; the branch remains.
+    await git(fixture.mainDir, undefined, "worktree", "remove", "--force", fixture.worktreeDir)
+    const result = await runClose({
+      targetDir: fixture.mainDir,
+      branch: "feat/add-widget",
+      changeID: "add-widget",
+      resume: true,
+      writer: writerFails,
+    })
+    expect(result.disposition).toBe("already-landed")
+    expect(result.landing?.sha).toBe(first.landing?.sha)
   })
 
   test("a clean sync folds the sync merge and convoy commits into one conventional commit (SC-2)", async () => {
@@ -300,12 +327,17 @@ describe("runClose", () => {
     await git(fixture.mainDir, undefined, "commit", "-m", "chore: advance main in parallel")
 
     const result = await runTestClose(fixture)
-    expect(result.merged).toBe(true)
+    expect(result.disposition).toBe("landed")
+    // The base gains exactly ONE regular commit on top of its advance — the
+    // landing commit with a single parent, never a merge commit (task 5.8).
+    expect(await git(fixture.mainDir, undefined, "rev-list", "--count", "main")).toBe("3")
+    const parents = await git(fixture.mainDir, undefined, "log", "--format=%P", "-n", "1", "main")
+    expect(parents.split(/\s+/)).toHaveLength(1)
 
     const log = await git(fixture.mainDir, undefined, "log", "--format=%s", "main")
-    // The operator's proposal commit survives, and the feature lands as the
-    // one conventional commit — the base's own advance is also present.
-    expect(log).toContain("feat(openspec): propose add-widget")
+    // The feature lands as the one conventional commit — the base's own
+    // advance is present, and the proposal commit is not duplicated there.
+    expect(log).not.toContain("feat(openspec): propose add-widget")
     expect(log).toContain(fallbackSubject)
     expect(log).toContain("chore: advance main in parallel")
     // ...and none of the raw convoy step commits or the archive commit leak
@@ -342,7 +374,7 @@ describe("runClose", () => {
     const fixture = await makeFixture()
     process.env.CONVOY_OPENSPEC_ARCHIVE_FAIL = "1"
     try {
-      await expect(runTestClose(fixture)).rejects.toThrow(/archive.*failed[\s\S]*before any squash or merge/)
+      await expect(runTestClose(fixture)).rejects.toThrow(/archive.*failed[\s\S]*before any squash-merge/)
       // The change was not archived (the CLI failed before moving it)...
       expect((await stat(join(fixture.worktreeDir, "openspec", "changes", "add-widget"))).isDirectory()).toBe(true)
       await expect(stat(join(fixture.worktreeDir, "openspec", "changes", "archive", "add-widget"))).rejects.toThrow()
@@ -373,19 +405,17 @@ describe("runClose", () => {
       "step-skipped:sync",
       "step-started:archive",
       "step-completed:archive",
-      "step-started:squash",
+      "step-started:squash-merge",
       "squash-phase",
       "squash-phase",
-      "step-completed:squash",
-      "step-started:merge",
-      "merge-shape",
-      "step-completed:merge",
+      "step-completed:squash-merge",
       "result",
     ])
-    // The base never moved, so the merge narrates its fast-forward shape.
-    expect(events).toContainEqual({ type: "merge-shape", shape: "fast-forward" })
+    // One landing result names the base and the commit — no merge shape exists
+    // anywhere in the narration (task 5.8, design D8).
+    expect(events.filter((event) => event.type === "step-skipped" || event.type === "step-started" || event.type === "step-completed" || event.type === "step-failed").map((event) => event.step)).toEqual(expect.arrayContaining(["sync", "archive", "squash-merge"]))
     const result = events.find((event) => event.type === "result")
-    expect(result && result.type === "result" ? result.result.mergeShape : undefined).toBe("fast-forward")
+    expect(result && result.type === "result" ? result.result.disposition : undefined).toBe("landed")
   })
 
   test("a mid-sequence archive stop emits the failed step and its remediation", async () => {
@@ -393,7 +423,7 @@ describe("runClose", () => {
     process.env.CONVOY_OPENSPEC_ARCHIVE_FAIL = "1"
     try {
       const events: CloseEvent[] = []
-      await expect(runTestClose(fixture, { onEvent: (event) => events.push(event) })).rejects.toThrow(/before any squash or merge/)
+      await expect(runTestClose(fixture, { onEvent: (event) => events.push(event) })).rejects.toThrow(/before any squash-merge/)
       expect(events[events.length - 1]).toMatchObject({ type: "step-failed", step: "archive" })
       expect(events.some((event) => event.type === "result")).toBe(false)
     } finally {
@@ -401,18 +431,19 @@ describe("runClose", () => {
     }
   })
 
-  test("a resume shows the previously completed sequence as detected skips", async () => {
+  test("a resume after a completed close narrates the receipt as detected skips", async () => {
     const fixture = await makeFixture()
     await runTestClose(fixture)
     const events = await collectEvents(fixture, { resume: true })
     const skips = events.filter((event) => event.type === "step-skipped")
-    expect(skips).toHaveLength(4)
+    expect(skips).toHaveLength(3)
     for (const skip of skips) {
       if (skip.type !== "step-skipped") continue
-      expect(["sync", "archive", "squash", "merge"]).toContain(skip.step)
-      expect(skip.reason.length).toBeGreaterThan(0)
+      expect(["sync", "archive", "squash-merge"]).toContain(skip.step)
+      expect(skip.reason).toContain("receipt")
     }
-    expect(events).toContainEqual({ type: "merge-shape", shape: "already-up-to-date" })
+    const result = events.find((event) => event.type === "result")
+    expect(result && result.type === "result" ? result.result.disposition : undefined).toBe("already-landed")
   })
 
   // -- task 2.1: the message snapshot survives the archive's move ------------
@@ -450,7 +481,7 @@ describe("runClose", () => {
         return proposal.message
       },
     })
-    expect(result.squashed).toBeDefined()
+    expect(result.landing).toBeDefined()
     // The writer's broad scope was corrected to the sole touched capability,
     // and the change id was injected into the body.
     expect(seenProposals).toHaveLength(1)
@@ -469,7 +500,7 @@ describe("runClose", () => {
         return proposal.message
       },
     })
-    expect(result.squashed).toBeDefined()
+    expect(result.landing).toBeDefined()
     expect(seenProposals[0]!.source).toBe("fallback")
     expect(seenProposals[0]!.error).toContain("test double")
   })
@@ -563,16 +594,25 @@ describe("runClose", () => {
     expect(body).not.toContain("\u001b")
   })
 
-  test("an applySquash failure emits a step-failed squash event (SC-5)", async () => {
+  test("a declined candidate signature emits a step-failed squash-merge event and lands nothing (SC-5)", async () => {
     const fixture = await makeFixture()
-    const finish = await import("../src/finish")
-    const spy = spyOn(finish, "applySquash")
-    spy.mockRejectedValue(new Error("signature declined"))
+    const gitModule = await import("../src/git")
+    const real = gitModule.commitAsUser
+    let call = 0
+    // Call 1 is the archive commit (must succeed); call 2 is the candidate
+    // commit in the integration worktree (declined signature).
+    const spy = spyOn(gitModule, "commitAsUser").mockImplementation(async (...args) => {
+      call += 1
+      if (call === 2) throw new Error("signature declined")
+      return real(args[0] as string, args[1] as string)
+    })
     try {
       const events: CloseEvent[] = []
       await expect(runTestClose(fixture, { onEvent: (event) => events.push(event) })).rejects.toThrow(/signature declined/)
-      expect(events[events.length - 1]).toMatchObject({ type: "step-failed", step: "squash" })
+      expect(events[events.length - 1]).toMatchObject({ type: "step-failed", step: "squash-merge" })
       expect(events.some((event) => event.type === "result")).toBe(false)
+      // The base is unadvanced: the landing never happened.
+      expect(await git(fixture.mainDir, undefined, "rev-list", "--count", "main")).toBe("1")
     } finally {
       spy.mockRestore()
     }
@@ -594,8 +634,8 @@ describe("runClose", () => {
     expect(events.map((event) => (event.type === "squash-phase" ? `squash:${event.phase}` : event.type))).toEqual(
       expect.arrayContaining(["step-started", "squash:composing-message", "squash:awaiting-message-review", "squash:creating-commit", "step-completed"]),
     )
-    const squashStart = events.findIndex((event) => event.type === "step-started" && "step" in event && event.step === "squash")
-    const squashEnd = events.findIndex((event) => event.type === "step-completed" && "step" in event && event.step === "squash")
+    const squashStart = events.findIndex((event) => event.type === "step-started" && "step" in event && event.step === "squash-merge")
+    const squashEnd = events.findIndex((event) => event.type === "step-completed" && "step" in event && event.step === "squash-merge")
     const squashSlice = events.slice(squashStart + 1, squashEnd + 1)
     expect(squashSlice.map((event) => (event.type === "squash-phase" ? event.phase : event.type))).toEqual([
       "composing-message",
@@ -624,7 +664,7 @@ describe("runClose", () => {
       /wasn't confirmed/,
     )
     expect(events.some((event) => event.type === "squash-phase" && event.phase === "creating-commit")).toBe(false)
-    expect(events[events.length - 1]).toMatchObject({ type: "step-failed", step: "squash" })
+    expect(events[events.length - 1]).toMatchObject({ type: "step-failed", step: "squash-merge" })
   })
 
   test("an explicit --message skips composition and review but still names commit creation", async () => {
@@ -669,25 +709,34 @@ describe("runClose", () => {
       resume: true,
       resolveMessage: async (proposal) => proposal.message,
     })
-    expect(result.merged).toBe(true)
-    expect(result.mergeShape).toBe("merge-commit")
+    expect(result.disposition).toBe("landed")
+    // One regular commit on the (advanced) base — no merge commit.
+    expect(await git(fixture.mainDir, undefined, "rev-list", "--count", "main")).toBe("3")
+    const parents = await git(fixture.mainDir, undefined, "log", "--format=%P", "-n", "1", "main")
+    expect(parents.split(/\s+/)).toHaveLength(1)
 
     const log = await git(fixture.mainDir, undefined, "log", "--format=%s", "main")
     expect(log).not.toContain("convoy(implement): implement add-widget")
     expect(log).not.toContain("chore(openspec): archive add-widget")
-    // The operator's proposal commit survives the walk.
-    expect(log).toContain("feat(openspec): propose add-widget")
+    // The operator's proposal commit is included as content, not duplicated
+    // into base history, and the landing is a single-parent commit.
+    expect(log).not.toContain("feat(openspec): propose add-widget")
   })
 
   // -- task 2.4: merge shapes --------------------------------------------------
 
-  test("a moved base narrates a merge-commit shape", async () => {
+  test("a moved base still receives exactly one landing commit, not a merge", async () => {
     const fixture = await makeFixture()
     await writeFile(join(fixture.mainDir, "main-advance.txt"), "advance\n")
     await git(fixture.mainDir, undefined, "add", ".")
     await git(fixture.mainDir, undefined, "commit", "-m", "chore: advance main in parallel")
     const result = await runTestClose(fixture)
-    expect(result.mergeShape).toBe("merge-commit")
+    expect(result.disposition).toBe("landed")
+    const parents = await git(fixture.mainDir, undefined, "log", "--format=%P", "-n", "1", "main")
+    expect(parents.split(/\s+/)).toHaveLength(1)
+    // The landing's parent is exactly the captured base tip.
+    const baseTip = await git(fixture.mainDir, undefined, "rev-parse", "main^")
+    expect(result.landing).toBeDefined()
   })
 })
 

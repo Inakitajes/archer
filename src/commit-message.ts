@@ -8,7 +8,7 @@ import { parseModel } from "./runner"
 import { excerpt } from "./worktree"
 
 /**
- * Writes the conventional-commit message for the single commit `convoy finish`
+ * Writes the conventional-commit message for the single commit automatic run compaction
  * squashes a run into. Built on the same shape as the branch namer: an
  * ephemeral opencode server running a registered read-only agent, a strict JSON
  * contract, and a deterministic fallback so a failure here never blocks the
@@ -50,7 +50,7 @@ export type CommitMessageProposal = {
   error?: string
 }
 
-/** Cheap, fast model used to write the squashed commit message (`finish` and `close` share it). */
+/** Cheap, fast model used to write the squashed commit message (run compaction and `close` share it). */
 export const defaultCommitMessageModel = "openrouter/z-ai/glm-5.3-flash"
 
 /** Registered so the writer replaces opencode's default coding agent instead of merely appending to it. */
@@ -113,7 +113,7 @@ function writerOpencodeConfig(): Config {
 /**
  * Asks a cheap, read-only model to describe the run as one conventional commit.
  * Any failure (no auth, timeout, unparseable reply) degrades to a message built
- * from the branch name and the step commits, so `finish` always has something
+ * from the branch name and the step commits, so compaction always has something
  * to show.
  */
 export async function proposeCommitMessage(
@@ -135,7 +135,7 @@ export async function proposeCommitMessage(
     error = cause instanceof Error ? cause.message : String(cause)
   }
 
-  log.warn(`finish: couldn't generate an AI commit message (${error}); deriving one from the branch and the step commits`)
+  log.warn(`compaction: couldn't generate an AI commit message (${error}); deriving one from the branch and the step commits`)
   return { message: templateCommitMessage(input), source: "template", error }
 }
 
