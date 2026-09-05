@@ -498,7 +498,7 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(config, "implement").steps).toEqual(["tests"])
     expect(selectPipelineSpec(undefined, "implement").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(
-      'unknown pipeline "ghost" (available: fixer, hunter, hunter-max, implement, implement-lite, quick, review, review-cc, review-lite, ship)',
+      'unknown pipeline "ghost" (available: astra, fixer, full-cycle, hunter, hunter-max, implement, implement-lite, quick, review, review-cc, review-lite, ship)',
     )
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
   })
@@ -1022,12 +1022,12 @@ describe("serialization", () => {
     expect(reparsed.hooks).toEqual(config.hooks)
   })
 
-  test("defaultConfigTemplate preserves implement step model overrides and round-trips", () => {
+  test("defaultConfigTemplate materializes the default pipeline's step model overrides and round-trips", () => {
     const template = defaultConfigTemplate()
     expect(template.defaults.model).toBe(`${defaultGptModel}#${defaultGptVariant}`)
-    const steps = template.pipelines.implement!.steps
+    const steps = template.pipelines["full-cycle"]!.steps
     expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && !isGoalStepSpec(step) && step.agent === "design")).toEqual({ agent: "design", model: defaultImplementReviewModel, advisor: false })
-    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && !isGoalStepSpec(step) && step.agent === "adversarial")).toEqual({ agent: "adversarial", model: defaultAdversarialModel, advisor: false, reports: "all" })
+    expect(steps.find((step) => typeof step !== "string" && !isParallelSpec(step) && !isHumanStepSpec(step) && !isGoalStepSpec(step) && step.agent === "implementer")).toEqual({ agent: "implementer", model: "openrouter/z-ai/glm-5.3-flash#high", advisor: "openrouter/x-ai/grok-4.6#high", reports: "none" })
     const reparsed = parse(serializeConvoyConfig(template))
     expect(reparsed.defaults).toEqual(template.defaults)
     expect(reparsed.pipelines).toEqual(template.pipelines)

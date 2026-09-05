@@ -309,8 +309,8 @@ async function buildReviewedPlan(input: BuildRunPlanInput): Promise<RunPlan> {
   if (input.change && (!openspec || openspec.changeIds.length === 0)) {
     throw new Error(`--change "${input.change}" matched no active change under openspec/changes/ (archived or absent; run without --change to auto-resolve)`)
   }
-  // Selection rule 5: in an OpenSpec repo, implement needs a change contract;
-  // review keeps today's diff-inference fallback.
+  // Selection rule 5: in an OpenSpec repo, the default implementation pipeline
+  // (full-cycle) needs a change contract; review keeps today's diff-inference fallback.
   if (openspec && openspec.changeIds.length === 0 && input.pipeline.name === defaultPipelineName) {
     throw new Error("no change; run /opsx:propose first (or pass --change <id>)")
   }
@@ -1438,9 +1438,9 @@ Flags:
   --version, -V            Print Convoy's version, commit, and build platform
   --prompt-file <path>     Read the PRD/prompt from a file
   --file, -f <path>        Attach a file or directory to all steps (repeatable)
-   --pipeline, -p <name>    Pipeline to run (default: "implement"), which runs
-                            implementer,patterns,security,design,tests,adversarial,
-                            then distills every report into reports/run-report.md
+   --pipeline, -p <name>    Pipeline to run (default: "full-cycle"), which writes,
+                            audits, then measures and iterates on a terminal goal
+                            step until the score clears 90
   --only <steps>           Run only these pipeline steps
   --skip <steps>           Skip these pipeline steps
   --resume <id>            Resume a previous run by its ID (steps with an existing report are

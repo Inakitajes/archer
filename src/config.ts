@@ -1162,16 +1162,16 @@ export async function writeConvoyConfig(path: string, config: ConvoyConfig, targ
 
 /**
  * Boilerplate written by the config TUI's "initialize" action: the current
- * effective defaults plus the built-in `implement` pipeline expanded so it stays
- * editable. Agent model preferences that differ from defaults.model are inlined
- * on their steps, because defaults.model would otherwise shadow them.
+ * effective defaults plus the default pipeline expanded so it stays editable.
+ * Agent model preferences that differ from defaults.model are inlined on their
+ * steps, because defaults.model would otherwise shadow them.
  */
 export function defaultConfigTemplate(): ConvoyConfig {
   const globalModel = `${defaultGptModel}#${defaultGptVariant}`
   return {
     defaults: { model: globalModel },
     agents: {},
-    pipelines: { implement: materializePipelineSpec(builtInPipelines[defaultPipelineName]!, globalModel) },
+    pipelines: { [defaultPipelineName]: materializePipelineSpec(builtInPipelines[defaultPipelineName]!, globalModel) },
     permissions: { allow: [], deny: [] },
     hooks: emptyHooksConfig(),
     attachments: [],

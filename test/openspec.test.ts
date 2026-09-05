@@ -398,12 +398,12 @@ describe("--change wiring through the reviewed run plan", () => {
     await expect(runPlanFor(["--dir", plain, "--change", "add-foo", "review this"])).rejects.toThrow("--change \"add-foo\"")
   })
 
-  test("implement refuses when openspec/ is present but no change is active (selection rule 5)", async () => {
+  test("the default pipeline refuses when openspec/ is present but no change is active (selection rule 5)", async () => {
     const repo = await repoOn("main")
     await mkdir(join(repo, openspecDirName, "changes"), { recursive: true })
     await writeFile(join(repo, openspecDirName, "changes", "README.md"), "# changes\n")
 
-    await expect(runPlanFor(["--dir", repo, "-p", "implement", "build it"])).rejects.toThrow("/opsx:propose")
+    await expect(runPlanFor(["--dir", repo, "build it"])).rejects.toThrow("/opsx:propose")
   })
 
   test("review keeps the diff-inference fallback when openspec/ is present but no change is active", async () => {

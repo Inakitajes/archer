@@ -24,6 +24,10 @@ const deepseekHighModel = `${deepseekModel}#high`
 /** GPT 5.6 Sol: the advisor `implement` consults, and at xhigh the consensus reporter for the review/ship/hunter pipelines. */
 const solModel = "openai/gpt-5.6-sol"
 const solXhighModel = `${solModel}#xhigh`
+/** GLM 5.3 Flash with reasoning raised: the low-cost code-writer for `implement-lite` and the design/fixer legs of the goal pipelines. */
+const glm53FlashHighModel = "openrouter/z-ai/glm-5.3-flash#high"
+/** GPT 6 Astra at extra high: the advisor the goal pipelines (full-cycle/astra) and the fixer consult where Grok or Sol used to advise. */
+const astraXhighModel = "openai/gpt-6-astra#xhigh"
 
 // Per-step models the built-in `implement` pipeline pins. Exported so `convoy init`'s
 // inlined copy of that pipeline stays in sync with the built-in it claims to mirror.
@@ -455,7 +459,7 @@ export const readOnlyAgentSuffix = "__ro"
 export const verifyAgentSuffix = "__verify"
 
 /** The pipeline run when none is selected (no -p flag and no defaults.pipeline). */
-export const defaultPipelineName = "implement"
+export const defaultPipelineName = "full-cycle"
 
 export const builtInPipelines: Record<string, PipelineSpec> = {
   // The audits are pinned to GLM 5.3 high rather than left to inherit the run's
@@ -493,15 +497,114 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   // drop. DeepSeek V4 Flash (OpenRouter) writes instead of GLM, and Grok advises
   // rather than a second GLM: the cross-vendor disagreement costs no new provider.
   "implement-lite": {
-    description: "Like implement, but drops every code-writing phase to DeepSeek V4 Flash 0731 and GLM 5.3 to reduce cost; Grok 4.6 advises the implementer and polishes design, and adversarial runs on GLM 5.3",
+    description:
+      "Advised lite: GLM 5.3 Flash implements consulting Grok 4.6; patterns, security and tests audit on DeepSeek V4 Flash advised by GLM 5.3 high. Design stays on Grok 4.6 unadvised and adversarial on GLM 5.3. Closes with an extractive one-page run recap (run-report).",
     steps: [
-      { agent: "implementer", model: deepseekHighModel, advisor: grokModel, reports: "none" },
-      { agent: "patterns", model: glm53HighModel, advisor: false },
-      { agent: "security", model: glm53HighModel, advisor: false },
+      { agent: "implementer", model: glm53FlashHighModel, advisor: grokModel, reports: "none" },
+      { agent: "patterns", model: deepseekHighModel, advisor: glm53HighModel },
+      { agent: "security", model: deepseekHighModel, advisor: glm53HighModel },
       { agent: "design", model: grokModel, advisor: false },
-      { agent: "tests", model: glm53HighModel, advisor: false, reports: "none" },
+      { agent: "tests", model: deepseekHighModel, advisor: glm53HighModel, reports: "none" },
       { agent: "adversarial", model: glm53HighModel, advisor: false, reports: "all" },
-      { agent: "run-report", model: defaultRunReportModel, advisor: false, reports: "all", diff: false },
+      { agent: "run-report", model: deepseekHighModel, advisor: false, reports: "all", diff: false },
+    ],
+  },
+  // Full Cycle: implement-lite's writing phases (implementer, patterns, security,
+  // design, tests), closed by the terminal goal step that owns the whole loop:
+  // it measures FIRST (two independent quality-scorers + a verified consensus),
+  // and only under 90 does it iterate — the fixer applies exactly the reported
+  // gaps, re-scores, and stops at 90, after 3 fix iterations, or on a 3-round
+  // score plateau. All scoring lives inside the goal step's measure fragment, so
+  // the initial score and every re-score run through the same declared panel.
+  "full-cycle": {
+    description:
+      "Full Cycle: implement-lite's writing phases, then a terminal goal step that measures with two independent quality-scorers and a verified consensus, and drives fix iterations until the score clears 90.",
+    steps: [
+      { agent: "implementer", model: glm53FlashHighModel, advisor: grokModel, reports: "none" },
+      { agent: "patterns", model: deepseekHighModel, advisor: glm53HighModel },
+      { agent: "security", model: deepseekHighModel, advisor: glm53HighModel },
+      { agent: "design", model: grokModel, advisor: false },
+      { agent: "tests", model: deepseekHighModel, advisor: glm53HighModel, reports: "none" },
+      {
+        goal: {
+          target: 90,
+          improve: {
+            briefStep: "fix",
+            steps: [
+              // The directed fixer: applies exactly the gaps the previous
+              // scoring round reported, which arrive as its per-step brief.
+              { agent: "goal-fixer", name: "fix", model: deepseekHighModel, advisor: grokModel, reports: "none", diff: true, prdHistory: true },
+            ],
+          },
+          measure: {
+            steps: [
+              {
+                parallel: [
+                  // The re-scorers stay blind to the previous score: no reports
+                  // at all (they grade the artifact, not the run's history), but
+                  // they still get the original PRD via prdHistory and the
+                  // current diff for the rubric's `prd` dimension.
+                  { agent: "quality-scorer", name: "score", models: [grokModel, glm53HighModel], reports: "none", diff: true, prdHistory: true },
+                ],
+              },
+              // The consensus sees only the fresh scorer reports, never the
+              // fixer's, so its measurement cannot anchor on the number it is
+              // reconciling; the original PRD is attached so disagreements on
+              // the `prd` dimension can be judged against the requirements.
+              { agent: "quality-score-report", name: "score-report", model: glm53HighModel, reports: ["score"], verify: true, diff: true, prdHistory: true },
+            ],
+          },
+        },
+      },
+    ],
+  },
+  // Astra: full-cycle's shape, but the advisor is Astra 6 (GPT-6) in extra-high
+  // mode wherever full-cycle used Grok 4.6 (implementer and goal fixer), and the
+  // design phase joins the advised set on GLM 5.3 Flash. The fixer runs on GLM
+  // 5.3 Flash (instead of DeepSeek) advised by Astra 6, with up to 5 fix rounds.
+  // Scoring (measure fragment) is unchanged.
+  astra: {
+    description:
+      "Astra: full-cycle's writing phases, then a terminal goal step that measures with two independent quality-scorers and a verified consensus, and drives fix iterations until the score clears 90. Advisor is Astra 6 (extra high) wherever full-cycle used Grok 4.6; design is advised on GLM 5.3 Flash; the fixer runs on GLM 5.3 Flash advised by Astra 6 with up to 5 fix rounds.",
+    steps: [
+      { agent: "implementer", model: glm53FlashHighModel, advisor: astraXhighModel, reports: "none" },
+      { agent: "patterns", model: deepseekHighModel, advisor: glm53HighModel },
+      { agent: "security", model: deepseekHighModel, advisor: glm53HighModel },
+      { agent: "design", model: glm53FlashHighModel, advisor: astraXhighModel },
+      { agent: "tests", model: deepseekHighModel, advisor: glm53HighModel, reports: "none" },
+      {
+        goal: {
+          target: 90,
+          maxIterations: 5,
+          improve: {
+            briefStep: "fix",
+            steps: [
+              // The directed fixer, on GLM 5.3 Flash advised by Astra 6 (extra
+              // high). It alone receives the score brief (by step name). diff:
+              // true is load-bearing: as the fragment's first step it would
+              // otherwise default to no diff.
+              { agent: "goal-fixer", name: "fix", model: glm53FlashHighModel, advisor: astraXhighModel, reports: "none", diff: true, prdHistory: true },
+            ],
+          },
+          measure: {
+            steps: [
+              {
+                parallel: [
+                  // The scorers stay blind to any previous round: no reports at
+                  // all, but the original PRD via prdHistory and the current
+                  // diff for the rubric's `prd` dimension. Kept as-is (Grok 4.6
+                  // + GLM 5.3 high).
+                  { agent: "quality-scorer", name: "score", models: [grokModel, glm53HighModel], reports: "none", diff: true, prdHistory: true },
+                ],
+              },
+              // The consensus sees only the fresh scorer reports, never the
+              // fixer's, so its measurement cannot anchor on the number it is
+              // reconciling.
+              { agent: "quality-score-report", name: "score-report", model: glm53HighModel, reports: ["score"], verify: true, diff: true, prdHistory: true },
+            ],
+          },
+        },
+      },
     ],
   },
   // Report-only review + the measurement layer: after the parallel audits, two
@@ -539,16 +642,16 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   // writes the report, and the fan-outs pair GLM 5.3 with Grok 4.6.
   "review-lite": {
     description:
-      "Like review, but every phase runs on a low-cost model: GLM 5.3 scopes and reconciles the score, DeepSeek V4 Flash 0731 writes the report, and the audit and scorer fan-outs pair GLM 5.3 with Grok 4.6 instead of Opus.",
+      "Report-only PR review on ultra-cheap models: scope, parallel audits (DeepSeek V4 Flash + GLM 5.3 Flash) and report on flash models; the scoring uses GLM 5.3 high + Grok 4.6 high and the score consensus stays on GLM 5.3 high. Makes no changes.",
     defaultPrompt: "Review the current branch against its base and report prioritized findings with a verified quality score.",
     suggestedPrompts: ["Review the open PR for this branch", "Review only the last commit's diff"],
     steps: [
-      { agent: "review-scope", name: "scope", model: glm53HighModel, reports: "none", diff: true, verify: true, prdHistory: true },
+      { agent: "review-scope", name: "scope", model: deepseekHighModel, reports: "none", diff: true, verify: true, prdHistory: true },
       {
         parallel: [
-          { agent: "clean-code-auditor", name: "clean-code", models: [glm53HighModel, grokModel], reports: ["scope"] },
-          { agent: "security-reviewer", name: "security", models: [glm53HighModel, grokModel], reports: ["scope"] },
-          { agent: "bug-auditor", name: "bugs", models: [glm53HighModel, grokModel], reports: ["scope"] },
+          { agent: "clean-code-auditor", name: "clean-code", models: [deepseekHighModel, glm53FlashHighModel], reports: ["scope"] },
+          { agent: "security-reviewer", name: "security", models: [deepseekHighModel, glm53FlashHighModel], reports: ["scope"] },
+          { agent: "bug-auditor", name: "bugs", models: [deepseekHighModel, glm53FlashHighModel], reports: ["scope"] },
         ],
       },
       { agent: "review-report", name: "report", model: deepseekHighModel, reports: "all" },
@@ -635,8 +738,8 @@ export const builtInPipelines: Record<string, PipelineSpec> = {
   fixer: {
     description: "Turn supplied findings into proven regression tests, targeted fixes, and an independently rerun final report",
     steps: [
-      { agent: "fixer-test-author", name: "reproduction", model: fallbackModel, advisor: solXhighModel, reports: "none", diff: true },
-      { agent: "fixer-implementer", name: "fixes", model: fallbackModel, advisor: solXhighModel, reports: ["reproduction"] },
+      { agent: "fixer-test-author", name: "reproduction", model: fallbackModel, advisor: astraXhighModel, reports: "none", diff: true },
+      { agent: "fixer-implementer", name: "fixes", model: fallbackModel, advisor: astraXhighModel, reports: ["reproduction"] },
       { agent: "fixer-validator", name: "validation", model: fallbackModel, reports: ["reproduction", "fixes"], verify: true },
     ],
   },
