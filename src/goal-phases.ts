@@ -13,7 +13,7 @@
  * new persisted state.
  */
 
-import { goalInvocationId, qualifyInvocation } from "./goal-scheduler"
+import { goalInvocationId, qualifyInvocation, type GoalInvocationId } from "./goal-scheduler"
 import type { GoalRunState } from "./metadata"
 import { progressPhases } from "./runner"
 import type { ProgressPhase } from "./progress"
@@ -34,16 +34,13 @@ export type GoalPhaseReconstructionOptions = {
   goal?: GoalRunState
 }
 
-/** One goal invocation in the scheduler's execution order. */
-type Invocation = { stage: "improve" | "measure"; iteration: number }
-
 /**
  * Enumerates the invocation sequence the scheduler executes: measurement
  * zero, then — while below target — one improvement fragment followed by one
  * fresh measurement fragment, up to the policy's improvement-round cap.
  */
-export function goalInvocationSequence(plan: NonNullable<Pipeline["goalPlan"]>): Invocation[] {
-  const sequence: Invocation[] = [{ stage: "measure", iteration: 0 }]
+export function goalInvocationSequence(plan: NonNullable<Pipeline["goalPlan"]>): GoalInvocationId[] {
+  const sequence: GoalInvocationId[] = [{ stage: "measure", iteration: 0 }]
   for (let round = 1; round <= plan.maxIterations; round++) {
     sequence.push({ stage: "improve", iteration: round }, { stage: "measure", iteration: round })
   }

@@ -17,6 +17,7 @@ import { defaultAdvisorMaxCalls } from "./advisor"
 import { openClaudeSessionWindow } from "./claude-code"
 import { aggregateAdvisorEvents, type AdvisorEvent } from "./advisor-events"
 import { copyReportToClipboard, writeClipboardOSC52, type ClipboardResult } from "./clipboard"
+import { parseGoalInvocationId } from "./goal-scheduler"
 import { openRouterLowBalance, startLimitsPoller } from "./limits"
 import { log } from "./log"
 import { markdownInlineChunks, markdownLines, parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
@@ -4638,10 +4639,11 @@ function stepLabel(phase: Pick<ProgressPhase, "name" | "stepName">): string {
 
 // A goal invocation's display group id (`goal-measure-0`, the shared
 // `goal-<stage>-<n>` qualification prefix) renders as an iteration label
-// instead of the literal `parallel`; undefined for every prefix group.
+// instead of the literal `parallel`; undefined for every prefix group. Built on
+// the shared parser so the label can never drift from the qualification rule.
 function goalInvocationLabel(groupId: string | undefined): string | undefined {
-  const match = groupId ? /^goal-(improve|measure)-(\d+)$/.exec(groupId) : undefined
-  return match ? `${match[1]} #${match[2]}` : undefined
+  const parsed = groupId ? parseGoalInvocationId(groupId) : undefined
+  return parsed ? `${parsed.stage} #${parsed.iteration}` : undefined
 }
 
 // A compact model label for a fanned-out member: provider prefix dropped, and
