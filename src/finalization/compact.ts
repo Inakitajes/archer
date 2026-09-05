@@ -214,7 +214,7 @@ export async function runFinalization(input: RunFinalizationInput): Promise<Fina
     }
 
     // Persist the outcome in the cleanup-surviving run index.
-    await updateRunIndex(input, interval, produced, evidence.manifestPath, "compacted")
+    await updateRunIndex(input, interval, produced, evidence.manifestPath, evidence.preCompactionRef, "compacted")
 
     activity(`compacted ${interval.commits.length} run commit${interval.commits.length === 1 ? "" : "s"} into ${produced.slice(0, 8)}`)
     return record("completed", undefined, {
@@ -280,7 +280,7 @@ export async function finalizeNetZeroInterval(input: RunFinalizationInput, inter
     // this only cleans any residual staged state from the removed commits).
     await execFile("git", ["reset", "--hard", interval.startHead], { cwd })
 
-    await updateRunIndex(input, interval, undefined, evidence.manifestPath, "no-net-change")
+    await updateRunIndex(input, interval, undefined, evidence.manifestPath, evidence.preCompactionRef, "no-net-change")
     return record("completed", "the run's commits net out to no content change; the interval was removed back to the run start", {
       now,
       recoveryRef: evidence.preCompactionRef,
@@ -352,6 +352,7 @@ async function updateRunIndex(
   interval: Extract<RunInterval, { ok: true }>,
   producedSha: string | undefined,
   manifestPath: string,
+  recoveryRef: string,
   disposition: "compacted" | "no-net-change",
 ): Promise<void> {
   try {
@@ -373,10 +374,15 @@ async function updateRunIndex(
       worktreeDir: input.targetDir,
       ...(input.branch ? { branch: input.branch } : {}),
       manifestPath,
+      recoveryRef,
       preCompactionHead: interval.headSha,
       startHead: interval.startHead,
       ...(producedSha ? { producedSha } : {}),
       disposition,
+      state: "completed" as const,
+      // A title survives workspace cleanup so run discovery can still name the
+      // run it rediscovers through this index.
+      title: (entry?.title as string | undefined) ?? (await runTitleFrom(input.runDir)),
       recordedAt: (entry?.recordedAt as number | undefined) ?? now,
       updatedAt: now,
     }
@@ -385,6 +391,15 @@ async function updateRunIndex(
     // The index is discoverability sugar over the manifest and refs; a failed
     // write must not fail the compaction itself.
   }
+}
+
+/** The run's prd.md first line, as run history titles it; undefined when unavailable. */
+async function runTitleFrom(runDir: string | undefined): Promise<string | undefined> {
+  if (!runDir || runDir === "/") return undefined
+  const prd = await readOptional(join(runDir, "prd.md"))
+  if (!prd) return undefined
+  const line = prd.split("\n").map((raw) => raw.replace(/^#+\s*/, "").trim()).find(Boolean)
+  return line ? line.slice(0, 120) : undefined
 }
 
 type ReconcileResult =

@@ -511,12 +511,9 @@ describe("parseCommand", () => {
     await expect(parseCommand(["agents", "invalid"])).rejects.toThrow("usage: convoy agents eject")
   })
 
-  test("finish --help returns help", async () => {
-    const cmd = await parseCommand(["finish", "--help"])
-    expect(cmd.type).toBe("help")
-    if (cmd.type === "help") {
-      expect(cmd.text).toContain("convoy finish")
-    }
+  test("retired finish command fails with the removal diagnostic", async () => {
+    const cmd = await parseCommand(["finish", "--branch", "feat/x"])
+    expect(cmd.type).toBe("retired-finish")
   })
 
   test("rejects both --prompt and --prompt-file", async () => {

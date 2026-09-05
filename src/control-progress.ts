@@ -116,6 +116,7 @@ export class ControlProgress implements ProgressUI {
       status: outcome.status,
       ...(outcome.error !== undefined ? { error: outcome.error } : {}),
       ...(outcome.goalLoop ? { goalLoop: outcome.goalLoop } : {}),
+      ...(outcome.finalization ? { finalization: outcome.finalization } : {}),
     })
   }
 

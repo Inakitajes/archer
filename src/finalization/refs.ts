@@ -42,6 +42,23 @@ export async function refExists(ref: string, cwd: string): Promise<boolean> {
   return result.exitCode === 0
 }
 
+/**
+ * Protects a goal-discarded attempt tip (design D3, task 1.4) before the best
+ * measured state is restored. Create-only, and tolerant of the ref already
+ * existing — restoring the same best state twice must not fail. Returns false
+ * when the tip could not be protected, so the caller can refuse the
+ * restoration instead of resetting a discardable tip away unprotected.
+ */
+export async function protectAttemptTip(ref: string, sha: string, cwd: string): Promise<boolean> {
+  if (await refExists(ref, cwd)) return true
+  try {
+    await createRefIfAbsent(ref, sha, cwd)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Resolves a ref to its commit SHA, or undefined when it does not exist. */
 export async function resolveRef(ref: string, cwd: string): Promise<string | undefined> {
   const result = await execFile("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { cwd, allowFailure: true })

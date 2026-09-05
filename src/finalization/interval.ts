@@ -1,4 +1,4 @@
-import { commitsBetween, currentBranch, execFile, resolveCommit, statusPorcelain } from "../git"
+import { currentBranch, execFile, resolveCommit, statusPorcelain } from "../git"
 import type { CommitLedgerEntry, RunBoundary } from "./types"
 
 /**
@@ -122,7 +122,14 @@ export async function verifyRunInterval(
   // The ledger's ownership chain: every committed entry must chain from the
   // run-start HEAD (no-change entries carry no commit and stay transparent),
   // consecutive entries must touch, and the chain must end exactly at HEAD.
-  const committed = ledger.filter((entry) => entry.afterSha)
+  // Goal settlement (capability run-finalization) restores the branch to the
+  // best measured state — a ledgered attempt commit — so ledger entries past
+  // it were discarded by settlement, not mutated externally. When HEAD lands
+  // exactly on a ledgered afterSha, the effective chain is the prefix ending
+  // there; the discarded tips stay inspectable behind their protected refs.
+  const committedAll = ledger.filter((entry) => entry.afterSha)
+  const restoredAtIndex = committedAll.findIndex((entry) => entry.afterSha === headSha)
+  const committed = restoredAtIndex === -1 ? committedAll : committedAll.slice(0, restoredAtIndex + 1)
   let cursor = boundary.startHead
   for (const [index, entry] of committed.entries()) {
     if (entry.beforeSha !== cursor) {
@@ -191,8 +198,3 @@ export async function verifyRunInterval(
   }
 }
 
-/** Convenience wrapper preserving the existing commitsBetween shape for callers that only need subjects. */
-export async function rangeSubjects(startHead: string, headSha: string, cwd: string): Promise<string[]> {
-  const commits = await commitsBetween(startHead, headSha, cwd)
-  return commits.map((commit) => commit.subject)
-}

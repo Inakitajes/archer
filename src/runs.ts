@@ -6,7 +6,7 @@ import { stdin, stdout } from "node:process"
 import { readControlFile } from "./control-client"
 import type { PendingSnapshot } from "./control-server"
 import { readRunMetadata, type GoalRunState, type PhaseMetadataStatus, type RunMetadata } from "./metadata"
-import { isValidRunID, runsRoot } from "./workspace"
+import { isValidRunID, convoyHome, runsRoot } from "./workspace"
 import { readAdvisorSplit } from "./advisor-report"
 import type { TuiRoute } from "./tui-session"
 
@@ -41,6 +41,134 @@ export type RunEntry = {
   phases: RunPhaseInfo[]
   /** The durable goal-cycle record exposed to run history (schema-v4 goal runs only). */
   goal?: RunEntryGoal
+  /**
+   * The automatic run-compaction outcome (capability run-finalization), merged
+   * from the run's metadata and its cleanup-surviving run-record index entry.
+   * Carries the recovery-evidence pointers the historical views quote as exact
+   * Git inspection commands.
+   */
+  finalization?: RunEntryFinalization
+}
+
+/** The finalization facts run history presents, from durable records only. */
+export type RunEntryFinalization = {
+  state: string
+  reason?: string
+  /** The single operator-authored commit compaction produced, when any. */
+  producedSha?: string
+  /** The protected ref holding the pre-compaction tip. */
+  recoveryRef?: string
+  /** The recovery manifest in the repository's Git common dir. */
+  manifestPath?: string
+  /** HEAD at run start and immediately before compaction: the endpoint pair. */
+  startHead?: string
+  preCompactionHead?: string
+  disposition?: string
+}
+
+/**
+ * The cleanup-surviving run-record index (design D3, task 1.5):
+ * `<convoy-home>/run-records/<run-id>.json`. Written by finalization, read here
+ * so deleting a disposable run workspace cannot delete the run's discoverable
+ * history or its recovery evidence.
+ */
+export type RunIndexRecord = {
+  runID: string
+  title?: string
+  summary?: string
+  worktreeDir?: string
+  branch?: string
+  manifestPath?: string
+  startHead?: string
+  preCompactionHead?: string
+  producedSha?: string
+  disposition?: string
+  state?: string
+  reason?: string
+  /** The protected ref holding the pre-compaction tip. */
+  recoveryRef?: string
+}
+
+/** Reads one run-record index entry; undefined when absent or malformed. */
+export async function readRunIndexEntry(runID: string): Promise<RunIndexRecord | undefined> {
+  let raw: string
+  try {
+    raw = await readFile(join(convoyHome(), "run-records", `${runID}.json`), "utf8")
+  } catch {
+    return undefined
+  }
+  return parseRunIndexRecord(raw, runID)
+}
+
+/** Reads every run-record index entry, skipping malformed files. */
+export async function listRunIndexRecords(): Promise<RunIndexRecord[]> {
+  let names: string[]
+  try {
+    names = await readdir(join(convoyHome(), "run-records"))
+  } catch {
+    return []
+  }
+  const records = await Promise.all(
+    names
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => readRunIndexEntry(name.slice(0, -".json".length))),
+  )
+  return records.filter((record): record is RunIndexRecord => record !== undefined)
+}
+
+function parseRunIndexRecord(raw: string, runID: string): RunIndexRecord | undefined {
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>
+    if (typeof value !== "object" || value === null) return undefined
+    const finalization = isRecordOf(value.finalization) ? value.finalization : undefined
+    const record: RunIndexRecord = {
+      runID: typeof value.runID === "string" && value.runID ? value.runID : runID,
+      ...(typeof value.title === "string" && value.title ? { title: value.title } : {}),
+      ...(typeof value.summary === "string" && value.summary ? { summary: value.summary } : {}),
+      ...(typeof value.worktreeDir === "string" && value.worktreeDir ? { worktreeDir: value.worktreeDir } : {}),
+      ...(typeof value.branch === "string" && value.branch ? { branch: value.branch } : {}),
+      ...(typeof value.manifestPath === "string" && value.manifestPath ? { manifestPath: value.manifestPath } : {}),
+      ...(typeof value.startHead === "string" && value.startHead ? { startHead: value.startHead } : {}),
+      ...(typeof value.preCompactionHead === "string" && value.preCompactionHead ? { preCompactionHead: value.preCompactionHead } : {}),
+      ...(typeof value.producedSha === "string" && value.producedSha ? { producedSha: value.producedSha } : {}),
+      ...(typeof value.disposition === "string" && value.disposition ? { disposition: value.disposition } : {}),
+      ...(typeof value.recoveryRef === "string" && value.recoveryRef ? { recoveryRef: value.recoveryRef } : {}),
+    }
+    if (finalization) {
+      if (typeof finalization.state === "string") record.state = finalization.state
+      if (typeof finalization.reason === "string") record.reason = finalization.reason
+    } else if (typeof value.state === "string") {
+      record.state = value.state
+    }
+    return record
+  } catch {
+    return undefined
+  }
+}
+
+function isRecordOf(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** Merges the run's durable finalization outcome into the entry's presentation shape. */
+function finalizationInfo(metadata: RunMetadata | undefined, index: RunIndexRecord | undefined): RunEntryFinalization | undefined {
+  const record = metadata?.finalization
+  const state = record?.state ?? index?.state
+  if (!state) return undefined
+  const reason = record?.reason ?? index?.reason
+  const producedSha = record?.producedSha ?? index?.producedSha
+  const manifestPath = record?.manifestPath ?? index?.manifestPath
+  const recoveryRef = record?.recoveryRef ?? index?.recoveryRef
+  return {
+    state,
+    ...(reason ? { reason } : {}),
+    ...(producedSha ? { producedSha } : {}),
+    ...(recoveryRef ? { recoveryRef } : {}),
+    ...(manifestPath ? { manifestPath } : {}),
+    ...(index?.startHead ? { startHead: index.startHead } : {}),
+    ...(index?.preCompactionHead ? { preCompactionHead: index.preCompactionHead } : {}),
+    ...(index?.disposition ? { disposition: index.disposition } : {}),
+  }
 }
 
 /** The goal-cycle facts run history presents, derived from the durable metadata record. */
@@ -68,6 +196,12 @@ export type RunsResolution =
   | { type: "retry"; runID: string; targetDir?: string }
 
 export async function listRuns(root = runsRoot()): Promise<RunEntry[]> {
+  const [workspaceRuns, indexRecords] = await Promise.all([listWorkspaceRuns(root), listRunIndexRecords()])
+  return mergeRunRecords(workspaceRuns, indexRecords, root)
+}
+
+/** The runs that still have workspace metadata on disk. */
+async function listWorkspaceRuns(root: string): Promise<RunEntry[]> {
   let names: string[]
   try {
     names = await readdir(root)
@@ -77,6 +211,35 @@ export async function listRuns(root = runsRoot()): Promise<RunEntry[]> {
   // Run IDs start with the wall-clock timestamp, so lexicographic order is chronological.
   const ids = names.filter(isValidRunID).sort().reverse()
   return Promise.all(ids.map((runID) => loadRunEntry(root, runID)))
+}
+
+/**
+ * Merges workspace runs with the cleanup-surviving run-record index (task 1.5):
+ * a run whose disposable workspace was deleted stays discoverable through its
+ * index record, with its finalization evidence and inspection commands intact.
+ */
+function mergeRunRecords(workspaceRuns: RunEntry[], indexRecords: RunIndexRecord[], root: string): RunEntry[] {
+  const known = new Set(workspaceRuns.map((run) => run.runID))
+  const indexedOnly = indexRecords
+    .filter((record) => isValidRunID(record.runID) && !known.has(record.runID))
+    .map((record) => runEntryFromIndexRecord(record, root))
+  return [...workspaceRuns, ...indexedOnly].sort((a, b) => b.runID.localeCompare(a.runID))
+}
+
+/** A run known only through its run-record index entry: metadata is gone, evidence is not. */
+function runEntryFromIndexRecord(record: RunIndexRecord, root: string): RunEntry {
+  const failed = record.state === "failed"
+  return {
+    runID: record.runID,
+    dir: join(root, record.runID),
+    title: record.title ?? record.summary ?? "(run workspace cleaned; evidence retained)",
+    targetDir: record.worktreeDir,
+    status: failed ? "compaction failed" : "completed",
+    statusKind: failed ? "failed" : "completed",
+    live: false,
+    phases: [],
+    finalization: finalizationInfo(undefined, record),
+  }
 }
 
 /** Interactive run-history browser: pick a run, then resume it, read its reports, or open a subshell in its dir. */
@@ -113,29 +276,68 @@ export async function browseRuns(initialRunID?: string, route?: TuiRoute): Promi
 /** SUMMARY.md when the run finished; otherwise whatever phase reports landed before it died. */
 export async function loadRunSummary(run: RunEntry): Promise<string> {
   const summary = await readIfExists(join(run.dir, "SUMMARY.md"))
-  if (summary !== undefined) return summary
-
-  let reports: string[] = []
-  try {
-    // Forensic copies of rejected deliverables (persistInvalidPhaseReport) end
-    // in .raw.md; they must never render as phase reports in the summary.
-    reports = (await readdir(join(run.dir, "reports"))).filter((name) => name.endsWith(".md") && !name.endsWith(".raw.md")).sort()
-  } catch {
-    // no reports dir
+  let body: string
+  if (summary !== undefined) {
+    body = summary
+  } else {
+    let reports: string[] = []
+    try {
+      // Forensic copies of rejected deliverables (persistInvalidPhaseReport) end
+      // in .raw.md; they must never render as phase reports in the summary.
+      reports = (await readdir(join(run.dir, "reports"))).filter((name) => name.endsWith(".md") && !name.endsWith(".raw.md")).sort()
+    } catch {
+      // no reports dir
+    }
+    if (reports.length === 0) {
+      body = run.finalization ? "" : "no summary or reports for this run"
+    } else {
+      const sections: string[] = []
+      for (const name of reports) {
+        const evidence = await readIfExists(join(run.dir, "reports", name))
+        if (evidence !== undefined) sections.push(`## reports/${name}\n\n${evidence.trim()}`)
+      }
+      body = sections.join("\n\n")
+    }
   }
-  if (reports.length === 0) return "no summary or reports for this run"
+  return [body.trim(), recoveryEvidenceSection(run)].filter(Boolean).join("\n\n")
+}
 
-  const sections: string[] = []
-  for (const name of reports) {
-    const body = await readIfExists(join(run.dir, "reports", name))
-    if (body !== undefined) sections.push(`## reports/${name}\n\n${body.trim()}`)
+/**
+ * The run's durable recovery evidence, quoted as exact local Git commands
+ * (capability run-finalization, design D3, task 1.5). The commands inspect the
+ * retained endpoints; recovery is a new branch from the protected tip — never
+ * an unconditional hard reset of a branch that may have advanced.
+ */
+function recoveryEvidenceSection(run: RunEntry): string {
+  const f = run.finalization
+  if (!f) return ""
+  const lines = ["## Recovery evidence", "", `- Run compaction: ${f.state}${f.disposition ? ` (${f.disposition})` : ""}`]
+  if (f.reason) lines.push(`- Reason: ${f.reason}`)
+  if (f.producedSha) lines.push(`- Resulting commit: ${f.producedSha}`)
+  if (f.startHead && f.preCompactionHead) {
+    lines.push(`- Replaced interval endpoints: ${f.startHead.slice(0, 12)} → ${f.preCompactionHead.slice(0, 12)}`)
+    lines.push("- Inspect the run's original intermediate history:", "", "  ```", `  git diff ${f.startHead} ${f.preCompactionHead}`, "  ```")
   }
-  return sections.join("\n\n")
+  if (f.producedSha) {
+    lines.push("- Inspect the resulting compacted commit:", "", "  ```", `  git show ${f.producedSha}`, "  ```")
+  }
+  if (f.recoveryRef) {
+    lines.push(
+      "- Recover the original commits on a new branch (nothing is reset):",
+      "",
+      "  ```",
+      `  git branch recover/${run.runID} ${f.recoveryRef}`,
+      "  ```",
+    )
+  }
+  if (f.manifestPath) lines.push(`- Recovery manifest: ${f.manifestPath}`)
+  return lines.join("\n")
 }
 
 async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
   const dir = join(root, runID)
   const metadata = await readRunMetadata(join(dir, "metadata.json"))
+  const indexRecord = await readRunIndexEntry(runID)
   const summary = statusSummary(metadata)
   const serverLive = await isServerLive(metadata?.server)
   const control = await readControlFile(runID, root)
@@ -145,6 +347,7 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
   const executorCost = totalCost(metadata, split.executorPhases) ?? (split.executor.cost > 0 ? split.executor.cost : undefined)
   const advisorCost = split.advisor.cost
   const goal = metadata?.goal
+  const finalization = finalizationInfo(metadata, indexRecord)
   return {
     runID,
     dir,
@@ -164,6 +367,7 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
     createdAt: metadata?.createdAt,
     phases: phaseInfos(metadata),
     ...(goal ? { goal: goalInfo(goal) } : {}),
+    ...(finalization ? { finalization } : {}),
   }
 }
 
@@ -320,8 +524,15 @@ function phaseInfos(metadata: RunMetadata | undefined): RunPhaseInfo[] {
 }
 
 function printRunList(runs: RunEntry[]) {
-  const statusText = (run: RunEntry) =>
-    run.live ? (run.waiting ? `running · waiting for a ${run.waiting === "permission" ? "permission" : "review"}` : "running") : run.status
+  const statusText = (run: RunEntry) => {
+    const base = run.live ? (run.waiting ? `running · waiting for a ${run.waiting === "permission" ? "permission" : "review"}` : "running") : run.status
+    // Surface the compaction outcome next to the pipeline status: a blocked or
+    // failed compaction must never read as an unqualified clean finish.
+    if (run.finalization && run.finalization.state !== "completed") {
+      return `${base} · compaction ${run.finalization.state}`
+    }
+    return base
+  }
   const goalText = (run: RunEntry) => {
     if (!run.goal) return ""
     const trajectory = run.goal.trajectory ? ` · ${run.goal.trajectory.join(" → ")}` : ""

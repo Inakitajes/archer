@@ -17,7 +17,7 @@ import { fileParts } from "./attachments"
 import { Caffeinate } from "./caffeinate"
 import { ensureClaudeAvailable, openClaudeSessionWindow, promptClaudePhase } from "./claude-code"
 import { addAllAndCommit, createCleanRepoSnapshot, currentBranch, currentHead, describeRepoSnapshotDifference, dirtyFilesPreview, dirtyTreeError, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, statusPorcelain, writeDiff } from "./git"
-import { gitCommonDir, createRefIfAbsent, runRefPrefix } from "./finalization/refs"
+import { gitCommonDir, protectAttemptTip, runRefPrefix } from "./finalization/refs"
 import { recordLedgeredCommit } from "./finalization/ledger"
 import type { RunBoundary } from "./finalization/types"
 import { hookPhaseNames, hooksForPipeline, runHooks, type HookStage } from "./hooks"
@@ -591,9 +591,9 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
     // tab back to whatever owned it, rather than leaving Convoy's last title up.
     if (notificationSettings.terminalTitle) titleSaved = pushTerminalTitle()
 
-    // Imported lazily: finish pulls in the commit-message writer (and through it
-    // opencode), which a run that never reaches its finish screen shouldn't pay for.
-    const { createFinishSeam } = await import("./finish")
+    // Imported lazily: publish pulls in the summary readers, which a run that
+    // never reaches its finish screen shouldn't pay for.
+    const { createPublishSeam } = await import("./publish")
     const hostControls: ProgressHostControls = {
       onPauseToggle: () => {
         void control?.toggle().catch((error) => log.warn(`couldn't persist pause state: ${formatSdkError(error)}`))
@@ -601,7 +601,7 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       onKeepAwakeToggle: () => {
         void caffeinate?.toggle().catch((error) => log.warn(`couldn't toggle Caffeinate: ${formatSdkError(error)}`))
       },
-      finish: createFinishSeam({ cwd: options.targetDir, baseRef: options.baseRef, runDir: workspace.dir }),
+      publish: createPublishSeam({ cwd: options.targetDir, runDir: workspace.dir }),
     }
     if (options.progress) {
       // Hosted by the coordinator (or the goal loop): reuse its dashboard or
@@ -805,13 +805,19 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
         // A goal-discarded attempt tip is protected with a create-only ref
         // before the best measured state is restored (capability
         // run-finalization, task 1.4), so the discarded work stays inspectable
-        // even after the restore and ordinary garbage collection.
+        // even after the restore and ordinary garbage collection. A protection
+        // failure refuses the restoration (design D3): restoreBestEffort
+        // discloses the refusal and the branch stays where the last iteration
+        // left it, instead of the tip being reset away unprotected.
         restoreSnapshot: async (snapshot, cwd) => {
           const head = await currentHead(cwd)
           if (head) {
-            await createRefIfAbsent(`${runRefPrefix(workspace.runID)}/goal-attempts/${head.slice(0, 12)}`, head, cwd).catch((error) =>
-              log.warn(`couldn't protect goal attempt tip: ${String(error)}`),
-            )
+            const protectedTip = await protectAttemptTip(`${runRefPrefix(workspace.runID)}/goal-attempts/${head.slice(0, 12)}`, head, cwd)
+            if (!protectedTip) {
+              throw new Error(
+                `couldn't protect the goal attempt tip ${head.slice(0, 12)} behind its evidence ref; refusing to restore the best measured state`,
+              )
+            }
           }
           await restoreRepoSnapshot(snapshot, cwd)
         },
@@ -931,6 +937,18 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       ...(runScoreResult ? { qualityScore: runScoreResult.score.score } : {}),
       // The finish screen freezes the verdict and the full measured trajectory.
       ...(goalView ? { goalLoop: goalView } : {}),
+      // The compaction outcome rides the finish screen separately from the
+      // pipeline result (capability run-finalization, design D8): blocked or
+      // failed compaction stays visible without turning execution into failure.
+      ...(finalizationRecord
+        ? {
+            finalization: {
+              state: finalizationRecord.state,
+              ...(finalizationRecord.reason ? { reason: finalizationRecord.reason } : {}),
+              ...(finalizationRecord.producedSha ? { producedSha: finalizationRecord.producedSha } : {}),
+            },
+          }
+        : {}),
     }, Boolean(options.progress))
     // Hosted runs skip the finish hold, so the tracker's runFinished wrapper
     // never fires here. Publish the terminal snapshot now so Herdr shows

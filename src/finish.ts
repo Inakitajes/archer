@@ -1,19 +1,13 @@
-import { readFile } from "node:fs/promises"
-import { join } from "node:path"
-
 import {
   commitAsUser,
   commitsBetween,
   convoyAuthorEmail,
   currentBranch,
-  detectBaseRef,
   diffStat,
   dirtyFilesPreview,
   findSuspiciousStagedFiles,
   isAncestor,
-  mainWorktreeDir,
   mergeBase,
-  pushBranch,
   resetSoft,
   resolveCommit,
   statusPorcelain,
@@ -21,15 +15,14 @@ import {
   upstreamRef,
   type CommitInfo,
 } from "./git"
-import { proposeCommitMessage, type ConventionalMessage } from "./commit-message"
-import type { FinishSeam } from "./progress"
-import { listRuns } from "./runs"
 
 /**
- * Closing a run: collapse the per-step commits convoy made on this branch into
- * one conventional commit created by the user, so the branch lands in history
- * semantic and signed instead of as a stack of "convoy(security): Security
- * audit" machine commits.
+ * Close's squash primitives (capability feature-close): resolve the
+ * authorship-anchored range of convoy commits on a feature branch and collapse
+ * it into one operator-authored commit. This is retained for `convoy close`
+ * only — the manual finish command and the dashboard's finish seam are removed
+ * (capability run-finalization, design D5), and close's own replacement, the
+ * true squash landing, will retire this authorship walk entirely.
  */
 
 /** Why a branch can't be squashed. Each maps to a message the UI shows verbatim. */
@@ -197,207 +190,6 @@ export async function applySquash(input: ApplySquashInput): Promise<SquashResult
   return { sha, branch: plan.branch, backupRef, replaced: plan.commits.length }
 }
 
-export type FinishContext = {
-  /** The worktree/repo holding the run's branch. */
-  cwd: string
-  baseRef: string
-  /** Run workspace, when the caller has it; otherwise it is discovered from the run history. */
-  runDir?: string
-  commitMessageModel?: string
-  signal?: AbortSignal
-}
-
-export type FinishPreparation =
-  | { ok: false; reason: SquashBlockReason; message: string }
-  | {
-      ok: true
-      plan: SquashPlan
-      message: ConventionalMessage
-      messageSource: "model" | "template"
-      /** Set when the writing model failed and the message is the deterministic fallback. */
-      messageError?: string
-    }
-
-/**
- * Everything `finish` needs before it can ask the user to confirm: the commits
- * it would replace, and a proposed message for the one that replaces them.
- * Shared by `convoy finish` and the dashboard's finish screen so both offer
- * exactly the same operation.
- */
-export async function prepareFinish(context: FinishContext): Promise<FinishPreparation> {
-  const range = await resolveSquashRange(context.cwd, context.baseRef)
-  if (!range.ok) return range
-
-  const { ok: _ok, ...plan } = range
-  const runDir = context.runDir ?? (await findRunDir(context.cwd))
-  const [summary, prompt] = await Promise.all([readRunFile(runDir, "SUMMARY.md"), readRunFile(runDir, "prd.md")])
-
-  const proposal = await proposeCommitMessage({
-    targetDir: context.cwd,
-    branch: plan.branch,
-    commits: plan.commits.map((commit) => commit.subject),
-    diffStat: plan.diffStat,
-    ...(summary ? { summary } : {}),
-    ...(prompt ? { prompt } : {}),
-    ...(context.commitMessageModel ? { model: context.commitMessageModel } : {}),
-    ...(context.signal ? { signal: context.signal } : {}),
-  })
-
-  return {
-    ok: true,
-    plan,
-    message: proposal.message,
-    messageSource: proposal.source,
-    ...(proposal.error ? { messageError: proposal.error } : {}),
-  }
-}
-
-/** The newest run recorded against this directory, so a standalone `convoy finish` still finds its reports. */
-async function findRunDir(cwd: string): Promise<string | undefined> {
-  try {
-    const runs = await listRuns()
-    return runs.find((run) => run.targetDir === cwd)?.dir
-  } catch {
-    return undefined
-  }
-}
-
-async function readRunFile(runDir: string | undefined, name: string): Promise<string | undefined> {
-  if (!runDir) return undefined
-  try {
-    return await readFile(join(runDir, name), "utf8")
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * Wires `finish` up for the run dashboard's [f]. Everything git- and
- * model-shaped stays on this side, so tui.ts only ever sees plain data — the
- * same seam the launcher uses for branch naming.
- */
-export function createFinishSeam(input: { cwd: string; baseRef?: string; runDir?: string }): FinishSeam {
-  let plan: SquashPlan | undefined
-
-  return {
-    async prepare() {
-      const { loadMergedConvoyConfig } = await import("./config")
-      const config = await loadMergedConvoyConfig(input.cwd)
-      const prepared = await prepareFinish({
-        cwd: input.cwd,
-        baseRef: input.baseRef ?? (await resolveFinishBase(input.cwd, config?.defaults.baseRef)),
-        ...(input.runDir ? { runDir: input.runDir } : {}),
-        ...(config?.defaults.commitMessageModel ? { commitMessageModel: config.defaults.commitMessageModel } : {}),
-      })
-      if (!prepared.ok) return { ok: false, message: prepared.message }
-
-      plan = prepared.plan
-      const notes: string[] = []
-      if (prepared.plan.stoppedAt) {
-        notes.push(`stops at ${prepared.plan.stoppedAt.sha.slice(0, 8)} "${prepared.plan.stoppedAt.subject}" — your own commit, left untouched`)
-      }
-      if (prepared.messageError) notes.push("the writing model failed; this message is derived from the branch and the step commits")
-
-      return {
-        ok: true as const,
-        proposal: {
-          branch: prepared.plan.branch,
-          commitCount: prepared.plan.commits.length,
-          subject: formatSubject(prepared.message),
-          body: prepared.message.body,
-          notes,
-        },
-      }
-    },
-
-    async apply(message) {
-      if (!plan) throw new Error("finish was applied before it was prepared")
-      const result = await applySquash({ cwd: input.cwd, plan, message: joinMessage(message) })
-      // The branch has been rewritten; a second apply would squash the commit
-      // it just made onto the base again.
-      plan = undefined
-      return result
-    },
-
-    async edit(message) {
-      return await editMessageInEditor(joinMessage(message))
-    },
-
-    async push(branch) {
-      await pushBranch(branch, defaultRemote, input.cwd)
-    },
-
-    canOpenPullRequest,
-
-    async openPullRequest(message) {
-      await openPullRequest(input.cwd, message)
-    },
-  }
-}
-
-export const defaultRemote = "origin"
-
-/** A PR needs the GitHub CLI; without it the offer is never made rather than failing at the prompt. */
-export function canOpenPullRequest(): boolean {
-  return Boolean(Bun.which("gh"))
-}
-
-export async function openPullRequest(cwd: string, message: { subject: string; body: string[] }) {
-  const body = message.body.map((line) => `- ${line}`).join("\n")
-  const proc = Bun.spawn(["gh", "pr", "create", "--title", message.subject, "--body", body], {
-    cwd,
-    stdin: "inherit",
-    stdout: "inherit",
-    stderr: "inherit",
-    env: process.env,
-  })
-  if ((await proc.exited) !== 0) throw new Error("gh pr create didn't complete")
-}
-
-/**
- * The base must be detected in the main checkout: inside a worktree the
- * current-branch fallback would answer with the run's own branch, which would
- * floor the squash at HEAD and find nothing to do.
- */
-export async function resolveFinishBase(cwd: string, configured?: string): Promise<string> {
-  if (configured) return configured
-  const detectionDir = (await mainWorktreeDir(cwd)) ?? cwd
-  const detected = await detectBaseRef(detectionDir)
-  return detected?.ref ?? "HEAD"
-}
-
-function formatSubject(message: ConventionalMessage): string {
-  return `${message.type}${message.scope ? `(${message.scope})` : ""}: ${message.subject}`
-}
-
-function joinMessage(message: { subject: string; body: string[] }): string {
-  if (message.body.length === 0) return message.subject
-  return `${message.subject}\n\n${message.body.map((line) => `- ${line}`).join("\n")}`
-}
-
-/**
- * Hands the whole message to $EDITOR, because a multi-line body can't be edited
- * in the modal's one-line field. Returns undefined when the user emptied the
- * file, which is git's own "abort the commit" convention.
- */
-export async function editMessageInEditor(message: string): Promise<{ subject: string; body: string[] } | undefined> {
-  const { mkdtemp, readFile: read, rm, writeFile } = await import("node:fs/promises")
-  const { tmpdir } = await import("node:os")
-
-  const dir = await mkdtemp(join(tmpdir(), "convoy-finish-"))
-  const path = join(dir, "COMMIT_EDITMSG")
-  try {
-    await writeFile(path, `${message}\n\n# Lines starting with '#' are ignored.\n# An empty message cancels the commit.\n`)
-    const editor = process.env.GIT_EDITOR || process.env.VISUAL || process.env.EDITOR || "vi"
-    const proc = Bun.spawn(["sh", "-c", `${editor} "$1"`, "sh", path], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: process.env })
-    if ((await proc.exited) !== 0) return undefined
-    return parseMessage(await read(path, "utf8"))
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-}
-
-/** Splits an edited message back into subject + body, dropping git's comment lines. */
 export function parseMessage(raw: string): { subject: string; body: string[] } | undefined {
   const lines = raw
     .split("\n")

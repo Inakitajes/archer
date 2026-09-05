@@ -7,7 +7,7 @@ import type { ControlReset, ControlRole, PendingSnapshot } from "./control-serve
 import { goalProgressPhases } from "./goal-phases"
 import { readRunMetadata, type RunMetadata } from "./metadata"
 import { connectOpencode } from "./opencode"
-import type { AutoAccept, PermissionPromptInfo, ProgressPhase, ProgressUI } from "./progress"
+import type { AutoAccept, PermissionPromptInfo, ProgressPhase, ProgressUI, RunFinalizationView } from "./progress"
 import { isControlLive, isServerLive } from "./runs"
 import { progressPhases } from "./runner"
 import { stepRunnerFor } from "./step-runners"
@@ -50,6 +50,21 @@ type AttachView = {
   runDir: string
   metaPath: string
   phases: readonly ProgressPhase[]
+}
+
+/**
+ * The durable finalization outcome as a finish-screen view (capability
+ * run-finalization, design D8): reconstructed from metadata, so a late attach
+ * or a stopped run shows the same compaction result the live run reported.
+ */
+function finalizationViewFrom(metadata: RunMetadata): RunFinalizationView | undefined {
+  const record = metadata.finalization
+  if (!record) return undefined
+  return {
+    state: record.state,
+    ...(record.reason ? { reason: record.reason } : {}),
+    ...(record.producedSha ? { producedSha: record.producedSha } : {}),
+  }
 }
 
 /**
@@ -128,7 +143,7 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
     resolveDetached = resolve
   })
 
-  const { createFinishSeam } = await import("./finish")
+  const { createPublishSeam } = await import("./publish")
   // Claim the controller slot BEFORE the dashboard exists: the role decides how
   // the dashboard is built (observer flag, Ctrl+C, host controls). A client
   // that loses the claim (409 — another controller is attached — or the
@@ -166,10 +181,9 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
       mode: live ? "live" : "historical",
       ctrlC: options.ctrlC ?? "detach",
       route,
-      // [f] is gated on `finished`, so wiring the seam on a live attach is
-      // inert until the finish hold lands. Skipping it here used to leave a
-      // coordinated finish screen without Finalize.
-      finish: createFinishSeam({ cwd: targetDir, runDir: dir }),
+      // [f] is gated on `finished`, so wiring the publication seam on a live
+      // attach is inert until the finish hold lands.
+      publish: createPublishSeam({ cwd: targetDir, runDir: dir }),
     },
   )
   tui.start(runID, targetDir, dir)
@@ -177,7 +191,10 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
   if (!live) {
     replayHistory(tui, metadata)
     const goalLoop = goalLoopViewFrom(metadata.goal)
-    await Promise.race([tui.runFinished?.({ status: overallStatus(metadata), runDir: dir, ...(goalLoop ? { goalLoop } : {}) }) ?? Promise.resolve(), detached])
+    await Promise.race([
+      tui.runFinished?.({ status: overallStatus(metadata), runDir: dir, ...(goalLoop ? { goalLoop } : {}), ...(finalizationViewFrom(metadata) ? { finalization: finalizationViewFrom(metadata)! } : {}) }) ?? Promise.resolve(),
+      detached,
+    ])
     tui.stop()
     return
   }
@@ -248,7 +265,7 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
     })
     // Point [f] at this iteration's workspace so the squash reads the latest
     // SUMMARY.md / prd.md after a goal-loop reset.
-    tui.setHostControls?.({ finish: createFinishSeam({ cwd: reset.targetDir, runDir: reset.runDir }) })
+    tui.setHostControls?.({ publish: createPublishSeam({ cwd: reset.targetDir, runDir: reset.runDir }) })
     if (reset.goalLoop) tui.setGoalLoop?.(reset.goalLoop)
     void startView({
       runID: reset.runID,
@@ -312,7 +329,10 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
     await reconcileAdvisorJournal(latest, view.runDir)
     replayHistory(tui, latest)
     const goalLoop = goalLoopViewFrom(latest.goal)
-    await Promise.race([tui.runFinished?.({ status: overallStatus(latest), runDir: view.runDir, ...(goalLoop ? { goalLoop } : {}) }) ?? Promise.resolve(), detached])
+    await Promise.race([
+      tui.runFinished?.({ status: overallStatus(latest), runDir: view.runDir, ...(goalLoop ? { goalLoop } : {}), ...(finalizationViewFrom(latest) ? { finalization: finalizationViewFrom(latest)! } : {}) }) ?? Promise.resolve(),
+      detached,
+    ])
   }
   tui.stop()
 }
@@ -394,13 +414,14 @@ export function startPendingPoller(controller: ControlClient, session: AttachSes
             replayHistory(tui, latest)
           }
           // The finish hold carries the coordinator's real outcome (status,
-          // error, goal-loop verdict) so the screen matches what an in-process
-          // owner would see.
+          // error, goal-loop verdict, run-finalization result) so the screen
+          // matches what an in-process owner would see.
           await tui.runFinished?.({
             status: finish.status,
             runDir: view().runDir,
             ...(finish.error ? { error: finish.error } : {}),
             ...(finish.goalLoop ? { goalLoop: finish.goalLoop } : {}),
+            ...(finish.finalization ? { finalization: finish.finalization } : {}),
           })
           await controller.finishDismiss().catch(() => {})
           session.onFinishDismissed()

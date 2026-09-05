@@ -1,6 +1,6 @@
 // Reproduction tests for the 6 release-blocking findings from the Hunter NaN PRD.
 // Each test captures the pre-fix behavior so the fix can be verified against it.
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -195,6 +195,36 @@ describe("HN-020: finish skips secret scanning", () => {
     expect(source).toContain("suspicious.length > 0")
     // And it should restore the branch on finding secrets
     expect(source).toContain("resetSoft(plan.head")
+  })
+})
+
+// ===== run-finalization: the manual finish rewrite is unreachable =====
+//
+// Capability run-finalization (design D5) removes the manual finish: the CLI
+// spelling is retired, and the dashboard's finish modal, [f] seam, and
+// push/PR follow-ups are gone. The authorship walk in finish.ts survives only
+// as an internal primitive of `convoy close` until its true-squash landing
+// replaces it. These assertions keep every surface honest about that.
+describe("run-finalization: the manual finish rewrite is unreachable", () => {
+  test("no source file still wires the retired finish seam or its modal", async () => {
+    const srcDir = join(import.meta.dir, "..", "src")
+    const files = (await readdir(srcDir)).filter((file) => file.endsWith(".ts"))
+    expect(files.length).toBeGreaterThan(10)
+    for (const file of files) {
+      const source = await readFile(join(srcDir, file), "utf8")
+      // The seam factory and the FinishSeam type are removed; nothing may
+      // reference them (the dashboard has no path back to the rewrite).
+      expect(source, file).not.toContain("createFinishSeam")
+      expect(source, file).not.toContain("FinishSeam")
+      expect(source, file).not.toContain("openFinishModal")
+      expect(source, file).not.toContain("applyFinish(")
+    }
+  })
+
+  test("the progress host controls expose publication, not a branch rewrite", async () => {
+    const source = await readFile(join(import.meta.dir, "..", "src", "progress.ts"), "utf8")
+    expect(source).toContain("publish?: PublishSeam")
+    expect(source).not.toContain("finish?: FinishSeam")
   })
 })
 
