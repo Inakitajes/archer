@@ -3,6 +3,8 @@ import { dirname, join } from "node:path"
 import { stdin, stdout } from "node:process"
 
 import { addAllAndCommit } from "./git"
+import { recordLedgeredCommit } from "./finalization/ledger"
+import type { CommitLedgerEntry } from "./finalization/types"
 import { log } from "./log"
 import { openInteractiveOpencodeWindow } from "./opencode"
 import { noopProgress, type HumanReviewAction, type ProgressUI } from "./progress"
@@ -11,6 +13,7 @@ import { stepCommitMessageFactory } from "./step-commit"
 import { createTerminalInput, type TerminalInput, TerminalInterrupt } from "./terminal-input"
 import type { RunOptions } from "./types"
 import type { Workspace } from "./workspace"
+import type { RunMetadataStore } from "./metadata"
 
 type HumanReviewGateDeps = {
   openInteractiveOpencodeWindow: typeof openInteractiveOpencodeWindow
@@ -27,6 +30,7 @@ export async function runHumanReviewGate(
   permissions?: PermissionGate,
   stepName = "human-review",
   deps: HumanReviewGateDeps = defaultHumanReviewGateDeps,
+  metadata?: RunMetadataStore,
 ) {
   // Human steps are filtered out of new pipelines when --no-human-step / --no-human-review is
   // set; this guard covers resumed runs whose frozen pipeline still has one.
@@ -66,7 +70,7 @@ export async function runHumanReviewGate(
 
     for (;;) {
       if (action === "continue") {
-        await commitHumanChanges(workspace, options, stepName)
+        await commitHumanChanges(workspace, options, stepName, metadata)
         await writeHumanReviewReport(workspace, "approved", iterations, stepName)
         progress.phaseCompleted(stepName, "approved")
         return
@@ -91,10 +95,10 @@ export async function runHumanReviewGate(
           }
 
           await runSuspendedInteractiveIteration(options, opencodeUrl, progress, stepName, permissions, deps.runInteractiveOpencode)
-          await commitHumanChanges(workspace, options, stepName)
+          await commitHumanChanges(workspace, options, stepName, metadata)
         } else {
           await runInteractiveIteration(options, opencodeUrl, stepName, permissions, deps.runInteractiveOpencode)
-          await commitHumanChanges(workspace, options, stepName)
+          await commitHumanChanges(workspace, options, stepName, metadata)
         }
         action = await askAction()
         continue
@@ -292,13 +296,19 @@ async function runInteractiveOpencode(options: RunOptions, opencodeUrl: string, 
  * Commits one human OpenCode iteration as the step's intermediate commit. The
  * message is composed inside the commit seam from the exact staged paths —
  * never the fixed `apply manual iteration` — and carries the active run's
- * `Convoy-Run` trailer (capability `step-commit-messages`).
+ * `Convoy-Run` trailer (capability `step-commit-messages`). The commit is
+ * ledgered into durable run metadata so automatic finalization can attribute
+ * it to the run (task 1.3).
  */
-async function commitHumanChanges(workspace: Workspace, options: RunOptions, stepName: string) {
-  const committed = await addAllAndCommit(
-    stepCommitMessageFactory({ workspace, step: stepName, mode: "human" }),
-    options.targetDir,
-  )
+async function commitHumanChanges(workspace: Workspace, options: RunOptions, stepName: string, metadata?: RunMetadataStore) {
+  const record: ((entry: CommitLedgerEntry) => Promise<void>) | undefined = metadata
+    ? (entry) => metadata.appendLedgerEntry(entry).catch((error) => log.warn(`couldn't persist commit ledger entry: ${String(error)}`))
+    : undefined
+  const commit = () =>
+    addAllAndCommit(stepCommitMessageFactory({ workspace, step: stepName, mode: "human" }), options.targetDir)
+  const committed = record
+    ? await recordLedgeredCommit(record, { mode: "human", step: stepName, cwd: options.targetDir }, commit)
+    : await commit()
   if (committed) log.info(`[${stepName}] committed manual changes (${workspace.runID})`)
 }
 
