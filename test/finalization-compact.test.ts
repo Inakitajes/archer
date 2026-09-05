@@ -1,11 +1,11 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { currentHead, execFile, resolveCommit } from "../src/git"
 import { finalizeNetZeroInterval, isNetZeroInterval, runFinalization, type FinalizationJournal } from "../src/finalization/compact"
-import { boundedCommitAsOperator } from "../src/finalization/executor"
+import { boundedCommitAsOperator, BoundedCommitError } from "../src/finalization/executor"
 import { verifyRunInterval } from "../src/finalization/interval"
 import { acquireMutationLease, LeaseUnavailableError, mutationLeaseHeld } from "../src/finalization/lease"
 import { createRefIfAbsent, gitCommonDir, ledgerTipRef, preCompactionRef, refExists, resolveRef } from "../src/finalization/refs"
@@ -214,6 +214,43 @@ describe("bounded commit executor", () => {
     await writeFile(join(dir, ".env"), "TOKEN=1\n")
     await git(["add", "-A"], dir)
     await expect(boundedCommitAsOperator("feat: leak", dir)).rejects.toThrow("look like they contain secrets")
+  })
+
+  test("a hanging commit hook is terminated at the deadline without advancing HEAD", async () => {
+    // A detached coordinator must never hang on interactive signing or a hook:
+    // the bounded executor closes stdin and kills the git process at the
+    // deadline, preserving the staged work for a later attempt.
+    const dir = await repo()
+    const hook = join(dir, ".git", "hooks", "pre-commit")
+    await writeFile(hook, "#!/bin/sh\nsleep 30\n")
+    await chmod(hook, 0o755)
+    await writeFile(join(dir, "work.txt"), "work\n")
+    await git(["add", "-A"], dir)
+    const before = (await currentHead(dir))!
+    const started = Date.now()
+    await expect(boundedCommitAsOperator("feat: hang", dir, { timeoutMs: 700 })).rejects.toThrow(/terminated after/)
+    // The kill fires at the deadline, not after the hook's own sleep.
+    expect(Date.now() - started).toBeLessThan(10_000)
+    // The deadline is not interpreted as a successful no-op commit.
+    expect(await currentHead(dir)).toBe(before)
+    // The staged work is untouched, so a retry stays possible.
+    expect((await git(["status", "--porcelain"], dir)).stdout.trim()).toContain("work.txt")
+  }, 15_000)
+
+  test("captures hook diagnostics when the commit is rejected", async () => {
+    // A hook that rejects the commit must fail visibly with its diagnostics in
+    // the outcome — no silent unsigned/unverified fallback.
+    const dir = await repo()
+    const hook = join(dir, ".git", "hooks", "pre-commit")
+    await writeFile(hook, "#!/bin/sh\necho 'denied by local policy' >&2\nexit 1\n")
+    await chmod(hook, 0o755)
+    await writeFile(join(dir, "work.txt"), "work\n")
+    await git(["add", "-A"], dir)
+    const before = (await currentHead(dir))!
+    const error = await boundedCommitAsOperator("feat: denied", dir).catch((caught) => caught)
+    expect(error).toBeInstanceOf(BoundedCommitError)
+    expect((error as BoundedCommitError).diagnostics).toContain("denied by local policy")
+    expect(await currentHead(dir)).toBe(before)
   })
 })
 
@@ -514,5 +551,67 @@ describe("automatic compaction", () => {
     const dir = await repo()
     const verdict = await verifyNotPublished([(await currentHead(dir))!], dir)
     expect(verdict).toEqual({ ok: true, checkedRemotes: [] })
+  })
+
+  test("two compacted runs keep independently inspectable evidence after garbage collection", async () => {
+    // run-finalization spec scenario "Two runs followed by cleanup and
+    // garbage collection": protective refs and manifests must keep each run's
+    // phase changes and pre-compaction history inspectable even after GC, and
+    // a later run must never overwrite an earlier run's evidence.
+    const dir = await repo()
+    const firstID = "20260905-120000-aa01"
+    const secondID = "20260905-120000-aa02"
+
+    // First run: two phase commits, compacted into one operator commit.
+    const firstStart = (await currentHead(dir))!
+    await runCommit(dir, "a.txt", "a\n", "design", firstID)
+    await runCommit(dir, "b.txt", "b\n", "implement", firstID)
+    const firstPre = (await currentHead(dir))!
+    const first = await runFinalization({ runID: firstID, targetDir: dir, boundary: boundaryFor(dir, firstStart), ledger: await ledgerFor(dir, firstStart, firstID), branch: "main", composeMessage: compose })
+    expect(first.state).toBe("completed")
+
+    // Second run on the same branch: its boundary is the first run's product,
+    // so a naive author-walk would have swallowed both runs together.
+    const secondStart = (await currentHead(dir))!
+    expect(secondStart).toBe(first.producedSha!)
+    await runCommit(dir, "c.txt", "c\n", "design", secondID)
+    await runCommit(dir, "d.txt", "d\n", "implement", secondID)
+    const secondPre = (await currentHead(dir))!
+    const second = await runFinalization({ runID: secondID, targetDir: dir, boundary: boundaryFor(dir, secondStart), ledger: await ledgerFor(dir, secondStart, secondID), branch: "main", composeMessage: compose })
+    expect(second.state).toBe("completed")
+
+    // Expire reflogs and run aggressive GC with immediate pruning: only the
+    // protected create-only refs keep the pre-compaction commits alive.
+    await git(["reflog", "expire", "--expire=now", "--all"], dir)
+    await git(["gc", "--prune=now", "--aggressive", "--quiet"], dir)
+
+    // Both runs' pre-compaction tips and per-commit refs survive GC.
+    for (const [id, pre] of [
+      [firstID, firstPre],
+      [secondID, secondPre],
+    ] as const) {
+      expect(await resolveRef(preCompactionRef(id), dir)).toBe(pre)
+      expect(await resolveRef(ledgerTipRef(id, 0), dir)).toBeTruthy()
+      expect(await resolveRef(ledgerTipRef(id, 1), dir)).toBeTruthy()
+    }
+
+    // Each run's interval endpoints stay diffable, so its individual phase
+    // changes remain independently inspectable after GC.
+    const firstDiff = await git(["diff", "--name-only", firstStart, firstPre], dir)
+    expect(firstDiff.stdout).toContain("a.txt")
+    expect(firstDiff.stdout).toContain("b.txt")
+    const secondDiff = await git(["diff", "--name-only", secondStart, secondPre], dir)
+    expect(secondDiff.stdout).toContain("c.txt")
+    expect(secondDiff.stdout).toContain("d.txt")
+
+    // The manifests also survive in the git common dir.
+    const common = (await gitCommonDir(dir))!
+    expect(await Bun.file(join(common, "convoy", "finalization", `${firstID}.manifest.json`)).exists()).toBe(true)
+    expect(await Bun.file(join(common, "convoy", "finalization", `${secondID}.manifest.json`)).exists()).toBe(true)
+
+    // The branch itself carries exactly one produced commit per run: running
+    // twice on one branch never replaces the preceding run's product.
+    const subjects = await git(["log", "--format=%s", `${firstStart}..HEAD`], dir)
+    expect(subjects.stdout.split("\n").filter(Boolean)).toEqual(["feat: add the thing", "feat: add the thing"])
   })
 })

@@ -77,7 +77,8 @@ const killedExitCodes = new Set([143, 271, -1])
 
 /**
  * Runs one git command under the executor's contract: closed stdin, no
- * terminal credential prompts, captured output, deadline with process kill.
+ * terminal credential prompts, captured output, deadline with process-group
+ * kill.
  */
 export async function boundedExec(args: string[], cwd: string, timeoutMs = defaultGitOperationTimeoutMs): Promise<BoundedExecResult> {
   const proc = Bun.spawn(["git", ...args], {
@@ -86,15 +87,22 @@ export async function boundedExec(args: string[], cwd: string, timeoutMs = defau
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
+    // Own process group: a git command can outlive its direct child (a
+    // pre-commit hook that keeps running) and those descendants inherit the
+    // output pipes, so a direct-child kill alone would leave the bounded
+    // operation blocked on their EOF. Killing the group terminates the whole
+    // operation at the deadline (design D4).
+    detached: true,
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "echo" },
   })
   proc.stdin?.end()
 
   const stdoutPromise = new Response(proc.stdout).text()
   const stderrPromise = new Response(proc.stderr).text()
+  const deadline = Date.now() + timeoutMs
   const timer = setTimeout(() => {
     try {
-      proc.kill()
+      killProcessGroup(proc.pid)
     } catch {
       // Already exited.
     }
@@ -107,9 +115,44 @@ export async function boundedExec(args: string[], cwd: string, timeoutMs = defau
   } finally {
     clearTimeout(timer)
   }
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
-  if (killedExitCodes.has(exitCode)) {
+  // The output drain shares the same deadline: a descendant that survives the
+  // group kill must not extend the bounded operation beyond its window.
+  const drainMs = Math.max(1, deadline - Date.now())
+  const [stdout, stderr] = await Promise.all([raceText(stdoutPromise, drainMs), raceText(stderrPromise, drainMs)])
+  if (killedExitCodes.has(exitCode) || Date.now() > deadline) {
     throw new BoundedCommitError(`git ${args.join(" ")} was terminated after ${Math.round(timeoutMs / 1000)}s`, (stderr || stdout).trim())
   }
   return { stdout, stderr, exitCode }
+}
+
+/** Terminates the whole process group of `pid`; falls back to the direct child. */
+function killProcessGroup(pid: number): void {
+  if (process.platform === "win32") {
+    try {
+      process.kill(pid, "SIGTERM")
+    } catch {
+      // Already exited.
+    }
+    return
+  }
+  try {
+    process.kill(-pid, "SIGTERM")
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM")
+    } catch {
+      // Already exited.
+    }
+  }
+}
+
+/** Resolves with the buffered text when it arrives inside `ms`, else with whatever fit the window. */
+async function raceText(promise: Promise<string>, ms: number): Promise<string> {
+  return Promise.race([
+    promise,
+    new Promise<string>((resolve) => {
+      const timer = setTimeout(() => resolve(""), ms)
+      timer.unref?.()
+    }),
+  ])
 }
