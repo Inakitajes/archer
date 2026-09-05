@@ -32,6 +32,15 @@ async function makeRepo(): Promise<string> {
 const deltaFeat = "## ADDED Requirements\n### Requirement: It works\n"
 const deltaFix = "## REMOVED Requirements\n### Requirement: Old thing\n"
 
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function proposeUncommittedChange(repo: string, id: string, delta = deltaFeat): Promise<void> {
   const changeDir = join(repo, "openspec", "changes", id)
   await mkdir(join(changeDir, "specs", "cli"), { recursive: true })
@@ -78,9 +87,29 @@ describe("spin", () => {
     // The base checkout shows no trace of the change.
     const baseStatus = await git(repo, "status", "--porcelain")
     expect(baseStatus).not.toContain("add-widget")
+    // …and no empty-directory residue either: git does not track empty dirs,
+    // so the physical change tree must be gone, not just quiet.
+    expect(await pathExists(join(repo, "openspec", "changes", "add-widget"))).toBe(false)
+    expect(await pathExists(join(repo, "openspec", "changes", "add-widget", "specs"))).toBe(false)
+    expect(await pathExists(join(repo, "openspec", "changes", "add-widget", "specs", "cli"))).toBe(false)
     // The branch exists in the repo and is checked out in the worktree.
     expect(await git(repo, "branch", "--list", "feat/add-widget")).toContain("feat/add-widget")
     expect(await git(result.worktreeDir, "branch", "--show-current")).toBe("feat/add-widget")
+  })
+
+  test("cleanup stops at the change root and preserves the parent OpenSpec tree", async () => {
+    await freshEnv()
+    const repo = await makeRepo()
+    await proposeUncommittedChange(repo, "add-widget")
+
+    await runSpin({ targetDir: repo })
+
+    // The selected change root is fully removed…
+    expect(await pathExists(join(repo, "openspec", "changes", "add-widget"))).toBe(false)
+    // …but the bounded ancestor walk never rises into the parent OpenSpec
+    // directories, which a recursive sweep outside the change tree would.
+    expect(await pathExists(join(repo, "openspec", "changes"))).toBe(true)
+    expect(await pathExists(join(repo, "openspec"))).toBe(true)
   })
 
   test("spin never installs the /convoy-spin command — that is `convoy opencode install`'s job", async () => {
@@ -120,6 +149,30 @@ describe("spin", () => {
     const result = await runSpin({ targetDir: repo, changeID: "add-two" })
     expect(result.branch).toBe("feat/add-two")
     expect(result.changeID).toBe("add-two")
+    // The selected change's emptied source directories are gone…
+    expect(await pathExists(join(repo, "openspec", "changes", "add-two"))).toBe(false)
+    // …and every other active change stays physically intact.
+    expect(await pathExists(join(repo, "openspec", "changes", "add-one"))).toBe(true)
+    await expect(readFile(join(repo, "openspec", "changes", "add-one", "proposal.md"), "utf8")).resolves.toContain("add-one")
+  })
+
+  test("retained content prevents directory deletion", async () => {
+    await freshEnv()
+    const repo = await makeRepo()
+    // Ignored content is never moved, so the directory it lives in must survive.
+    await writeFile(join(repo, ".gitignore"), "*.local\n")
+    await git(repo, "add", ".gitignore")
+    await git(repo, "commit", "-m", "chore: ignore local scratch files")
+    await proposeUncommittedChange(repo, "add-widget")
+    await writeFile(join(repo, "openspec", "changes", "add-widget", "specs", "cli", "scratch.local"), "keep me\n")
+
+    const result = await runSpin({ targetDir: repo })
+    expect(result.movedFiles).not.toContain("openspec/changes/add-widget/specs/cli/scratch.local")
+    // The ignored file anchors its directory chain: nothing above it is removed.
+    expect(await pathExists(join(repo, "openspec", "changes", "add-widget", "specs", "cli", "scratch.local"))).toBe(true)
+    expect(await pathExists(join(repo, "openspec", "changes", "add-widget", "specs", "cli"))).toBe(true)
+    expect(await pathExists(join(repo, "openspec", "changes", "add-widget", "specs"))).toBe(true)
+    expect(await pathExists(join(repo, "openspec", "changes", "add-widget"))).toBe(true)
   })
 
   test("several uncommitted changes without --change list and stop", async () => {
