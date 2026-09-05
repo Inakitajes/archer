@@ -3186,14 +3186,62 @@ export class TuiProgress implements ProgressUI {
     const namePart = this.pipelineName ? ` · ${this.pipelineName}` : ""
     this.pipelineBox.title = allReadOnly ? ` pipeline${namePart} · read-only ` : ` pipeline${namePart} `
 
+    // The step-level children every multi-phase group shares: singleton steps
+    // render one leaf row, fanned-out steps nest a step header over model rows.
+    const emitStepGroups = (stepGroups: PhaseState[][], memberBadges: (phase: PhaseState) => readonly string[]) => {
+      stepGroups.forEach((members, stepIndex) => {
+        const lastStep = stepIndex === stepGroups.length - 1
+        if (members.length === 1) {
+          emitRow(members[0]!, [lastStep], stepLabel(members[0]!), phaseMetaChunks(members[0]!, now), memberBadges(members[0]!))
+          return
+        }
+        emitHeader(
+          members,
+          stepLabel(members[0]!),
+          "step",
+          members.length,
+          [lastStep],
+          {
+            kind: "group",
+            groupId: members[0]!.groupId!,
+            stepName: stepLabel(members[0]!),
+          },
+          memberBadges(members[0]!),
+        )
+        members.forEach((phase, index) => emitModelRow(phase, [lastStep, index === members.length - 1]))
+      })
+    }
+
     for (const group of groupPhases(this.phases)) {
-      if (group.length === 1) {
+      // A goal invocation's display group id (`goal-measure-0`) names the tree
+      // group by stage and round instead of the literal `parallel`, so
+      // iteration boundaries stay visible — even when the fragment is a
+      // single step, which still renders its header over one child.
+      const goalLabel = goalInvocationLabel(group[0]!.groupId)
+      if (group.length === 1 && !goalLabel) {
         const phase = group[0]!
-        emitRow(phase, [], phase.name, phaseMetaChunks(phase, now), allReadOnly ? [] : phaseCapabilityBadges(phase))
+        emitRow(phase, [], stepLabel(phase), phaseMetaChunks(phase, now), allReadOnly ? [] : phaseCapabilityBadges(phase))
         continue
       }
 
       const stepGroups = chunkByStepName(group)
+
+      if (goalLabel) {
+        const groupReadOnly = group.every((phase) => phase.readOnly)
+        emitHeader(
+          group,
+          goalLabel,
+          "parallel",
+          stepGroups.length,
+          [],
+          { kind: "group", groupId: group[0]!.groupId! },
+          allReadOnly || !groupReadOnly ? [] : phaseCapabilityBadges(group[0]!),
+        )
+        const memberBadges = (phase: PhaseState) => (allReadOnly || groupReadOnly ? [] : phaseCapabilityBadges(phase))
+        emitStepGroups(stepGroups, memberBadges)
+        continue
+      }
+
       if (stepGroups.length === 1) {
         // A single step fanned out across models: the header names the step,
         // each member names just its model. All members share the step's
@@ -3229,27 +3277,7 @@ export class TuiProgress implements ProgressUI {
         allReadOnly || !groupReadOnly ? [] : phaseCapabilityBadges(group[0]!),
       )
       const memberBadges = (phase: PhaseState) => (allReadOnly || groupReadOnly ? [] : phaseCapabilityBadges(phase))
-      stepGroups.forEach((members, stepIndex) => {
-        const lastStep = stepIndex === stepGroups.length - 1
-        if (members.length === 1) {
-          emitRow(members[0]!, [lastStep], stepLabel(members[0]!), phaseMetaChunks(members[0]!, now), memberBadges(members[0]!))
-          return
-        }
-        emitHeader(
-          members,
-          stepLabel(members[0]!),
-          "step",
-          members.length,
-          [lastStep],
-          {
-            kind: "group",
-            groupId: members[0]!.groupId!,
-            stepName: stepLabel(members[0]!),
-          },
-          memberBadges(members[0]!),
-        )
-        members.forEach((phase, index) => emitModelRow(phase, [lastStep, index === members.length - 1]))
-      })
+      emitStepGroups(stepGroups, memberBadges)
     }
 
     // Pinned header (progress bar + spacer) over a scrolled window of the step
@@ -3276,7 +3304,7 @@ export class TuiProgress implements ProgressUI {
   private groupDetailContent(selection: GroupSelection, members: PhaseState[], now: number, width: number): StyledText[] {
     const status = groupStatus(members)
     const logicalSteps = new Set(members.map(stepLabel)).size
-    const label = selection.stepName ?? "parallel"
+    const label = selection.stepName ?? goalInvocationLabel(selection.groupId) ?? "parallel"
     const countLabel = selection.stepName
       ? `${members.length} model${members.length === 1 ? "" : "s"}`
       : `${logicalSteps} step${logicalSteps === 1 ? "" : "s"} · ${members.length} run${members.length === 1 ? "" : "s"}`
@@ -4428,6 +4456,9 @@ export function pipelineSelectionTargets(phases: readonly ProgressPhase[]): Pipe
   const targets: PipelineSelectionTarget[] = []
   for (const group of groupPhases(phases)) {
     if (group.length === 1) {
+      // A one-step goal invocation still renders its iteration header, so the
+      // header is a real target ahead of its single child row.
+      if (goalInvocationLabel(group[0]!.groupId)) targets.push({ kind: "group", groupId: group[0]!.groupId! })
       targets.push({ kind: "phase", name: group[0]!.name })
       continue
     }
@@ -4603,6 +4634,14 @@ function phaseNameChunk(text: string, status: PhaseStatus, selected: boolean): T
 // sequential step or a human gate.
 function stepLabel(phase: Pick<ProgressPhase, "name" | "stepName">): string {
   return phase.stepName ?? phase.name
+}
+
+// A goal invocation's display group id (`goal-measure-0`, the shared
+// `goal-<stage>-<n>` qualification prefix) renders as an iteration label
+// instead of the literal `parallel`; undefined for every prefix group.
+function goalInvocationLabel(groupId: string | undefined): string | undefined {
+  const match = groupId ? /^goal-(improve|measure)-(\d+)$/.exec(groupId) : undefined
+  return match ? `${match[1]} #${match[2]}` : undefined
 }
 
 // A compact model label for a fanned-out member: provider prefix dropped, and

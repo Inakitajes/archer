@@ -75,6 +75,44 @@ export type GoalCycleInput = {
   resume?: GoalRunState
 }
 
+export type GoalInvocationId = {
+  stage: "improve" | "measure"
+  /** 0 for the opening measurement; 1..n afterwards. */
+  iteration: number
+}
+
+/** The qualified phase identity one physical phase name encodes. */
+export type QualifiedGoalPhase = GoalInvocationId & {
+  /** The fragment step's logical (pre-qualification) name. */
+  stepName: string
+}
+
+/** The deterministic display group id shared by one invocation's phases (`goal-measure-0`). */
+export function goalInvocationId(stage: "improve" | "measure", iteration: number): string {
+  return `goal-${stage}-${iteration}`
+}
+
+/**
+ * Inverse of `qualifyInvocation`'s naming rule: `goal-<stage>-<n>-<name>` →
+ * its invocation identity and logical step name. Returns undefined for
+ * anything else — prefix phases, hooks, legacy names — so callers can treat
+ * parseability as "this phase belongs to a goal invocation". The qualify and
+ * parse pair must move together; round-trip tests over the built-in
+ * fragments pin that.
+ */
+export function parseGoalPhaseName(name: string): QualifiedGoalPhase | undefined {
+  const match = /^goal-(improve|measure)-(\d+)-(.+)$/.exec(name)
+  return match
+    ? { stage: match[1] as "improve" | "measure", iteration: Number(match[2]), stepName: match[3] }
+    : undefined
+}
+
+/** Parses a display group id produced by `goalInvocationId`. */
+export function parseGoalInvocationId(id: string): GoalInvocationId | undefined {
+  const match = /^goal-(improve|measure)-(\d+)$/.exec(id)
+  return match ? { stage: match[1] as "improve" | "measure", iteration: Number(match[2]) } : undefined
+}
+
 /**
  * Qualifies one fragment invocation's steps. Physical phase IDs are
  * deterministic (`goal-<stage>-<n>-<name>`) so two measurements can never

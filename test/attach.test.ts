@@ -1,10 +1,13 @@
-import { afterAll, expect, test } from "bun:test"
+import { afterAll, describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+import { reconstructedPhases } from "../src/attach"
 import { goalLoopViewFrom, overallStatus, reconcileAdvisorJournal, replayHistory } from "../src/attach-runtime"
 import { noopProgress } from "../src/progress"
+import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
+import { qualifyInvocation } from "../src/goal-scheduler"
 
 import type { AdvisorEvent } from "../src/advisor-events"
 import type { GoalRunState, PhaseMetadata, RunMetadata } from "../src/metadata"
@@ -127,5 +130,76 @@ test("advisor journal reconciliation restores events missing from metadata", asy
     status: "pending",
     advisorEvents: [event],
     advisor: { attempted: 1 },
+  })
+})
+
+describe("reconstructedPhases", () => {
+  const ship = resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents })
+  const goalPlan = ship.goalPlan!
+  const qualified = (stage: "improve" | "measure", iteration: number) =>
+    qualifyInvocation(stage, iteration, goalPlan[stage].steps).map((step) => step.name)
+
+  function runMetadata(phases: Record<string, PhaseMetadata>, goal?: GoalRunState): RunMetadata {
+    return {
+      schemaVersion: 4,
+      runID: "run-goal",
+      targetDir: "/repo",
+      createdAt: 1,
+      updatedAt: 1,
+      control: { state: "running" },
+      pipeline: ship,
+      phases,
+      ...(goal ? { goal } : {}),
+    }
+  }
+
+  test("rebuilds a stopped goal run's phases grouped per invocation, prefix and hooks first", () => {
+    const metadata = runMetadata({
+      "pre-hook-1": { status: "completed" },
+      sync: { status: "completed" },
+      ...Object.fromEntries(qualified("measure", 0).map((name) => [name, { status: "completed" as const }])),
+      ...Object.fromEntries(qualified("improve", 1).map((name) => [name, { status: "completed" as const }])),
+    })
+
+    const rows = reconstructedPhases(metadata, false)
+    expect(rows.map((row) => row.name)).toEqual([
+      "pre-hook-1",
+      "sync",
+      ...qualified("measure", 0),
+      ...qualified("improve", 1),
+    ])
+    // Display groups are per-invocation ids, never the shared fragment groupId.
+    expect(new Set(rows.map((row) => row.groupId))).toEqual(new Set([undefined, "g1", "goal-measure-0", "goal-improve-1"]))
+  })
+
+  test("a live run lists the in-flight invocation before its phases start", () => {
+    const metadata = runMetadata(
+      Object.fromEntries(qualified("measure", 0).map((name) => [name, { status: "completed" as const }])),
+      { target: 85, maxIterations: 3, plateau: 3, iteration: 1, stage: "improve", scores: [] },
+    )
+    expect(reconstructedPhases(metadata, true).map((row) => row.groupId)).toEqual([
+      "g1",
+      ...qualified("measure", 0).map(() => "goal-measure-0"),
+      ...qualified("improve", 1).map(() => "goal-improve-1"),
+    ])
+    // The same metadata on a settled (non-live) view lists no pending improve.
+    expect(reconstructedPhases(metadata, false).map((row) => row.groupId)).not.toContain("goal-improve-1")
+  })
+
+  test("recorded goal-phase names survive as bare rows when no goal plan exists", () => {
+    const legacy = { ...runMetadata({}), pipeline: resolvePipeline({ name: "fixer", spec: builtInPipelines.fixer!, agents: builtInAgents }) }
+    legacy.phases = {
+      "pre-hook-1": { status: "completed" },
+      reproduction: { status: "completed" },
+      "goal-measure-0-score-report": { status: "failed" },
+    }
+    expect(reconstructedPhases(legacy, false).map((row) => row.name)).toEqual([
+      "pre-hook-1",
+      "reproduction",
+      "fixes",
+      "validation",
+      "goal-measure-0-score-report",
+    ])
+    expect(reconstructedPhases(legacy, false).at(-1)).toEqual({ name: "goal-measure-0-score-report", description: "" })
   })
 })

@@ -4,7 +4,8 @@ import { stdout } from "node:process"
 import { LiveAttach, goalLoopViewFrom, overallStatus, reconcileAdvisorJournal, replayHistory, waitForServerUrl } from "./attach-runtime"
 import { createControlClient, readControlFile, type ControlClient } from "./control-client"
 import type { ControlReset, ControlRole, PendingSnapshot } from "./control-server"
-import { readRunMetadata } from "./metadata"
+import { goalProgressPhases } from "./goal-phases"
+import { readRunMetadata, type RunMetadata } from "./metadata"
 import { connectOpencode } from "./opencode"
 import type { AutoAccept, PermissionPromptInfo, ProgressPhase, ProgressUI } from "./progress"
 import { isControlLive, isServerLive } from "./runs"
@@ -52,6 +53,30 @@ type AttachView = {
 }
 
 /**
+ * The phase list a dashboard opens with: the pipeline prefix, then the goal
+ * cycle's invocations reconstructed structurally from the frozen plan
+ * (`goalProgressPhases`), then any other recorded phase neither could place
+ * (legacy shapes, hook rows) as today's bare extras. Pre-hook rows stay ahead
+ * of the pipeline. (Exported pure so reconstruction can be tested without a
+ * terminal.)
+ */
+export function reconstructedPhases(metadata: RunMetadata, live: boolean): ProgressPhase[] {
+  const pipeline = metadata.pipeline
+  if (!pipeline) return []
+  const phases = progressPhases(pipeline)
+  const known = new Set(phases.map((phase) => phase.name))
+  const extras = Object.keys(metadata.phases).filter((name) => !known.has(name))
+  phases.unshift(...extras.filter((name) => name.startsWith("pre-hook")).map((name) => ({ name, description: "" })))
+  phases.push(...goalProgressPhases(pipeline, new Set(Object.keys(metadata.phases)), { live, goal: metadata.goal }))
+  // Reconstruction is best-effort: anything recorded that neither the prefix
+  // nor the reconstruction placed keeps today's bare row instead of
+  // disappearing, so unknown or legacy names degrade rather than fail.
+  const placed = new Set(phases.map((phase) => phase.name))
+  phases.push(...extras.filter((name) => !placed.has(name)).map((name) => ({ name, description: "" })))
+  return phases
+}
+
+/**
  * Re-enters a run's convoy dashboard from `convoy runs`, without resuming it:
  *
  * - a **coordinated live run** (its control server is up) attaches as the
@@ -79,11 +104,6 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
   // debounced metadata write after a crash. Merge it before reconstruction.
   await reconcileAdvisorJournal(metadata, dir)
   const targetDir = metadata.targetDir || process.cwd()
-  const phases = progressPhases(metadata.pipeline)
-  const known = new Set(phases.map((phase) => phase.name))
-  const extras = Object.keys(metadata.phases).filter((name) => !known.has(name))
-  phases.unshift(...extras.filter((name) => name.startsWith("pre-hook")).map((name) => ({ name, description: "" })))
-  phases.push(...extras.filter((name) => !name.startsWith("pre-hook")).map((name) => ({ name, description: "" })))
 
   const server = (await isServerLive(metadata.server)) ? metadata.server : undefined
   const controlFile = await readControlFile(runID)
@@ -93,6 +113,9 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
   // dashboard can attach and watch rather than failing on the first lap.
   const controlLive = controlFile ? await isControlLive(controlFile) : false
   const controlServer = controlFile && controlLive ? controlFile : undefined
+  const live = Boolean(server || controlServer)
+
+  const phases = reconstructedPhases(metadata, live)
 
   let userDetached = false
   let wentBackground = false
@@ -122,7 +145,6 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
   // The controller dashboard's own auto-accept view. The coordinator's shared
   // object is authoritative; /status mirrors it and shift+tab POSTs back.
   const controllerAutoAccept: AutoAccept = { mode: "off" }
-  const live = Boolean(server || controlServer)
   const tui = await createTuiProgress(
     phases,
     () => {

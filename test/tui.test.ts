@@ -1258,8 +1258,7 @@ describe("cost formatting", () => {
 })
 
 describe("pipeline group selection", () => {
-  test("includes model and parallel headers in the same order as their child rows", () => {
-    const phases: ProgressPhase[] = [
+  test("includes model and parallel headers in the same order as their child rows", () => {    const phases: ProgressPhase[] = [
       { name: "prepare", description: "" },
       { name: "review__opus", description: "", groupId: "models", stepName: "review", plannedModel: "anthropic/claude-opus" },
       { name: "review__gpt", description: "", groupId: "models", stepName: "review", plannedModel: "openai/gpt" },
@@ -1790,5 +1789,57 @@ describe("permission modal [e] explain and [i] inspect", () => {
     } finally {
       dashboard.stop()
     }
+  })
+})
+
+describe("goal invocation tree", () => {
+  // The shape reconstruction produces: one group per invocation, a fanned-out
+  // measurement, and a single-step improvement round.
+  const goalPhases: ProgressPhase[] = [
+    { name: "sync", description: "" },
+    { name: "goal-improve-1-fix", description: "", groupId: "goal-improve-1", stepName: "fix" },
+    { name: "goal-measure-0-score__provider-grok", description: "", groupId: "goal-measure-0", stepName: "score", plannedModel: "x-ai/grok-4-6", readOnly: true },
+    { name: "goal-measure-0-score__provider-glm", description: "", groupId: "goal-measure-0", stepName: "score", plannedModel: "z-ai/glm", readOnly: true },
+    { name: "goal-measure-0-score-report", description: "", groupId: "goal-measure-0", stepName: "score-report", readOnly: true },
+  ]
+
+  test("labels goal groups by stage and round and leaves by logical step names", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40, goalPhases)
+    try {
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("improve #1")
+      expect(frame).toContain("measure #0")
+      expect(frame).toContain("score ×2")
+      expect(frame).toContain("grok-4-6")
+      expect(frame).toContain("score-report")
+      expect(frame).toContain("fix")
+      // No raw qualified physical id leaks into the tree as a label.
+      expect(frame).not.toContain("goal-measure-0-score__")
+      expect(frame).not.toContain("goal-improve-1-fix")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("selection targets match the rendered tree, including single-step invocation headers", () => {
+    expect(pipelineSelectionTargets(goalPhases)).toEqual([
+      { kind: "phase", name: "sync" },
+      { kind: "group", groupId: "goal-improve-1" },
+      { kind: "phase", name: "goal-improve-1-fix" },
+      { kind: "group", groupId: "goal-measure-0" },
+      { kind: "group", groupId: "goal-measure-0", stepName: "score" },
+      { kind: "phase", name: "goal-measure-0-score__provider-grok" },
+      { kind: "phase", name: "goal-measure-0-score__provider-glm" },
+      { kind: "phase", name: "goal-measure-0-score-report" },
+    ])
+  })
+
+  test("auto-follow rests on the invocation header for multi-step rounds", () => {
+    // The single-step improvement round follows its leaf; every member of the
+    // multi-step measurement round follows the invocation header itself.
+    expect(autoFollowGroup(goalPhases, goalPhases[1]!)).toBeUndefined()
+    expect(autoFollowGroup(goalPhases, goalPhases[2]!)).toEqual({ kind: "group", groupId: "goal-measure-0" })
+    expect(autoFollowGroup(goalPhases, goalPhases[4]!)).toEqual({ kind: "group", groupId: "goal-measure-0" })
   })
 })
