@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -15,8 +15,21 @@ import type { CommitLedgerEntry, RunBoundary } from "../src/finalization/types"
 const dirs: string[] = []
 const runID = "20260905-120000-compact"
 const convoyEnv = { GIT_AUTHOR_NAME: "convoy", GIT_AUTHOR_EMAIL: "convoy@local", GIT_COMMITTER_NAME: "convoy", GIT_COMMITTER_EMAIL: "convoy@local" }
+let savedHome: string | undefined
+
+// runFinalization writes the cleanup-surviving index under
+// <convoy-home>/run-records, so isolate the home or a real record leaks into
+// other tests that read the index.
+beforeAll(async () => {
+  savedHome = process.env.CONVOY_HOME
+  const home = await mkdtemp(join(tmpdir(), "convoy-home-"))
+  dirs.push(home)
+  process.env.CONVOY_HOME = home
+})
 
 afterAll(async () => {
+  if (savedHome === undefined) delete process.env.CONVOY_HOME
+  else process.env.CONVOY_HOME = savedHome
   await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
