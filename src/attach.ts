@@ -248,6 +248,11 @@ export async function openRunDashboard(runID: string, options: AttachOptions = {
     tui.serverReady(url)
     const fresh = new LiveAttach(connectOpencode(url), tui, next.targetDir, next.metaPath, liveAttachPhases(next.phases))
     attach = fresh
+    // Completed phases' session tabs reconstruct their transcripts through the
+    // attach that owns the run's live server; each view rebinds the seam (the
+    // previous attach's closure no-ops on its stopped flag). Merging keeps any
+    // pause/background controls that were wired before.
+    tui.setHostControls?.({ requestSessionBackfill: (name) => fresh.requestSessionBackfill(name) })
     await fresh.start()
   }
   await startView(view, server?.url)

@@ -3552,3 +3552,258 @@ describe("createConcurrencyLimiter edge cases", () => {
     expect(peak).toBe(1)
   })
 })
+
+/**
+ * Transcript backfill: a dashboard that attaches mid-run reconstructs a
+ * session's earlier output from the live server and merges it with the live
+ * stream. The fakes delay `session.messages` so the buffered live chunks and
+ * the fetched history deterministically straddle the server's snapshot — the
+ * race the merge must resolve without duplicates.
+ */
+describe("watchSession transcript backfill", () => {
+  const assistantMessage = (id: string, text: string, opts: { completed?: boolean; parts?: unknown[] } = {}) => ({
+    info: {
+      id,
+      sessionID: "ses_1",
+      role: "assistant" as const,
+      time: opts.completed === false ? { created: 1 } : { created: 1, completed: 2 },
+      parentID: "p",
+      modelID: "gpt-5.6-sol",
+      providerID: "openai",
+      mode: "primary",
+      agent: "implementer",
+      path: { cwd: "/repo", root: "/repo" },
+      cost: 0.1,
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+    parts:
+      opts.parts ??
+      [{ id: `${id}_p`, sessionID: "ses_1", messageID: id, type: "text" as const, text }],
+  })
+
+  const textDelta = (messageID: string, partID: string, delta: string) => ({
+    type: "message.part.delta",
+    properties: { sessionID: "ses_1", messageID, partID, field: "text", delta },
+  })
+
+  function backfillClient(liveUpdates: unknown[], messages: unknown[], delayMs = 0) {
+    const chunks: { channel: string; text: string; partID?: string }[] = []
+    async function* stream() {
+      for (const update of liveUpdates) yield update
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        messages: async () => {
+          if (delayMs > 0) await Bun.sleep(delayMs)
+          return { data: messages }
+        },
+        status: async () => ({ data: {} }),
+      },
+    } as never
+    const progress: ProgressUI = {
+      ...noopProgress,
+      phaseMessage: (_name, message) => void chunks.push(message),
+    }
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress,
+      signal: new AbortController().signal,
+      backfill: true,
+    })
+    return { watcher, chunks }
+  }
+
+  const until = async (chunks: unknown[], count: number) => {
+    for (let attempt = 0; attempt < 200 && chunks.length < count; attempt++) await Bun.sleep(5)
+  }
+
+  test("history and live merge without duplication, history first", async () => {
+    const { watcher, chunks } = backfillClient(
+      [textDelta("msg_2", "p2", "NO"), textDelta("msg_2", "p2", " CHANGES")],
+      [assistantMessage("msg_1", "first report")],
+    )
+    try {
+      await until(chunks, 3)
+      expect(chunks).toEqual([
+        { channel: "response", text: "first report", partID: "msg_1_p" },
+        { channel: "response", text: "NO", partID: "p2" },
+        { channel: "response", text: " CHANGES", partID: "p2" },
+      ])
+    } finally {
+      await watcher.stop()
+    }
+  })
+
+  test("buffered deltas straddling the snapshot continue the part instead of duplicating it", async () => {
+    // History holds the response up to the snapshot ("hello world"); the
+    // buffer holds the deltas since subscription: the snapshot's tail ("world"
+    // — or just "ld", depending on when the subscribe landed) plus the part's
+    // continuation ("!"). The merged transcript reads "hello world!" exactly
+    // once — even when the part began streaming before the subscription, so
+    // the buffer only ever held its tail.
+    for (const buffered of [["world", "!"], ["ld", "!"]]) {
+      const { watcher, chunks } = backfillClient(
+        buffered.map((delta) => textDelta("msg_1", "p1", delta)),
+        [assistantMessage("msg_1", "", { completed: false, parts: [{ id: "p1", sessionID: "ses_1", messageID: "msg_1", type: "text" as const, text: "hello world" }] })],
+        40,
+      )
+      try {
+        await until(chunks, 2)
+        expect(chunks).toHaveLength(2)
+        expect(chunks[0]).toEqual({ channel: "response", text: "hello world", partID: "p1" })
+        // Whatever the snapshot already covered was trimmed from the buffer;
+        // only the continuation survives it.
+        expect(chunks[1]!.text).toBe("!")
+        expect(chunks.map((chunk) => chunk.text).join("")).toBe("hello world!")
+      } finally {
+        await watcher.stop()
+      }
+    }
+  })
+
+  test("a completed message's stale delta is dropped, not doubled", async () => {
+    const { watcher, chunks } = backfillClient(
+      [textDelta("msg_1", "msg_1_p", "more")],
+      [assistantMessage("msg_1", "done")],
+    )
+    try {
+      await Bun.sleep(60)
+      expect(chunks).toEqual([{ channel: "response", text: "done", partID: "msg_1_p" }])
+    } finally {
+      await watcher.stop()
+    }
+  })
+
+  test("tool markers dedupe against history by call id", async () => {
+    const { watcher, chunks } = backfillClient(
+      [
+        { type: "session.next.tool.called", properties: { sessionID: "ses_1", assistantMessageID: "msg_1", callID: "call_1", tool: "read", input: { filePath: "src/a.ts" } } },
+        { type: "session.next.shell.started", properties: { sessionID: "ses_1", assistantMessageID: "msg_1", callID: "call_2", command: "bun test" } },
+      ],
+      [
+        assistantMessage("msg_1", "", {
+          completed: false,
+          parts: [{ id: "tp1", sessionID: "ses_1", messageID: "msg_1", type: "tool" as const, callID: "call_1", tool: "read", state: { status: "completed", input: { filePath: "src/a.ts" }, output: "ok", title: "", metadata: {} } }],
+        }),
+      ],
+      40,
+    )
+    try {
+      await until(chunks, 2)
+      expect(chunks).toEqual([
+        { channel: "tool", text: "read: src/a.ts" },
+        { channel: "bash", text: "bun test" },
+      ])
+    } finally {
+      await watcher.stop()
+    }
+  })
+
+  test("a server that cannot answer leaves the live stream flowing", async () => {
+    const chunks: { channel: string; text: string; partID?: string }[] = []
+    async function* stream() {
+      yield textDelta("msg_1", "p1", "fresh text")
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: {
+        messages: async () => {
+          throw new Error("server gone")
+        },
+        status: async () => ({ data: {} }),
+      },
+    } as never
+    const progress: ProgressUI = { ...noopProgress, phaseMessage: (_name, message) => void chunks.push(message) }
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress,
+      signal: new AbortController().signal,
+      backfill: true,
+    })
+    try {
+      await until(chunks, 1)
+      expect(chunks).toEqual([{ channel: "response", text: "fresh text", partID: "p1" }])
+    } finally {
+      await watcher.stop()
+    }
+  })
+
+  test("a cancelled attach's in-flight backfill delivers nothing, even when history resolves late", async () => {
+    // The owning attach was torn down while the fetch was pending (a reset
+    // replaced the view): neither the fetched history nor the buffered live
+    // deltas may reach the dashboard — the next run can reuse the phase name,
+    // and stale transcript content would suppress its correct backfill.
+    let resolveMessages: (value: { data: unknown[] }) => void = () => {}
+    const chunks: { channel: string; text: string; partID?: string }[] = []
+    let cancelled = false
+    async function* stream() {
+      yield textDelta("msg_2", "p2", "live delta")
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: { messages: () => new Promise<{ data: unknown[] }>((resolve) => { resolveMessages = resolve }), status: async () => ({ data: {} }) },
+    } as never
+    const progress: ProgressUI = { ...noopProgress, phaseMessage: (_name, message) => void chunks.push(message) }
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress,
+      signal: new AbortController().signal,
+      backfill: true,
+      isCancelled: () => cancelled,
+    })
+    try {
+      // The live delta is buffered while the fetch is pending; nothing emits.
+      await Bun.sleep(20)
+      expect(chunks).toEqual([])
+
+      cancelled = true
+      resolveMessages({ data: [assistantMessage("msg_1", "stale history")] })
+      await Bun.sleep(40)
+      // The late-arriving history and the dropped buffer both stay silent.
+      expect(chunks).toEqual([])
+    } finally {
+      await watcher.stop()
+    }
+  })
+
+  test("a same-run watcher stop does not cancel the in-flight backfill", async () => {
+    // The phase finalized while its fetch was in flight — the common eager
+    // case — and the attach never stopped: the history still delivers.
+    let resolveMessages: (value: { data: unknown[] }) => void = () => {}
+    const chunks: { channel: string; text: string; partID?: string }[] = []
+    async function* stream() {
+      await new Promise<void>(() => {})
+    }
+    const client = {
+      event: { subscribe: async () => ({ stream: stream() }) },
+      session: { messages: () => new Promise<{ data: unknown[] }>((resolve) => { resolveMessages = resolve }), status: async () => ({ data: {} }) },
+    } as never
+    const progress: ProgressUI = { ...noopProgress, phaseMessage: (_name, message) => void chunks.push(message) }
+    const watcher = watchSession(client, {
+      directory: "/repo",
+      phaseName: "build",
+      sessionID: "ses_1",
+      progress,
+      signal: new AbortController().signal,
+      backfill: true,
+      isCancelled: () => false,
+    })
+    try {
+      resolveMessages({ data: [assistantMessage("msg_1", "late but wanted")] })
+      await until(chunks, 1)
+      expect(chunks).toEqual([{ channel: "response", text: "late but wanted", partID: "msg_1_p" }])
+    } finally {
+      await watcher.stop()
+    }
+  })
+})

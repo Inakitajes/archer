@@ -17,6 +17,15 @@ export type ProgressPhase = {
   runner?: StepRunner
   /** Whether Convoy restricts this phase to audit-only behavior. */
   readOnly?: boolean
+  /**
+   * The report this phase writes, relative to the run dir — canonical
+   * (`reports/<step>.md`) for prefix steps, iteration-qualified
+   * (`reports/goal/iteration-N/<stage>/<step>.md`) for goal fragments. The row
+   * carries the data so report panels resolve it without re-deriving the
+   * scheduler's qualification rule in display code; absent rows fall back to
+   * the canonical `reports/<name>.md` path.
+   */
+  reportPath?: string
   plannedAdvisor?: string
   advisorMaxCalls?: number
 }
@@ -258,6 +267,15 @@ export type ProgressHostControls = {
    * that session after the finish hold.
    */
   onKeepRunDirRequested?: () => void
+  /**
+   * Asks the attach runtime to reconstruct a completed phase's session
+   * transcript from the run's live server. Called by the dashboard the first
+   * time the operator views a completed phase's still-empty session tab (one
+   * attempt per phase), mirroring `loadReport`'s laziness. Absent on
+   * historical dashboards, whose server is gone and which keep the honest
+   * placeholder.
+   */
+  requestSessionBackfill?: (name: string) => void
   publish?: PublishSeam
 }
 
@@ -352,6 +370,16 @@ export type ProgressUI = {
    */
   setGoalLoop?(view: GoalLoopView): void
   /**
+   * Aligns the dashboard's phase list with the expected rows, additively: rows
+   * already present are left untouched (their state continues to be driven by
+   * phase events), missing rows are appended in the given order as pending,
+   * and nothing is cleared. Idempotent and one-way (client state never feeds
+   * back), so a poller can call it every tick: an attached dashboard grows its
+   * panel when a goal scheduler starts the next invocation, without the
+   * destructive rebuild `resetPipeline` performs.
+   */
+  syncPhases?(rows: readonly ProgressPhase[]): void
+  /**
    * One goal-loop iteration is over and the next run is about to start: swap in
    * its pending phases, ids and pipeline name, and clear everything that belongs
    * to the previous iteration's run (feed, transcripts, reports, queues,
@@ -396,6 +424,7 @@ export const noopProgress: ProgressUI = {
   phaseSkipped() {},
   phaseFailed() {},
   phaseRestored() {},
+  syncPhases() {},
   message() {},
   suspend() {},
   resume() {},

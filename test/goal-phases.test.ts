@@ -109,4 +109,35 @@ describe("goalProgressPhases", () => {
       "measure-3",
     ])
   })
+
+  test("qualified goal rows carry their iteration-qualified report paths", () => {
+    const pipeline = ship()
+    const plan = pipeline.goalPlan!
+    const recorded = new Set([...qualifiedNames(plan, "measure", 0), ...qualifiedNames(plan, "improve", 1)])
+
+    const rows = goalProgressPhases(pipeline, recorded)
+    for (const row of rows) {
+      const qualified = /^goal-(improve|measure)-(\d+)-(.+)$/.exec(row.name)!
+      expect(row.reportPath).toBe(`reports/goal/iteration-${qualified[2]}/${qualified[1]}/${qualified[3]}.md`)
+    }
+    // The consensus step of measurement zero points at its own round's report,
+    // not the promoted conventional copy or another round's.
+    const consensus = rows.find((row) => row.stepName === "score-report")!
+    expect(consensus.reportPath).toBe(`reports/goal/iteration-0/measure/${consensus.stepName}.md`)
+  })
+
+  test("prefix rows keep their canonical report paths alongside the goal rows", () => {
+    const pipeline = ship()
+    const plan = pipeline.goalPlan!
+    const recorded = new Set(qualifiedNames(plan, "measure", 0))
+    const rows = goalProgressPhases(pipeline, recorded)
+    // Prefix rows are not part of the reconstruction; the assertion here is
+    // that the qualified mapping did not leak a goal path onto a prefix-named
+    // row if any prefix step shared a logical name with a fragment step.
+    for (const row of rows) {
+      if (pipeline.steps.some((step) => step.name === row.name)) {
+        expect(row.reportPath).toBe(`reports/${row.name}.md`)
+      }
+    }
+  })
 })

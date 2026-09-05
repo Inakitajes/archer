@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, dirname } from "node:path"
 
 import { TuiProgress, autoFollowGroup, comparisonColumnCount, initialContentTab, iteratePrompt, phaseCapabilityBadges, phaseCapabilityLabel, pickBadge, pipelineSelectionTargets } from "../src/tui"
 import { displayWidth, formatMoney, limitsRow } from "../src/tui-theme"
@@ -1500,6 +1500,260 @@ describe("goal invocation tree", () => {
       expect(frame).toContain("glm-5.3#high")
       expect(frame).not.toContain("goal-measure-0-score__")
       expect(frame).not.toContain("goal-improve-1-")
+    } finally {
+      dashboard.stop()
+    }
+  })
+})
+
+describe("syncPhases", () => {
+  test("appends missing rows in the given order without touching existing ones", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(140, 40, [{ name: "plan", description: "" }])
+    try {
+      dashboard.phaseStarted("plan")
+      dashboard.phaseCompleted("plan")
+      await renderOnce()
+      expect(captureCharFrame()).toContain("1/1")
+
+      dashboard.syncPhases([
+        { name: "plan", description: "" },
+        { name: "goal-improve-1-fixer", description: "improve" },
+        { name: "goal-measure-1-scorer", description: "measure" },
+      ])
+      await renderOnce()
+      const frame = captureCharFrame()
+      // The counter counts the appended rows and the completed prefix row kept
+      // its state through the growth.
+      expect(frame).toContain("1/3")
+      expect(frame).toContain("plan")
+      expect(frame).toContain("goal-improve-1-fixer")
+      expect(frame).toContain("goal-measure-1-scorer")
+      // Order is the poller's: the improvement row renders before the next
+      // measurement row.
+      expect(frame.indexOf("goal-improve-1-fixer")).toBeLessThan(frame.indexOf("goal-measure-1-scorer"))
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("re-syncing the same rows is idempotent", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(140, 40, [{ name: "plan", description: "" }])
+    try {
+      const rows = [{ name: "goal-improve-1-fixer", description: "improve" }]
+      dashboard.syncPhases(rows)
+      await renderOnce()
+      expect(captureCharFrame()).toContain("0/2")
+
+      dashboard.syncPhases(rows)
+      dashboard.syncPhases([...rows])
+      await renderOnce()
+      expect(captureCharFrame()).toContain("0/2")
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("earlier rows keep status, cost, and transcripts when a later invocation appends", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(140, 40, [{ name: "plan", description: "" }])
+    try {
+      dashboard.phaseStarted("plan")
+      dashboard.phaseUsageTotal("plan", { cost: 0.42, tokens: { input: 12000, output: 4000, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 16000 } })
+      dashboard.phaseCompleted("plan")
+      dashboard.phaseMessage("plan", { channel: "response", text: "prefix transcript kept" })
+      dashboard.syncPhases([{ name: "goal-improve-1-fixer", description: "improve" }])
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("1/2")
+      expect(frame).toContain("$0.42")
+      expect(frame).toContain("prefix transcript kept")
+    } finally {
+      dashboard.stop()
+    }
+  })
+})
+
+describe("phase report path resolution", () => {
+  test("a goal row reads its iteration-qualified report; a prefix row keeps reports/<name>.md", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "convoy-tui-reportpath-"))
+    try {
+      const goalRel = "reports/goal/iteration-0/measure/score-report.md"
+      await mkdir(join(runDir, dirname(goalRel)), { recursive: true })
+      await writeFile(join(runDir, goalRel), "# Round zero consensus\n\n- score 84")
+      await mkdir(join(runDir, "reports"), { recursive: true })
+      await writeFile(join(runDir, "reports", "plan.md"), "# Prefix report")
+
+      const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(140, 40, [
+        { name: "plan", description: "" },
+        { name: "goal-measure-0-score-report", description: "consensus", stepName: "score-report", reportPath: goalRel },
+      ])
+      try {
+        dashboard.start("run", process.cwd(), runDir)
+        dashboard.phaseCompleted("plan")
+        dashboard.phaseCompleted("goal-measure-0-score-report")
+
+        mockInput.pressKey("2")
+        await waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("Round zero consensus"))
+
+        // The fullscreen reader shares the same row-carried resolution.
+        mockInput.pressKey("v")
+        await renderOnce()
+        const fullscreen = captureCharFrame()
+        expect(fullscreen).toContain("report · goal-measure-0-score-report")
+        expect(fullscreen).toContain("Round zero consensus")
+        mockInput.pressEscape()
+        await Bun.sleep(20)
+        await renderOnce()
+
+        // Select the prefix row: its report still resolves canonically.
+        dashboard.phaseStarted("plan")
+        await waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("Prefix report"))
+      } finally {
+        dashboard.stop()
+      }
+    } finally {
+      await rm(runDir, { recursive: true, force: true })
+    }
+  })
+
+  test("two completed rounds stay separately browsable in the panel", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "convoy-tui-rounds-"))
+    try {
+      const round0 = "reports/goal/iteration-0/measure/scorer.md"
+      const round1 = "reports/goal/iteration-1/measure/scorer.md"
+      await mkdir(join(runDir, "reports", "goal", "iteration-0", "measure"), { recursive: true })
+      await mkdir(join(runDir, "reports", "goal", "iteration-1", "measure"), { recursive: true })
+      await writeFile(join(runDir, round0), "# Round zero consensus\n\n- score 71")
+      await writeFile(join(runDir, round1), "# Round one consensus\n\n- score 92")
+
+      const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(140, 40, [
+        { name: "plan", description: "" },
+        { name: "goal-measure-0-scorer", description: "score", stepName: "scorer", reportPath: round0 },
+        { name: "goal-measure-1-scorer", description: "score", stepName: "scorer", reportPath: round1 },
+      ])
+      try {
+        dashboard.start("run", process.cwd(), runDir)
+        dashboard.phaseCompleted("plan")
+        dashboard.phaseCompleted("goal-measure-0-scorer")
+        dashboard.phaseCompleted("goal-measure-1-scorer")
+
+        // The reports tab opens on the last completed row: round one's report.
+        mockInput.pressKey("2")
+        await waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("Round one consensus"))
+        expect(captureCharFrame()).not.toContain("Round zero consensus")
+
+        // Move up to the round-zero row: it resolves round zero's report, never
+        // the round-one one shown a moment ago.
+        mockInput.pressKey("k")
+        await waitForRenderedFrame(renderOnce, captureCharFrame, (frame) => frame.includes("Round zero consensus"))
+        expect(captureCharFrame()).not.toContain("Round one consensus")
+      } finally {
+        dashboard.stop()
+      }
+    } finally {
+      await rm(runDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("session tab backfill request", () => {
+  test("a completed phase's empty session tab asks the attach runtime once", async () => {
+    const { dashboard, mockInput, renderOnce, captureCharFrame } = await createDashboard(120, 40, [
+      { name: "implement", description: "" },
+      { name: "other", description: "" },
+    ])
+    try {
+      const requested: string[] = []
+      dashboard.setHostControls({ requestSessionBackfill: (name) => void requested.push(name) })
+
+      dashboard.phaseRestored("implement", { status: "completed", sessionID: "ses_1" })
+      dashboard.phaseRestored("other", { status: "failed", sessionID: "ses_2" })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("no streamed messages captured for this step")
+      expect(requested).toEqual(["implement"])
+
+      // Re-renders stay one-shot per phase; moving to the other completed row
+      // asks for that phase in turn.
+      await renderOnce()
+      await renderOnce()
+      expect(requested).toEqual(["implement"])
+
+      mockInput.pressKey("j")
+      await renderOnce()
+      expect(requested).toEqual(["implement", "other"])
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("resetPipeline lets a reused phase name ask for a backfill again", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40, [{ name: "implement", description: "" }])
+    try {
+      const requested: string[] = []
+      dashboard.setHostControls({ requestSessionBackfill: (name) => void requested.push(name) })
+
+      // Iteration one: the operator views the completed step's empty session
+      // tab, spending its one backfill attempt.
+      dashboard.phaseRestored("implement", { status: "completed", sessionID: "ses_1" })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("no streamed messages captured for this step")
+      expect(requested).toEqual(["implement"])
+
+      // The hosted loop resets into the next iteration, which reuses the phase
+      // name; its own completed step gets a fresh attempt, like the report
+      // cache does.
+      dashboard.resetPipeline([{ name: "implement", description: "" }], { runID: "run-2", targetDir: process.cwd(), runDir: "", pipeline: { name: "fixer", steps: [] } })
+      dashboard.phaseRestored("implement", { status: "completed", sessionID: "ses_2" })
+      await renderOnce()
+      expect(captureCharFrame()).toContain("no streamed messages captured for this step")
+      expect(requested).toEqual(["implement", "implement"])
+    } finally {
+      dashboard.stop()
+    }
+  })
+
+  test("a phase with streamed content never asks, and without the seam nothing is requested", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      const requested: string[] = []
+      dashboard.setHostControls({ requestSessionBackfill: (name) => void requested.push(name) })
+
+      dashboard.phaseStarted("implement")
+      dashboard.phaseMessage("implement", { channel: "response", text: "streamed before completing" })
+      dashboard.phaseCompleted("implement")
+      await renderOnce()
+      expect(captureCharFrame()).toContain("streamed before completing")
+      expect(requested).toEqual([])
+
+      const unhooked = await createDashboard(120, 40)
+      try {
+        unhooked.dashboard.phaseRestored("implement", { status: "completed", sessionID: "ses_1" })
+        await unhooked.renderOnce()
+        // Historical dashboards keep the placeholder; nothing crashes.
+        expect(unhooked.captureCharFrame()).toContain("no streamed messages captured for this step")
+      } finally {
+        unhooked.dashboard.stop()
+      }
+    } finally {
+      dashboard.stop()
+    }
+  })
+})
+
+describe("transcript cap under backfill", () => {
+  test("a backfilled oversized history trims from the top and keeps tailing the newest", async () => {
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40)
+    try {
+      dashboard.phaseStarted("implement")
+      // One block well past the 24k transcript cap, with distinct head/tail
+      // markers — what a goal scorer's long reasoning history looks like when
+      // a late attach reconstructs it in one shot.
+      const filler = "x".repeat(23_000)
+      dashboard.phaseMessage("implement", { channel: "reasoning", text: `HEAD-MARKER ${filler}` })
+      dashboard.phaseMessage("implement", { channel: "response", text: "TAIL-MARKER final answer" })
+      await renderOnce()
+      const frame = captureCharFrame()
+      expect(frame).toContain("TAIL-MARKER final answer")
+      expect(frame).not.toContain("HEAD-MARKER")
     } finally {
       dashboard.stop()
     }
