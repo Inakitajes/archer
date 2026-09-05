@@ -7,11 +7,15 @@ import { join } from "node:path"
 import { TuiProgress, autoFollowGroup, comparisonColumnCount, initialContentTab, iteratePrompt, phaseCapabilityBadges, phaseCapabilityLabel, pickBadge, pipelineSelectionTargets } from "../src/tui"
 import { displayWidth, formatMoney, limitsRow } from "../src/tui-theme"
 import { shortVersion } from "../src/version"
+import { reconstructedPhases } from "../src/attach"
+import { qualifyInvocation } from "../src/goal-scheduler"
+import { builtInAgents, builtInPipelines, resolvePipeline } from "../src/pipeline"
 
 import type { ClipboardResult } from "../src/clipboard"
 import type { LimitsSnapshot } from "../src/limits"
 import type { FinishSeam, ProgressPhase } from "../src/progress"
 import type { AdvisorEvent } from "../src/advisor-events"
+import type { RunMetadata } from "../src/metadata"
 
 async function createDashboard(
   width = 120,
@@ -1841,5 +1845,54 @@ describe("goal invocation tree", () => {
     expect(autoFollowGroup(goalPhases, goalPhases[1]!)).toBeUndefined()
     expect(autoFollowGroup(goalPhases, goalPhases[2]!)).toEqual({ kind: "group", groupId: "goal-measure-0" })
     expect(autoFollowGroup(goalPhases, goalPhases[4]!)).toEqual({ kind: "group", groupId: "goal-measure-0" })
+  })
+
+  test("reconstruction chains into the dashboard: the counter denominator is the real phase total", async () => {
+    // The 6/7 → 6/8 undercounting bug: the in-flight invocation's phases are
+    // seeded as pending rows, so the progress counter's denominator is the real
+    // phase total instead of only the phases that have already started.
+    const ship = resolvePipeline({ name: "ship", spec: builtInPipelines.ship!, agents: builtInAgents })
+    const goalPlan = ship.goalPlan!
+    const qualified = (stage: "improve" | "measure", iteration: number) =>
+      qualifyInvocation(stage, iteration, goalPlan[stage].steps).map((step) => step.name)
+    const measure0 = qualified("measure", 0)
+    const meta: RunMetadata = {
+      schemaVersion: 4,
+      runID: "run-goal",
+      targetDir: "/repo",
+      createdAt: 1,
+      updatedAt: 1,
+      control: { state: "running" },
+      pipeline: ship,
+      phases: Object.fromEntries(measure0.map((name) => [name, { status: "completed" as const }])),
+      goal: { target: 85, maxIterations: 3, plateau: 3, iteration: 1, stage: "improve", scores: [] },
+    }
+
+    // Reconstruction produces the rows; the dashboard initializes them pending
+    // until live phase events (replayHistory) mark them. The seeded improvement
+    // round is a real row, so the counter's denominator is the reconstructed
+    // phase total instead of only the phases that have already started.
+    const phases = reconstructedPhases(meta, true)
+    expect(phases.some((phase) => phase.groupId === "goal-improve-1")).toBe(true)
+    // The live seed adds the in-flight improvement round, so the reconstructed
+    // phase list is strictly larger than the settled view of the same run.
+    expect(phases.length).toBeGreaterThan(reconstructedPhases(meta, false).length)
+
+    const { dashboard, renderOnce, captureCharFrame } = await createDashboard(120, 40, phases)
+    try {
+      await renderOnce()
+      const frame = captureCharFrame()
+      // The counter denominator is the real phase total — seeded in-flight rows
+      // included (here 0/5, before the seed it would be 0/4) — and no qualified
+      // physical id leaks into the tree as a label. The fan-out members render
+      // with their model *and* variant (`grok-4.6#high`), not an anonymous id.
+      expect(frame).toContain(`0/${phases.length}`)
+      expect(frame).toContain("grok-4.6#high")
+      expect(frame).toContain("glm-5.3#high")
+      expect(frame).not.toContain("goal-measure-0-score__")
+      expect(frame).not.toContain("goal-improve-1-")
+    } finally {
+      dashboard.stop()
+    }
   })
 })

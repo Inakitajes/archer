@@ -33,6 +33,9 @@ describe("goalProgressPhases", () => {
     const scorers = rows.filter((row) => row.stepName === "score")
     expect(scorers).toHaveLength(2)
     expect(scorers.every((row) => row.readOnly && row.plannedModel)).toBe(true)
+    // Each fan-out member carries its model variant, so the tree can render the
+    // model label with its `#high` suffix rather than an anonymous id.
+    expect(scorers.every((row) => row.plannedVariant === "high")).toBe(true)
     expect(scorers.map((row) => row.plannedModel)).not.toEqual([scorers[0]!.plannedModel, scorers[0]!.plannedModel])
     const consensus = rows.find((row) => row.stepName === "score-report")
     expect(consensus).toBeDefined()
