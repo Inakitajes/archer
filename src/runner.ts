@@ -1311,7 +1311,7 @@ function renderFinalizationSummarySection(record: {
   const lines = ["## Run finalization", "", `- State: ${record.state}`]
   if (record.producedSha) lines.push(`- Compacted into ${record.producedSha.slice(0, 8)}`)
   if (record.recoveryRef) lines.push(`- Pre-compaction history protected at ${record.recoveryRef}`)
-  if (record.reason) lines.push(`- Detail: ${record.reason}`)
+  if (record.reason) lines.push(`- Reason: ${record.reason}`)
   return `${lines.join("\n")}\n`
 }
 
