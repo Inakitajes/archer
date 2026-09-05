@@ -9,7 +9,7 @@ import { gitCommonDir, preCompactionRef, resolveRef } from "../src/finalization/
 import { recordLedgeredCommit } from "../src/finalization/ledger"
 import type { CommitLedgerEntry } from "../src/finalization/types"
 import { persistRunBoundary } from "../src/runner"
-import type { Pipeline, RunOptions } from "./../src/types"
+import type { Pipeline, RunOptions } from "../src/types"
 
 const dirs: string[] = []
 const runID = "20260905-130000-ledger"

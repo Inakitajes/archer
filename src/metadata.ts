@@ -478,26 +478,26 @@ export async function readRunMetadata(path: string): Promise<RunMetadata | undef
   } catch {
     return undefined
   }
-    try {
-      const parsed = JSON.parse(body) as Partial<RunMetadata> & { schemaVersion?: number }
-      // v1 predates the frozen pipeline; v1/v2/v3 predate cooperative run control
-      // and durable goal state. Schema-v3 records (including historical goal-fix
-      // child runs) stay readable as plain runs; the goal record only exists
-      // from v4 onward, and boundary/ledger/finalization from v5.
-      if (![1, 2, 3, 4, 5].includes(parsed.schemaVersion ?? 0) || typeof parsed.phases !== "object" || !parsed.phases) {
-        log.warn(`ignoring run metadata with unknown shape at ${path}`)
-        return undefined
-      }
-      const state = parsed.control?.state
-      const control = state === "running" || state === "pausing" || state === "paused" ? parsed.control! : { state: "running" as const }
-      // Normalize: old records without newer-era fields keep their own schema
-      // version, so their readers never guess that those eras existed.
-      const normalized = parsed.schemaVersion === 5 ? 5 : parsed.schemaVersion === 4 ? 4 : 3
-      return { ...parsed, schemaVersion: normalized, control, phases: parsed.phases } as RunMetadata
-    } catch {
-      log.warn(`ignoring corrupt run metadata at ${path}`)
+  try {
+    const parsed = JSON.parse(body) as Partial<RunMetadata> & { schemaVersion?: number }
+    // v1 predates the frozen pipeline; v1/v2/v3 predate cooperative run control
+    // and durable goal state. Schema-v3 records (including historical goal-fix
+    // child runs) stay readable as plain runs; the goal record only exists
+    // from v4 onward, and boundary/ledger/finalization from v5.
+    if (![1, 2, 3, 4, 5].includes(parsed.schemaVersion ?? 0) || typeof parsed.phases !== "object" || !parsed.phases) {
+      log.warn(`ignoring run metadata with unknown shape at ${path}`)
       return undefined
     }
+    const state = parsed.control?.state
+    const control = state === "running" || state === "pausing" || state === "paused" ? parsed.control! : { state: "running" as const }
+    // Normalize: old records without newer-era fields keep their own schema
+    // version, so their readers never guess that those eras existed.
+    const normalized = parsed.schemaVersion === 5 ? 5 : parsed.schemaVersion === 4 ? 4 : 3
+    return { ...parsed, schemaVersion: normalized, control, phases: parsed.phases } as RunMetadata
+  } catch {
+    log.warn(`ignoring corrupt run metadata at ${path}`)
+    return undefined
+  }
 }
 
 function newMetadata(runID: string, targetDir: string): RunMetadata {

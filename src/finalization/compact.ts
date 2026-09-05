@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 
-import { proposeCommitMessage } from "../commit-message"
+import { formatCommitMessage, proposeCommitMessage } from "../commit-message"
 import { currentHead, diffStat, execFile, resetSoft, resolveCommit } from "../git"
 import { convoyHome } from "../workspace"
 import { boundedCommitAsOperator } from "./executor"
@@ -444,8 +444,7 @@ async function composeMessage(input: RunFinalizationInput, interval: Extract<Run
     ...(input.signal ? { signal: input.signal } : {}),
   })
   const message = proposal.message
-  const subject = `${message.type}${message.scope ? `(${message.scope})` : ""}: ${message.subject}`
-  return message.body.length > 0 ? `${subject}\n\n${message.body.map((line) => `- ${line}`).join("\n")}` : subject
+  return formatCommitMessage(message)
 }
 
 async function restoreOriginalHead(originalHead: string, cwd: string): Promise<void> {

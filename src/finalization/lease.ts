@@ -149,7 +149,7 @@ export async function acquireMutationLease(commonDir: string, _options: { timeou
       // Remove the diagnostic sidecar only when it is still ours.
       try {
         const current = await readInfo(infoPath)
-        if (current?.pid === process.pid) await unlinkSyncSafe(infoPath)
+        if (current?.pid === process.pid) await removeIfPresent(infoPath)
       } catch {
         // The sidecar is advisory; its absence is fine.
       }
@@ -157,7 +157,7 @@ export async function acquireMutationLease(commonDir: string, _options: { timeou
   }
 }
 
-async function unlinkSyncSafe(path: string): Promise<void> {
+async function removeIfPresent(path: string): Promise<void> {
   try {
     await rm(path, { force: true })
   } catch {
