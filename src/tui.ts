@@ -477,6 +477,11 @@ export class TuiProgress implements ProgressUI {
   // Phases the user armed with [i]: the runner checks this set (via
   // isInteractiveTakeover) and gates instead of retrying or completing.
   private readonly interactiveTakeover = new Set<string>()
+  // Completed phases whose (still-empty) session tab already asked the attach
+  // runtime for a transcript backfill — one attempt per phase, mirroring
+  // loadReport's laziness, so an attached dashboard can read steps that ran
+  // before it attached without bursting a fetch per phase at open time.
+  private readonly sessionBackfillRequested = new Set<string>()
   private permissionChoice = 0
   // Suspension nests: outer scopes (human-review gate) and inner prompts may
   // both suspend; only the outermost transition touches the renderer.
@@ -1621,6 +1626,24 @@ export class TuiProgress implements ProgressUI {
     this.scheduleRender()
   }
 
+  /**
+   * Grows the panel additively to match the expected rows an attach poller
+   * derives from durable run state (the goal scheduler's next invocation
+   * starting under qualified phase ids). Merge is strictly by phase name:
+   * existing rows — with their status, durations, costs, transcripts, reports
+   * — are left untouched, missing rows are appended in the given order as
+   * pending, and nothing is cleared. Idempotent: re-syncing the same list is a
+   * no-op. Unlike `resetPipeline` this never rebuilds or destroys anything;
+   * destructive view swaps remain resetPipeline's exclusive job.
+   */
+  syncPhases(rows: readonly ProgressPhase[]): void {
+    const known = new Set(this.phases.map((phase) => phase.name))
+    const additions = rows.filter((row) => !known.has(row.name))
+    if (additions.length === 0) return
+    this.phases.push(...pendingPhases(additions))
+    this.scheduleRender()
+  }
+
   // The focused phase, clamped to a valid index (the pipeline can be empty
   // only in degenerate cases). Shared by rendering and [o].
   private focusedPhase(): PhaseState | undefined {
@@ -1771,7 +1794,12 @@ export class TuiProgress implements ProgressUI {
     const token = {}
     this.reportLoads.set(name, token)
     this.reports.set(name, "loading")
-    readFile(join(runDir, "reports", `${name}.md`), "utf8")
+    // The row carries its own report path when it has one (goal invocations
+    // write iteration-qualified paths); everything else keeps the canonical
+    // name-derived location. Shared by the inline panel and the fullscreen
+    // reader, which both funnel through this single resolution.
+    const path = this.findPhase(name)?.reportPath ?? `reports/${name}.md`
+    readFile(join(runDir, path), "utf8")
       .then((body) => {
         if (this.reportLoads.get(name) !== token) return
         this.reportLoads.delete(name)
@@ -3799,6 +3827,19 @@ export class TuiProgress implements ProgressUI {
   private sessionSourceLines(phase: PhaseState, width: number): StyledText[] {
     const blocks = this.transcripts.get(phase.name) ?? []
     if (blocks.length === 0) {
+      // A completed phase with nothing streamed was likely running before this
+      // dashboard attached: ask the attach runtime once to reconstruct the
+      // session from the run's live server. The placeholder stays until (and
+      // unless) chunks actually land, so a server that cannot answer keeps the
+      // honest "nothing captured" line.
+      if (
+        (phase.status === "completed" || phase.status === "failed") &&
+        phase.sessionID &&
+        !this.sessionBackfillRequested.has(phase.name)
+      ) {
+        this.sessionBackfillRequested.add(phase.name)
+        this.hostControls.requestSessionBackfill?.(phase.name)
+      }
       const hint =
         phase.status === "running"
           ? "waiting for the model to start streaming…"

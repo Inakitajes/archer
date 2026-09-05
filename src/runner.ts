@@ -2615,10 +2615,30 @@ export function watchSession(
      * covers the whole session — which is the same thing for a fresh one.
      */
     sinceMessageID?: string
+    /**
+     * Reconstruct the session's earlier output for a dashboard that did not
+     * watch the session from birth: subscribe first but buffer live transcript
+     * chunks, fetch the session history from the server, emit the history as
+     * transcript blocks, then release the buffer minus what history already
+     * covers — so history and live stream merge in order without duplication.
+     * The runner's own watchers never set this (they hold the session from
+     * birth); only the attach path does.
+     */
+    backfill?: boolean
   },
 ): SessionWatcher {
   const controller = new AbortController()
   const state = newActivityState()
+  // Built before the subscription registers, so every transcript chunk the
+  // hub delivers from the first moment is buffered while history is fetched.
+  const transcript = input.backfill
+    ? createBackfillTranscript(client, {
+        sessionID: input.sessionID,
+        directory: input.directory,
+        phaseName: input.phaseName,
+        progress: input.progress,
+      })
+    : undefined
 
   let settled = false
   let sawWork = false
@@ -2764,7 +2784,8 @@ export function watchSession(
     const chunk = describeMessageChunk(payload, state)
     if (chunk) {
       sawWork = true
-      input.progress.phaseMessage(input.phaseName, chunk)
+      if (transcript) transcript.live(chunk, chunkIdentity(properties))
+      else input.progress.phaseMessage(input.phaseName, chunk)
     }
   })
 
@@ -3037,6 +3058,234 @@ function rememberMessagePartChannel(properties: Record<string, unknown>, state: 
 
 function rawString(value: unknown): string {
   return typeof value === "string" ? value : ""
+}
+
+// ---------------------------------------------------------------------------
+// Session transcript backfill
+//
+// A dashboard that attaches mid-run (or re-attaches) did not watch a session
+// from birth, so its transcript starts empty. The backfill reconstructs the
+// session from the run's live OpenCode server and merges it with the live
+// stream: subscribe first and buffer live chunks, fetch `session.messages`,
+// emit the history as transcript blocks (same channel mapping the live chunk
+// extractor uses), then release the buffer minus what history already covers.
+// The overlap is the delta sequence between subscription and the server's
+// history snapshot — exactly the largest suffix of a history message's text
+// that matches a prefix of the buffered deltas — so a mid-stream part is
+// neither duplicated nor truncated. The TUI's transcript cap bounds memory.
+// ---------------------------------------------------------------------------
+
+type SessionHistoryMessage = { info: { id: string; role: string; time?: { completed?: number } | null }; parts: Part[] }
+
+type SessionHistory = {
+  /** History as transcript blocks, in message/part order. */
+  chunks: ProgressMessage[]
+  /** Full streaming text (reasoning + response parts concatenated) per assistant message. */
+  messageText: Map<string, string>
+  /** Tool call ids seen in history, for marker dedupe. */
+  callIDs: Set<string>
+  /** Assistant messages that completed — their stream can never grow again. */
+  completed: Set<string>
+}
+
+/**
+ * Maps a fetched session history onto the same transcript channels the live
+ * extractor produces: reasoning and text parts become streaming blocks keyed
+ * by their provider part id, tool parts become one-line action markers
+ * rendered exactly like `describeToolCall` renders the live event. Synthetic
+ * or ignored text parts (context injections the live stream never shows) are
+ * skipped. Only assistant messages stream; user prompts are not transcript.
+ */
+function historyTranscript(messages: readonly unknown[]): SessionHistory {
+  const chunks: ProgressMessage[] = []
+  const messageText = new Map<string, string>()
+  const callIDs = new Set<string>()
+  const completed = new Set<string>()
+  for (const message of messages) {
+    const record = message as SessionHistoryMessage | undefined
+    if (!record || typeof record !== "object" || !record.info || record.info.role !== "assistant") continue
+    const messageID = record.info.id
+    if (record.info.time?.completed) completed.add(messageID)
+    let text = ""
+    for (const part of record.parts ?? []) {
+      if (!part || typeof part !== "object") continue
+      if (part.type === "reasoning") {
+        const body = typeof part.text === "string" ? part.text : ""
+        chunks.push({ channel: "reasoning", text: body, ...(typeof part.id === "string" ? { partID: part.id } : {}) })
+        text += body
+      } else if (part.type === "text") {
+        if ("synthetic" in part && part.synthetic) continue
+        if ("ignored" in part && part.ignored) continue
+        const body = typeof part.text === "string" ? part.text : ""
+        chunks.push({ channel: "response", text: body, ...(typeof part.id === "string" ? { partID: part.id } : {}) })
+        text += body
+      } else if (part.type === "tool") {
+        if (typeof part.callID === "string") callIDs.add(part.callID)
+        const state = (part as { state?: { input?: unknown } }).state
+        chunks.push({ channel: "tool", text: describeToolCall({ tool: part.tool, input: state?.input }) })
+      }
+    }
+    if (text) messageText.set(messageID, text)
+  }
+  return { chunks, messageText, callIDs, completed }
+}
+
+/** The message/call identity a transcript event belongs to, for backfill dedupe. */
+function chunkIdentity(properties: Record<string, unknown> | undefined): { messageID?: string; callID?: string } {
+  if (!properties) return {}
+  const messageID = [properties.messageID, properties.assistantMessageID].find((value) => typeof value === "string") as string | undefined
+  const callID = typeof properties.callID === "string" ? properties.callID : undefined
+  return { ...(messageID ? { messageID } : {}), ...(callID ? { callID } : {}) }
+}
+
+/**
+ * The overlap between the buffered live deltas for one message and its
+ * history text: the largest prefix of the buffer that is also a suffix of the
+ * history. That suffix is precisely the delta sequence between subscription
+ * and the server's snapshot, so trimming it leaves only genuinely new text —
+ * even when the part began streaming before the subscription (the buffer
+ * holds only its tail). A coincidental longer match trims a few extra
+ * characters, degrading to a missing line, never a duplicate.
+ */
+function overlapLength(buffered: string, historyText: string): number {
+  const max = Math.min(buffered.length, historyText.length)
+  for (let k = max; k > 0; k--) {
+    if (buffered.startsWith(historyText.slice(historyText.length - k))) return k
+  }
+  return 0
+}
+
+type BackfillTranscript = {
+  /** Routes a live transcript chunk: buffered before release, guarded after. */
+  live(chunk: ProgressMessage, identity: { messageID?: string; callID?: string }): void
+}
+
+/**
+ * The buffered backfill used by `watchSession` when `backfill` is set. The
+ * fetch runs concurrently with the watcher; when it settles (or fails — a
+ * server that cannot answer simply has nothing to merge) the buffer is
+ * reconciled against the history and released, after which live chunks flow
+ * through with cheap guards only.
+ */
+function createBackfillTranscript(
+  client: OpencodeClient,
+  input: { sessionID: string; directory: string; phaseName: string; progress: ProgressUI },
+): BackfillTranscript {
+  type Pending = { chunk: ProgressMessage; messageID?: string; callID?: string }
+  const pending: Pending[] = []
+  let history: SessionHistory | undefined
+  let released = false
+  const emit = (chunk: ProgressMessage) => input.progress.phaseMessage(input.phaseName, chunk)
+
+  const release = () => {
+    if (released) return
+    released = true
+    if (!history) {
+      for (const entry of pending) emit(entry.chunk)
+      pending.length = 0
+      return
+    }
+    // Streaming chunks of a message history covers are reconciled per message:
+    // the first buffered chunk of that message computes the total overlap once,
+    // and it is consumed front-to-back across the message's buffered chunks.
+    const remaining = new Map<string, number>()
+    for (const entry of pending) {
+      const streaming = entry.chunk.channel === "reasoning" || entry.chunk.channel === "response"
+      if (!streaming) {
+        // Tool/bash markers: a call history recorded (by call id) must not
+        // double-post, and neither may a marker of an already-complete message.
+        if (entry.callID && history!.callIDs.has(entry.callID)) continue
+        if (entry.messageID && history!.completed.has(entry.messageID)) continue
+        emit(entry.chunk)
+        continue
+      }
+      if (!entry.messageID) {
+        emit(entry.chunk)
+        continue
+      }
+      // A completed message's stream can never grow: whatever the buffer holds
+      // for it, history already contains whole.
+      if (history!.completed.has(entry.messageID)) continue
+      if (!history!.messageText.has(entry.messageID)) {
+        emit(entry.chunk)
+        continue
+      }
+      let left = remaining.get(entry.messageID!)
+      if (left === undefined) {
+        const buffered = pending
+          .filter((other) => other.messageID === entry.messageID && (other.chunk.channel === "reasoning" || other.chunk.channel === "response"))
+          .map((other) => other.chunk.text)
+          .join("")
+        left = overlapLength(buffered, history!.messageText.get(entry.messageID!)!)
+        remaining.set(entry.messageID!, left)
+      }
+      if (left <= 0) {
+        emit(entry.chunk)
+        continue
+      }
+      if (entry.chunk.text.length <= left) {
+        remaining.set(entry.messageID!, left - entry.chunk.text.length)
+        continue
+      }
+      emit({ ...entry.chunk, text: entry.chunk.text.slice(left) })
+      remaining.set(entry.messageID!, 0)
+    }
+    pending.length = 0
+  }
+
+  void (async () => {
+    try {
+      const response = await client.session.messages({ sessionID: input.sessionID, directory: input.directory })
+      if (!response.error && response.data) {
+        history = historyTranscript(response.data)
+        for (const chunk of history.chunks) emit(chunk)
+      }
+    } catch {
+      // Server unreachable or the request failed: no history to merge, and the
+      // live stream (if any) flows on untouched.
+    } finally {
+      release()
+    }
+  })()
+
+  return {
+    live(chunk, identity) {
+      if (released) {
+        // Post-release guards: history already holds complete messages whole,
+        // and a tool call history recorded (by callID) must not double-post.
+        if (!history) {
+          emit(chunk)
+          return
+        }
+        if (identity.callID && history.callIDs.has(identity.callID)) return
+        if (identity.messageID && history.completed.has(identity.messageID)) return
+        emit(chunk)
+        return
+      }
+      pending.push({ chunk, ...identity })
+    },
+  }
+}
+
+/**
+ * One-shot transcript reconstruction for a session nobody is watching: fetches
+ * the session history from the live server and emits it as transcript blocks.
+ * Used for a completed phase's first session-tab view on an attached dashboard
+ * (a running phase's watcher does its own buffered merge instead). A server
+ * that cannot answer leaves the caller's placeholder untouched.
+ */
+export async function backfillSessionTranscript(
+  client: OpencodeClient,
+  input: { directory: string; phaseName: string; sessionID: string; progress: ProgressUI },
+): Promise<void> {
+  try {
+    const response = await client.session.messages({ sessionID: input.sessionID, directory: input.directory })
+    if (response.error || !response.data) return
+    const { chunks } = historyTranscript(response.data)
+    for (const chunk of chunks) input.progress.phaseMessage(input.phaseName, chunk)
+  } catch {
+    // Honest placeholder stays; nothing is fabricated for an unreachable server.
+  }
 }
 
 function describeSessionStatus(value: unknown): SessionSignal | undefined {
@@ -3369,6 +3618,7 @@ export function progressPhases(pipeline: Pipeline, hooks?: HookSet): ProgressPha
           ...(step.variant ? { plannedVariant: step.variant } : {}),
           ...(step.runner ? { runner: step.runner } : {}),
           ...(step.readOnly ? { readOnly: true } : {}),
+          reportPath: step.reportPath,
           ...(step.resolvedAdvisor ? { plannedAdvisor: step.resolvedAdvisor.target } : step.advisor ? { plannedAdvisor: step.advisor } : {}),
           ...(step.advisorMaxCalls !== undefined ? { advisorMaxCalls: step.advisorMaxCalls } : {}),
         }
