@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { listRuns, loadRunSummary } from "../src/runs"
+import { listRuns, loadRunSummary, readRunIndexEntry } from "../src/runs"
 
 /**
  * The cleanup-surviving run-record index (capability run-finalization, task
@@ -82,5 +82,65 @@ describe("run discovery merges the run-record index", () => {
     await writeFile(join(home, ".convoy", "run-records", "20260905-150000-ba1.json"), "{not json")
     const runs = await listRuns()
     expect(runs.find((run) => run.runID === "20260905-150000-ba1")).toBeUndefined()
+  })
+
+  test("the cleanup-surviving index preserves the reviewed feature link (task 5.1)", async () => {
+    const home = await mkdtemp(join(tmpdir(), "convoy-home-"))
+    dirs.push(home)
+    savedHome = process.env.CONVOY_HOME
+    process.env.CONVOY_HOME = home
+
+    await writeRunIndex(home, {
+      schemaVersion: 1,
+      runID,
+      title: "Feature-backed run",
+      worktreeDir: "/repo/worktrees/feat/add-widget",
+      branch: "feat/add-widget",
+      feature: {
+        featureId: "aaaaaaaa-0000-4000-8000-00000000abc1",
+        associationRevision: 3,
+        branch: "feat/add-widget",
+        baseRef: "main",
+        contracts: ["add-widget"],
+      },
+      disposition: "compacted",
+      state: "completed",
+      recordedAt: 1,
+      updatedAt: 2,
+    })
+
+    const record = await readRunIndexEntry(runID)
+    expect(record).toBeDefined()
+    expect(record!.feature).toEqual({
+      featureId: "aaaaaaaa-0000-4000-8000-00000000abc1",
+      associationRevision: 3,
+      branch: "feat/add-widget",
+      baseRef: "main",
+      contracts: ["add-widget"],
+    })
+  })
+
+  test("a malformed feature link is dropped without inventing identity (task 5.1)", async () => {
+    const home = await mkdtemp(join(tmpdir(), "convoy-home-"))
+    dirs.push(home)
+    savedHome = process.env.CONVOY_HOME
+    process.env.CONVOY_HOME = home
+
+    // writeRunIndex writes under the module-level runID; a fresh home keeps it
+    // isolated from the happy-parse test above.
+    await writeRunIndex(home, {
+      schemaVersion: 1,
+      runID,
+      title: "Run with a malformed feature link",
+      // featureId is not a string, so the link is dropped rather than
+      // interpreted — readers never invent identity.
+      feature: { featureId: 42, associationRevision: "nope", branch: ["bad"] },
+      state: "completed",
+    })
+
+    const record = await readRunIndexEntry(runID)
+    expect(record).toBeDefined()
+    expect(record!.feature).toBeUndefined()
+    expect(record!.state).toBe("completed")
   })
 })

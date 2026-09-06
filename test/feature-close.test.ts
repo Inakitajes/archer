@@ -52,7 +52,7 @@ async function git(cwd: string, env: Record<string, string> | undefined, ...args
 async function writeOpenspecDouble(binDir: string): Promise<void> {
   const script = [
     "#!/usr/bin/env bun",
-    "import { readdirSync, readFileSync, mkdirSync, renameSync, statSync } from 'node:fs'",
+    "import { readdirSync, readFileSync, mkdirSync, renameSync, statSync, writeFileSync } from 'node:fs'",
     "import { join } from 'node:path'",
     "const [cmd, ...rest] = process.argv.slice(2)",
     "const root = process.cwd()",
@@ -76,13 +76,18 @@ async function writeOpenspecDouble(binDir: string): Promise<void> {
     "    console.error('openspec archive failed (injected)')",
     "    process.exit(4)",
     "  }",
-    "  const id = rest.find((a) => !a.startsWith('-'))",
-    "  const from = join(root, 'openspec', 'changes', id)",
-    "  const to = join(root, 'openspec', 'changes', 'archive', id)",
-    "  statSync(from)",
-    "  mkdirSync(join(root, 'openspec', 'changes', 'archive'), { recursive: true })",
-    "  renameSync(from, to)",
-    "  process.exit(0)",
+  "  const id = rest.find((a) => !a.startsWith('-'))",
+  "  const from = join(root, 'openspec', 'changes', id)",
+  "  const to = join(root, 'openspec', 'changes', 'archive', id)",
+  "  statSync(from)",
+  "  mkdirSync(join(root, 'openspec', 'changes', 'archive'), { recursive: true })",
+  "  renameSync(from, to)",
+  "  // A real archive merges the deltas into the canonical specs; the double",
+  "  // writes the fixture's expected canonical requirement so close's",
+  "  // positive archive verification (task 7.2) sees a provable result.",
+  "  mkdirSync(join(root, 'openspec', 'specs', 'cli'), { recursive: true })",
+  "  writeFileSync(join(root, 'openspec', 'specs', 'cli', 'spec.md'), '## Requirements\\n\\n### Requirement: Widget\\n')",
+  "  process.exit(0)",
     "}",
     "console.error('unexpected openspec invocation: ' + cmd)",
     "process.exit(3)",
@@ -137,6 +142,12 @@ async function makeFixture(input: { tasksDone: boolean } = { tasksDone: true }):
   await writeFile(join(worktreeDir, "src.ts"), "export const widget = 1\n")
   await git(worktreeDir, convoy, "add", ".")
   await git(worktreeDir, convoy, "commit", "-m", "convoy(implement): implement add-widget")
+
+  // Register the feature as spin would have: the adoption gate (task 7.1)
+  // refuses closes on unassociated work, so every close fixture starts from
+  // an explicitly associated context.
+  const { registerSpinFeature } = await import("../src/feature-lifecycle/commands")
+  await registerSpinFeature({ cwd: mainDir, changeId: "add-widget", branch: "feat/add-widget", worktreeDir: await realPath(worktreeDir), baseRef: "main", phase: "intent" })
 
   return { root, mainDir: await realPath(mainDir), worktreeDir: await realPath(worktreeDir) }
 }
@@ -392,7 +403,8 @@ describe("runClose", () => {
     const fixture = await makeFixture()
     const events = await collectEvents(fixture)
 
-    expect(events[0]).toEqual({ type: "preflight", summary: "clean tree · 2/2 tasks · no live runs" })
+    // The checklist's preflight line names the registered feature it acts on (task 7.8).
+    expect(events[0]).toEqual({ type: "preflight", summary: "feature add-widget · clean tree · 2/2 tasks · no live runs" })
     // The base hasn't moved, so the sync is a detected skip, not a merge.
     expect(events[1]).toMatchObject({ type: "step-skipped", step: "sync" })
     const steps = events.map((event) =>

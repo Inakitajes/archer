@@ -1,6 +1,8 @@
-import { describe, expect, test } from "bun:test"
+import { afterAll, describe, expect, test } from "bun:test"
+import { rm } from "node:fs/promises"
 
 import { createPublishSeam, type PublishRunner, type RunResult } from "../src/publish"
+import type { FeatureRecord } from "../src/feature-lifecycle/records"
 
 /**
  * The deliberate `Create pull request` action (capability run-finalization,
@@ -139,5 +141,123 @@ describe("publish apply pushes normally and locates before creating", () => {
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.message).toContain("the branch was pushed to origin/feat/widget")
     expect(calls.some((call) => call.command === "git" && call.args[0] === "push")).toBe(true)
+  })
+})
+
+describe("publication revalidates the reviewed feature link (task 5.2)", () => {
+  const dirs: string[] = []
+
+  /** A real repo with a registered feature whose branch is checked out in a worktree. */
+  async function makeFeatureRepo(featureId: string): Promise<string> {
+    const { execFile } = await import("../src/git")
+    const { mkdir, mkdtemp: mkd, writeFile } = await import("node:fs/promises")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const main = join(await mkd(join(tmpdir(), "convoy-publish-feature-")), "main")
+    dirs.push(main)
+    await mkdir(main, { recursive: true })
+    await execFile("git", ["init", "-q", "-b", "main"], { cwd: main })
+    await writeFile(join(main, "README.md"), "x\n")
+    await execFile("git", ["add", "."], { cwd: main })
+    await execFile("git", ["-c", "user.email=t@x", "-c", "user.name=T", "commit", "-m", "init"], { cwd: main })
+    // The feature's branch is checked out in a worktree so the association verifies.
+    const { realpath } = await import("node:fs/promises")
+    const wt = join(await mkd(join(tmpdir(), "convoy-publish-feature-wt-")), "wt")
+    dirs.push(wt)
+    await execFile("git", ["worktree", "add", "-b", "feat/widget", wt], { cwd: main, allowFailure: true })
+    const { ensureRepositoryRecord, isFound, lifecycleCommonDir, withFeatureLock } = await import("../src/feature-lifecycle/store")
+    const { writeFeatureRecord } = await import("../src/feature-lifecycle/records")
+    const commonDir = (await lifecycleCommonDir(main))!
+    const repoRecord = await ensureRepositoryRecord(commonDir)
+    if (!isFound(repoRecord)) throw new Error("no repo record")
+    const record: FeatureRecord = {
+      schemaVersion: 1,
+      featureId,
+      repositoryId: repoRecord.value.repositoryId,
+      displayName: "add-widget",
+      associationRevision: 2,
+      contracts: [{ changeId: "add-widget", kind: "active", sourcePath: "openspec/changes/add-widget", provenance: "adopt", selectedAtRevision: 2 }],
+      intendedBaseRef: "main",
+      context: { branch: "feat/widget", checkoutPath: await realpath(wt) },
+      runIds: [],
+      closeAttemptIds: [],
+      history: [],
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    await withFeatureLock(join(commonDir, "convoy", "features", featureId), () => writeFeatureRecord(commonDir, record, 0))
+    return main
+  }
+
+  async function withRunDir(feature: unknown): Promise<string> {
+    const { mkdtemp: mkd, writeFile: wf } = await import("node:fs/promises")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const dir = await mkd(join(tmpdir(), "convoy-publish-rundir-"))
+    dirs.push(dir)
+    if (feature !== undefined) {
+      await wf(
+        join(dir, "metadata.json"),
+        JSON.stringify({
+          schemaVersion: 5,
+          runID: "20260101-000000-x",
+          targetDir: ".",
+          createdAt: 1,
+          updatedAt: 1,
+          control: { state: "completed" },
+          phases: {},
+          feature,
+        }),
+      )
+    }
+    return dir
+  }
+
+  test("a feature-backed run refuses publication when its link no longer verifies", async () => {
+    const main = await makeFeatureRepo("11111111-2222-4333-8444-555555555555")
+    const runDir = await withRunDir({
+      featureId: "99999999-2222-4333-8444-555555555555",
+      repositoryId: "88888888-2222-4333-8444-555555555555",
+      associationRevision: 1,
+      contracts: ["add-widget"],
+      baseRef: "main",
+      branch: "feat/widget",
+    })
+    const { seam } = seamWith({}, runDir)
+    void seam
+    // Re-create the seam with the real cwd so the gate reaches the store.
+    const real = createPublishSeam({ cwd: main, runDir, run: fakeRunner({}, []) })
+    const prepared = await real.prepare()
+    expect(prepared.ok).toBe(false)
+    if (!prepared.ok) expect(prepared.message).toMatch(/never pushes the branch now occupying the historical path/)
+  })
+
+  test("a verified feature link revalidates and publication proceeds", async () => {
+    const main = await makeFeatureRepo("11111111-2222-4333-8444-555555555556")
+    const runDir = await withRunDir({
+      featureId: "11111111-2222-4333-8444-555555555556",
+      repositoryId: "88888888-2222-4333-8444-555555555555",
+      associationRevision: 2,
+      contracts: ["add-widget"],
+      baseRef: "main",
+      branch: "feat/widget",
+    })
+    const calls: Array<{ command: string; args: string[] }> = []
+    const real = createPublishSeam({ cwd: main, runDir, run: fakeRunner({}, calls) })
+    const prepared = await real.prepare()
+    expect(prepared.ok).toBe(true)
+    if (!prepared.ok) return
+    expect(prepared.plan.branch).toBe("feat/widget")
+  })
+
+  test("a run without a feature link keeps the no-spec publication flow", async () => {
+    const runDir = await withRunDir(undefined)
+    const real = createPublishSeam({ cwd: "/repo", runDir, run: fakeRunner({}, []) })
+    const prepared = await real.prepare()
+    expect(prepared.ok).toBe(true)
+  })
+
+  afterAll(async () => {
+    await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true }).catch(() => {})))
   })
 })

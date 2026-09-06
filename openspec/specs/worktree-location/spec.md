@@ -71,10 +71,10 @@ All Convoy operations that reason about a worktree by its name SHALL resolve to 
 - **WHEN** a worktree already exists at the resolved location for a branch
 - **THEN** Convoy uses a suffixed branch and location (`-2`, `-3`, …) so no collision occurs
 
-#### Scenario: Finish locates a non-default worktree
+#### Scenario: Close and continue locate a non-default worktree
 
-- **WHEN** `convoy finish --branch <name>` targets a worktree that is not at the built-in default location
-- **THEN** Convoy locates the worktree from the repository's worktree list rather than assuming a fixed path
+- **WHEN** a lifecycle action such as close or continue targets a worktree that is not at the built-in default location
+- **THEN** Convoy locates the worktree from the repository's worktree list (or the feature's verified association) rather than assuming a fixed path
 
 ### Requirement: Conventional branch naming preserved
 

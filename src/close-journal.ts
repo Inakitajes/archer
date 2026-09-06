@@ -4,6 +4,8 @@ import { dirname, join } from "node:path"
 import { execFile, isAncestor, resolveCommit } from "./git"
 import { createRefIfAbsent, gitCommonDir, refExists } from "./finalization/refs"
 
+import type { RequiredEffect } from "./feature-lifecycle/records"
+
 /**
  * The close journal and landing receipt (capability feature-close, design D6
  * and D7, tasks 5.1/5.5/5.7): a versioned record in the repository's Git
@@ -50,6 +52,21 @@ export type CloseJournal = {
   candidateSha?: string
   /** The base branch after the guarded landing. */
   landingSha?: string
+  /**
+   * The canonical effects the archive must prove, snapshotted from the
+   * change's own deltas BEFORE the archive mutation (task 7.2). Resume
+   * validates against this snapshot — an operator editing or deleting the
+   * archived copy's deltas after the fact cannot make verification vacuous.
+   * Absent on journals written before this field existed.
+   */
+  requiredEffects?: RequiredEffect[]
+  /**
+   * Whether the base checkout has been materialized onto the landed ref
+   * (task 7.5): the guarded ref transaction is the landing; the checkout
+   * update is a distinct recorded stage. `false` means the landing stands
+   * but the checkout still needs reconciliation before cleanup.
+   */
+  checkoutMaterialized?: boolean
   phase: CloseJournalPhase
   recordedAt: number
   updatedAt: number
@@ -98,6 +115,21 @@ export function readCloseJournalValue(value: unknown): CloseJournal | undefined 
           : [],
       }
     : undefined
+  let requiredEffects: RequiredEffect[] | undefined
+  if (value.requiredEffects !== undefined) {
+    if (!Array.isArray(value.requiredEffects)) return undefined
+    requiredEffects = []
+    for (const effect of value.requiredEffects) {
+      if (!isRecord(effect)) return undefined
+      if ((effect.kind !== "present" && effect.kind !== "absent") || typeof effect.capability !== "string" || typeof effect.name !== "string") return undefined
+      requiredEffects.push({
+        kind: effect.kind,
+        capability: effect.capability,
+        name: effect.name,
+        scenarios: Array.isArray(effect.scenarios) ? effect.scenarios.filter((scenario): scenario is string => typeof scenario === "string") : [],
+      })
+    }
+  }
   return {
     schemaVersion: closeJournalSchemaVersion,
     attemptID: optionalString(value.attemptID) ?? "",
@@ -112,6 +144,8 @@ export function readCloseJournalValue(value: unknown): CloseJournal | undefined 
     ...(optionalString(value.message) ? { message: optionalString(value.message) } : {}),
     ...(optionalString(value.candidateSha) ? { candidateSha: optionalString(value.candidateSha) } : {}),
     ...(optionalString(value.landingSha) ? { landingSha: optionalString(value.landingSha) } : {}),
+    ...(requiredEffects ? { requiredEffects } : {}),
+    ...(typeof value.checkoutMaterialized === "boolean" ? { checkoutMaterialized: value.checkoutMaterialized } : {}),
     phase: phase as CloseJournalPhase,
     recordedAt: typeof value.recordedAt === "number" ? value.recordedAt : 0,
     updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : 0,
