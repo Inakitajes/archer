@@ -279,7 +279,22 @@ function inventory(change: SpecsChangeEntry): string[] {
  * itself is lazy-imported so non-interactive invocations never pull in opentui.
  */
 export async function browseSpecs(targetDir: string, route?: TuiRoute): Promise<SpecsResolution> {
-  const view = await loadSpecsView(targetDir)
+  let view: SpecsView
+  if (route && stdin.isTTY && stdout.isTTY) {
+    // The home session's handoff: the loading transition covers a genuinely
+    // slow board load; fast loads and non-interactive paths never see it.
+    const { withLoadingTransition, isLoadingInterrupted } = await import("./loading-transition")
+    const loaded = await withLoadingTransition(route, "specs", () => loadSpecsView(targetDir), { targetDir }).catch((error: unknown) => {
+      // Ctrl+C during the transition already flagged the home session as
+      // interrupted; exit quietly instead of opening the destination.
+      if (!isLoadingInterrupted(error)) throw error
+      return undefined
+    })
+    if (!loaded) return { type: "exit" }
+    view = loaded
+  } else {
+    view = await loadSpecsView(targetDir)
+  }
   if (view.changes.length === 0 && view.specs.length === 0 && (view.worktreesWithoutSpec?.length ?? 0) === 0) {
     if (route) {
       const { showNoticeTui } = await import("./notice-tui")
