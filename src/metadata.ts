@@ -14,7 +14,7 @@ import type {
   RunControlState,
 } from "./progress"
 import type { QualityScore } from "./quality-score"
-import type { Pipeline } from "./types"
+import type { FeaturePlanLink, Pipeline } from "./types"
 import type { ModelGateway } from "./model-routing"
 import { PhaseUsage } from "./usage"
 import { aggregateAdvisorEvents, type AdvisorEvent, type AdvisorPhaseAggregate } from "./advisor-events"
@@ -91,6 +91,12 @@ export type RunMetadata = {
   goal?: GoalRunState
   /** The run boundary persisted before any run-owned mutation (schema v5; capability run-finalization). */
   boundary?: RunBoundary
+  /**
+   * The reviewed feature link (capability feature-lifecycle, task 5.1):
+   * persisted at metadata open — before any execution — so board, attach, and
+   * history join by stable identity and never reinterpret a stored path.
+   */
+  feature?: FeaturePlanLink
   /** The ordered ledger of Convoy-created commits, recorded as each commit lands (schema v5). */
   commitLedger?: CommitLedgerEntry[]
   /** The automatic compaction outcome, independent of the pipeline result (schema v5). */
@@ -142,6 +148,8 @@ export type OpenRunMetadataOptions = {
   modelOverride?: boolean
   /** Execute the reviewed resume subset without replacing the stored full pipeline. */
   useExecutionPipeline?: boolean
+  /** The reviewed feature link, persisted at open — before any execution (task 4.2/5.1). */
+  feature?: FeaturePlanLink
 }
 
 const saveDebounceMs = 2_000
@@ -155,6 +163,10 @@ export async function openRunMetadata(
   const gateway = options.gateway ?? "configured"
   const path = join(workspace.dir, "metadata.json")
   const data = (await loadMetadata(path, workspace.runID)) ?? newMetadata(workspace.runID, targetDir)
+  // The reviewed feature link persists from the first open onward, including
+  // for failed/aborted runs (capability feature-lifecycle: the link is
+  // written before execution, not only after success).
+  if (options.feature && !data.feature) data.feature = options.feature
   // Opening metadata means a new coordinator owns the run. It resumes from the
   // next pending batch; pausing/running crashes still use normal phase recovery.
   if (data.control.state !== "running") data.control = { state: "running" }

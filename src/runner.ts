@@ -524,6 +524,8 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
       // The plan has already applied --only/--skip. Never re-expand a reviewed
       // resume back to the entire persisted pipeline.
       useExecutionPipeline: Boolean(options.resumeRunID && options.plan),
+      // The reviewed feature link persists before any execution (task 4.2).
+      ...(options.plan?.feature ? { feature: options.plan.feature } : {}),
     })
     const pipeline = metadata.pipeline
     pipelineNameForHooks = pipeline.name
@@ -900,6 +902,8 @@ export async function run(options: RunOptions, deps: RunDeps = defaultRunDeps) {
           boundary: metadata.boundary(),
           ledger: metadata.ledger(),
           ...(identity.branch ? { branch: identity.branch } : {}),
+          // The reviewed feature link survives workspace cleanup (task 5.1).
+          ...(options.plan?.feature ? { feature: options.plan.feature } : {}),
           signal: shutdown.signal,
           progress: {
             activity: (detail, kind) => progress.phaseActivity(compactRunRowName, detail, kind),

@@ -6,7 +6,7 @@ import { copyReportToClipboard, writeClipboardOSC52, type ClipboardResult } from
 import type { FeatureRow, WorktreeWithoutSpec } from "./control-board"
 import { parseMarkdown, renderMarkdownDoc, type MarkdownDoc } from "./markdown-render"
 import { stripYamlFrontmatter } from "./openspec"
-import { groupChangeArtifacts, specGroupSource, type SpecGroup, type SpecsChangeEntry, type SpecsResolution, type SpecsView } from "./specs"
+import { groupChangeArtifacts, loadSpecsView, specGroupSource, type LifecycleFeatureRow, type SpecGroup, type SpecsChangeEntry, type SpecsResolution, type SpecsView } from "./specs"
 import {
   hintsRow,
   joinLines,
@@ -35,9 +35,22 @@ const compactSpecsMaxWidth = 84
  */
 type ListRow =
   | { kind: "header"; label: string }
+  | { kind: "feature"; feature: LifecycleFeatureRow }
   | { kind: "change"; change: SpecsChangeEntry }
   | { kind: "worktree"; worktree: WorktreeWithoutSpec }
   | { kind: "spec"; path: string }
+
+/**
+ * One dispatchable or inspectable Actions-menu entry, built from the shared
+ * assessment's actions (`LifecycleFeatureRow.actions`) — the same eligibility
+ * rules the CLI, headless listing, and board rows consume, so no duplicated
+ * branch/path gate lives in the renderer.
+ */
+type MenuItem = {
+  action: { id: string; label: string; enabled: boolean; blockers: readonly string[]; remediation?: readonly string[] }
+  /** Present only when the browser can run the action itself. */
+  dispatch?: "close" | "continue" | "history" | "refresh" | "archive-main"
+}
 
 export class SpecsBrowser {
   readonly result: Promise<SpecsResolution>
@@ -55,11 +68,20 @@ export class SpecsBrowser {
   private scroll = 0
   /** Set while a change/spec was entered: the detail level's subject. */
   private subject?: { kind: "change"; change: SpecsChangeEntry } | { kind: "spec"; path: string }
+  /**
+   * The feature whose read-only History view is the current subject. History
+   * is inspection, not an active change: its subject id is a feature id, so
+   * apply/iterate stay hidden and inert while this is set.
+   */
+  private historyFeature?: LifecycleFeatureRow
   private groups: SpecGroup[] = []
   private selectedGroup = 0
   private detailScroll = 0
   /** Outcome of the last copy attempt, reported in the reader's title bar. */
   private copyStatus?: ClipboardResult
+  /** Set while the lifecycle Actions menu overlays the current level (task 6.4). */
+  private menuOpen = false
+  private menuIndex = 0
   /** Scroll position for the fullscreen reader's title bar (`top` / `end` / `%` / `all`). */
   private readerPosition = ""
   /** Artifact markdown read lazily, keyed by repo-relative file; failures become placeholders. */
@@ -100,7 +122,7 @@ export class SpecsBrowser {
 
   constructor(
     private readonly renderer: CliRenderer,
-    private readonly view: SpecsView,
+    private view: SpecsView,
     // Clipboard deps are constructor-injected exactly like the dashboard's
     // copyReport, so tests swap the transport instead of shelling out.
     private readonly copyReport: typeof copyReportToClipboard = copyReportToClipboard,
@@ -218,6 +240,8 @@ export class SpecsBrowser {
   // ── keys ────────────────────────────────────────────────────────────────
 
   private handleRootKey(key: KeyEvent) {
+    // The Actions menu owns the keyboard while open (task 6.4).
+    if (this.menuOpen && this.handleMenuKey(key)) return
     switch (key.name) {
       case "up":
       case "k":
@@ -263,6 +287,12 @@ export class SpecsBrowser {
         break
       }
       case "c": {
+        const lifecycle = this.selectedLifecycleFeature()
+        if (lifecycle?.checkoutPath && lifecycle.branch) {
+          const changeId = lifecycle.contracts.find((contract) => contract.state === "active")?.changeId
+          if (changeId) this.finish({ type: "continue-change", changeID: changeId, worktreeDir: lifecycle.checkoutPath, branch: lifecycle.branch })
+          break
+        }
         const feature = this.selectedFeature()
         if (feature?.worktreeDir && feature.branch) {
           this.finish({ type: "continue-change", changeID: feature.id, worktreeDir: feature.worktreeDir, branch: feature.branch })
@@ -270,6 +300,21 @@ export class SpecsBrowser {
         break
       }
       case "x": {
+        const lifecycle = this.selectedLifecycleFeature()
+        if (lifecycle?.checkoutPath && lifecycle.branch) {
+          const changeId = lifecycle.contracts.find((contract) => contract.state === "active")?.changeId
+          if (changeId) this.finish({ type: "close-change", changeID: changeId, worktreeDir: lifecycle.checkoutPath, branch: lifecycle.branch })
+          break
+        }
+        // A registered feature whose worktree is gone still reaches the close
+        // review — through its stable identity, never a silent no-op (task
+        // 6.4; the review reports the recorded landing or the concrete
+        // missing-context blocker with remediation).
+        const lifecycleOnly = this.selectedLifecycleFeature()
+        if (lifecycleOnly) {
+          this.finish({ type: "close-feature", featureId: lifecycleOnly.featureId })
+          break
+        }
         const feature = this.selectedFeature()
         if (feature?.worktreeDir && feature.branch) {
           this.finish({ type: "close-change", changeID: feature.id, worktreeDir: feature.worktreeDir, branch: feature.branch })
@@ -281,6 +326,17 @@ export class SpecsBrowser {
         if (feature?.probablyMerged) this.finish({ type: "archive-change-main", changeID: feature.id })
         break
       }
+      case "r": {
+        // Explicit refresh (task 6.5): reload the whole view, invalidate the
+        // artifact/document caches together, and keep the selection attached
+        // to identity rather than list position.
+        void this.refresh()
+        break
+      }
+      case "!":
+      case "exclamation":
+        this.openActionsMenu()
+        break
       case "q":
       case "escape":
         this.finish({ type: "exit" })
@@ -289,6 +345,9 @@ export class SpecsBrowser {
   }
 
   private handleDetailKey(key: KeyEvent) {
+    // The Actions menu owns the keyboard while open (task 6.4); the fullscreen
+    // reader keeps its copy/close/tab keys and never opens the menu.
+    if (this.menuOpen && !this.fullscreen && this.handleMenuKey(key)) return
     // Digits 1–9 jump straight to a tab (the strip labels the numbers).
     if (this.digitTab(key)) {
       this.render()
@@ -343,12 +402,12 @@ export class SpecsBrowser {
         break
       case "a": {
         const subject = this.subject
-        if (subject?.kind === "change") this.finish({ type: "apply-change", changeID: subject.change.id })
+        if (subject?.kind === "change" && !this.historyFeature) this.finish({ type: "apply-change", changeID: subject.change.id })
         return
       }
       case "i": {
         const subject = this.subject
-        if (subject?.kind === "change") this.finish({ type: "iterate-change", changeID: subject.change.id })
+        if (subject?.kind === "change" && !this.historyFeature) this.finish({ type: "iterate-change", changeID: subject.change.id })
         return
       }
       case "escape":
@@ -362,8 +421,135 @@ export class SpecsBrowser {
       case "b":
         if (!this.fullscreen) this.leaveSubject()
         break
+      case "!":
+      case "exclamation":
+        // The Actions menu exists at the ordinary detail level too (task 6.4);
+        // the fullscreen reader keeps its copy/close/tab keys untouched.
+        if (!this.fullscreen) this.openActionsMenu()
+        break
     }
     this.render()
+  }
+
+  // ── the lifecycle Actions menu (task 6.4) ────────────────────────────────
+
+  /** The lifecycle feature the menu acts on, at the current level. */
+  private menuTarget(): LifecycleFeatureRow | undefined {
+    if (this.level === "root") return this.selectedLifecycleFeature()
+    if (this.historyFeature) return this.historyFeature
+    const subject = this.subject
+    if (subject?.kind === "change") {
+      return (this.view.features ?? []).find((feature) => feature.contracts.some((contract) => contract.changeId === subject.change.id))
+    }
+    return undefined
+  }
+
+  /** The menu entries: the shared assessment's applicable actions plus the browser's own refresh. */
+  private menuItems(): MenuItem[] {
+    const feature = this.menuTarget()
+    if (!feature) return []
+    const items: MenuItem[] = (feature.actions ?? [])
+      .filter((action) => action.id !== "spin" && action.id !== "adopt")
+      .map((action) => {
+        switch (action.id) {
+          case "close":
+            // Identity-keyed close review: dispatchable even when the
+            // worktree is gone — the review reports the verified landing or
+            // the concrete missing-context blocker.
+            return { action, dispatch: "close" as const }
+          case "continue":
+            return feature.checkoutPath && feature.branch && feature.contracts.some((contract) => contract.state === "active")
+              ? { action, dispatch: "continue" as const }
+              : { action }
+          case "history":
+            return { action, dispatch: "history" as const }
+          case "archive-on-main": {
+            const changeId = feature.contracts.find((contract) => contract.state === "active")?.changeId
+            return changeId ? { action, dispatch: "archive-main" as const } : { action }
+          }
+          default:
+            // push/bind and any other shared action without an in-browser
+            // executor stay inspectable with their blockers and the exact
+            // remediation command, never silently absent.
+            return { action }
+        }
+      })
+    items.push({ action: { id: "refresh", label: "Refresh", enabled: true, blockers: [] }, dispatch: "refresh" })
+    return items
+  }
+
+  private openActionsMenu() {
+    if (this.menuItems().length === 0) return
+    this.menuOpen = true
+    this.menuIndex = Math.max(0, this.menuItems().findIndex((item) => item.dispatch && item.action.enabled))
+    this.render()
+  }
+
+  private closeActionsMenu() {
+    this.menuOpen = false
+    this.render()
+  }
+
+  /** Menu keys; returns false when the key wasn't a menu key (root falls through). */
+  private handleMenuKey(key: KeyEvent): boolean {
+    const items = this.menuItems()
+    switch (key.name) {
+      case "up":
+      case "k":
+        this.menuIndex = (this.menuIndex - 1 + items.length) % Math.max(1, items.length)
+        break
+      case "down":
+      case "j":
+        this.menuIndex = (this.menuIndex + 1) % Math.max(1, items.length)
+        break
+      case "return":
+      case "linefeed": {
+        const item = items[this.menuIndex]
+        if (item?.dispatch && item.action.enabled) {
+          this.menuOpen = false
+          this.dispatchMenuItem(item, this.menuTarget())
+          return true
+        }
+        break
+      }
+      case "escape":
+        this.closeActionsMenu()
+        return true
+      case "q":
+        // q keeps its global meaning (quit/back) instead of closing the menu.
+        return false
+      default:
+        return true
+    }
+    this.render()
+    return true
+  }
+
+  private dispatchMenuItem(item: MenuItem, feature: LifecycleFeatureRow | undefined) {
+    if (!feature) return
+    switch (item.dispatch) {
+      case "close":
+        this.finish({ type: "close-feature", featureId: feature.featureId })
+        return
+      case "continue": {
+        const changeId = feature.contracts.find((contract) => contract.state === "active")?.changeId
+        if (changeId && feature.checkoutPath && feature.branch) {
+          this.finish({ type: "continue-change", changeID: changeId, worktreeDir: feature.checkoutPath, branch: feature.branch })
+        }
+        return
+      }
+      case "history":
+        this.enterFeatureHistory(feature)
+        return
+      case "refresh":
+        void this.refresh()
+        return
+      case "archive-main": {
+        const changeId = feature.contracts.find((contract) => contract.state === "active")?.changeId
+        if (changeId) this.finish({ type: "archive-change-main", changeID: changeId })
+        return
+      }
+    }
   }
 
   /** Digits 1–9 jump straight to a tab; the strip labels the numbers. */
@@ -436,6 +622,50 @@ export class SpecsBrowser {
     return change ? this.featureFor(change) : undefined
   }
 
+  /** The selected registered lifecycle row, when the cursor sits on one. */
+  private selectedLifecycleFeature(): LifecycleFeatureRow | undefined {
+    const row = this.rows[this.selectedRow]
+    return row?.kind === "feature" ? row.feature : undefined
+  }
+
+  /**
+   * Explicit refresh (task 6.5): reloads the view, invalidates cached
+   * artifact/assessment data together, and re-anchors the selection to the
+   * same identity (feature id, change id, worktree dir, or spec path). A
+   * failed refresh keeps the current view — stale evidence stays visible as
+   * such instead of readiness being presented as current.
+   */
+  private async refresh() {
+    const previous = this.rows[this.selectedRow]
+    const identity = previous?.kind === "feature" ? previous.feature.featureId : previous?.kind === "change" ? previous.change.id : previous?.kind === "worktree" ? previous.worktree.dir : previous?.kind === "spec" ? previous.path : undefined
+    try {
+      const next = await loadSpecsView(this.view.targetDir)
+      this.view = next
+    } catch {
+      // Keep the previous view: a failed refresh must not silently empty the
+      // board or present stale readiness as current. The next refresh retries.
+      this.render()
+      return
+    }
+    this.bodies.clear()
+    this.docs.clear()
+    const rows = this.rows
+    const matchIndex = rows.findIndex((row) => {
+      if (row.kind === "header" || previous === undefined || previous.kind === "header") return false
+      if (row.kind === "feature" && previous.kind === "feature") return row.feature.featureId === previous.feature.featureId
+      if (row.kind === "change" && previous.kind === "change") return row.change.id === previous.change.id
+      if (row.kind === "worktree" && previous.kind === "worktree") return row.worktree.dir === previous.worktree.dir
+      if (row.kind === "spec" && previous.kind === "spec") return row.path === previous.path
+      return false
+    })
+    if (matchIndex >= 0) this.selectedRow = matchIndex
+    else {
+      const firstSelectable = rows.findIndex((row) => row.kind !== "header")
+      if (firstSelectable >= 0) this.selectedRow = Math.min(firstSelectable, this.selectedRow)
+    }
+    this.render()
+  }
+
   private featureFor(change: SpecsChangeEntry): FeatureRow | undefined {
     return this.view.rows?.find((row) => row.id === change.id)
   }
@@ -445,11 +675,16 @@ export class SpecsBrowser {
     const row = this.rows[this.selectedRow]
     if (!row || row.kind === "header") return
     if (row.kind === "change") {
+      this.historyFeature = undefined
       this.subject = { kind: "change", change: row.change }
       this.groups = groupChangeArtifacts(row.change)
     } else if (row.kind === "worktree") {
       return
+    } else if (row.kind === "feature") {
+      this.enterFeatureHistory(row.feature)
+      return
     } else {
+      this.historyFeature = undefined
       this.subject = { kind: "spec", path: row.path }
       this.groups = [{ label: "Spec", delta: false, entries: [{ file: row.path }] }]
     }
@@ -463,8 +698,61 @@ export class SpecsBrowser {
   private leaveSubject() {
     if (!this.subject) return
     this.subject = undefined
+    this.historyFeature = undefined
     this.level = "root"
     this.fullscreen = false
+    this.menuOpen = false
+    this.render()
+  }
+
+  /**
+   * The discoverable History view (task 6.3): Enter on a feature row opens a
+   * single-group reading pane rendering the feature's durable history —
+   * landing receipts with their current reachability, linked runs, and the
+   * association events. Rendered from the row's own evidence; completed
+   * features stay inspectable without their worktrees.
+   */
+  private enterFeatureHistory(feature: LifecycleFeatureRow) {
+    const lines: string[] = [`# ${feature.displayName}`, "", `feature ${feature.featureId}`, `status: ${feature.summary}`, ""]
+    if (feature.branch) lines.push(`branch: ${feature.branch}`)
+    if (feature.receipts && feature.receipts.length > 0) {
+      lines.push("", "## Landing receipts", "")
+      for (const receipt of feature.receipts) {
+        lines.push(
+          `- attempt \`${receipt.attemptId.slice(0, 8)}\` — landing \`${receipt.landingSha.slice(0, 8)}\` — ${receipt.landingReachable ? "reachable from the base (verified)" : "**unreachable** (stale evidence)"}`,
+        )
+      }
+    }
+    if (feature.runIds && feature.runIds.length > 0) {
+      lines.push("", "## Runs", "")
+      for (const runId of feature.runIds) lines.push(`- \`${runId}\``)
+    }
+    if (feature.history && feature.history.length > 0) {
+      lines.push("", "## Association history", "")
+      for (const event of feature.history) {
+        const at = new Date(event.at).toISOString().slice(0, 16).replace("T", " ")
+        lines.push(`- ${at} · ${event.kind} — ${event.summary}`)
+      }
+    }
+    if (feature.blockers.length > 0) {
+      lines.push("", "## Blockers", "")
+      for (const blocker of feature.blockers) lines.push(`- ${blocker}`)
+    }
+    const historyKey = `history:${feature.featureId}`
+    this.bodies.set(historyKey, lines.join("\n"))
+    // The subject keeps the stable feature id as its identity; the display
+    // name only shapes the title (rendered history-aware below). The marker
+    // keeps apply/iterate — change-level actions — off this read-only view.
+    this.historyFeature = feature
+    this.subject = {
+      kind: "change",
+      change: { kind: "change", id: feature.featureId, title: `${feature.displayName} — history`, artifacts: [{ section: "other", file: historyKey }] },
+    }
+    this.groups = [{ label: "History", delta: false, entries: [{ file: historyKey }] }]
+    this.level = "detail"
+    this.selectedGroup = 0
+    this.detailScroll = 0
+    void this.loadSelectedGroup().then(() => this.render())
     this.render()
   }
 
@@ -496,6 +784,14 @@ export class SpecsBrowser {
 
   private get rows(): ListRow[] {
     const rows: ListRow[] = []
+    // Registered lifecycle features lead the board (capability specs-viewer:
+    // Features precedes Worktrees without spec, which precedes Canonical
+    // Specs); rows are keyed by stable feature identity.
+    const features = this.view.features ?? []
+    if (features.length > 0) {
+      rows.push({ kind: "header", label: "Features" })
+      for (const feature of features) rows.push({ kind: "feature", feature })
+    }
     if (this.view.changes.length > 0) {
       rows.push({ kind: "header", label: "Active Changes" })
       for (const change of this.view.changes) rows.push({ kind: "change", change })
@@ -623,7 +919,9 @@ export class SpecsBrowser {
     const group = this.groups[this.selectedGroup]
     if (this.fullscreen) {
       const subject = this.subject
-      const name = subject?.kind === "change" ? subject.change.id : subject ? specDisplayPath(subject.path) : ""
+      // The history view leads with its display name; the group label carries
+      // the "history" word, so the id (a feature uuid) never headlines it.
+      const name = subject?.kind === "change" ? (this.historyFeature ? this.historyFeature.displayName : subject.change.id) : subject ? specDisplayPath(subject.path) : ""
       const status = this.copyStatus ? ` · ${copyStatusLabel(this.copyStatus)}` : ""
       const position = this.readerPosition ? ` · ${this.readerPosition}` : ""
       return ` ${name} · ${group?.label.toLowerCase() ?? "read"}${status} · c copy · v/esc close${position} `
@@ -650,6 +948,20 @@ export class SpecsBrowser {
   private rowLine(row: ListRow, selected: boolean, width: number): StyledText {
     if (row.kind === "header") {
       return new StyledText([bold(fg(theme.accent)(` ${truncate(row.label.toUpperCase(), width)}`))])
+    }
+    if (row.kind === "feature") {
+      const feature = row.feature
+      const left: TextChunk[] = [selected ? fg(theme.accent)("▸ ") : raw("  "), fg(lifecycleColor(feature))("●"), raw(" ")]
+      const heading = feature.displayName === feature.featureId ? feature.featureId.slice(0, 8) : `${feature.displayName}`
+      const title = truncate(heading, Math.max(12, width - 18))
+      left.push(selected ? bold(fg(theme.text)(title)) : fg(theme.text)(title))
+      const state: TextChunk[] = [fg(lifecycleColor(feature))(feature.summary)]
+      const rest: string[] = []
+      if (feature.branch) rest.push(feature.branch)
+      if (feature.tasks && feature.tasks !== "unknown" && feature.tasks.total > 0) rest.push(`${feature.tasks.done}/${feature.tasks.total}`)
+      if (feature.liveRuns > 0) rest.push(`${feature.liveRuns} live`)
+      if (rest.length > 0) state.push(fg(theme.dim)(` · ${rest.join(" · ")}`))
+      return padBetween(left, state, width)
     }
     if (row.kind === "change") {
       const change = row.change
@@ -684,11 +996,46 @@ export class SpecsBrowser {
    * tab's markdown scrolls. Single-group subjects render no strip at all.
    */
   private detailsContent(width: number): StyledText {
+    // The Actions menu overlays either level (task 6.4); the fullscreen reader
+    // never shows it (its copy/close/tab keys are unchanged).
+    if (this.menuOpen && !(this.level === "detail" && this.fullscreen)) return this.menuContent(width)
     if (this.level !== "detail") {
       this.readerPosition = ""
       const row = this.rows[this.selectedRow]
       if (!row || row.kind === "header") return plain("")
       const lines: StyledText[] = []
+      if (row.kind === "feature") {
+        const feature = row.feature
+        // The same faint `label: ` anatomy the change rows' lifecycle block
+        // uses, so both root panels read as one surface.
+        const add = (label: string, value: string, color = theme.text) => {
+          lines.push(new StyledText([fg(theme.faint)(`${label}: `), fg(color)(truncate(value, Math.max(8, width - label.length - 2)))]))
+        }
+        lines.push(t`${bold(fg(theme.text)(truncate(feature.displayName, width)))}`)
+        lines.push(t`${fg(theme.dim)(`feature ${feature.featureId}`)}`)
+        lines.push(plain(""))
+        add("status", feature.summary, lifecycleColor(feature))
+        if (feature.branch) add("branch", feature.branch)
+        if (feature.checkoutPath) add("worktree", shortPath(feature.checkoutPath, Math.max(12, width - 10)))
+        if (feature.tasks && feature.tasks !== "unknown" && feature.tasks.total > 0) add("tasks", `${feature.tasks.done}/${feature.tasks.total} complete`)
+        if (feature.runIds?.length) add("runs", `${feature.runIds.length}${feature.liveRuns > 0 ? ` (${feature.liveRuns} live)` : ""}`)
+        else if (feature.liveRuns > 0) add("runs", `${feature.liveRuns} live`)
+        for (const contract of feature.contracts) add("contract", `${contract.changeId} (${contract.state})`)
+        if (feature.actions && feature.actions.length > 0) {
+          lines.push(plain(""))
+          lines.push(new StyledText([bold(fg(theme.accent)("actions"))]))
+          for (const action of feature.actions.filter((candidate) => candidate.enabled)) {
+            lines.push(new StyledText([raw("  "), fg(theme.green)("·"), fg(theme.text)(` ${truncate(action.label, Math.max(8, width - 4))}`)]))
+          }
+          for (const action of feature.actions.filter((candidate) => !candidate.enabled && candidate.blockers.length > 0)) {
+            lines.push(new StyledText([raw("  "), fg(theme.yellow)("·"), fg(theme.dim)(` ${truncate(action.label, Math.max(8, width - 4))} — blocked`)]))
+            for (const blocker of action.blockers) {
+              lines.push(new StyledText([raw("    "), fg(theme.yellow)(truncate(blocker, Math.max(8, width - 6)))]))
+            }
+          }
+        }
+        return joinLines(lines)
+      }
       if (row.kind === "change") {
         const change = row.change
         const feature = this.featureFor(change)
@@ -735,8 +1082,9 @@ export class SpecsBrowser {
     const subject = this.subject
     const lines: StyledText[] = []
 
-    // Title row identifying the subject.
-    const name = subject?.kind === "change" ? (subject.change.title === subject.change.id ? subject.change.id : `${subject.change.id} — ${subject.change.title}`) : subject ? specDisplayPath(subject.path) : ""
+    // Title row identifying the subject. A feature's history view titles by
+    // display name — its subject id is an opaque feature uuid, not a slug.
+    const name = subject?.kind === "change" ? (this.historyFeature ? `${this.historyFeature.displayName} — history` : subject.change.title === subject.change.id ? subject.change.id : `${subject.change.id} — ${subject.change.title}`) : subject ? specDisplayPath(subject.path) : ""
     lines.push(new StyledText([bold(fg(theme.accent)(` ${truncate(name, width)}`))]))
 
     // The tab strip: content rows, never a new box; hidden for single groups
@@ -773,12 +1121,56 @@ export class SpecsBrowser {
     return joinLines(lines.slice(0, this.detailsHeight()))
   }
 
+  /** The Actions menu overlay: dispatchable entries plus blocked reasons/remediation. */
+  private menuContent(width: number): StyledText {
+    const feature = this.menuTarget()
+    const items = this.menuItems()
+    if (this.menuIndex >= items.length) this.menuIndex = Math.max(0, items.length - 1)
+    const lines: StyledText[] = []
+    const title = feature ? `Actions — ${feature.displayName}` : "Actions"
+    lines.push(new StyledText([bold(fg(theme.accent)(` ${truncate(title, width)}`))]))
+    lines.push(plain(""))
+    items.forEach((item, index) => {
+      const selected = index === this.menuIndex
+      const marker = selected ? fg(theme.accent)("▸ ") : raw("  ")
+      const label = truncate(item.action.label, Math.max(8, width - 4))
+      if (item.dispatch && item.action.enabled) {
+        lines.push(new StyledText([marker, selected ? bold(fg(theme.text)(label)) : fg(theme.text)(label)]))
+      } else {
+        lines.push(new StyledText([marker, fg(theme.dim)(`${label} — blocked`)]))
+      }
+      for (const blocker of item.action.blockers) {
+        lines.push(new StyledText([raw("    "), fg(theme.yellow)(truncate(blocker, Math.max(8, width - 6)))]))
+      }
+      for (const remediation of item.action.remediation ?? []) {
+        lines.push(new StyledText([raw("    "), fg(theme.dim)(truncate(remediation, Math.max(8, width - 6)))]))
+      }
+    })
+    return joinLines(lines)
+  }
+
   /** Only actions that are not universal navigation conventions get hints. */
   private footerContent(width: number) {
+    // The open menu owns the footer: it names what answers what.
+    if (this.menuOpen) {
+      const hints: Hint[] = [
+        { keys: "↑↓", label: "move", priority: 1, style: "spaced" },
+        { keys: "enter", label: "run", priority: 2, style: "spaced" },
+        { keys: "esc", label: "back", priority: 3, style: "spaced" },
+      ]
+      return hintsRow(hints, [], width, { style: "spaced", overflow: moreHintsMarker })
+    }
+    // The discoverable action-menu entry is pinned (priority 0): footer
+    // truncation may drop every other hint, but access to the menu — and
+    // through it close review and its blockers — survives (task 6.4).
+    const actionsHint: Hint = { keys: "!", label: "actions", priority: 0, style: "spaced" }
     if (this.level === "detail") {
       const subject = this.subject
       const hints: Hint[] = [
-        ...(subject?.kind === "change"
+        actionsHint,
+        // Apply/iterate are change-level actions: the feature history view is
+        // read-only, so they stay off it entirely.
+        ...(subject?.kind === "change" && !this.historyFeature
           ? ([
               { keys: "a", label: "pply", priority: 2, style: "glued" },
               { keys: "i", label: "terate", priority: 5, style: "glued" },
@@ -793,9 +1185,11 @@ export class SpecsBrowser {
     }
 
     const feature = this.selectedFeature()
+    const lifecycle = this.selectedLifecycleFeature()
     const selected = this.rows[this.selectedRow]
     const canRead = selected?.kind === "change" || selected?.kind === "spec"
     const hints: Hint[] = [
+      actionsHint,
       ...(canRead ? ([{ keys: "enter", label: "read", priority: 2 }] as Hint[]) : []),
       ...(this.selectedChange()
         ? ([
@@ -806,6 +1200,15 @@ export class SpecsBrowser {
             ...(feature?.probablyMerged ? ([{ keys: "m", label: "archive", priority: 7 }] as Hint[]) : []),
           ] as Hint[])
         : []),
+      // Registered feature rows: the same continue/close/archive shortcuts,
+      // dispatched through the feature's verified identity (task 6.4).
+      ...(lifecycle?.checkoutPath && lifecycle.branch
+        ? ([
+            { keys: "c", label: "ontinue", priority: 6, style: "glued" },
+            { keys: "x", label: "close", priority: 7 },
+          ] as Hint[])
+        : []),
+      { keys: "r", label: "efresh", priority: 5, style: "glued" },
       { keys: "q", label: this.scene ? "back" : "uit", priority: 1, style: this.scene ? undefined : "glued" },
     ]
     const selectable = this.rows.filter((row) => row.kind !== "header").length
@@ -881,6 +1284,30 @@ function stageColor(stage: FeatureRow["stage"], live: boolean): string {
     case "probably-merged":
       return theme.orange
   }
+}
+
+/**
+ * A lifecycle row's dot and summary color, speaking the board's stage
+ * vocabulary: verified/ready in green, probable/stale in orange, repair in
+ * yellow (same attention color as a stranded row), live work in green, and
+ * everything else informational cyan. The summary strings come from the
+ * shared assessment (feature-lifecycle/assessment.ts), so the two move
+ * together.
+ */
+function lifecycleColor(feature: LifecycleFeatureRow): string {
+  if (feature.integration === "verified") return theme.green
+  if (feature.integration === "probable" || feature.integration === "stale") return theme.orange
+  if (feature.summary === "Ready to close" || feature.summary === "Implementation complete · archive verified") return theme.green
+  if (
+    feature.summary === "Association needed" ||
+    feature.summary === "Context missing" ||
+    feature.summary === "Context needs review" ||
+    feature.summary === "Contract sources need review" ||
+    feature.summary === "Implementation complete · blocked"
+  ) {
+    return theme.yellow
+  }
+  return feature.liveRuns > 0 ? theme.green : theme.cyan
 }
 
 /** The right-column state summary of a feature row: colored stage first, then dim signals. */

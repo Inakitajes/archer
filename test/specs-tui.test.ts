@@ -202,6 +202,68 @@ test("i iterates on the selected change from the root list", async () => {
   await expect(session.instance.result).resolves.toEqual({ type: "iterate-change", changeID: "add-login" })
 })
 
+test("a feature's history view never dispatches apply or iterate, even when its display name names an active change", async () => {
+  const view = sampleView()
+  view.features = [
+    {
+      featureId: "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      displayName: "add-login", // deliberately equals the active change id above
+      summary: "In implementation",
+      blockers: [],
+      liveRuns: 0,
+      integration: "pending",
+      contracts: [{ changeId: "add-login", state: "active" }],
+    },
+  ]
+  const session = await openBrowser(view)
+
+  // The cursor opens on the feature row; enter shows its read-only history.
+  session.press("return")
+  await session.renderOnce()
+  await settle()
+  await session.renderOnce()
+  const history = session.captureCharFrame()
+  // The title leads with the display name; the feature uuid never headlines it.
+  expect(history).toContain("add-login — history")
+  expect(history).not.toContain("— add-login — history")
+
+  // Apply/iterate are change-level actions: on the history view they neither
+  // launch the same-named change nor end the browser.
+  session.press("a")
+  await session.renderOnce().catch(() => {})
+  session.press("i")
+  await session.renderOnce().catch(() => {})
+  session.press("escape")
+  await session.renderOnce()
+  expect(session.captureCharFrame()).toContain("FEATURES")
+
+  // Quit still resolves exit — proving neither shortcut finished the browser.
+  session.press("q")
+  await expect(session.instance.result).resolves.toEqual({ type: "exit" })
+})
+
+test("a selected feature row's details panel shares the change rows' label anatomy", async () => {
+  const view = sampleView()
+  view.features = [
+    {
+      featureId: "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      displayName: "add-login",
+      branch: "feat/add-login",
+      checkoutPath: "/tmp/wt-add-login",
+      summary: "Association needed",
+      blockers: [],
+      liveRuns: 0,
+      integration: "pending",
+      contracts: [{ changeId: "add-login", state: "active" }],
+    },
+  ]
+  const frame = await frameOf(view)
+  expect(frame).toContain("status: Association needed")
+  expect(frame).toContain("branch: feat/add-login")
+  expect(frame).toContain("worktree: /tmp/wt-add-login")
+  expect(frame).toContain("contract: add-login (active)")
+})
+
 test("selection crosses sections: enter on a canonical spec reads it", async () => {
   const view = sampleView()
   view.changes = [{ kind: "change", id: "only-change", title: "Only change", artifacts: [] }]

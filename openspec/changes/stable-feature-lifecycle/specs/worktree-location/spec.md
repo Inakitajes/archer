@@ -7,10 +7,15 @@ New-worktree creation, collision handling, and launcher preview SHALL use the sa
 #### Scenario: Suffix avoids collision at a declared location
 - **WHEN** the launcher's worktree allocation finds the resolved branch location occupied
 - **THEN** its existing suffix policy selects a non-colliding branch/location consistently in preview and creation, and any resulting feature association records the actual result
-
 #### Scenario: Finish locates a non-default worktree
+
 - **WHEN** a lifecycle action such as close or continue targets a feature associated with a worktree outside the built-in default location
 - **THEN** Convoy validates that context against Git's worktree inventory instead of assuming a branch-derived path
+
+#### Scenario: Close and continue locate a non-default worktree
+
+- **WHEN** close or continue resolves a feature whose verified association points at a worktree outside the built-in default location
+- **THEN** Convoy locates the worktree from the repository's worktree list (or the feature's verified association) rather than reconstructing a fixed path
 
 #### Scenario: Worktree moves outside Convoy
 - **WHEN** Git reports a feature's worktree at a new path

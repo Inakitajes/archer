@@ -3,7 +3,7 @@ import { createTestRenderer } from "@opentui/core/testing"
 
 import { SpecsBrowser } from "../src/specs-browser"
 import type { FeatureRow, WorktreeWithoutSpec } from "../src/control-board"
-import type { SpecsChangeEntry, SpecsResolution, SpecsView } from "../src/specs"
+import type { LifecycleFeatureRow, SpecsChangeEntry, SpecsResolution, SpecsView } from "../src/specs"
 
 function keyEvent(name: string, options: { ctrl?: boolean; shift?: boolean; sequence?: string } = {}) {
   return {
@@ -231,5 +231,154 @@ describe("compact stacking", () => {
       testRenderer.renderer.keyInput.emit("keypress", keyEvent("c", { ctrl: true }))
       await instance.result.catch(() => {})
     }
+  })
+})
+
+// ── registered lifecycle features (tasks 6.3/6.4/6.5) ───────────────────────
+
+function lifecycleRow(overrides: Partial<LifecycleFeatureRow> = {}): LifecycleFeatureRow {
+  return {
+    featureId: "aaaaaaaa-0000-4000-8000-000000000009",
+    displayName: "add-widget",
+    branch: "feat/add-widget",
+    checkoutPath: "/wt/add-widget",
+    summary: "Ready to close",
+    blockers: [],
+    tasks: { done: 11, total: 11 },
+    liveRuns: 0,
+    integration: "pending",
+    contracts: [{ changeId: "add-widget", state: "active" }],
+    actions: [
+      { id: "close", label: "Close review", enabled: true, blockers: [] },
+      { id: "continue", label: "Continue implementation", enabled: true, blockers: [] },
+    ],
+    ...overrides,
+  }
+}
+
+function viewWithFeatures(features: LifecycleFeatureRow[]): SpecsView {
+  return {
+    targetDir: "/repo",
+    present: true,
+    changes: [],
+    specs: [],
+    features,
+    worktreesWithoutSpec: [],
+  }
+}
+
+describe("registered lifecycle features on the board", () => {
+  test("the Features section renders first with summaries and the assessment detail", async () => {
+    const frame = await frameOf(viewWithFeatures([lifecycleRow()]))
+    const lines = frame.split("\n")
+    const features = lines.findIndex((line) => line.includes("FEATURES"))
+    expect(features).toBeGreaterThanOrEqual(0)
+    // The Features section leads the board — before Worktrees/Canonical
+    // headers (absent here) and before any Active Changes rows.
+    expect(frame.indexOf("FEATURES")).toBeLessThan(frame.indexOf("add-widget"))
+    expect(frame).toContain("Ready to close")
+    expect(frame).toContain("feat/add-widget")
+  })
+
+  test("a blocked feature's detail exposes its blockers with reasons (task 6.4)", async () => {
+    const view = viewWithFeatures([
+      lifecycleRow({
+        summary: "In implementation",
+        blockers: ["1 live run(s) attached"],
+        actions: [{ id: "close", label: "Close review", enabled: false, blockers: ["1 live run(s) attached"] }],
+      }),
+    ])
+    const frame = await frameOf(view)
+    expect(frame).toContain("In implementation")
+    expect(frame).toContain("Close review")
+    expect(frame).toContain("blocked")
+    expect(frame).toContain("1 live run(s) attached")
+  })
+
+  test("x on a feature row dispatches the close handoff through its verified context (task 6.4)", async () => {
+    const session = await openBoard(viewWithFeatures([lifecycleRow()]))
+    session.press("x")
+    await expect(session.instance.result).resolves.toEqual({
+      type: "close-change",
+      changeID: "add-widget",
+      worktreeDir: "/wt/add-widget",
+      branch: "feat/add-widget",
+    })
+  })
+
+  test("Enter on a completed feature opens its History view with receipts (task 6.3)", async () => {
+    const completed = lifecycleRow({
+      summary: "Completed",
+      integration: "verified" as const,
+      contracts: [{ changeId: "add-widget", state: "verified-archived" }],
+      receipts: [{ attemptId: "dddddddd-0000-4000-8000-00000000abc3", landingSha: "e".repeat(40), landingReachable: true }],
+      history: [{ at: 1_700_000_000_000, kind: "recovered", summary: "adopted legacy landing" }],
+    })
+    const session = await openBoard(viewWithFeatures([completed]))
+    session.press("return")
+    await session.renderOnce()
+    const frame = session.captureCharFrame()
+    expect(frame).toContain("add-widget — history")
+    expect(frame).toContain("Landing receipts")
+    expect(frame).toContain("reachable from the base (verified)")
+    expect(frame).toContain("Association history")
+    // Leaving the history detail restores the feature row (identity preserved).
+    session.press("escape")
+    await session.renderOnce()
+    expect(session.captureCharFrame()).toContain("FEATURES")
+    session.press("c", { ctrl: true })
+    await session.instance.result.catch(() => {})
+  })
+
+  test("refresh reloads external changes from the real repo (task 6.5)", async () => {
+    const { execFile: nodeExecFile } = await import("node:child_process")
+    const { mkdir, mkdtemp, writeFile } = await import("node:fs/promises")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const { promisify } = await import("node:util")
+    const exec = promisify(nodeExecFile)
+    const root = await mkdtemp(join(tmpdir(), "convoy-board-refresh-"))
+    const main = join(root, "main")
+    const wt = join(root, "wt")
+    await mkdir(main, { recursive: true })
+    await exec("git", ["init", "-b", "main"], { cwd: main })
+    await writeFile(join(main, "README.md"), "# repo\n")
+    await exec("git", ["add", "."], { cwd: main })
+    await exec("git", ["-c", "user.email=t@x", "-c", "user.name=T", "commit", "-m", "init"], { cwd: main })
+    await exec("git", ["worktree", "add", "-b", "feat/add-widget", wt], { cwd: main })
+    const changeDir = join(wt, "openspec", "changes", "add-widget")
+    await mkdir(changeDir, { recursive: true })
+    await writeFile(join(changeDir, "proposal.md"), "# Add widget\n")
+    await writeFile(join(changeDir, "tasks.md"), "- [x] one\n- [x] two\n")
+
+    const { featureAdopt } = await import("../src/feature-lifecycle/commands")
+    await featureAdopt({ cwd: main, branch: "feat/add-widget", changeIds: ["add-widget"], base: "main" })
+
+    // Stub the real openspec CLI so task counting is deterministic: the
+    // checkbox fallback parses tasks.md directly.
+    const { chmod } = await import("node:fs/promises")
+    const stubDir = join(root, "bin")
+    await mkdir(stubDir, { recursive: true })
+    await writeFile(join(stubDir, "openspec"), "#!/bin/sh\nexit 1\n")
+    await chmod(join(stubDir, "openspec"), 0o755)
+    const savedPath = process.env.PATH
+    process.env.PATH = `${stubDir}:${savedPath}`
+    const restorePath = () => {
+      if (savedPath !== undefined) process.env.PATH = savedPath
+    }
+
+    const { loadSpecsView } = await import("../src/specs")
+    const session = await openBoard(await loadSpecsView(main))
+    expect(session.captureCharFrame()).toContain("Ready to close")
+
+    // An external edit marks a task incomplete; refresh must show it.
+    await writeFile(join(changeDir, "tasks.md"), "- [x] one\n- [ ] two\n")
+    session.press("r")
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const frame = session.captureCharFrame()
+    restorePath()
+    expect(frame).toContain("In implementation")
+    session.press("c", { ctrl: true })
+    await session.instance.result.catch(() => {})
   })
 })

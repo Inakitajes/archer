@@ -237,6 +237,7 @@ describe("spin", () => {
         movedFiles: ["openspec/changes/add-widget/proposal.md"],
         committedOnBase: false,
         prefix: "feat",
+        featureId: "00000000-0000-4000-8000-000000000001",
       })
     } finally {
       process.stdout.write = originalWrite
@@ -263,6 +264,7 @@ describe("spin", () => {
         movedFiles: [],
         committedOnBase: true,
         prefix: "feat",
+        featureId: "00000000-0000-4000-8000-000000000002",
       })
     } finally {
       process.stdout.write = originalWrite

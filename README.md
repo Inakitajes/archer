@@ -174,7 +174,21 @@ convoy --change add-login -p review
 
 ## The feature lifecycle: control, spin, close
 
-Everything the board shows is derived at render time from git, OpenSpec, and run plans — Convoy keeps no feature registry. If it appears, it is correct; if a worktree is deleted outside Convoy, the next open simply shows it gone.
+A unit of work has a stable, repository-scoped identity that survives renames, archiving, and cleanup. Convoy keeps a small local registry in the repository's Git common directory (`<git-common-dir>/convoy/`) — a repository UUID, one record per feature (its change contracts, intended base, current branch/worktree, runs, and close attempts), and immutable per-attempt landing receipts. The registry remembers what the operator associated with a context; everything it *displays* — worktrees, branches, tasks, run liveness, integration eligibility — is still derived at render time from fresh evidence, so if a worktree is deleted outside Convoy, the next open simply shows it gone. Records are keyed by opaque ids, so branch renames and reused branch names never alias old work into new authority.
+
+### Stable identities: `convoy feature`
+
+```bash
+convoy feature show                 # the feature for this context (or list discovery evidence)
+convoy feature show <id> --json     # machine-readable record, receipts, blockers
+convoy feature adopt --branch team/alice/release-42 --change add-widget --base main
+convoy feature bind <id> --branch feature/renamed --worktree <path>   # rebind after a rename/move
+convoy feature revise <id> --change one --change two --base main      # replace the contract set
+convoy feature recover --legacy --change add-widget                   # adopt a completed legacy landing
+convoy feature new-work --branch feat/one --worktree <path> --change next --base main
+```
+
+Adoption and rebinding are explicit consent operations: they validate repository membership, the actual checked-out branch, worktree registration, and the selected sources, and they never rename a branch (any Git-valid name is accepted as-is). Adoption records intent — it never marks tasks, archives, or integration complete. A completed feature (verified landing receipt) releases its claim on its branch; starting new work on that branch is the explicit `new-work` decision, which mints a fresh identity and inherits nothing. Legacy close journals from before stable ids are readable evidence: `recover --legacy` imports one only after validating its embedded landing against current Git, refusing collisions with registered features.
 
 ### The specs board (`convoy specs`)
 
@@ -213,7 +227,7 @@ branch: feat/add-login
 continue the same OpenCode conversation: run /move and pick the worktree above
 ```
 
-The operator's OpenCode session relocates with `/move` (OpenCode's own command — Convoy never forks or summarizes a session). If `/move`'s picker doesn't list the fresh worktree, open a session in the printed directory instead. A tree dirty outside `openspec/` refuses to spin; a change already committed on the base branch spins with nothing moved.
+The operator's OpenCode session relocates with `/move` (OpenCode's own command — Convoy never forks or summarizes a session). If `/move`'s picker doesn't list the fresh worktree, open a session in the printed directory instead. A tree dirty outside `openspec/` refuses to spin; a change already committed on the base branch spins with nothing moved. A successful spin also **registers the feature**: the stable identity, the selected contract, and the created branch/worktree are durably associated before the handoff prints, so every later board, launcher, and close lookup resolves the same feature by identity rather than by branch spelling. If the registry write fails, spin refuses to claim success and prints the created worktree, transferred files, and recovery steps — nothing is committed or deleted.
 
 The global `/convoy-spin` OpenCode command is opt-in: run `convoy opencode install` once and the thin wrapper at `~/.config/opencode/commands/convoy-spin.md` tells the agent to run `convoy spin` and relay its output, touching no other command files (spin never writes into your global config).
 
@@ -237,9 +251,19 @@ In a terminal the whole sequence runs in a full-screen TUI: completed, skipped (
 
 The message review is a vertical Accept / Edit / Cancel list: `↑`/`↓` (or `j`/`k`) move the selection, `Enter` activates the highlighted choice, and the direct shortcuts `y` / `e` / `n` still work. **Edit opens an inline multiline editor inside the TUI** — no external `$EDITOR` round-trip. Type freely (`Enter` inserts a newline), press `Ctrl+S` to save and return to review, or `Esc` to discard the draft and keep the previously reviewed message. Nothing lands until you explicitly choose Accept, so saving an edit is not a confirmation.
 
-Push, worktree removal, and branch deletion are separate, deliberate offers — never automatic. Push uses the base branch's configured remote with an explicit refspec, and is unavailable (with the setup step printed instead) when the base branch has no upstream. Worktree removal must succeed before branch deletion is offered, because git refuses to delete a checked-out branch; and because a squash-landed branch has no merge ancestry, deletion is gated on close's verified landing receipt — the exact feature tip unchanged and the landing commit still reachable from the base — with the printed command re-checking both facts right before `git branch -D`. Headless runs print the equivalent guarded commands in that same safe order.
+Push, worktree removal, and branch deletion are separate, deliberate offers — never automatic. Push uses the base branch's configured remote with an explicit refspec, and is unavailable (with the setup step printed instead) when the base branch has no upstream. Worktree removal must succeed before branch deletion is offered, because git refuses to delete a checked-out branch; and because a squash-landed branch has no merge ancestry, deletion is gated on close's verified landing receipt — the exact feature tip unchanged and the landing commit still reachable from the base — and executed as an **atomic expected-tip deletion** (`git update-ref -d refs/heads/<branch> <expected-tip>`): if the branch moved between the check and the deletion — for example because a new feature reused the name — the expected-old value refuses, so the wrong work is never deleted. Headless runs print the equivalent guarded commands in that same safe order.
 
 One cleanup nuance: when close was **launched from inside the feature worktree**, worktree removal and branch deletion are presented as *deferred cleanup* — an explanation plus the exact `git -C <main-checkout>` commands in dependency order — rather than as selectable actions. A process cannot remove the directory its own shell sits in, so no amount of navigation inside this session can make those actions runnable; leave the worktree in your terminal first and run the printed commands from outside. Push is unaffected: it is offered either way.
+
+### What close's evidence means (and what it doesn't)
+
+Lifecycle facts are kept deliberately orthogonal — none implies another:
+
+- **Tasks complete** is not "ready to close": a live run, an unverified context, or an unreadable source each blocks the close review with its reason, and the review stays reachable while blocked.
+- **Archived** is not "integrated": a change can be archived (including by hand, or by `m` archive-on-main) while its branch is unlanded. The board reports *Implementation complete · archive verified* and keeps the close review available.
+- **Probably merged** is not "merged": patch equivalence without a receipt stays probabilistic, forever.
+- **A verified landing receipt** is the only certain local integration: it names the exact feature tip and the landing commit, and counts only while that landing is still reachable from the base and the tip is unchanged. That is *integrated locally* — it says nothing about a remote, a PR, or a hosted merge.
+- **Landing is two recorded stages**: the base ref moves through an expected-old guarded ref transaction (after which the landing has happened, even if the process dies), and the base checkout is then materialized with a guarded update. A crash between them is reconciled on the next `close --resume` — the landing is recognized, the checkout is brought up to date, the receipt is written, and no second commit is ever created for the same closed tip.
 
 ## Goal mode
 

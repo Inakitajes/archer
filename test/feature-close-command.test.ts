@@ -161,6 +161,22 @@ describe("parseCloseArgs", () => {
     expect(() => parseCloseArgs(["--branch"])).toThrow(/requires a value/)
     expect(() => parseCloseArgs(["--message"])).toThrow(/requires a value/)
   })
+
+  test("--feature and --cleanup parse; a bad cleanup value refuses (SC-2)", () => {
+    expect(parseCloseArgs(["--feature", "abc-uuid"])).toMatchObject({ featureId: "abc-uuid" })
+    expect(parseCloseArgs(["--feature=abc-uuid"])).toMatchObject({ featureId: "abc-uuid" })
+    expect(parseCloseArgs(["--cleanup", "worktree"])).toMatchObject({ cleanup: "worktree" })
+    expect(parseCloseArgs(["--cleanup=branch"])).toMatchObject({ cleanup: "branch" })
+    expect(() => parseCloseArgs(["--cleanup", "everything"])).toThrow(/expects "worktree" or "branch"/)
+    expect(() => parseCloseArgs(["--cleanup"])).toThrow(/requires a value/)
+  })
+
+  test("the help documents --feature and --cleanup (the remediation never names a flag the parser rejects)", () => {
+    const help = closeHelp()
+    expect(help).toContain("--feature <id>")
+    expect(help).toContain("--cleanup")
+    expect(help).toContain("worktree|branch")
+  })
 })
 
 // -- task 3.2: the checklist frames ----------------------------------------------
@@ -342,8 +358,31 @@ describe("resolveCloseFollowUps", () => {
     const unevidenced = await resolveCloseFollowUps({ targetDir: fixture.mainDir, baseRef: "main", branch: "feat/add-widget", worktreeDir: fixture.worktreeDir })
     expect(unevidenced.branchDelete).toBeUndefined()
     expect(unevidenced.branchDeleteRemediation).toContain("receipt")
-    // With the receipt the deletion is offered as a guarded command that
-    // re-checks the exact tip and landing reachability right before `branch -D`.
+    // With the receipt and the resolved feature, cleanup prints the
+    // feature-keyed guarded commands (design D9): they execute the same
+    // identity-aware checks as the TUI actions — fresh association,
+    // unresolved-attempt, live-run, worktree-inventory, and mutation-lease
+    // checks on top of the landing evidence — never a display-only git
+    // recipe.
+    const tip = await git(fixture.mainDir, "rev-parse", "feat/add-widget")
+    const followUps = await resolveCloseFollowUps({
+      targetDir: fixture.mainDir,
+      baseRef: "main",
+      branch: "feat/add-widget",
+      worktreeDir: fixture.worktreeDir,
+      featureId: "11111111-2222-3333-4444-555555555555",
+      evidence: { landingSha: tip, featureTip: tip },
+    })
+    // Push still names its explicit remote and refspec (publication is not cleanup).
+    const main = await realPath(fixture.mainDir)
+    expect(followUps.push).toEqual({ remote: "origin", refspec: "main:main", command: `git -C ${main} push origin main:main` })
+    expect(followUps.pushRemediation).toBeUndefined()
+    expect(followUps.worktreeRemoval).toBe("convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup worktree")
+    expect(followUps.branchDelete).toBe("convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup branch")
+  })
+
+  test("without a resolved feature the guarded git display remains (synthetic callers only; close itself always resolves one)", async () => {
+    const fixture = await makeFixture()
     const tip = await git(fixture.mainDir, "rev-parse", "feat/add-widget")
     const followUps = await resolveCloseFollowUps({
       targetDir: fixture.mainDir,
@@ -352,20 +391,19 @@ describe("resolveCloseFollowUps", () => {
       worktreeDir: fixture.worktreeDir,
       evidence: { landingSha: tip, featureTip: tip },
     })
-    // The printed commands carry git -C <main-repo> and only quote unsafe paths,
-    // so they stay executable from inside the feature worktree (SC-2).
     const main = await realPath(fixture.mainDir)
-    expect(followUps.push).toEqual({ remote: "origin", refspec: "main:main", command: `git -C ${main} push origin main:main` })
-    expect(followUps.pushRemediation).toBeUndefined()
     expect(followUps.worktreeRemoval).toBe(`git -C ${main} worktree remove ${fixture.worktreeDir}`)
+    // The legacy display keeps the full guarded chain: tip check, reachability,
+    // worktree inventory, then the atomic expected-tip ref deletion.
     expect(followUps.branchDelete).toBe(
       `git -C ${main} rev-parse --verify refs/heads/feat/add-widget | grep -qx ${tip} && ` +
       `git -C ${main} merge-base --is-ancestor ${tip} main && ` +
-      `git -C ${main} branch -D feat/add-widget`,
+      `! git -C ${main} worktree list --porcelain | grep -qx 'branch refs/heads/feat/add-widget' && ` +
+      `git -C ${main} update-ref -d refs/heads/feat/add-widget ${tip}`,
     )
   })
 
-  test("a feature tip that moved past the landing withdraws the deletion command", async () => {
+  test("a moved tip cannot withdraw the feature-keyed command: it is the guarded op and refuses at action time", async () => {
     const fixture = await makeFixture()
     const tip = await git(fixture.mainDir, "rev-parse", "feat/add-widget")
     await git(fixture.worktreeDir, "commit", "--allow-empty", "-m", "feat: new work after the landing")
@@ -374,10 +412,12 @@ describe("resolveCloseFollowUps", () => {
       baseRef: "main",
       branch: "feat/add-widget",
       worktreeDir: fixture.worktreeDir,
+      featureId: "11111111-2222-3333-4444-555555555555",
       evidence: { landingSha: tip, featureTip: tip },
     })
-    expect(followUps.branchDelete).toBeUndefined()
-    expect(followUps.branchDeleteRemediation).toContain("moved past the landed state")
+    // The command is printed, but executing it refuses with the moved-tip
+    // diagnostic — the guard lives in the operation, not in the printout.
+    expect(followUps.branchDelete).toBe("convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup branch")
   })
 
   test("a missing upstream yields the remediation and no push", async () => {
@@ -397,13 +437,13 @@ describe("resolveCloseFollowUps", () => {
   test("formatCloseFollowUps keeps push, worktree removal, then branch deletion in order", () => {
     const lines = formatCloseFollowUps({
       push: { remote: "origin", refspec: "main:main", command: "git push origin main:main" },
-      worktreeRemoval: "git worktree remove /wt",
-      branchDelete: "git branch -d feat/x",
+      worktreeRemoval: "convoy close --feature f-1 --cleanup worktree",
+      branchDelete: "convoy close --feature f-1 --cleanup branch",
     })
     const at = (needle: string) => lines.findIndex((line) => line.includes(needle))
     expect(at("git push origin main:main")).toBeGreaterThan(-1)
-    expect(at("git worktree remove /wt")).toBeGreaterThan(at("git push origin main:main"))
-    expect(at("git branch -d feat/x")).toBeGreaterThan(at("git worktree remove /wt"))
+    expect(at("convoy close --feature f-1 --cleanup worktree")).toBeGreaterThan(at("git push origin main:main"))
+    expect(at("convoy close --feature f-1 --cleanup branch")).toBeGreaterThan(at("convoy close --feature f-1 --cleanup worktree"))
   })
 })
 
@@ -452,12 +492,13 @@ describe("confirmCloseMessage", () => {
 describe("buildCloseFollowUpsView", () => {
   const offersFor = (fixture: { mainDir: string; worktreeDir: string }): FollowUpOffers => ({
     push: { remote: "origin", refspec: "main:main", command: `git -C ${fixture.mainDir} push origin main:main` },
-    worktreeRemoval: `git -C ${fixture.mainDir} worktree remove '${fixture.worktreeDir}'`,
-    branchDelete: `git -C ${fixture.mainDir} branch -d feat/add-widget`,
+    worktreeRemoval: "convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup worktree",
+    branchDelete: "convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup branch",
     baseRef: "main",
     branch: "feat/add-widget",
     worktreeDir: fixture.worktreeDir,
     targetDir: fixture.mainDir,
+    featureId: "11111111-2222-3333-4444-555555555555",
   })
 
   test("launched outside the worktree: push and removal are actions, branch deletion is blocked (same-session dependency)", async () => {
@@ -469,8 +510,8 @@ describe("buildCloseFollowUpsView", () => {
       "worktree:available",
       "branch:blocked",
     ])
-    // The blocked row keeps its explicit command for later use.
-    expect(view.actions[2]!.command).toContain("branch -d feat/add-widget")
+    // The blocked row keeps its explicit feature-keyed command for later use.
+    expect(view.actions[2]!.command).toContain("convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup branch")
   })
 
   test("launched inside the worktree: only push is an action; cleanup is ordered deferred guidance naming the shell location", async () => {
@@ -479,9 +520,11 @@ describe("buildCloseFollowUpsView", () => {
     expect(view.actions.map((action) => action.id)).toEqual(["push"])
     expect(view.deferred).toBeDefined()
     expect(view.deferred!.reason).toContain("launched from inside")
+    // The deferred steps are the feature-keyed guarded commands, worktree
+    // removal before branch deletion (design D9) — not raw git recipes.
     expect(view.deferred!.steps.map((step) => step.command)).toEqual([
-      `git -C ${fixture.mainDir} worktree remove '${fixture.worktreeDir}'`,
-      `git -C ${fixture.mainDir} branch -d feat/add-widget`,
+      "convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup worktree",
+      "convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup branch",
     ])
   })
 
@@ -522,19 +565,20 @@ describe("offerCloseFollowUps", () => {
     const io = createIO(["n"])
     await offerCloseFollowUps(
       {
-        branchDelete: "git branch -D feat/add-widget",
+        branchDelete: "convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup branch",
         ...(await evidenceFor(fixture.mainDir)),
-        worktreeRemoval: `git worktree remove ${fixture.worktreeDir}`,
+        worktreeRemoval: "convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup worktree",
         baseRef: "main",
         branch: "feat/add-widget",
         worktreeDir: fixture.worktreeDir,
         targetDir: fixture.mainDir,
+        featureId: "11111111-2222-3333-4444-555555555555",
       },
       io,
     )
     const text = cleaned(io.chunks)
-    expect(text).toContain(`next: git worktree remove ${fixture.worktreeDir}`)
-    expect(text).toContain("next (after the worktree is removed): git branch -D feat/add-widget")
+    expect(text).toContain("next: convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup worktree")
+    expect(text).toContain("next (after the worktree is removed): convoy close --feature 11111111-2222-3333-4444-555555555555 --cleanup branch")
     // The branch still exists and still has its worktree.
     expect((await stat(fixture.worktreeDir)).isDirectory()).toBe(true)
     expect(await git(fixture.mainDir, "rev-parse", "--verify", "feat/add-widget")).toBeTruthy()

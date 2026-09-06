@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `convoy specs` command lets an operator browse OpenSpec state — active changes and canonical specs — in a terminal UI, read each change's artifacts as rendered markdown, hand a selected change straight to the interactive run launcher with it already pinned as the contract, or open a standalone OpenCode session on the repo rooted at the change's planning files.
+The `convoy specs` command lets an operator browse OpenSpec state — registered features and active changes (lifecycle work), canonical specs — in a terminal UI, read each change's artifacts as rendered markdown from its authoritative source, hand a selected change straight to the interactive run launcher with it already pinned as the contract, or open a standalone OpenCode session on the repo rooted at the change's planning files.
 
 ## Requirements
 
