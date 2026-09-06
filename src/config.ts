@@ -58,6 +58,19 @@ export type ConvoyConfig = {
    * keep the built-in defaults; `enabled: false` turns the whole guard off.
    */
   loopGuard?: LoopGuardSettings
+  /** Terminal-experience tweaks; only keys the user set take effect. */
+  ui?: UiConfig
+}
+
+/** TUI motion preferences; see the loading-transition capability. */
+export type UiConfig = {
+  /**
+   * Motion for the home session's loading transition: "auto" (the default)
+   * probes the OS reduce-motion setting, "on" always renders a static frame,
+   * "off" always animates. The CONVOY_REDUCED_MOTION environment variable
+   * outranks this.
+   */
+  reducedMotion?: "auto" | "on" | "off"
 }
 
 export type ConvoyDefaults = {
@@ -218,6 +231,7 @@ export function mergeConvoyConfigs(global: ConvoyConfig | undefined, project: Co
       overrides: mergeRoutingOverrides(global.modelRouting?.overrides ?? {}, project.modelRouting?.overrides ?? {}),
     },
     ...(global.loopGuard || project.loopGuard ? { loopGuard: { ...global.loopGuard, ...project.loopGuard } } : {}),
+    ...(global.ui || project.ui ? { ui: { ...global.ui, ...project.ui } } : {}),
   }
 }
 
@@ -294,6 +308,13 @@ defaults:
 #   sameToolFailures: 6    # same tool failing in a row (args may drift)
 #   maxSteps: 200          # hard budget gate; a best-effort model-only nudge is queued at half this value
 #   maxPhaseCost: 20       # USD; false to disable the cost fuse
+
+# Terminal motion for the home session's loading transition. "auto" (the
+# default) honors the OS reduce-motion setting; "on" always renders a static
+# frame; "off" always animates. The CONVOY_REDUCED_MOTION environment variable
+# outranks this.
+# ui:
+#   reducedMotion: auto
 
 # Agents are matched by name with Markdown prompts next to this config:
 #   agents/<name>.md
@@ -515,7 +536,7 @@ export function parseConvoyConfig(body: string, source: string, targetDir: strin
   const root = v.record(raw, "")
   // Unknown keys warn instead of failing so configs written for a newer
   // convoy still load; typos surface in the warning either way.
-  v.knownKeys(root, "", ["version", "defaults", "agents", "pipelines", "permissions", "hooks", "attachments", "notifications", "modelRouting", "loopGuard"])
+  v.knownKeys(root, "", ["version", "defaults", "agents", "pipelines", "permissions", "hooks", "attachments", "notifications", "modelRouting", "loopGuard", "ui"])
 
   if (root.version !== undefined && root.version !== 1) v.fail("version", `unsupported value ${JSON.stringify(root.version)}; this convoy reads version 1`)
 
@@ -533,8 +554,22 @@ export function parseConvoyConfig(body: string, source: string, targetDir: strin
   if (root.notifications !== undefined) config.notifications = validateNotifications(v, root.notifications)
   if (root.modelRouting !== undefined) config.modelRouting = validateModelRouting(v, root.modelRouting)
   if (root.loopGuard !== undefined) config.loopGuard = validateLoopGuard(v, root.loopGuard)
+  if (root.ui !== undefined) config.ui = validateUi(v, root.ui)
 
   return config
+}
+
+function validateUi(v: Validator, raw: unknown): UiConfig {
+  const record = v.record(raw, "ui")
+  v.knownKeys(record, "ui", ["reducedMotion"])
+  const ui: UiConfig = {}
+  if (record.reducedMotion !== undefined) {
+    if (record.reducedMotion !== "auto" && record.reducedMotion !== "on" && record.reducedMotion !== "off") {
+      v.fail("ui.reducedMotion", 'must be "auto", "on", or "off"')
+    }
+    ui.reducedMotion = record.reducedMotion as UiConfig["reducedMotion"]
+  }
+  return ui
 }
 
 /**
@@ -1133,6 +1168,7 @@ export function serializeConvoyConfig(config: ConvoyConfig): string {
   if (Object.keys(config.notifications).length > 0) out.notifications = config.notifications
   if (config.modelRouting && (config.modelRouting.gateway !== undefined || Object.keys(config.modelRouting.overrides).length > 0)) out.modelRouting = config.modelRouting
   if (config.loopGuard && Object.keys(config.loopGuard).length > 0) out.loopGuard = config.loopGuard
+  if (config.ui && Object.keys(config.ui).length > 0) out.ui = config.ui
   return Bun.YAML.stringify(out, null, 2)
 }
 

@@ -982,6 +982,40 @@ describe("loopGuard config", () => {
   })
 })
 
+describe("ui config", () => {
+  test("parses the reduced-motion switch and leaves it unset by default", () => {
+    expect(parse("ui:\n  reducedMotion: on").ui).toEqual({ reducedMotion: "on" })
+    expect(parse("ui:\n  reducedMotion: off").ui).toEqual({ reducedMotion: "off" })
+    expect(parse("ui:\n  reducedMotion: auto").ui).toEqual({ reducedMotion: "auto" })
+    expect(parse("defaults:\n  prdHistory: true").ui).toBeUndefined()
+  })
+
+  test("rejects values outside the auto/on/off tri-state", () => {
+    expect(() => parse("ui:\n  reducedMotion: sometimes")).toThrow("ui.reducedMotion")
+    expect(() => parse("ui:\n  reducedMotion: true")).toThrow("ui.reducedMotion")
+  })
+
+  test("the project choice wins over the global one", () => {
+    const global = parse("ui:\n  reducedMotion: off")
+    const project = parse("ui:\n  reducedMotion: on")
+    expect(mergeConvoyConfigs(global, project)?.ui).toEqual({ reducedMotion: "on" })
+    expect(mergeConvoyConfigs(project, undefined)?.ui).toEqual({ reducedMotion: "on" })
+  })
+
+  test("round-trips through serialize", () => {
+    const config = parse("ui:\n  reducedMotion: on")
+    const yaml = serializeConvoyConfig(config)
+    // The serializer quotes "on" defensively; the parse is what matters.
+    expect(yaml).toContain("reducedMotion:")
+    expect(parse(yaml).ui).toEqual(config.ui)
+  })
+
+  test("the config template documents the section", () => {
+    expect(defaultConvoyConfig).toContain("# ui:")
+    expect(defaultConvoyConfig).toContain("#   reducedMotion: auto")
+  })
+})
+
 describe("serialization", () => {
   test("preserves notification settings when a config is written and reloaded", () => {
     const config = parse("notifications:\n  enabled: false\n  waiting: false\n  terminalTitle: false\n  sound: Ping")
