@@ -1,23 +1,23 @@
 # control-board Specification
 
 ## Purpose
-One inferred surface — `convoy specs` — where every feature's stage is derived live from git, OpenSpec, and run plans, with the actions that move it along; no persisted registry, one shared change resolver.
+One inferred surface — `convoy specs` — where every feature's stage is derived live from git, OpenSpec, run plans, and the repository-scoped feature registry, with the actions that move it along; registered features and explicit associations provide stable identity, while worktrees, branches, tasks, and run liveness stay derived from fresh evidence with one shared change resolver.
 
 ## Requirements
 
 ### Requirement: Control command is the single inferred board
 
-`convoy specs` SHALL present the board (with `convoy control` retained only as a compatibility alias) and derive every displayed fact at render time from the filesystem: worktrees and branches from git, task completion from the OpenSpec CLI, run linkage from run plans' frozen branch field, and change identity from the same resolver the launcher and runs use for branch↔change matching. Convoy SHALL NOT persist any feature registry — a row's existence in the world is its existence on the board.
+`convoy specs` SHALL present the board, retaining `convoy control` as a compatibility alias, and use the shared feature resolver and lifecycle assessment. It SHALL persist explicit identity and associations but derive current worktrees, branches, task completion, run liveness, and integration eligibility from fresh evidence. Read-only OpenSpec task queries SHALL be permitted with filesystem fallback when the CLI is unavailable; unreadable evidence SHALL remain unknown. Historical run linkage SHALL use durable feature identity and frozen provenance, not the branch currently checked out at an old run path. Browsing SHALL NOT write the registry. The board SHALL distinguish unresolved legacy candidates from registered features.
 
 #### Scenario: Deleting the worktree updates the board
 
-- **WHEN** a feature's worktree is removed outside convoy and the board is reopened
-- **THEN** the row no longer claims a worktree, without any cache to invalidate
+- **WHEN** a feature's worktree is removed outside Convoy and the board is reopened
+- **THEN** the feature remains visible without claiming a worktree and offers missing-context or remaining-cleanup guidance as appropriate
 
 #### Scenario: One resolver everywhere
 
-- **WHEN** a branch named `feat/add-foo` exists while a change `add-foo` is active
-- **THEN** the board links them by the same matching rule a run's spec bundle would use
+- **WHEN** a branch with any valid name is explicitly associated with a change
+- **THEN** board and run selection use that association and show the same verified implementation context
 
 ### Requirement: Active change rows derive their lifecycle state
 

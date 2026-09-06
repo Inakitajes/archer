@@ -3,6 +3,25 @@ import type { LoopGuardSettings } from "./loop-guard"
 import type { NotificationSettings } from "./notifications"
 import type { OpenSpecBundle } from "./openspec"
 import type { PrdHistoryPreview } from "./prd-history"
+
+/**
+ * The reviewed feature/contract/context association a feature-backed run
+ * freezes into its plan (capability feature-lifecycle, design D4). Pure
+ * data — defined here so plans and metadata stay dependency-light.
+ */
+export type FeaturePlanLink = {
+  featureId: string
+  repositoryId: string
+  /** The association revision the review validated; execution refuses a stale one. */
+  associationRevision: number
+  contracts: readonly string[]
+  /** The intended local base ref the feature recorded. */
+  baseRef: string
+  /** The verified implementation branch. */
+  branch: string
+  /** The verified checkout path, when resolved. */
+  worktreeDir?: string
+}
 import type { AutoAccept, ProgressUI } from "./progress"
 import type { StepRunnerId } from "./step-runners"
 import type { ModelGateway, ModelRoutingOverrides, ResolvedModel } from "./model-routing"
@@ -13,6 +32,8 @@ export type RunOptions = {
   prdHistory: boolean
   /** Explicit OpenSpec change id (`--change <id>`); resolves the spec bundle contract. */
   change?: string
+  /** Explicit feature id (`--feature <id>`); resolves the feature/contract/context link. */
+  featureId?: string
   files: string[]
   onlySteps: string[]
   skipSteps: string[]
@@ -296,6 +317,13 @@ export type RunPlan = {
     /** Worktree runs only: where that branch will be checked out. */
     worktreeDir?: string
   }
+  /**
+   * The frozen feature link (capability feature-lifecycle): the stable
+   * identity, association revision, contract set, and verified context this
+   * run was reviewed against. Execution revalidates it before starting, and
+   * durable run metadata preserves it after cleanup (task 4.2/5.1).
+   */
+  feature?: FeaturePlanLink
   pipeline: Pipeline
   modelRouting: { gateway: ModelGateway }
   smartJudge?: { model: ResolvedModel }

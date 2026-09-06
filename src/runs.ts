@@ -48,6 +48,23 @@ export type RunEntry = {
    * Git inspection commands.
    */
   finalization?: RunEntryFinalization
+  /**
+   * The durable feature link (capability feature-lifecycle, task 5.1/SC-6):
+   * the run's stable feature identity, surfaced from the cleanup-surviving
+   * run-record index so board, attach, and history join by identity rather
+   * than reinterpreting the stored worktree path as today's branch. Absent
+   * for legacy or no-spec runs.
+   */
+  feature?: RunEntryFeatureLink
+}
+
+/** The feature identity a run is linked to, as preserved in run history. */
+export type RunEntryFeatureLink = {
+  featureId: string
+  associationRevision: number
+  branch: string
+  baseRef: string
+  contracts: readonly string[]
 }
 
 /** The finalization facts run history presents, from durable records only. */
@@ -87,6 +104,12 @@ export type RunIndexRecord = {
   reason?: string
   /** The protected ref holding the pre-compaction tip. */
   recoveryRef?: string
+  /**
+   * The reviewed feature link, preserved through workspace cleanup (task
+   * 5.1): history joins by stable identity, never by reinterpreting the
+   * stored worktree path as today's branch.
+   */
+  feature?: { featureId: string; associationRevision: number; branch: string; baseRef: string; contracts: readonly string[] }
 }
 
 /** Reads one run-record index entry; undefined when absent or malformed. */
@@ -140,6 +163,18 @@ function parseRunIndexRecord(raw: string, runID: string): RunIndexRecord | undef
     } else if (typeof value.state === "string") {
       record.state = value.state
     }
+    // The feature link survives cleanup as a plain object; a malformed one is
+    // dropped rather than interpreted (readers never invent identity).
+    if (typeof value.feature === "object" && value.feature !== null && typeof (value.feature as Record<string, unknown>).featureId === "string") {
+      const raw = value.feature as Record<string, unknown>
+      record.feature = {
+        featureId: raw.featureId as string,
+        ...(typeof raw.associationRevision === "number" ? { associationRevision: raw.associationRevision } : { associationRevision: 0 }),
+        ...(typeof raw.branch === "string" ? { branch: raw.branch } : { branch: "" }),
+        ...(typeof raw.baseRef === "string" ? { baseRef: raw.baseRef } : { baseRef: "" }),
+        contracts: Array.isArray(raw.contracts) ? raw.contracts.filter((entry): entry is string => typeof entry === "string") : [],
+      }
+    }
     return record
   } catch {
     return undefined
@@ -148,6 +183,19 @@ function parseRunIndexRecord(raw: string, runID: string): RunIndexRecord | undef
 
 function isRecordOf(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** Merges the run's durable feature link from the cleanup-surviving index record. */
+function featureLinkOf(index: RunIndexRecord | undefined): RunEntryFeatureLink | undefined {
+  const feature = index?.feature
+  if (!feature) return undefined
+  return {
+    featureId: feature.featureId,
+    associationRevision: feature.associationRevision,
+    branch: feature.branch,
+    baseRef: feature.baseRef,
+    contracts: feature.contracts,
+  }
 }
 
 /** Merges the run's durable finalization outcome into the entry's presentation shape. */
@@ -239,6 +287,7 @@ function runEntryFromIndexRecord(record: RunIndexRecord, root: string): RunEntry
     live: false,
     phases: [],
     finalization: finalizationInfo(undefined, record),
+    ...(featureLinkOf(record) ? { feature: featureLinkOf(record) } : {}),
   }
 }
 
@@ -368,6 +417,7 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
     phases: phaseInfos(metadata),
     ...(goal ? { goal: goalInfo(goal) } : {}),
     ...(finalization ? { finalization } : {}),
+    ...(featureLinkOf(indexRecord) ? { feature: featureLinkOf(indexRecord) } : {}),
   }
 }
 

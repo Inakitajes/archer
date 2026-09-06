@@ -1,7 +1,7 @@
 # feature-spin Specification
 
 ## Purpose
-Deterministically materialize a working context — isolated worktree, conventional branch — for an OpenSpec change proposed on the base checkout, and hand the operator's existing OpenCode session over to it without summarizing, forking, or persisting any registry state.
+Deterministically materialize a working context — isolated worktree, conventional branch — for an OpenSpec change proposed on the base checkout, register the feature's stable identity and association durably as part of a successful spin, and hand the operator's existing OpenCode session over to it without summarizing, forking, or touching any session state.
 
 ## Requirements
 

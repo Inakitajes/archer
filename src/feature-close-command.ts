@@ -3,7 +3,7 @@ import { stat } from "node:fs/promises"
 import { resolve } from "node:path"
 import type { Readable } from "node:stream"
 
-import { archiveChangeOnMain, runClose, verifiedCloseReceipt, type CloseEvent, type CloseInput, type CloseMessageProposal, type CloseResult, type CloseStep } from "./feature-close"
+import { archiveChangeOnMain, runClose, runCloseCleanup, verifiedCloseReceipt, type CloseEvent, type CloseInput, type CloseMessageProposal, type CloseResult, type CloseStep } from "./feature-close"
 import { stripControlBytes } from "./commit-text"
 import {
   applyCloseEvent,
@@ -51,6 +51,10 @@ export type CloseOptions = {
   /** The worktree directory, when the caller (the board) already resolved it. */
   worktreeDir?: string
   changeID?: string
+  /** Explicit stable feature id: identity-keyed resolution, resume, and cleanup (design D3/D9). */
+  featureId?: string
+  /** Cleanup-only continuation of a verified landing: `worktree` then `branch`. */
+  cleanup?: "worktree" | "branch"
   /** Continue a stopped sequence from the first incomplete step. */
   resume?: boolean
   message?: string
@@ -64,11 +68,32 @@ export async function runCloseCommand(options: CloseOptions, route?: TuiRoute): 
     stdout.write(`close would run: preflight → sync → archive → squash-merge${options.resume ? " (resuming)" : ""}\n`)
     return
   }
+  // Cleanup is its own deliberate surface (design D9): the feature-keyed
+  // guarded commands the TUI and headless output print are executable here,
+  // running the same action-time revalidation as the TUI follow-ups.
+  if (options.cleanup) {
+    try {
+      const outcome = await runCloseCleanup({
+        targetDir: options.targetDir,
+        ...(options.featureId ? { featureId: options.featureId } : {}),
+        ...(options.worktreeDir ? { worktreeDir: resolve(options.worktreeDir) } : {}),
+        cleanup: options.cleanup,
+      })
+      stdout.write(`${outcome}\n`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      stdout.write(`${firstLine(message)}\n`)
+      log.error(message)
+      process.exitCode = 1
+    }
+    return
+  }
   const input: CloseInput = {
     targetDir: options.targetDir,
     ...(options.worktreeDir ? { worktreeDir: resolve(options.worktreeDir) } : {}),
     ...(options.branch ? { branch: options.branch } : {}),
     ...(options.changeID ? { changeID: options.changeID } : {}),
+    ...(options.featureId ? { featureId: options.featureId } : {}),
     ...(options.resume ? { resume: true } : {}),
     ...(options.message !== undefined ? { message: options.message } : {}),
   }
@@ -104,6 +129,7 @@ export async function runCloseHeadless(input: CloseInput): Promise<void> {
       baseRef: result.baseRef,
       branch: result.branch,
       worktreeDir: result.worktreeDir,
+      ...(result.featureId ?? input.featureId ? { featureId: result.featureId ?? input.featureId } : {}),
       ...(evidence ? { evidence: { landingSha: evidence.landingSha, featureTip: evidence.postArchiveTip } } : {}),
     })
     stdout.write(formatCloseEvents(events, { followUps }))
@@ -196,6 +222,8 @@ export async function resolveCloseFollowUps(args: {
   baseRef: string
   branch: string
   worktreeDir: string
+  /** The resolved feature: cleanup then prints the feature-keyed guarded commands (design D9). */
+  featureId?: string
   /** Present only when a verified receipt authorizes branch deletion. */
   evidence?: CloseLandingEvidence
 }): Promise<CloseFollowUps> {
@@ -216,39 +244,59 @@ export async function resolveCloseFollowUps(args: {
     pushRemediation = `${shq(args.baseRef)} has no configured upstream — set one first: ${gitC} branch --set-upstream-to=<remote>/<branch> ${shq(args.baseRef)}`
   }
 
+  // Cleanup commands are the feature-keyed guarded operations (design D9):
+  // `convoy close --feature <id> --cleanup worktree` then `--cleanup branch`.
+  // They execute the same identity-aware checks the TUI actions do — fresh
+  // association, unresolved-attempt, live-run, and mutation-lease checks on
+  // top of the landing evidence — so a deferred or headless operator never
+  // falls back to a display-only git recipe. The raw git forms below remain
+  // only as the pre-identity display for synthetic callers with no feature.
   let worktreeRemoval: string | undefined
   const isMainCheckout = (await sameDir(mainDir, args.worktreeDir)) === true
   const worktreeExists = await stat(args.worktreeDir).then(
     () => true,
     () => false,
   )
-  if (!isMainCheckout && worktreeExists) worktreeRemoval = `${gitC} worktree remove ${shq(args.worktreeDir)}`
+  if (args.featureId) {
+    if (!isMainCheckout && worktreeExists) worktreeRemoval = `convoy close --feature ${shq(args.featureId)} --cleanup worktree`
+  } else if (!isMainCheckout && worktreeExists) {
+    worktreeRemoval = `${gitC} worktree remove ${shq(args.worktreeDir)}`
+  }
 
   // Branch deletion is evidence-gated (design D7, task 6.3): a locally
   // squash-landed branch has no merge ancestry, so plain `branch -d` refuses
   // it and force deletion is permitted ONLY behind a verified receipt naming
   // the exact current feature tip and a landing still reachable from the
-  // base. The printed command re-checks both facts immediately before the
-  // deletion, so a branch that moved between close and cleanup refuses
-  // instead of deleting new work; shell quoting covers branch names with
-  // unusual characters. Without a receipt there is no deletion command at
-  // all — only the inspection guidance.
+  // base. With the feature id the printed command IS the guarded operation —
+  // it re-verifies the association, receipt, tip, worktree inventory, and
+  // lease at action time and refuses a moved tip with its diagnostic — so
+  // the old check-then-delete shell recipe is no longer the safety
+  // mechanism. Without a receipt there is no deletion command at all — only
+  // the inspection guidance.
   let branchDelete: string | undefined
   let branchDeleteRemediation: string | undefined
   if (args.evidence) {
-    const tipNow = await execFile("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${args.branch}`], {
-      cwd: mainDir,
-      allowFailure: true,
-    })
-    if (tipNow.exitCode === 0 && tipNow.stdout.trim() === args.evidence.featureTip) {
-      branchDelete =
-        `${gitC} rev-parse --verify refs/heads/${shq(args.branch)} | grep -qx ${shq(args.evidence.featureTip)} && ` +
-        `${gitC} merge-base --is-ancestor ${shq(args.evidence.landingSha)} ${shq(args.baseRef)} && ` +
-        `${gitC} branch -D ${shq(args.branch)}`
-    } else if (tipNow.exitCode === 0) {
-      branchDeleteRemediation = `${args.branch}'s tip moved past the landed state (${tipNow.stdout.trim().slice(0, 8)}) — inspect the branch before deleting anything`
+    if (args.featureId) {
+      branchDelete = `convoy close --feature ${shq(args.featureId)} --cleanup branch`
     } else {
-      branchDeleteRemediation = `${args.branch} no longer exists locally — nothing to delete`
+      const tipNow = await execFile("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${args.branch}`], {
+        cwd: mainDir,
+        allowFailure: true,
+      })
+      if (tipNow.exitCode === 0 && tipNow.stdout.trim() === args.evidence.featureTip) {
+        // The final act is the atomic expected-tip ref deletion (task 7.6): the
+        // printed checks re-verify tip and reachability, and `update-ref -d`
+        // refuses if the branch moved between the check and the deletion.
+        branchDelete =
+          `${gitC} rev-parse --verify refs/heads/${shq(args.branch)} | grep -qx ${shq(args.evidence.featureTip)} && ` +
+          `${gitC} merge-base --is-ancestor ${shq(args.evidence.landingSha)} ${shq(args.baseRef)} && ` +
+          `! ${gitC} worktree list --porcelain | grep -qx ${shq(`branch refs/heads/${args.branch}`)} && ` +
+          `${gitC} update-ref -d refs/heads/${shq(args.branch)} ${shq(args.evidence.featureTip)}`
+      } else if (tipNow.exitCode === 0) {
+        branchDeleteRemediation = `${args.branch}'s tip moved past the landed state (${tipNow.stdout.trim().slice(0, 8)}) — inspect the branch before deleting anything`
+      } else {
+        branchDeleteRemediation = `${args.branch} no longer exists locally — nothing to delete`
+      }
     }
   } else {
     branchDeleteRemediation =
@@ -309,11 +357,13 @@ export async function runCloseInteractive(input: CloseInput, io: CloseIO = {}, r
       resolveMessage: (proposal) => tui.confirmMessage(proposal),
     })
     const evidence = await verifiedCloseReceipt(input.targetDir, result.branch, result.changeID)
+    const featureId = result.featureId ?? input.featureId
     const followUps = await resolveCloseFollowUps({
       targetDir: input.targetDir,
       baseRef: result.baseRef,
       branch: result.branch,
       worktreeDir: result.worktreeDir,
+      ...(featureId ? { featureId } : {}),
       ...(evidence ? { evidence: { landingSha: evidence.landingSha, featureTip: evidence.postArchiveTip } } : {}),
     })
     await offerCloseFollowUpsTui(tui, {
@@ -322,6 +372,7 @@ export async function runCloseInteractive(input: CloseInput, io: CloseIO = {}, r
       branch: result.branch,
       worktreeDir: result.worktreeDir,
       targetDir: input.targetDir,
+      ...(featureId ? { featureId } : {}),
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
@@ -374,6 +425,8 @@ export type FollowUpOffers = CloseFollowUps & {
   targetDir: string
   /** The verified receipt the deletion offer is gated on, when present. */
   evidence?: CloseLandingEvidence
+  /** The resolved feature: present for every close the adoption gate lets through. */
+  featureId?: string
 }
 
 /**
@@ -393,6 +446,34 @@ async function assertLandingEvidenceIntact(mainDir: string, followUps: FollowUpO
   const reachable = await execFile("git", ["merge-base", "--is-ancestor", evidence.landingSha, followUps.baseRef], { cwd: mainDir, allowFailure: true })
   if (reachable.exitCode !== 0) {
     throw new Error(`the landing commit ${evidence.landingSha.slice(0, 8)} is no longer reachable from ${followUps.baseRef} — inspect the history before deleting anything`)
+  }
+  await assertNoRegisteredWorktree(mainDir, followUps.branch)
+}
+
+/**
+ * No registered worktree may have the branch checked out (design D9, task
+ * 7.6): Git's worktree inventory — never a path guess — decides, so a reused
+ * branch name at a surviving worktree is never deleted under anyone.
+ */
+async function assertNoRegisteredWorktree(mainDir: string, branch: string): Promise<void> {
+  const list = await execFile("git", ["worktree", "list", "--porcelain"], { cwd: mainDir, allowFailure: true })
+  if (list.exitCode !== 0) throw new Error("couldn't read the worktree inventory — refusing to delete the branch while registration is unverifiable")
+  if (list.stdout.split("\n").includes(`branch refs/heads/${branch}`)) {
+    throw new Error(`${branch} is checked out in a registered worktree — remove that worktree before deleting the branch`)
+  }
+}
+
+/**
+ * The guarded branch deletion (task 7.6): an expected-tip ref deletion —
+ * `git update-ref -d refs/heads/<branch> <expectedTip>` — is atomic, so a
+ * branch that moved between the tip check and the deletion makes the
+ * expected-old value refuse. Never `branch -D` after a separate tip test.
+ */
+async function guardedBranchDeletion(mainDir: string, followUps: FollowUpOffers): Promise<void> {
+  await assertLandingEvidenceIntact(mainDir, followUps)
+  const result = await execFile("git", ["update-ref", "-d", `refs/heads/${followUps.branch}`, followUps.evidence!.featureTip], { cwd: mainDir, allowFailure: true })
+  if (result.exitCode !== 0) {
+    throw new Error((result.stderr || `the expected-tip deletion of ${followUps.branch} was refused`).trim())
   }
 }
 
@@ -522,14 +603,19 @@ async function offerCloseFollowUpsTui(tui: CloseTui, followUps: FollowUpOffers):
         await tui.withTerminal(() => pushRefspec(followUps.push!.remote, followUps.push!.refspec, mainDir))
       } else if (id === "worktree") {
         if (!followUps.worktreeRemoval) continue
-        await removeWorktree(followUps.worktreeDir, mainDir)
+        // A resolved feature runs the feature-keyed guarded operation — the
+        // same identity-aware checks the printed command executes (design
+        // D9); the legacy direct removal remains only for synthetic offers
+        // without one.
+        if (followUps.featureId) await runCloseCleanup({ targetDir: followUps.targetDir, featureId: followUps.featureId, cleanup: "worktree" })
+        else await removeWorktree(followUps.worktreeDir, mainDir)
       } else {
-        // Evidence is rechecked at action time (design D7), then the
-        // evidence-gated force delete runs: the squash landing left no
-        // merge ancestry, so plain `branch -d` would refuse a landed branch.
-        await assertLandingEvidenceIntact(mainDir, followUps)
-        const result = await execFile("git", ["branch", "-D", followUps.branch], { cwd: mainDir, allowFailure: true })
-        if (result.exitCode !== 0) throw new Error(result.stderr || `git branch -D ${followUps.branch} failed`)
+        // Evidence is rechecked at action time (task 7.6), then the guarded
+        // expected-tip deletion runs: the squash landing left no merge
+        // ancestry, so the receipt is the authority, and the atomic
+        // update-ref -d makes the tip check and the deletion one operation.
+        if (followUps.featureId) await runCloseCleanup({ targetDir: followUps.targetDir, featureId: followUps.featureId, cleanup: "branch" })
+        else await guardedBranchDeletion(mainDir, followUps)
       }
       state[id] = { status: "completed" }
     } catch (error) {
@@ -569,7 +655,10 @@ export async function offerCloseFollowUps(followUps: FollowUpOffers, io: CloseIO
       worktreeRemoved = await offerAction(
         "worktree removal",
         `Remove the worktree at ${followUps.worktreeDir}? [y/N] `,
-        () => removeWorktree(followUps.worktreeDir, mainDir),
+        async () => {
+          if (followUps.featureId) await runCloseCleanup({ targetDir: followUps.targetDir, featureId: followUps.featureId, cleanup: "worktree" })
+          else await removeWorktree(followUps.worktreeDir, mainDir)
+        },
         io,
       )
       if (worktreeRemoved) out.write("worktree removed\n")
@@ -593,9 +682,8 @@ export async function offerCloseFollowUps(followUps: FollowUpOffers, io: CloseIO
       "branch deletion",
       `Delete the branch ${followUps.branch}? [y/N] `,
       async () => {
-        await assertLandingEvidenceIntact(mainDir, followUps)
-        const result = await execFile("git", ["branch", "-D", followUps.branch], { cwd: mainDir, allowFailure: true })
-        if (result.exitCode !== 0) throw new Error(result.stderr || `git branch -D ${followUps.branch} failed`)
+        if (followUps.featureId) await runCloseCleanup({ targetDir: followUps.targetDir, featureId: followUps.featureId, cleanup: "branch" })
+        else await guardedBranchDeletion(mainDir, followUps)
       },
       io,
     )
@@ -640,9 +728,10 @@ export async function runArchiveOnMain(input: { targetDir: string; changeID: str
     const result = await archiveChangeOnMain(input)
     stdout.write(
       result.committed
-        ? `archived ${input.changeID} in the main checkout and committed on the base branch\n`
-        : `openspec archived ${input.changeID} with nothing to commit\n`,
+        ? `archived ${input.changeID} in the main checkout and committed on the base branch${result.archiveSource ? ` (archive source: ${result.archiveSource})` : ""}\n`
+        : `openspec archived ${input.changeID} with nothing to commit${result.archiveSource ? ` (archive source: ${result.archiveSource})` : ""}\n`,
     )
+    stdout.write("integration remains probably merged or pending — archive-on-main never claims the feature landed\n")
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     log.error(message)
@@ -681,26 +770,39 @@ so saving an edit is not a confirmation.
 Once landed, current-session cleanup stays in that TUI as separate, deliberate
 actions — never automatic. Push is a normal push that names the configured
 remote and refspec explicitly, and is unavailable (with the setup step) when
-the base branch has no upstream; branch deletion is evidence-gated: it is
-offered only when close's verified landing receipt still names the branch's
-exact tip and a landing commit reachable from the base, the worktree has been
-removed first, and the printed command re-checks both facts immediately
-before the deletion runs. When close was
+the base branch has no upstream. Cleanup — worktree removal, then branch
+deletion — is evidence-gated and feature-keyed: the printed and deferred
+commands are \`convoy close --feature <id> --cleanup worktree|branch\`, which
+revalidate the association, the verified landing receipt (exact tip and a
+landing commit still reachable from the base), the worktree inventory, live
+runs, and the mutation lease at execution time before the guarded removal or
+the atomic expected-tip ref deletion runs. When close was
 launched from inside the feature worktree, worktree and branch cleanup are
 shown instead as deferred cleanup — the reason (a process cannot remove the
-directory its shell sits in) plus the exact git -C commands to run after
-leaving the worktree. Headless (piped) runs print the same facts as a stdout
-summary plus executable commands, and attempt nothing interactive.
+directory its shell sits in) plus those same feature-keyed commands to run
+after leaving the worktree. Headless (piped) runs print the same facts as a
+stdout summary plus the same executable commands, and attempt nothing
+interactive.
 
-The feature is resolved from the current worktree, or pass --branch <name> to
-target another feature's worktree.
+The feature is resolved through stable identity: running inside the worktree
+or passing --branch <name> still selects it, but an unassociated context
+refuses until the work is adopted explicitly (\`convoy feature adopt\`), and
+--feature <id> resolves, resumes, and cleans up by identity — including after
+the worktree was removed.
 
 Usage:
-  convoy close [--branch <name>] [--change <id>] [--resume] [--message <subject>]
+  convoy close [--branch <name>] [--change <id>] [--feature <id>] [--resume]
+               [--cleanup worktree|branch] [--message <subject>]
 
 Options:
   --branch <name>    Close the feature worktree carrying this branch
   --change <id>      Pin the OpenSpec change id (default: the branch's id)
+  --feature <id>     Resolve by stable feature id (see \`convoy feature show\`);
+                     permits resume and cleanup after the worktree is gone
+  --cleanup <what>   Cleanup-only continuation of a verified landing:
+                     \`worktree\` removes the feature worktree, \`branch\` then
+                     deletes the local branch at its landed tip (expected-tip
+                     guarded; requires --feature). Requires --feature.
   --resume           Continue a stopped sequence from the first incomplete step
   --message <text>   Exact message for the squashed commit; skips composition
                      and confirmation
@@ -721,12 +823,26 @@ export function parseCloseArgs(argv: string[]): CloseOptions {
     else if (arg.startsWith("--branch=")) options.branch = arg.slice("--branch=".length)
     else if (arg === "--change") options.changeID = value()
     else if (arg.startsWith("--change=")) options.changeID = arg.slice("--change=".length)
-    else if (arg === "--message") options.message = value()
+    else if (arg === "--feature") options.featureId = value()
+    else if (arg.startsWith("--feature=")) options.featureId = arg.slice("--feature=".length)
+    else if (arg === "--cleanup") {
+      const what = value()
+      if (what !== "worktree" && what !== "branch") {
+        throw new Error(`--cleanup expects "worktree" or "branch", got "${what}"`)
+      }
+      options.cleanup = what
+    } else if (arg.startsWith("--cleanup=")) {
+      const what = arg.slice("--cleanup=".length)
+      if (what !== "worktree" && what !== "branch") {
+        throw new Error(`--cleanup expects "worktree" or "branch", got "${what}"`)
+      }
+      options.cleanup = what
+    } else if (arg === "--message") options.message = value()
     else if (arg.startsWith("--message=")) options.message = arg.slice("--message=".length)
     else if (arg === "--resume") options.resume = true
     else if (arg === "--dry-run") options.dryRun = true
     else if (arg === "--worktree-dir") options.worktreeDir = value()
-    else throw new Error(`usage: convoy close [--branch <name>] [--change <id>] [--resume] [--message <subject>] (unexpected argument: ${arg})`)
+    else throw new Error(`usage: convoy close [--branch <name>] [--change <id>] [--feature <id>] [--resume] [--cleanup worktree|branch] [--message <subject>] (unexpected argument: ${arg})`)
   }
   return options
 }

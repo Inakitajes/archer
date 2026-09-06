@@ -97,6 +97,14 @@ export function createPublishSeam(input: CreatePublishSeamInput) {
       const recovery = await recoveryGate(input.runDir)
       if (!recovery.ok) return recovery
 
+      // Feature-backed publication revalidates the reviewed feature link
+      // immediately before the push (capability run-finalization, task 5.2):
+      // the run's durable feature link must still verify — the same feature,
+      // association revision, and branch. A historical run whose path was
+      // reused by another feature never publishes the replacement branch.
+      const featureGate = await featureLinkGate(input.runDir, cwd)
+      if (!featureGate.ok) return featureGate
+
       return { ok: true, plan: { branch, remote, base } }
     },
 
@@ -170,6 +178,34 @@ async function recoveryGate(runDir: string | undefined): Promise<{ ok: true } | 
     }
   }
   return { ok: true }
+}
+
+/**
+ * The feature-link gate (task 5.2): a feature-backed run's durable link is
+ * revalidated against the live repository right before publication. The
+ * resolution is lazy so no-spec runs never touch the lifecycle module.
+ */
+async function featureLinkGate(runDir: string | undefined, cwd: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (!runDir || runDir === "/") return { ok: true }
+  let metadata: { feature?: { featureId: string; associationRevision: number; branch: string; baseRef: string; contracts: readonly string[]; repositoryId: string; worktreeDir?: string } }
+  try {
+    metadata = JSON.parse(await readFile(join(runDir, "metadata.json"), "utf8"))
+  } catch {
+    return { ok: true }
+  }
+  const link = metadata.feature
+  if (!link) return { ok: true }
+  const { revalidateFeatureLink } = await import("./feature-lifecycle/launch")
+  try {
+    await revalidateFeatureLink({ cwd, link })
+    return { ok: true }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    return {
+      ok: false,
+      message: `publication refuses: the run's reviewed feature context no longer verifies — ${detail}. Publication never pushes the branch now occupying the historical path.`,
+    }
+  }
 }
 
 /** `gh` availability and authentication, each with concrete remediation (D5). */

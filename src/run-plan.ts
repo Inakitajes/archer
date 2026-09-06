@@ -2,7 +2,7 @@ import { resolveModel, type ModelGateway, type ModelRoutingOverrides } from "./m
 import type { OpenSpecBundle } from "./openspec"
 import type { PrdHistoryPreview } from "./prd-history"
 import { stepRunnerFor } from "./step-runners"
-import type { AgentStep, Pipeline, ResolvedGoalPlan, RunOptions, RunPlan, Step } from "./types"
+import type { AgentStep, FeaturePlanLink, Pipeline, ResolvedGoalPlan, RunOptions, RunPlan, Step } from "./types"
 
 export type BuildRunPlanInput = RunOptions & {
   promptSource?: RunPlan["prompt"]["source"]
@@ -17,6 +17,8 @@ export type BuildRunPlanInput = RunOptions & {
   prdHistoryPreview?: PrdHistoryPreview
   /** Precomputed OpenSpec contract; `buildRunPlan` does not touch the filesystem. */
   openspec?: OpenSpecBundle
+  /** Precomputed feature link (verified by the caller); frozen into the plan for execution-time revalidation. */
+  feature?: FeaturePlanLink
 }
 
 /** Purely resolves the complete execution shape; it performs no filesystem or process effects. */
@@ -51,6 +53,7 @@ export function buildRunPlan(input: BuildRunPlanInput): RunPlan {
     hooks,
     attachments: [...input.files],
     ...(input.openspec ? { openspec: input.openspec } : {}),
+    ...(input.feature ? { feature: input.feature } : {}),
     ...(input.prdHistoryPreview ? { prdHistory: input.prdHistoryPreview } : {}),
     permissions: input.yolo ? "yolo" : input.smart ? "smart" : "interactive",
     ...(pipeline.goalPlan ? { goal: pipeline.goalPlan } : {}),

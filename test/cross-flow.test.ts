@@ -145,6 +145,11 @@ async function makeRepo(): Promise<Repo> {
   await git(worktreeDir, operatorEnv, "add", "-A")
   await git(worktreeDir, operatorEnv, "commit", "-qm", "feat(openspec): propose add-widget")
 
+  // Register the feature as spin would have: close's adoption gate (task 7.1)
+  // refuses unassociated work, so the cross-flow fixtures start associated.
+  const { registerSpinFeature } = await import("../src/feature-lifecycle/commands")
+  await registerSpinFeature({ cwd: mainDir, changeId: "add-widget", branch: "feat/add-widget", worktreeDir, baseRef: "main", phase: "intent" })
+
   return { root, remote, mainDir, worktreeDir }
 }
 
@@ -372,7 +377,7 @@ describe("cross-flow: hermetic lifecycle and crash-resume (8.3)", () => {
 async function writeOpenspecDouble(binDir: string): Promise<void> {
   const script = [
     "#!/usr/bin/env bun",
-    "import { readdirSync, readFileSync, mkdirSync, renameSync, statSync } from 'node:fs'",
+    "import { readdirSync, readFileSync, mkdirSync, renameSync, statSync, writeFileSync } from 'node:fs'",
     "import { join } from 'node:path'",
     "const [cmd, ...rest] = process.argv.slice(2)",
     "const root = process.cwd()",
@@ -398,6 +403,11 @@ async function writeOpenspecDouble(binDir: string): Promise<void> {
     "  statSync(from)",
     "  mkdirSync(join(root, 'openspec', 'changes', 'archive'), { recursive: true })",
     "  renameSync(from, to)",
+    "  // A real archive merges the deltas into the canonical specs; the double",
+    "  // writes the fixture's expected canonical requirement so close's",
+    "  // positive archive verification (task 7.2) sees a provable result.",
+    "  mkdirSync(join(root, 'openspec', 'specs', 'cli'), { recursive: true })",
+    "  writeFileSync(join(root, 'openspec', 'specs', 'cli', 'spec.md'), '## Requirements\\n\\n### Requirement: Widget\\n')",
     "  process.exit(0)",
     "}",
     "console.error('unexpected openspec invocation: ' + cmd)",

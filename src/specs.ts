@@ -1,4 +1,4 @@
-import { readdir, readFile } from "node:fs/promises"
+import { readdir, readFile, stat } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { stdin, stdout } from "node:process"
 
@@ -57,8 +57,49 @@ export type SpecsView = {
   rows?: FeatureRow[]
   /** Worktrees carrying runs but no OpenSpec change — a peer board section. */
   worktreesWithoutSpec?: WorktreeWithoutSpec[]
+  /**
+   * Registered lifecycle features with their shared assessment (capability
+   * feature-lifecycle, task 6.1/6.3): the pending-work surface beyond active
+   * directories. Undefined when discovery never ran.
+   */
+  features?: LifecycleFeatureRow[]
   /** The repo's detected base branch, for the sync/merged markers. */
   baseBranch?: string
+}
+
+/** One registered feature's derived lifecycle row for the specs viewer. */
+export type LifecycleFeatureRow = {
+  featureId: string
+  displayName: string
+  branch?: string
+  /** The verified checkout path, when the context verified (task 6.2). */
+  checkoutPath?: string
+  /** The derived summary (design D5's precedence), never a persisted status. */
+  summary: string
+  blockers: string[]
+  tasks?: { done: number; total: number } | "unknown"
+  liveRuns: number
+  integration: "pending" | "probable" | "verified" | "stale" | "unknown"
+  contracts: Array<{ changeId: string; state: string }>
+  /**
+   * The verified associated source for each readable contract (task 6.2):
+   * absolute artifact roots that take precedence over same-id copies in the
+   * launch checkout. Absent for missing/ambiguous/unreadable sources — the
+   * row's blockers disclose the condition instead of a silent fallback.
+   */
+  artifactSources?: Array<{ changeId: string; root: string }>
+  /**
+   * The shared assessment's applicable actions with availability, blocker
+   * reasons, and remediation (tasks 2.5/6.4): the same eligibility the CLI
+   * and headless listing render, never a duplicated rule.
+   */
+  actions?: Array<{ id: string; label: string; enabled: boolean; blockers: readonly string[]; remediation?: readonly string[] }>
+  /** The verified landing receipts (task 6.3): completed work's durable evidence. */
+  receipts?: Array<{ attemptId: string; landingSha: string; landingReachable: boolean }>
+  /** The association history events, oldest first (task 6.3). */
+  history?: Array<{ at: number; kind: string; summary: string }>
+  /** Durable run ids linked to the feature (task 6.3). */
+  runIds?: string[]
 }
 
 /**
@@ -75,6 +116,8 @@ export type SpecsResolution =
   | { type: "continue-change"; changeID: string; worktreeDir: string; branch: string }
   /** Run the full closing sequence (sync → archive → squash → merge) for a feature. */
   | { type: "close-change"; changeID: string; worktreeDir: string; branch: string }
+  /** Run the close review by stable feature identity — dispatched even when the worktree is gone (task 6.4). */
+  | { type: "close-feature"; featureId: string }
   /** Archive a probably-merged-but-unarchived change in the main checkout. */
   | { type: "archive-change-main"; changeID: string }
 
@@ -155,6 +198,25 @@ export async function loadSpecsView(targetDir: string): Promise<SpecsView> {
     // the launch checkout's `openspec/changes/` holds for the id — a stale
     // husk on the base checkout must not shadow the real files.
     const merged = await mergeWorktreeChanges(changes, board.rows)
+    // Registered lifecycle features join the view through the shared
+    // assessment (task 6.1): read-only discovery, no registry writes.
+    const features = await loadLifecycleFeatureRows(targetDir)
+    // The verified associated source outranks the heuristic merge (task 6.2):
+    // for every registered feature contract whose source is readable, its own
+    // tree — absolute paths — supplies the artifact inventory and title, and
+    // an inherited or husk copy in the launch checkout never claims the id.
+    if (features) {
+      for (const feature of features) {
+        for (const source of feature.artifactSources ?? []) {
+          const entry = await loadSpecsChangeAt(source.root, source.changeId, { absolute: true })
+          if (entry.artifacts.length === 0) continue
+          const index = merged.findIndex((change) => change.id === source.changeId)
+          if (index >= 0) merged[index] = entry
+          else merged.push(entry)
+        }
+      }
+      merged.sort((a, b) => a.id.localeCompare(b.id))
+    }
     return {
       targetDir,
       present,
@@ -162,10 +224,84 @@ export async function loadSpecsView(targetDir: string): Promise<SpecsView> {
       specs,
       rows: board.rows,
       worktreesWithoutSpec: board.worktreesWithoutSpec,
+      ...(features ? { features } : {}),
       ...(board.baseBranch ? { baseBranch: board.baseBranch } : {}),
     }
   } catch {
     return { targetDir, present, changes, specs }
+  }
+}
+
+/**
+ * Builds the registered-feature rows for the specs viewer via read-only
+ * discovery and the shared lifecycle assessment (tasks 2.5/6.1). Every fact
+ * is derived at load time; discovery never writes the registry. A discovery
+ * failure degrades to no rows rather than failing the browser.
+ */
+export async function loadLifecycleFeatureRows(targetDir: string): Promise<LifecycleFeatureRow[] | undefined> {
+  try {
+    const { discoverLifecycle } = await import("./feature-lifecycle/discovery")
+    const { buildObservationsForFeature } = await import("./feature-lifecycle/observe")
+    const { assessLifecycle } = await import("./feature-lifecycle/assessment")
+    const discovery = await discoverLifecycle({ cwd: targetDir })
+    const rows: LifecycleFeatureRow[] = []
+    for (const discovered of discovery.features) {
+      const { lifecycleCommonDir } = await import("./feature-lifecycle/store")
+      const commonDir = (await lifecycleCommonDir(targetDir)) ?? ""
+      const observations = await buildObservationsForFeature({ cwd: targetDir, commonDir, feature: discovered.record })
+      const assessment = assessLifecycle(observations)
+      // Verified associated sources (task 6.2): each readable contract's
+      // own tree, addressed absolutely, in feature-then-contract order.
+      const artifactSources: Array<{ changeId: string; root: string }> = []
+      const checkout = observations.context.verification === "verified" ? observations.context.checkoutPath : undefined
+      if (checkout) {
+        for (const contract of discovered.record.contracts) {
+          const root = join(checkout, contract.sourcePath)
+          const present = await stat(root).then(
+            () => true,
+            () => false,
+          )
+          if (!present) continue
+          const files = await collectDirRelativeMarkdown(root, ".")
+          if (files.length === 0) continue
+          if (!artifactSources.some((source) => source.changeId === contract.changeId)) {
+            artifactSources.push({ changeId: contract.changeId, root })
+          }
+        }
+      }
+      rows.push({
+        featureId: discovered.record.featureId,
+        displayName: discovered.record.displayName,
+        ...(observations.context.branch ? { branch: observations.context.branch } : {}),
+        ...(observations.context.checkoutPath ? { checkoutPath: observations.context.checkoutPath } : {}),
+        summary: assessment.summary,
+        blockers: [...assessment.blockers],
+        ...(assessment.tasks === "unknown" ? { tasks: "unknown" as const } : assessment.tasks ? { tasks: assessment.tasks } : {}),
+        liveRuns: assessment.liveRuns,
+        integration: assessment.integration,
+        contracts: assessment.contracts.map((contract) => ({ changeId: contract.changeId, state: contract.state })),
+        ...(artifactSources.length > 0 ? { artifactSources } : {}),
+        ...(assessment.actions ? { actions: assessment.actions.map((action) => ({ id: action.id, label: action.label, enabled: action.enabled, blockers: action.blockers, ...(action.remediation.length > 0 ? { remediation: action.remediation } : {}) })) } : {}),
+        ...(discovered.receipts.length > 0
+          ? {
+              receipts: await Promise.all(
+                discovered.receipts.flatMap(async ({ receipt }) => {
+                  if (!receipt) return []
+                  const { isLandingReachableFrom } = await import("./feature-lifecycle/refs")
+                  return [{ attemptId: receipt.attemptId, landingSha: receipt.landingSha, landingReachable: await isLandingReachableFrom(receipt.landingSha, receipt.baseRef, targetDir) }]
+                }),
+              ).then((nested) => nested.flat()),
+            }
+          : {}),
+        ...(discovered.record.history.length > 0
+          ? { history: discovered.record.history.map((event) => ({ at: event.at, kind: event.kind, summary: event.summary })) }
+          : {}),
+        ...(discovered.record.runIds.length > 0 ? { runIds: [...discovered.record.runIds] } : {}),
+      })
+    }
+    return rows
+  } catch {
+    return undefined
   }
 }
 
@@ -211,7 +347,19 @@ async function loadSpecsChange(
   id: string,
   options: { absolute?: boolean } = {},
 ): Promise<SpecsChangeEntry> {
-  const changeRoot = join(changesDir, id)
+  return loadSpecsChangeAt(join(changesDir, id), id, options)
+}
+
+/**
+ * Loads one change's entry from an explicit change root — shared by the
+ * launch-checkout loader and the association-driven source precedence
+ * (task 6.2), so both produce identical entries.
+ */
+export async function loadSpecsChangeAt(
+  changeRoot: string,
+  id: string,
+  options: { absolute?: boolean } = {},
+): Promise<SpecsChangeEntry> {
   let title = id
   try {
     const body = await readFile(join(changeRoot, "proposal.md"), "utf8")
@@ -233,10 +381,24 @@ async function loadSpecsChange(
 }
 
 /**
- * Plain-text listing for pipes and CI: active changes with their artifact
- * inventory first, canonical specs below. No colors, no control sequences.
+ * Plain-text listing for pipes and CI: registered lifecycle features with
+ * their summaries and blockers, active changes with their artifact inventory,
+ * run-bearing unassociated worktrees, then canonical specs. No colors, no
+ * control sequences.
  */
-export function printSpecsList(view: Pick<SpecsView, "present" | "changes" | "specs">): void {
+export function printSpecsList(view: Pick<SpecsView, "present" | "changes" | "specs"> & Partial<Pick<SpecsView, "features" | "worktreesWithoutSpec">>): void {
+  if (view.features && view.features.length > 0) {
+    stdout.write("\nfeatures:\n")
+    for (const feature of view.features) {
+      const heading = feature.displayName === feature.featureId ? feature.featureId : `${feature.displayName} (${feature.featureId})`
+      const branch = feature.branch ? ` on ${feature.branch}` : ""
+      stdout.write(`    ${heading}${branch} — ${feature.summary}\n`)
+      if (feature.tasks && feature.tasks !== "unknown") stdout.write(`      tasks ${feature.tasks.done}/${feature.tasks.total}\n`)
+      if (feature.liveRuns > 0) stdout.write(`      ${feature.liveRuns} live run${feature.liveRuns === 1 ? "" : "s"}\n`)
+      for (const contract of feature.contracts) stdout.write(`      contract ${contract.changeId}: ${contract.state}\n`)
+      for (const blocker of feature.blockers) stdout.write(`      blocker: ${blocker}\n`)
+    }
+  }
   stdout.write("\nspecs:\n")
   stdout.write("  active changes:\n")
   if (view.changes.length === 0) {
@@ -252,6 +414,12 @@ export function printSpecsList(view: Pick<SpecsView, "present" | "changes" | "sp
       for (const artifact of inventory(change)) {
         stdout.write(`      ${artifact}\n`)
       }
+    }
+  }
+  if (view.worktreesWithoutSpec && view.worktreesWithoutSpec.length > 0) {
+    stdout.write("  worktrees without spec:\n")
+    for (const worktree of view.worktreesWithoutSpec) {
+      stdout.write(`    ${worktree.dir}${worktree.branch ? ` (${worktree.branch})` : ""} — ${worktree.runCount} run${worktree.runCount === 1 ? "" : "s"}\n`)
     }
   }
   stdout.write("  canonical specs:\n")
@@ -295,7 +463,12 @@ export async function browseSpecs(targetDir: string, route?: TuiRoute): Promise<
   } else {
     view = await loadSpecsView(targetDir)
   }
-  if (view.changes.length === 0 && view.specs.length === 0 && (view.worktreesWithoutSpec?.length ?? 0) === 0) {
+  if (
+    view.changes.length === 0 &&
+    view.specs.length === 0 &&
+    (view.worktreesWithoutSpec?.length ?? 0) === 0 &&
+    (view.features?.length ?? 0) === 0
+  ) {
     if (route) {
       const { showNoticeTui } = await import("./notice-tui")
       await showNoticeTui(route, { title: "specs", message: `No specs found under ${join(view.targetDir, openspecDirName)}` })

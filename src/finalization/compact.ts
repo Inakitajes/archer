@@ -4,6 +4,7 @@ import { dirname, join } from "node:path"
 import { formatCommitMessage, proposeCommitMessage } from "../commit-message"
 import { currentHead, diffStat, execFile, resetSoft, resolveCommit } from "../git"
 import { convoyHome } from "../workspace"
+import type { FeaturePlanLink } from "../types"
 import { boundedCommitAsOperator } from "./executor"
 import { verifyRunInterval, type RunInterval } from "./interval"
 import { acquireMutationLease, LeaseUnavailableError, type MutationLease } from "./lease"
@@ -64,6 +65,8 @@ export type RunFinalizationInput = {
   ledger: readonly CommitLedgerEntry[]
   /** Frozen pipeline name/branch context for message composition. */
   branch?: string
+  /** The reviewed feature link, preserved in the cleanup-surviving index (task 5.1). */
+  feature?: FeaturePlanLink
   commitMessageModel?: string
   signal?: AbortSignal
   progress?: FinalizationProgress
@@ -373,6 +376,9 @@ async function updateRunIndex(
       commonDir: (await gitCommonDir(input.targetDir)) ?? "",
       worktreeDir: input.targetDir,
       ...(input.branch ? { branch: input.branch } : {}),
+      // The reviewed feature link survives workspace cleanup (task 5.1): run
+      // history joins by identity, never by reinterpreting a stored path.
+      ...(input.feature ? { feature: input.feature } : {}),
       manifestPath,
       recoveryRef,
       preCompactionHead: interval.headSha,

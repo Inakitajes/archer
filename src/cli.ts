@@ -24,6 +24,7 @@ import { preflightRunPlan } from "./preflight"
 import type { LaunchBranchCheck, LaunchBranchProposal, LaunchRunPreparation, LaunchRunSelection } from "./launch-tui"
 import type { SpinOptions } from "./spin"
 import type { CloseOptions } from "./feature-close-command"
+import { resolveFeatureForLaunch, revalidateFeatureLink } from "./feature-lifecycle/launch"
 import { formatVersion } from "./version"
 import type { UpdateResult } from "./update"
 import type { TuiRoute } from "./tui-session"
@@ -75,6 +76,8 @@ export type ParsedArgs = {
   noConfirm?: boolean
   /** --change: explicit OpenSpec change id; wins over every selection heuristic. */
   change?: string
+  /** --feature: explicit feature id; resolves the feature/contract/context link (feature-lifecycle). */
+  featureId?: string
 }
 
 export type InitOptions = {
@@ -92,6 +95,7 @@ export type CliCommand =
   | { type: "spin"; options: SpinOptions }
   | { type: "opencode-install" }
   | { type: "close"; options: CloseOptions }
+  | { type: "feature"; args: string[] }
   | { type: "config"; targetDir: string }
   | { type: "init"; options: InitOptions }
   | { type: "agents"; action: "eject"; agentName: string; options: InitOptions }
@@ -154,6 +158,11 @@ export async function parseAndRun(argv: string[]) {
     await runCloseCommand(command.options)
     return
   }
+  if (command.type === "feature") {
+    const { runFeatureCommand, parseFeatureArgs } = await import("./feature-lifecycle/command-cli")
+    await runFeatureCommand(parseFeatureArgs(command.args))
+    return
+  }
   if (command.type === "config") {
     await openConfigEditor(command.targetDir)
     return
@@ -211,6 +220,13 @@ export async function parseAndRun(argv: string[]) {
     process.stdout.write(renderRunPlan(plan, true))
   }
   await preflightRunPlan(plan)
+  // Execution-time identity revalidation (capability feature-lifecycle, task
+  // 4.4): the reviewed feature link must still verify — same repository,
+  // association revision, branch, and base. A changed target refuses before
+  // anything is created; this is additional to the dirty-tree gate below.
+  if (plan.feature) {
+    await revalidateFeatureLink({ cwd: command.options.targetDir, link: plan.feature })
+  }
   // Nothing has touched the repo yet; the worktree is the first effect, and only
   // once the plan has been accepted.
   let options = command.options
@@ -314,7 +330,19 @@ async function buildReviewedPlan(input: BuildRunPlanInput): Promise<RunPlan> {
   if (openspec && openspec.changeIds.length === 0 && input.pipeline.name === defaultPipelineName) {
     throw new Error("no change; run /opsx:propose first (or pass --change <id>)")
   }
-  return buildRunPlan({ ...input, prdHistoryPreview: preview, ...(openspec ? { openspec } : {}) })
+  // The feature link (capability feature-lifecycle, tasks 4.3/4.4): an
+  // explicit `--feature` must resolve to a verified association — it never
+  // falls through to naming heuristics, and a refusal carries the exact
+  // adoption command. Without `--feature`, an unassociated context launches
+  // unlinked (the ordinary flow).
+  const feature = await resolveFeatureForLaunch({
+    cwd: input.targetDir,
+    ...(input.featureId ? { featureId: input.featureId } : {}),
+    ...(input.change ? { changeId: input.change } : {}),
+    ...(input.branch ? { branch: input.branch } : {}),
+    ...(input.worktreeDir ? { worktreeDir: input.worktreeDir } : {}),
+  })
+  return buildRunPlan({ ...input, prdHistoryPreview: preview, ...(openspec ? { openspec } : {}), ...(feature ? { feature } : {}) })
 }
 
 /** The result of deciding whether goal mode applies to a resolved run. */
@@ -692,6 +720,15 @@ export async function openSpecsBrowser(targetDir: string, route?: TuiRoute): Pro
     )
     return
   }
+  if (resolution.type === "close-feature") {
+    // The identity-keyed handoff (task 6.4): close resolves through the
+    // feature's stable id, so a removed worktree still reaches the close
+    // review — it reports the recorded landing (with remaining follow-ups)
+    // or the concrete missing-context blocker, never a silent no-op.
+    const { runCloseCommand } = await import("./feature-close-command")
+    await runCloseCommand({ targetDir, featureId: resolution.featureId }, route)
+    return
+  }
   if (resolution.type === "archive-change-main") {
     const { runArchiveOnMain } = await import("./feature-close-command")
     await runArchiveOnMain({ targetDir, changeID: resolution.changeID })
@@ -859,6 +896,13 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     }
     const { parseCloseArgs } = await import("./feature-close-command")
     return { type: "close", options: parseCloseArgs(argv.slice(1)) }
+  }
+  if (argv[0] === "feature") {
+    if (argv.slice(1).some((arg) => arg === "--help" || arg === "-h")) {
+      const { featureHelp } = await import("./feature-lifecycle/command-cli")
+      return { type: "help", text: featureHelp() }
+    }
+    return { type: "feature", args: argv.slice(1) }
   }
   if (argv[0] === "config") {
     if (argv.length > 1) throw new Error("usage: convoy config")
@@ -1111,6 +1155,7 @@ export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOpt
     resumeRunID: parsed.resumeRunID ?? "",
     prdHistory: defaults.prdHistory ?? true,
     ...(parsed.change ? { change: parsed.change } : {}),
+    ...(parsed.featureId ? { featureId: parsed.featureId } : {}),
     keepRunDir: parsed.keepRunDir ?? true,
     modelOverride: parsed.modelOverride ?? "",
     advisorOverride: parsed.advisorOverride ?? "",
@@ -1316,6 +1361,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
         break
       case "--change":
         parsed.change = takeValue()
+        break
+      case "--feature":
+        parsed.featureId = takeValue()
         break
       case "--base":
         parsed.baseRef = takeValue()

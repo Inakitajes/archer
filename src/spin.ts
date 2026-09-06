@@ -39,6 +39,8 @@ export type SpinResult = {
   committedOnBase: boolean
   /** The inferred or overridden conventional prefix the branch got. */
   prefix: string
+  /** The stable feature identity spin registered for this work (capability feature-lifecycle). */
+  featureId: string
 }
 
 /**
@@ -85,7 +87,26 @@ export async function runSpin(options: SpinOptions): Promise<SpinResult> {
   // 4. Create the worktree on the base ref a launcher-isolated run would use.
   const worktree = await createIsolatedWorktree({ targetDir, branch, baseRef })
 
-  // 5. Carry the uncommitted files over. Committed files stay exactly where
+  // 5. Persist the spin intent (capability feature-lifecycle, design D4):
+  //    the association's intent record is durable before the proposal
+  //    transfer, so a crash mid-transfer leaves recoverable evidence instead
+  //    of an ownerless worktree.
+  const { registerSpinFeature } = await import("./feature-lifecycle/commands")
+  let registration: Awaited<ReturnType<typeof registerSpinFeature>>
+  try {
+    registration = await registerSpinFeature({ cwd: targetDir, changeId: changeID, branch: worktree.branch, worktreeDir: worktree.dir, baseRef, phase: "intent" })
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      `the worktree was created but persisting the spin intent failed — spin cannot proceed without durable registration evidence\n` +
+        `  created worktree (not yet transferred into): ${worktree.dir}\n` +
+        `  branch: ${worktree.branch}\n` +
+        `  recovery: remove it with \`git worktree remove ${worktree.dir}\`, or adopt it with \`convoy feature adopt --branch ${worktree.branch} --change ${changeID} --base ${baseRef}\`\n` +
+        `  (${detail})`,
+    )
+  }
+
+  // 6. Carry the uncommitted files over. Committed files stay exactly where
   //    they are — the worktree's base ref carries them, and overlap resolves
   //    at merge time.
   const untracked = await listUntrackedFilesUnder(targetDir, join(openspecDirName, "changes", changeID))
@@ -99,13 +120,34 @@ export async function runSpin(options: SpinOptions): Promise<SpinResult> {
       : []
   const committedOnBase = seenOnBase && movedFiles.length === 0
   if (!seenOnBase && untracked.length === 0) {
+    // The intent record stays: the operator can adopt or clean up explicitly.
     throw new Error(
       `the change ${changeID} is not uncommitted here and not on the base ref (${baseRef}) — it is committed on another branch, ` +
-        "so its files would not arrive in this worktree; check out the branch that carries it or spin a change that exists here",
+        `so its files would not arrive in this worktree; check out the branch that carries it or spin a change that exists here. ` +
+        `A spin intent for feature ${registration.feature.featureId} was already recorded with the created worktree at ${worktree.dir}.`,
     )
   }
 
-  return { changeID, branch: worktree.branch, worktreeDir: worktree.dir, movedFiles, committedOnBase, prefix }
+  // 7. Commit the association before success output (design D4): a
+  //    persistence failure here prevents the success handoff and exposes the
+  //    created context and transferred files with recovery guidance.
+  let committed: Awaited<ReturnType<typeof registerSpinFeature>>
+  try {
+    committed = await registerSpinFeature({ cwd: targetDir, changeId: changeID, branch: worktree.branch, worktreeDir: worktree.dir, baseRef, phase: "committed" })
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      `the worktree and file transfer succeeded but persisting the feature association failed — spin cannot claim successful registration\n` +
+        `  feature intent: ${registration.feature.featureId}\n` +
+        `  worktree: ${worktree.dir}\n` +
+        `  branch: ${worktree.branch}\n` +
+        `  transferred files: ${movedFiles.length === 0 ? "none" : movedFiles.join(", ")}\n` +
+        `  recovery: resolve the storage error, then run \`convoy feature show\` (or adopt explicitly). Nothing was committed and no transferred file was deleted.\n` +
+        `  (${detail})`,
+    )
+  }
+
+  return { changeID, branch: worktree.branch, worktreeDir: worktree.dir, movedFiles, committedOnBase, prefix, featureId: committed.feature.featureId }
 }
 
 /**
@@ -119,6 +161,7 @@ export function printSpinHandoff(result: SpinResult): void {
   const lines: string[] = []
   lines.push(`spun out ${result.changeID} → ${result.worktreeDir}`)
   lines.push(`branch: ${result.branch}`)
+  lines.push(`feature: ${result.featureId} (registered; \`convoy feature show\` inspects it)`)
   if (result.committedOnBase) {
     lines.push("nothing was moved: the change is already committed on the base branch, and the worktree's base ref carries it")
   } else {
