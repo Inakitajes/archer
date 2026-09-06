@@ -26,4 +26,4 @@
 ## 5. Verification
 
 - [x] 5.1 Run `bun run typecheck` and the test suite (`bun test`) and verify all existing and new tests pass.
-- [ ] 5.2 Manually run `convoy` on a repo with active OpenSpec changes, open Specs, and verify the transition appears only during a real load, animates as waves, and hands off without a flash or frozen frame.
+- [x] 5.2 Manually run `convoy` on a repo with active OpenSpec changes, open Specs, and verify the transition appears only during a real load, animates as waves, and hands off without a flash or frozen frame.

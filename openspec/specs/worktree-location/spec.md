@@ -64,17 +64,27 @@ Convoy SHALL honor an explicit worktree-location convention declared in the repo
 
 ### Requirement: Consistent path across decision points
 
-All Convoy operations that reason about a worktree by its name SHALL resolve to the same path: creation, the collision check that appends `-2`, `-3`, … to avoid clobbering, the launcher preview shown before confirmation, and lookups that locate an existing worktree (via `git worktree list` when it is not at the built-in default). A path already considered taken for a branch SHALL never be handed to `git worktree add` again.
+New-worktree creation, collision handling, and launcher preview SHALL use the same documented/configured/default location allocation. A path already considered taken SHALL never be handed to `git worktree add` again. Existing feature contexts SHALL instead be located through verified associations and the current repository's Git worktree inventory, never by reconstructing ownership from branch-derived directory names. A moved context SHALL require verified rebinding when its association is stale. Rebinding SHALL not rename or recreate the directory merely to match current branch spelling. Branch slug templates SHALL remain allocation/display conventions.
 
 #### Scenario: Suffix avoids collision at a declared location
 
-- **WHEN** a worktree already exists at the resolved location for a branch
-- **THEN** Convoy uses a suffixed branch and location (`-2`, `-3`, …) so no collision occurs
+- **WHEN** the launcher's worktree allocation finds the resolved branch location occupied
+- **THEN** its existing suffix policy selects a non-colliding branch/location consistently in preview and creation, and any resulting feature association records the actual result
+
+#### Scenario: Finish locates a non-default worktree
+
+- **WHEN** a lifecycle action such as close or continue targets a feature associated with a worktree outside the built-in default location
+- **THEN** Convoy validates that context against Git's worktree inventory instead of assuming a branch-derived path
 
 #### Scenario: Close and continue locate a non-default worktree
 
-- **WHEN** a lifecycle action such as close or continue targets a worktree that is not at the built-in default location
-- **THEN** Convoy locates the worktree from the repository's worktree list (or the feature's verified association) rather than assuming a fixed path
+- **WHEN** close or continue resolves a feature whose verified association points at a worktree outside the built-in default location
+- **THEN** Convoy locates the worktree from the repository's worktree list (or the feature's verified association) rather than reconstructing a fixed path
+
+#### Scenario: Worktree moves outside Convoy
+
+- **WHEN** Git reports a feature's worktree at a new path
+- **THEN** the feature remains visible, verified rebinding updates its current location, and old run paths remain historical observations rather than current mutation targets
 
 ### Requirement: Conventional branch naming preserved
 

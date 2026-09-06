@@ -21,40 +21,60 @@ One inferred surface — `convoy specs` — where every feature's stage is deriv
 
 ### Requirement: Active change rows derive their lifecycle state
 
-Each active change row SHALL show its derived stage and signals: tasks completed of total, linked runs (count and liveness), whether the proposal sits uncommitted, whether the feature branch contains the base branch's tip (synced), and merged-ness reported as probably merged at most. Rows SHALL render for changes on the base checkout (stranded), changes inside their worktrees (proposing, implementing when runs are linked), and completed-but-unarchived changes (ready to close, or probably merged).
+The board SHALL show registered pending features and unassociated active-change candidates, not only active directories. Each feature row SHALL show its assessed lifecycle summary, tasks done/total when known, linked runs and liveness, uncommitted proposal signal, base synchronization, artifact/archive state, and integration evidence with its certainty. Verified local landing SHALL be labelled integrated locally; patch equivalence alone SHALL remain probably merged. Archived-but-unintegrated features and integrated features with pending cleanup SHALL remain in the pending-work surface. Completed features SHALL remain accessible through history. Unassociated candidates SHALL show association or spin remediation rather than asserting ready-to-close ownership. “Ready to close” SHALL require the shared close-start prerequisites, and blockers SHALL be visible.
 
 #### Scenario: Implementing feature
 
-- **WHEN** a change in a worktree has two runs recorded against its branch, one live
-- **THEN** its row shows implementing with two runs and the live one marked
+- **WHEN** a feature has two associated runs, one live
+- **THEN** its row shows implementation in progress with two runs and the live one marked, rather than claiming ready to close from task counts alone
 
 #### Scenario: Stranded change on main
 
-- **WHEN** a change exists uncommitted on the base checkout with no worktree
-- **THEN** its row shows stranded on main and offers spin out
+- **WHEN** an uncommitted change exists on the base checkout with no feature association
+- **THEN** it remains visible as unassociated work and offers spin or explicit association without inventing an implementation branch
+
+#### Scenario: Archived before integration
+
+- **WHEN** a feature's own change is archived while its branch also contains an unrelated active change inherited from main
+- **THEN** the feature remains listed with its archived contract and pending integration; the inherited change does not replace its identity
+
+#### Scenario: Definite local landing
+
+- **WHEN** a feature has a verified receipt whose landing remains reachable and its feature tip is unchanged
+- **THEN** the board reports integrated locally and offers only applicable follow-ups without labelling the evidence as patch-equivalence probability
 
 ### Requirement: Worktrees without spec get their own section
 
-The board SHALL include a section listing worktrees that carry runs but no OpenSpec change, each linking to the runs browser for that branch. The section SHALL be a peer of the active-changes and canonical-specs sections, not a footnote. Empty peer sections SHALL be omitted entirely, including their titles. A non-empty worktrees-without-spec section SHALL make the interactive board non-empty even when no active changes or canonical specs exist.
+The board SHALL include a peer section for run-bearing worktrees without an associated OpenSpec feature, each linking to its runs. Presence of unrelated change-directory copies SHALL NOT suppress this section. Registered features with archived contracts SHALL stay in the feature lifecycle surface rather than being downgraded to specless worktrees. Empty peer sections SHALL be omitted entirely. A non-empty worktree section SHALL make the board interactive even without changes or canonical specs.
 
 #### Scenario: Plain isolated run appears
 
-- **WHEN** an isolated run's worktree exists with no change directory
-- **THEN** it is listed in the worktrees-without-spec section with its branch and run count
+- **WHEN** an isolated run's worktree exists without an associated OpenSpec feature
+- **THEN** it is listed with its branch and run count and can open its runs
 
 #### Scenario: Worktree-only board remains interactive
 
-- **WHEN** worktrees carrying runs exist but there are no active changes or canonical specs
-- **THEN** the interactive board opens with only Worktrees without spec, omitting the Active Changes and Canonical Specs titles
+- **WHEN** only run-bearing unassociated worktrees exist
+- **THEN** the interactive board opens with that section and no empty feature or canonical-spec headers
+
+#### Scenario: Foreign artifacts do not hide a worktree
+
+- **WHEN** a no-spec run's worktree contains active changes copied from the base
+- **THEN** those copies do not assign the run to a feature or remove the worktree's run-navigation entry
 
 ### Requirement: Continue reuses the feature's worktree and branch
 
-Launching a run from a feature row SHALL preselect that feature's existing worktree and branch — the run executes in the worktree on the feature branch with the base ref as base — instead of creating a new worktree or minting a new branch name. Isolation SHALL be on by default in this path, and the launcher SHALL proceed without invoking the branch namer.
+Launching continue from a feature SHALL carry stable feature identity, its explicit contract set, intended base, and verified implementation context into the launcher. Continue SHALL reuse that worktree and actual branch without creating another worktree or invoking the branch namer; new-worktree isolation SHALL be disabled for this handoff. The reviewed plan SHALL freeze the association revision and current context for execution-time validation. Invalid or missing associations SHALL present resolution guidance rather than silently creating replacement work. Archived contracts SHALL remain available for closing/history but SHALL require an explicit new active-work decision before another implementation run.
 
 #### Scenario: Second run lands on the same branch
 
-- **WHEN** a feature already ran once and continue launches another run
-- **THEN** the run's plan freezes the existing feature branch and worktree directory, and no new worktree is created
+- **WHEN** an active feature already ran once and continue launches another run
+- **THEN** the reviewed plan retains the same feature identity, actual branch, worktree, and contracts without minting a new branch
+
+#### Scenario: Rename requires verified context
+
+- **WHEN** continue is requested after an external branch rename
+- **THEN** Convoy resolves a previously verified rebind or offers rebinding before launch, rather than choosing another change by branch spelling
 
 ### Requirement: The launcher warns on nested isolation
 
@@ -67,19 +87,28 @@ When the launcher detects it is running inside a worktree, isolation SHALL remai
 
 ### Requirement: Change rows resolve to the owning worktree
 
-When several feature worktrees list the same change id in their `openspec/changes/`, the board SHALL resolve the row's checkout by precedence rather than by first-listed worktree: the worktree whose branch matches the change id under the shared branch↔change resolver rule SHALL win over every other copy; among the remaining candidates, a copy carrying change markdown SHALL outrank a husk directory with none; remaining ties SHALL keep stable worktree-list order. Every derived fact of the row — branch, task counts, title, uncommitted-proposal marker — SHALL come from the resolved checkout, so stage derivation describes the copy that actually owns the change. Resolution SHALL never drop a row: when no candidate carries markdown and no branch matches, the row SHALL render from the first-listed candidate exactly as it does today.
+Explicit verified feature associations SHALL determine the authoritative context and artifact sources for feature rows. Branch-name matches, Markdown presence, and worktree-list order SHALL NOT select ownership. Discovered copies SHALL remain inspectable as candidates with their source locations. Ambiguous, missing, or unreadable associations SHALL keep the feature visible without borrowing another copy's tasks, title, runs, or mutation target. Unassociated candidates SHALL offer explicit selection/adoption, with no automatic writes while browsing.
 
 #### Scenario: A husk in an earlier worktree cannot steal the row
 
-- **WHEN** an unrelated feature worktree that `git worktree list` reports earlier contains only a husk directory for the id (no markdown inside), while the worktree whose branch matches the id carries the change with all tasks complete and runs recorded against that branch
-- **THEN** the row resolves to the branch-matching worktree and shows its branch, its complete task counts, and the ready-to-close stage — leaving close and continue available
+- **WHEN** an unrelated earlier-listed worktree contains a husk while the explicitly associated worktree carries the complete change
+- **THEN** the associated context supplies the row's facts and action assessment regardless of listing order
 
 #### Scenario: Branch match outranks a fuller foreign copy
 
-- **WHEN** two feature worktrees both carry markdown for the same change id but only one worktree's branch matches the id
-- **THEN** the branch-matching worktree supplies the row, even when the other copy lists more files
+- **WHEN** two worktrees both carry the same change and only one carries the explicitly associated implementation context
+- **THEN** the explicitly associated context supplies the row even when the other copy lists more files or its branch name happens to match the change id
 
 #### Scenario: Husk-only candidates keep the row present
 
-- **WHEN** every worktree listing the change id carries only husk directories and no branch matches the id
-- **THEN** the row still renders from the first-listed candidate with no branch and no task counts, degraded but never absent
+- **WHEN** every discovered copy of a change id carries only husk directories and none is explicitly associated
+- **THEN** the candidate remains listed with its source locations and no fabricated task counts, ownership, or close eligibility
+
+### Requirement: Board assessment can be refreshed without changing selection identity
+
+The board SHALL provide an explicit refresh action, refresh after returning from lifecycle actions, and invalidate cached artifact and assessment data together. Selection SHALL remain attached to feature identity rather than list position or branch name where that identity still exists. A failed refresh SHALL disclose unavailable/stale evidence and SHALL NOT present stale readiness as a current verified fact.
+
+#### Scenario: External archive becomes visible
+
+- **WHEN** the operator archives a selected feature outside Convoy and refreshes the board
+- **THEN** the same feature remains selected with updated artifact state and close prerequisites

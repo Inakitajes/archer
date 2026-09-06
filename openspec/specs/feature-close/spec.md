@@ -7,22 +7,32 @@ Close a feature in one orchestrated sequence — sync, archive, squash, merge, o
 
 ### Requirement: Close preflights before touching anything
 
-`convoy close` SHALL refuse to start unless the feature worktree's tree is clean, the change's tasks are all complete, no live Convoy run is attached to the worktree's branch, and the main checkout is clean and on the intended local base branch. Repository identities and required Git state MUST be verifiable. Each blocker SHALL include concrete remediation. A published feature branch SHALL NOT block close merely because it is published; close SHALL disclose known remote tracking/publication context without asserting that a PR exists or has been merged. An upstream by itself SHALL NOT be described as proof of publication. Close MUST NOT force-push or automatically publish.
+`convoy close` SHALL resolve stable feature identity, its explicit contract set, intended local base, and verified current context through the shared lifecycle assessment. Branch/change selectors SHALL be validated against that identity; unresolved legacy work SHALL require explicit adoption rather than a branch-name guess. For a new integration, the feature tree SHALL be clean, all associated contracts' task prerequisites SHALL be verified complete, no live run SHALL be attached to the feature or implementation context, and the base checkout SHALL be clean and on the intended local base branch. Required repository identities, context registration, current branch/HEAD, and Git/run state MUST be verifiable. An archived contract SHALL require positive archive/task evidence; missing active files SHALL not bypass task checks. Each blocker SHALL include remediation. Cleanup-only continuation of verified landing SHALL assess remaining cleanup prerequisites without demanding removed worktrees or active task files. A published branch SHALL NOT block close merely because it is published; known remote context SHALL be disclosed without asserting a PR exists or merged. An upstream alone SHALL NOT be proof of publication. Close MUST NOT force-push or automatically publish.
 
 #### Scenario: Incomplete tasks stop the sequence
 
-- **WHEN** close runs on a change with 8 of 11 tasks complete
-- **THEN** nothing changes on any branch and the message names the missing task count
+- **WHEN** close runs on a feature with an associated change at 8 of 11 tasks complete
+- **THEN** no branch changes and the blocker identifies the change and missing task count
 
 #### Scenario: Main checkout is unavailable for landing
 
-- **WHEN** the main checkout is dirty or not on the intended local base branch
-- **THEN** close stops before sync or archive with the concrete prerequisite rather than mutating the feature first
+- **WHEN** the base checkout is dirty or not on the intended local base branch
+- **THEN** close stops before sync or archive with the concrete prerequisite
 
 #### Scenario: Published feature closes normally
 
-- **WHEN** a complete, clean feature branch has published commits and all other preconditions hold
-- **THEN** close discloses the known remote context and proceeds without rewriting the published commits or requiring a force-push
+- **WHEN** a complete clean feature has published commits and all other preconditions hold
+- **THEN** close discloses remote context and proceeds without rewriting published feature history or requiring a force-push
+
+#### Scenario: A mistyped change is not an archive
+
+- **WHEN** an explicit change selector is absent from the feature's contract set or its required artifact/evidence source cannot be verified
+- **THEN** close refuses before mutation rather than skipping tasks or declaring the change already archived
+
+#### Scenario: Worktree and branch disagree
+
+- **WHEN** explicit or recorded worktree/branch selectors refer to different checked-out contexts or repositories
+- **THEN** close refuses before sync or archive and identifies the conflicting context
 
 ### Requirement: Close syncs the base branch before archiving
 
@@ -45,89 +55,162 @@ Close SHALL merge the local base branch into the feature branch inside the featu
 
 ### Requirement: Close archives through the OpenSpec CLI
 
-Close SHALL archive the change by running the OpenSpec CLI's archive command inside the feature worktree — convoy never edits `openspec/` itself — and SHALL commit the archive result on the feature branch under the operator's identity. Archive failures SHALL abort the sequence before any squash or merge happens.
+After required synchronization, close SHALL archive each associated active change through the OpenSpec CLI in the verified feature checkout and commit the archive result under the operator's identity; Convoy SHALL not author OpenSpec artifacts itself. Archive success SHALL require verified correspondence between the selected change, archive artifacts, canonical-spec synchronization, completed task evidence, and committed result. An absent active directory alone SHALL never mean already archived. An externally archived change SHALL be accepted only after locating and validating its unambiguous archived artifacts, task completion, and canonical-spec result; otherwise close SHALL stop with remediation. For previously verified archives, close SHALL revalidate their applicability after base synchronization and SHALL not archive them a second time. Failure or ambiguity SHALL stop before landing, preserve completed archive evidence, and support resumption of remaining contracts. Message context SHALL include verified archived proposal/capability artifacts when active artifacts are no longer present.
 
 #### Scenario: Archive then commit
 
-- **WHEN** the sync step completed cleanly
-- **THEN** the OpenSpec CLI archives the change inside the worktree, the change directory moves to the archive layout, canonical specs gain the merged deltas, and the result is committed on the feature branch
+- **WHEN** sync completes and an associated contract is active
+- **THEN** OpenSpec archives it in the feature worktree, canonical specs receive the deltas, the result is committed on the feature branch, and close retains its archive evidence
+
+#### Scenario: External archive before close
+
+- **WHEN** an operator already archived a feature's change and its archived tasks and canonical-spec result can be verified
+- **THEN** close shows archive verified/skipped, retains the proposal context, and continues integration without recreating the active directory
+
+#### Scenario: Archive directory exists but canonical sync is missing
+
+- **WHEN** archived delta artifacts are present but their required canonical-spec effect cannot be established
+- **THEN** close blocks before landing and asks for archive/spec reconciliation rather than treating directory presence as success
+
+#### Scenario: Multi-contract archive is interrupted
+
+- **WHEN** one contract is verified archived and archiving the next fails
+- **THEN** no landing occurs and resume revalidates the first result before continuing only the unmet archive work
+
+#### Scenario: Overlapping contracts compose their effects
+
+- **WHEN** two associated contracts modify the same requirement and both must be verified before landing
+- **THEN** close verifies the ordered composed effect against retained per-contract evidence, or refuses before the first archive mutation when it cannot establish that composition
 
 ### Requirement: Close always squash-lands the complete feature
 
-After archiving, close SHALL land the entire feature-exclusive result as exactly one regular conventional commit under the operator's identity on the captured local base revision. The commit SHALL have one parent, that base revision, and SHALL include operator commits, previous run-compaction results, remaining intermediate run work, sync resolutions, and archive output as content rather than additional base-history commits. Commits already reachable from the base SHALL NOT be duplicated. Close MUST NOT squash-rewrite the feature branch, fast-forward the base to its tip, or create an additional merge commit. The existing feature history SHALL remain intact apart from additive sync/archive work. Empty aggregate changes SHALL produce an explicit no-change result, not an empty landing commit or an unsupported claim of prior landing.
+After verified archive processing, close SHALL land the entire feature-exclusive result as exactly one regular conventional commit under the operator's identity on the captured local base revision. The commit SHALL have one parent, that base revision, and include operator commits, previous run-compaction results, remaining intermediate run work, sync resolutions, and archive output as content rather than additional base-history commits. Commits already reachable from the base SHALL NOT be duplicated. Close MUST NOT squash-rewrite the feature branch, fast-forward the base to its tip, or create an additional merge commit. Feature history SHALL remain intact apart from additive sync/archive work. Review SHALL identify the feature, complete contract set, source branch, intended base, and whole-branch landing scope; selecting a contract SHALL NOT imply path-filtered integration. Empty aggregate changes SHALL produce an explicit no-change result, not an empty commit or unsupported prior-landing claim.
 
-The landing SHALL preserve operator signing, hooks, and secret-file protections and SHALL guard against stale branch/base/index/worktree state. A failure before landing MUST leave the base unadvanced; interrupted operations SHALL expose recovery evidence and MUST NOT discard unrelated work. Completed landing SHALL be recorded durably for resume and cleanup.
+The landing SHALL preserve operator signing, hooks, and secret-file protections and guard against stale association, branch/base/index/worktree state. A failure before landing MUST leave the base unadvanced; interrupted operations SHALL expose durable recovery evidence and MUST NOT discard unrelated work. Landing and cleanup evidence SHALL be tied to stable feature identity, an individual attempt, exact prepared feature tip/tree, and the captured base and resulting landing. Conflicting Convoy mutations SHALL be serialized and final ref changes SHALL be guarded against intervening external changes.
 
-After a verified landing, pushing the base to its configured remote, removing the worktree, and deleting the local feature branch SHALL remain separate deliberate choices. Push MUST be normal, never forced. Cleanup SHALL require verified landing evidence tied to the exact current feature tip and a landing still contained in the base, rather than assuming squash-merged ancestry or relying only on tree equality. Worktree removal SHALL precede branch deletion and refuse dirty or changed worktrees. When launched inside the feature worktree, removal/deletion SHALL be deferred guidance with guarded commands in safe execution order, not runnable in-session actions. Headless guidance SHALL name the configured remote/base and preserve these guards. Missing base upstream SHALL disable push with concrete setup guidance. Remote feature branch deletion SHALL NOT be automatic.
+After verified landing, base push, worktree removal, and local feature-branch deletion SHALL remain separate deliberate choices. Push SHALL be normal, never forced. Both worktree removal and branch deletion SHALL require a verified landing still contained in the intended base and a verified association to the exact unchanged feature tip, not squash ancestry assumptions or tree equality alone. Worktree removal SHALL precede branch deletion, refuse dirty/changed contexts, and preserve unrelated branches at reused names or paths. Inside the feature worktree, removal/deletion SHALL remain deferred guarded guidance, not runnable in-session actions. Headless guidance SHALL name the configured remote/base and preserve the same identity, landing, tip, and execution-order guards. Missing base upstream SHALL disable push with setup guidance. Remote feature-branch deletion SHALL NOT be automatic. Run recovery refs and completed landing evidence SHALL survive ordinary cleanup.
 
 #### Scenario: One conventional commit lands
 
-- **WHEN** close completes for a branch containing an operator proposal, two automatically compacted runs, and archive output
-- **THEN** the base gains exactly one regular commit with all resulting feature content, no individual proposal/run/archive commits are added to base history, and the feature worktree still exists
+- **WHEN** close completes for a branch containing an operator proposal, two compacted runs, and archive output
+- **THEN** the base gains exactly one regular commit containing the complete result and the feature worktree remains until deliberate cleanup
 
 #### Scenario: Advanced base still receives one commit
 
 - **WHEN** the base advanced since the fork and sync resolved integration before archive
-- **THEN** close lands one commit on the synchronized base without an additional merge commit or duplicated base changes
+- **THEN** close lands one commit on the synchronized base without an extra merge commit or duplicated base changes
 
 #### Scenario: Uncompacted or operator-only feature
 
 - **WHEN** a feature contains unsquashed machine commits or only operator-authored work
-- **THEN** close includes the complete feature result without depending on a successful automatic run compaction
+- **THEN** close includes the complete result without depending on automatic compaction success
 
 #### Scenario: Empty aggregate change
 
-- **WHEN** the validated archived feature tree is identical to the captured base tree and no landing receipt exists
-- **THEN** close reports no content to land, creates no empty commit, and does not offer destructive branch cleanup on that fact alone
+- **WHEN** the verified archived feature tree equals the captured base tree and no landing receipt exists
+- **THEN** close reports no content to land, creates no empty commit, and does not authorize destructive cleanup on equality alone
 
 #### Scenario: Cleanup respects git dependencies
 
-- **WHEN** close has verified landing evidence, runs outside the unchanged feature worktree, and that worktree still exists
-- **THEN** configured push and clean worktree removal are runnable, branch deletion remains unavailable until removal succeeds, and no cleanup runs without confirmation
+- **WHEN** close has verified evidence, runs outside the unchanged feature worktree, and that worktree still exists
+- **THEN** push and clean worktree removal are runnable after consent, branch deletion remains unavailable until removal succeeds, and every operation revalidates its evidence
 
 #### Scenario: Cleanup is deferred inside the feature worktree
 
-- **WHEN** close completes from inside the feature worktree
-- **THEN** configured base push remains runnable and worktree/branch cleanup is presented as guarded continuation commands after leaving that directory
+- **WHEN** close completes from within that worktree
+- **THEN** configured base push remains runnable while worktree/branch cleanup is shown as guarded continuation commands for execution after leaving it
 
 #### Scenario: Feature changes before cleanup
 
-- **WHEN** the feature tip changes or the worktree becomes dirty after landing
-- **THEN** cleanup refuses removal/deletion instead of applying an unconditional force-delete based on an old landing
+- **WHEN** the feature tip changes, association changes, or worktree becomes dirty after landing
+- **THEN** cleanup refuses removal/deletion rather than applying a stale receipt or unconditional force-delete
 
 #### Scenario: Missing upstream disables push
 
-- **WHEN** close completes and the base has no configured upstream
-- **THEN** push is unavailable with setup remediation and headless mode prints no invalid push command
+- **WHEN** the base has no configured upstream after close
+- **THEN** push is unavailable with setup guidance and no invalid push command is printed
+
+#### Scenario: Reused branch is not cleaned up
+
+- **WHEN** an old feature's original branch name now points to another feature's work
+- **THEN** old-receipt cleanup refuses to remove that branch or its worktree even if names match
 
 ### Requirement: Merged detection reports probability, not certainty
 
-For a change whose branch content appears in the base only through inferred patch equivalence, the board and close SHALL report *probably merged*, never *merged*. A verified durable Convoy landing receipt naming the feature tip and a landing commit still reachable from the base SHALL establish a completed close even after the base subsequently advances. Resume MUST consult this evidence before performing new sync/archive work and MUST NOT create a second landing for the same closed tip. Equality of trees alone SHALL NOT establish a previous close or authorize forced branch deletion. When a change appears probably merged but remains unarchived, the board SHALL retain the deliberate archive-on-main remediation without performing sync or another feature landing. Close SHALL NOT claim that a hosted PR was merged merely because a local squash landing or base push succeeded.
+Board and close SHALL use the same integration assessment. Patch equivalence without verified Convoy landing evidence SHALL remain *probably merged*, never a completed close or cleanup authorization. A verified durable receipt for the selected feature and unchanged feature tip, with its landing still reachable from the intended base, SHALL establish completed local integration even after base advancement. Every close invocation, with or without `--resume`, SHALL consult existing attempts and receipts before new sync/archive work and SHALL not create another landing for the same closed tip. Missing worktree or renamed branch SHALL not erase the feature's evidence; any current binding SHALL be verified before mutation. Tree equality alone SHALL not establish a previous close or authorize branch deletion. Probable external integration SHALL stop direct close before duplicate landing and retain deliberate archive-on-main remediation for active contracts. Archive-on-main SHALL verify a clean checkout on the intended base, invoke OpenSpec there, and commit only the archive result without feature sync/landing. Neither local landing, base push, nor archive-on-main SHALL assert hosted PR merge.
 
 #### Scenario: Squash-merged change shows honestly
 
-- **WHEN** a feature was squash-merged externally without a Convoy receipt and remains unarchived
-- **THEN** the board reports probably merged and offers archive on main rather than inventing a certain Convoy landing
+- **WHEN** a feature appears externally squash-merged without a Convoy receipt and remains unarchived
+- **THEN** the board reports probably merged and offers deliberate archive-on-main guidance without inventing a certain landing
 
 #### Scenario: Direct close encounters probable external landing
 
-- **WHEN** direct close detects patch-equivalence evidence suggesting an external landing but has no verified receipt
-- **THEN** it stops before syncing or landing again and provides inspection or deliberate archive-on-main guidance instead of treating probability as permission for a duplicate landing
+- **WHEN** direct close finds patch-equivalence evidence without a verified receipt
+- **THEN** it stops before sync or another landing and provides inspection/archive-on-main guidance
 
 #### Scenario: Archive on main
 
-- **WHEN** the operator accepts archive on main for that change
-- **THEN** OpenSpec archives in the main checkout and the result is committed there without sync, squash, or feature merge
+- **WHEN** the operator accepts archive on main and the base checkout is verified clean and on the intended base branch
+- **THEN** OpenSpec archives there and the result is committed without feature sync, squash, or merge
+
+#### Scenario: Archive on main verifies its source
+
+- **WHEN** archive-on-main is selected for a feature whose active artifacts also exist in the feature worktree
+- **THEN** Convoy verifies the base-checkout copy corresponds to the selected contract before archiving, records the archive source and evidence, and leaves integration reported as probably merged or pending rather than confirmed
 
 #### Scenario: Resume after base advances beyond a completed landing
 
-- **WHEN** close is resumed for an unchanged feature tip whose recorded landing remains reachable from the now-advanced base
-- **THEN** close reports the existing landing and offers only still-safe cleanup without resyncing or creating another commit
+- **WHEN** close targets an unchanged feature whose recorded landing remains reachable from the advanced base
+- **THEN** it reports the existing landing and offers only applicable safe follow-ups without another commit, regardless of whether `--resume` was supplied
 
 #### Scenario: Resume after worktree removal
 
-- **WHEN** a verified close removed the feature worktree but branch cleanup was interrupted
-- **THEN** resume resolves the recorded branch from the landing receipt without requiring a worktree, rechecks its tip and landing, and offers only remaining safe cleanup
+- **WHEN** verified close removed a feature's worktree but branch cleanup was interrupted
+- **THEN** feature-identity lookup reconstructs remaining cleanup without requiring the worktree and rechecks the current branch tip and landing
+
+#### Scenario: Landing evidence becomes stale
+
+- **WHEN** the base no longer contains the recorded landing or the associated feature tip has advanced
+- **THEN** close reports stale evidence and requests explicit recovery or new-work planning instead of relanding or deleting automatically
+
+### Requirement: Close attempts reconcile every mutation boundary
+
+Close SHALL persist feature/attempt identity and the intended operation before each irreversible or externally visible repository mutation, and persist verified outcomes after it. Sync conflicts, archive execution/commit, candidate creation, base landing, and cleanup SHALL have recoverable before/after evidence. Resumption SHALL inspect current Git and artifact state to reconcile a completed operation whose acknowledgement was not saved; it SHALL not rely solely on the journal's last phase label. A candidate already reachable from the base with the recorded parent/tree and unchanged feature preparation SHALL be reconciled as the existing landing even if the base advanced afterward. Unexplained divergence SHALL stop for recovery. Renewed integration after an unrelated base advance SHALL retain prior evidence and revalidate archive output against the new preparation. Successful receipts SHALL be immutable and survive later attempts, no-change outcomes, and cleanup.
+
+#### Scenario: Crash after base landing before receipt acknowledgement
+
+- **WHEN** the base contains the recorded candidate but the journal still describes landing as pending
+- **THEN** resume verifies candidate, preparation, and ancestry, records the existing landing, and does not create another commit
+
+#### Scenario: Crash after archive before archive commit
+
+- **WHEN** OpenSpec completed archive but the process stopped before committing it
+- **THEN** resume checks the recorded archive intent, expected artifact effects, and absence of unrelated dirt before committing only the verified archive result or stops with recovery guidance
+
+#### Scenario: Base moves without containing the candidate
+
+- **WHEN** a pending candidate was built against an older base and the current base does not contain it
+- **THEN** close refuses the stale candidate and requests renewed integration/review without deleting its recovery evidence
+
+#### Scenario: Repeated close after success
+
+- **WHEN** the operator invokes close again for the same feature and unchanged landed tip
+- **THEN** the prior receipt remains intact and no sync, archive, or second landing is performed
+
+### Requirement: Close and cleanup expose the same recoverable action assessment
+
+Interactive close SHALL retain its existing checklist, message-review, and failure-display behavior while adding verified feature/context identification and explicit archive/integration/cleanup distinctions. Applicable blocked actions SHALL expose reasons rather than disappear. Completed steps SHALL show verified skip/completion reasons; missing evidence SHALL not be rendered as completion. Cleanup eligibility and evidence SHALL be preserved through command output, TUI follow-up selection, and action-time revalidation. Deferred/headless follow-ups SHALL invoke the same guarded operations rather than print an unprotected check-then-force-delete recipe. Cancellation SHALL preserve recoverable preparation but SHALL not authorize landing or cleanup.
+
+#### Scenario: Cleanup evidence reaches the action
+
+- **WHEN** the operator chooses worktree removal or branch deletion from close's result screen
+- **THEN** the operation receives the selected feature/attempt identity, reloads and validates current evidence, and either performs that authorized action or explains its blocker
+
+#### Scenario: Close review is opened while blocked
+
+- **WHEN** a feature has complete tasks but an unresolved association or live run
+- **THEN** close review remains reachable, explains what must be resolved, and performs no Git or archive mutation
 
 ### Requirement: The squashed commit carries a composed conventional message
 

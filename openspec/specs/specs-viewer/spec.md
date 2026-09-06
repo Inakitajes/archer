@@ -8,60 +8,75 @@ The `convoy specs` command lets an operator browse OpenSpec state — registered
 
 ### Requirement: Specs command discovers OpenSpec state from the filesystem
 
-Convoy SHALL expose a `convoy specs` subcommand that reads only the `openspec/` directory of the target repo: active changes are the entries of `openspec/changes/` excluding `archive`, dotfiles, and stray non-directory files; canonical specs are every markdown file under `openspec/specs/**`. The command MUST NOT invoke the `openspec` binary or write any file.
+`convoy specs` SHALL discover OpenSpec artifacts from the filesystem: active changes are real directories in `openspec/changes/` excluding `archive`, dotfiles, and stray non-directory files; canonical specs are Markdown files under `openspec/specs/**`. It SHALL also read repository-scoped feature associations, referenced archives, run/close evidence, and current Git context for lifecycle discovery. Read-only OpenSpec task queries SHALL be permitted by the shared assessment contract. Discovery, refresh, and browsing MUST NOT write any file or silently adopt/migrate features. Absence of active changes or of the launch checkout's `openspec/` SHALL NOT suppress registered features or run-bearing worktrees.
 
 #### Scenario: Repo without openspec directory
 
-- **WHEN** `convoy specs` runs in a repository with no `openspec/` directory
-- **THEN** Convoy prints a message saying no specs were found and exits successfully without launching any UI
+- **WHEN** a repository has no `openspec/` directory and no discoverable registered features or run-bearing worktrees
+- **THEN** Convoy reports that no specs were found and exits successfully without launching a UI
 
 #### Scenario: Repo with openspec directory but no active changes
 
-- **WHEN** `convoy specs` runs in a repository whose `openspec/changes/` contains only `archive`
-- **THEN** the interactive root omits the Active Changes section and its title entirely, and canonical specs (if any) remain browsable
+- **WHEN** a repository has `openspec/` but its changes directory holds only `archive` and there are no pending registered features
+- **THEN** the pending-feature section is omitted, canonical specs remain browsable, and registered completed features remain accessible in history
+
+#### Scenario: Archived work remains pending
+
+- **WHEN** only archived contracts remain for a registered feature awaiting integration
+- **THEN** the feature remains discoverable and its verified archived artifacts are readable
 
 ### Requirement: Worktree-backed changes read their artifacts from the worktree
 
-When the control board resolves an active change to a feature worktree, the specs view SHALL load that change's artifact inventory and title from that worktree's `openspec/changes/<id>/` tree, and every artifact file it lists SHALL be addressed by an absolute path so the reading pane loads it regardless of the working directory `convoy specs` was launched from. This resolution SHALL take precedence over any directory for the same change id in the launch checkout's `openspec/changes/` — including a stale, partial, or empty skeleton left behind there — mirroring the precedence the control board already applies to feature rows over same-id rows stranded on the base checkout. Changes the board does not resolve to a worktree SHALL keep loading from the launch checkout unchanged, and the operator SHALL NOT be required to relaunch the browser from another checkout, switch checkouts, or take any extra action to read such a change's artifacts.
+The specs view SHALL load a registered feature's title and artifact inventory from its verified associated contract source, using absolute paths into its active change tree or verified archive. That source SHALL take precedence over same-id copies in the launch checkout. A missing, ambiguous, or unreadable associated source SHALL display its condition rather than fall back silently to another checkout. Unassociated active changes SHALL remain readable from explicitly identified discovered sources; multiple copies SHALL be selectable without assigning ownership. The operator SHALL not need to relaunch from the source checkout to read available artifacts.
 
 #### Scenario: Stale skeleton on the launch checkout
 
-- **WHEN** `convoy specs` opens in a checkout whose `openspec/changes/` holds a change directory with no markdown files, while the board resolves that change to a feature worktree carrying its full artifact set
-- **THEN** the change lists with the worktree's artifacts and title, and entering it renders those artifacts in the reading pane instead of reporting that no markdown artifacts were found
+- **WHEN** the launch checkout holds a husk while the verified associated worktree contains the change's full artifacts
+- **THEN** the worktree supplies the title and readable artifact inventory
 
 #### Scenario: Reading works from any launch directory
 
-- **WHEN** a worktree-backed change is listed and the browser's process working directory is not the worktree that carries the change's files
-- **THEN** the artifact paths resolve into the worktree and every tab renders its file's content without read placeholders
+- **WHEN** a feature's artifacts live outside the browser's process directory
+- **THEN** absolute artifact paths load the associated source without read placeholders caused by the launch location
 
 #### Scenario: Diverging copies resolve to the worktree
 
-- **WHEN** both the launch checkout and the feature worktree carry files for the same change id and the board resolves the change to the worktree
-- **THEN** the worktree's copy supplies the artifact inventory and the row title
+- **WHEN** the launch checkout and the verified associated worktree carry differing copies of a change
+- **THEN** the associated source supplies feature artifacts and facts without mixing in the launch copy
 
 #### Scenario: Changes without a worktree are unchanged
 
-- **WHEN** an active change is not resolved to any feature worktree
-- **THEN** its artifacts and title load from the launch checkout's `openspec/changes/` exactly as before this resolution existed
+- **WHEN** an active change is not associated with any feature context and is discovered in the launch checkout
+- **THEN** its files remain readable there with unassociated status and no inferred mutation target
+
+#### Scenario: Associated artifacts are missing
+
+- **WHEN** the associated worktree is absent but another checkout has the same slug
+- **THEN** the feature shows missing-source remediation and exposes the other copy only as a candidate, not as a replacement owner
 
 ### Requirement: Root view shows only non-empty sections
 
-In the interactive browser, the root navigation list SHALL present each non-empty board section in this order: **Active Changes**, **Worktrees without spec**, then **Canonical Specs**. The sections SHALL have visually distinct headers and remain independently reachable while scrolling. A section with no entries SHALL be omitted entirely, including its header. A change entry without a readable `proposal.md` SHALL still be listed by its id.
+The root SHALL present non-empty sections in this order: **Features**, **Worktrees without spec**, and **Canonical Specs**. Features SHALL include registered pending lifecycle work and unassociated active-change candidates. A discoverable history view SHALL expose completed registered features without requiring them to clutter pending work. Section headers SHALL remain distinct and reachable while scrolling; empty sections and headers SHALL be omitted. Missing proposals SHALL not hide entries; features SHALL use their recorded display identity and unassociated changes their change id. Selection SHALL use stable feature identity where available, not a mutable branch or directory name.
 
 #### Scenario: Sections appear in order
 
-- **WHEN** the browser opens with entries in all three sections
-- **THEN** Active Changes is listed above Worktrees without spec, which is listed above Canonical Specs, with visually distinct headers
+- **WHEN** all three root sections have entries
+- **THEN** Features precedes Worktrees without spec, which precedes Canonical Specs, with distinct headers
 
 #### Scenario: Empty root sections disappear
 
-- **WHEN** any root section has no entries
-- **THEN** neither that section's rows nor its title are rendered
+- **WHEN** any root section is empty
+- **THEN** neither its rows nor its title are rendered
 
 #### Scenario: Change missing its proposal
 
-- **WHEN** an active change directory has no `proposal.md`
-- **THEN** the change still appears in the list, titled by its directory id
+- **WHEN** a candidate change has no readable proposal
+- **THEN** the candidate remains listed by id with its artifact availability disclosed
+
+#### Scenario: Completed feature is inspected
+
+- **WHEN** the operator opens feature history after worktree cleanup
+- **THEN** the feature's recorded contracts, runs, and integration evidence remain inspectable
 
 ### Requirement: Canonical selection keeps the root list full-size
 
@@ -113,50 +128,55 @@ Entering an active change or a canonical spec SHALL show one full-width reading 
 
 ### Requirement: Apply this spec hands off to the launcher preselected
 
-While browsing a change, the user can invoke an **Apply this spec** action. Convoy SHALL then open the standard interactive run launcher with that change id pinned as the selected contract — equivalent to starting `convoy` and picking that spec row — so the operator continues through the normal pipeline selection, run-option toggles, branch step, and plan review. A cancelled launcher returns control to exit without starting any run.
+While browsing an active contract, **Apply this spec** SHALL open the standard launcher with the selected contract and its explicit source pinned. For a registered feature it SHALL also carry feature identity, complete associated contract set, verified context, and intended base; execution SHALL reuse that context unless the operator explicitly chooses a separate new feature. For an unassociated candidate, normal context selection and association review SHALL precede execution. No missing preset SHALL silently fall back to another contract. A cancelled launcher SHALL start no run and leave no newly created context or association. An archived contract SHALL remain readable but implementation SHALL require an explicit new active-work decision, not silently reactivate the archive.
 
 #### Scenario: Handoff preselects the change
 
-- **WHEN** the user selects "Apply this spec" on change `add-specs-viewer` and confirms through the launcher
-- **THEN** the resulting run attaches exactly the `add-specs-viewer` bundle without re-asking which change to use
+- **WHEN** Apply is selected on an active `add-specs-viewer` feature and accepted through the launcher
+- **THEN** the resulting run uses its reviewed contract set and associated context without re-asking which copy to use
 
 #### Scenario: Launcher cancelled after handoff
 
-- **WHEN** the user invokes "Apply this spec" and then aborts the launcher
-- **THEN** no run starts and no side effects remain
+- **WHEN** the operator invokes Apply and aborts before acceptance
+- **THEN** no run starts and no new context or association remains
+
+#### Scenario: Selected source disappears
+
+- **WHEN** an active contract disappears between browsing and launch review
+- **THEN** the launcher reports the missing selected source instead of choosing a different active change
 
 ### Requirement: Iterate on this plan opens an OpenCode session on the change
 
-While browsing a change, the user can invoke an **Iterate on this plan** action. Convoy SHALL open a standalone OpenCode session rooted at the repository directory, with the change's planning files (proposal, design, tasks, and delta specs) referenced as initial context. The session SHALL be pre-authorized to read the entire repository without per-file read confirmations — revising a change requires consulting the surrounding code and specs, so the repo-wide read grant is intentional; only reads are pre-granted, and writes follow the session's normal defaults. The session is external to Convoy and outlives the browser; any edits to the change are made by the operator through OpenSpec authoring commands inside that session, not by Convoy.
+**Iterate on this plan** SHALL open a standalone OpenCode session rooted at the verified checkout containing the selected active planning artifacts, with proposal, design, tasks, and delta specs referenced as context. For a registered feature the source SHALL come from its association; for an unassociated candidate the source SHALL be explicitly selected. The session SHALL be pre-authorized to read the entire selected repository checkout without per-file read confirmations; only reads are pre-granted and writes retain normal defaults. The session SHALL outlive the browser and use OpenSpec authoring commands for edits, not Convoy artifact writes. Missing, ambiguous, or archived-only planning sources SHALL yield guidance rather than silently opening an unrelated checkout for editing.
 
 #### Scenario: Iterate opens a repo-rooted session
 
-- **WHEN** the user selects "Iterate on this plan" on change `add-specs-viewer`
-- **THEN** Convoy opens a standalone OpenCode session in the repository directory whose initial prompt lists the change's planning files as context
+- **WHEN** Iterate is selected for an active change associated with another worktree
+- **THEN** the standalone session opens at that worktree's root with its planning files as context
 
 #### Scenario: Iterate requires no launcher
 
-- **WHEN** the user selects "Iterate on this plan" and then closes the session without running any pipeline
-- **THEN** no run starts; only the standalone session was opened
+- **WHEN** the operator iterates and closes the session without running a pipeline
+- **THEN** no run starts and only the standalone session was opened
 
 #### Scenario: Iterate session is pre-authorized to read the repository
 
-- **WHEN** the user selects "Iterate on this plan"
-- **THEN** the OpenCode session starts with read access to the whole repository pre-granted (no per-file read confirmations), so the agent can consult surrounding code and specs while revising the change
+- **WHEN** Iterate opens on a verified planning checkout
+- **THEN** reads across that checkout are pre-granted while writes follow normal session permissions
 
 ### Requirement: Non-TTY invocations print a plain listing
 
-When stdin or stdout is not a TTY, `convoy specs` SHALL print a plain text listing of active changes (id plus artifact inventory) and canonical specs instead of launching the TUI, and exit successfully.
+Non-TTY `convoy specs` SHALL print a plain listing of pending features/candidates, their artifact inventories and lifecycle summaries, applicable actions with blocker/remediation information, run-bearing unassociated worktrees, and canonical specs, rather than launching a TUI. Headless and interactive listings SHALL use the same assessment and expose history inspection guidance. Listing SHALL not mutate or silently adopt work.
 
 #### Scenario: Piped output
 
-- **WHEN** `convoy specs` runs with stdout redirected to a pipe in a repo with changes
-- **THEN** a plain listing prints and the process exits 0 without any terminal control sequences
+- **WHEN** `convoy specs` runs with stdout redirected in a repository containing lifecycle work
+- **THEN** it prints the shared lifecycle facts and action reasons without terminal control sequences and exits successfully
 
 #### Scenario: Empty state when piped
 
-- **WHEN** `convoy specs` runs piped in a repo with no openspec directory
-- **THEN** a single message notes that no specs were found and the process exits 0
+- **WHEN** no OpenSpec artifacts or lifecycle work are discoverable
+- **THEN** a single empty-state message prints and the process exits successfully
 
 ### Requirement: Fullscreen reader
 
@@ -209,3 +229,22 @@ The board's chrome SHALL stay lean. The header SHALL show exactly one content li
 
 - **WHEN** the detail level renders with actions available
 - **THEN** the footer hints list actions like read, apply, iterate, full, and quit — and contains no arrow-key or paging hints
+
+### Requirement: Lifecycle actions are discoverable in root and detail
+
+The selected feature's root and ordinary detail views SHALL expose the same applicable lifecycle action menu, including close review, association/rebinding, refresh, and history navigation as appropriate. Blocked actions SHALL remain inspectable with reasons and remediation rather than disappear. Footer truncation SHALL retain a discoverable action-menu entry so omitted hints do not remove access; handlers and menu availability SHALL consume shared capabilities. Fullscreen reader copy/close/tab keys SHALL remain unchanged; returning to detail SHALL restore lifecycle actions without losing subject identity. Invoking close review SHALL disclose the feature, contracts, entire source branch, base, and any blockers before mutation.
+
+#### Scenario: Narrow terminal hides the close shortcut hint
+
+- **WHEN** footer space cannot show every shortcut
+- **THEN** the action menu remains discoverable and exposes close review and its current blockers
+
+#### Scenario: Ready feature is opened in detail
+
+- **WHEN** a feature assessed ready to close is selected and its detail reader is opened
+- **THEN** its ordinary detail action menu offers the same close action as the root
+
+#### Scenario: Reader copy remains copy
+
+- **WHEN** the operator presses `c` in the fullscreen reader
+- **THEN** the active tab is copied as before and no lifecycle mutation is triggered
