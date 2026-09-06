@@ -51,17 +51,7 @@ jobs:
         run: bun run typecheck
 
       - name: Test and enforce coverage
-        # Temporary: tee the full test output to a file so a failing runner's
-        # log (truncated by GitHub's stream cap) can be read from the artifact.
-        run: set -o pipefail && bun run scripts/coverage.ts 2>&1 | tee /tmp/test-output.log
-
-      - name: Upload test output
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v5.0.0
-        with:
-          name: test-output-${{ matrix.os }}
-          path: /tmp/test-output.log
-          retention-days: 3
+        run: bun run test:coverage
 
       - name: Upload coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v5.0.0

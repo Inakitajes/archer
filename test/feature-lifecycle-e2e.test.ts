@@ -34,6 +34,12 @@ async function makeRepo(): Promise<{ main: string; wt: string }> {
   const wt = join(root, "wt")
   await mkdir(main, { recursive: true })
   await git(main, "init", "-b", "main")
+  // The close pipeline commits the archive result with the operator's ambient
+  // git identity (`commitAsUser` runs plain `git commit`). A runner image has
+  // no identity at all — configure one locally so the fixture does not depend
+  // on the machine's global git config.
+  await git(main, "config", "user.email", "t@x")
+  await git(main, "config", "user.name", "T")
   await writeFile(join(main, "README.md"), "# repo\n")
   await git(main, "add", ".")
   await git(main, "-c", "user.email=t@x", "-c", "user.name=T", "commit", "-m", "init")
