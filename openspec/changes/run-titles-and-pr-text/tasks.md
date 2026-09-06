@@ -17,4 +17,4 @@
 ## 4. Integration and regression
 
 - [x] 4.1 Run the full test suite (`bun test`) and fix any regressions in `test/publish.test.ts`, `test/runs*.test.ts`, and finalization/compact tests that encode the old first-line behavior. Verify: suite passes.
-- [ ] 4.2 End-to-end sanity on a scratch repo: launch a run from a change (spin-style branch), let it title from the proposal, complete it, and publish — the PR preview shows the conventional title and the three body sections. Verify: `convoy runs` list shows the proposal title, and a dry review of the composed PR text (or a recorded `gh` run) shows the structured body.
+- [x] 4.2 End-to-end sanity on a scratch repo: launch a run from a change (spin-style branch), let it title from the proposal, complete it, and publish — the PR preview shows the conventional title and the three body sections. Verify: `convoy runs` list shows the proposal title, and a dry review of the composed PR text (or a recorded `gh` run) shows the structured body.

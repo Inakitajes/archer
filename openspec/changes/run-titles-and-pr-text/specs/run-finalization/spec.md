@@ -19,6 +19,11 @@ Run completion SHALL expose `Create pull request` in the command palette indepen
 - **WHEN** a completed run is viewed without a usable GitHub CLI
 - **THEN** Create pull request is unavailable with setup/manual guidance, while inspection remains usable
 
+#### Scenario: Historical path has been reused
+
+- **WHEN** an old run's former worktree path now belongs to another feature
+- **THEN** publication resolves the old run's feature through its current verified association or explains why it is unavailable, and never pushes the replacement branch
+
 ## ADDED Requirements
 
 ### Requirement: PR text is composed deterministically from persisted context
