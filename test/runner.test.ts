@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -54,6 +54,21 @@ import { writeCommitSidecar } from "../src/step-commit"
 import { qualityDimensionWeights } from "../src/quality-score"
 
 const recoveryDirs: string[] = []
+
+// A RunShutdown that has requested an abort arms a 15s force-exit timer
+// (process.exit(130)) inside the test process. A test that never disposes its
+// shutdown therefore leaves a live bomb behind: the unref'd timer fires once
+// bun has moved on to other files, killing the whole suite mid-run. Track
+// every shutdown a test creates and dispose the survivors after each test.
+const liveShutdowns: RunShutdown[] = []
+function trackedShutdown(): RunShutdown {
+  const shutdown = new RunShutdown()
+  liveShutdowns.push(shutdown)
+  return shutdown
+}
+afterEach(() => {
+  for (const shutdown of liveShutdowns.splice(0)) shutdown.dispose()
+})
 
 function deferred() {
   let resolve!: () => void
@@ -543,7 +558,7 @@ describe("run phase gate", () => {
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -595,7 +610,7 @@ describe("run phase gate", () => {
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -649,7 +664,7 @@ describe("run phase gate", () => {
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -701,7 +716,7 @@ describe("run phase gate", () => {
       prepared,
       undefined,
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -737,7 +752,7 @@ describe("run phase gate", () => {
         return Promise.resolve("abort")
       },
     }
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     const trip = {
       reason: "max-steps" as const,
       message: "phase reached 200 model steps without finishing (cap 200). The phase was aborted to stop a runaway session.",
@@ -788,7 +803,7 @@ describe("run phase gate", () => {
         prepared,
         undefined,
         noopProgress,
-        new RunShutdown(),
+        trackedShutdown(),
         createGitLock(),
         undefined,
         {
@@ -824,7 +839,7 @@ describe("run phase gate", () => {
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -870,7 +885,7 @@ describe("run phase gate", () => {
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -925,7 +940,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -963,7 +978,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
         prepared,
         { head: "baseline" },
         progress,
-        new RunShutdown(),
+        trackedShutdown(),
         createGitLock(),
         { serverUrl: "http://127.0.0.1:1" },
         {
@@ -991,7 +1006,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       prepared,
       { head: "baseline" },
       noopProgress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -1020,7 +1035,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       prepared,
       { head: "baseline" },
       noopProgress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -1072,7 +1087,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
         prepared,
         { head: "baseline" },
         progress,
-        new RunShutdown(),
+        trackedShutdown(),
         createGitLock(),
         { serverUrl: "http://127.0.0.1:1" },
         {
@@ -1123,7 +1138,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
         prepared,
         { head: "baseline" },
         progress,
-        new RunShutdown(),
+        trackedShutdown(),
         createGitLock(),
         { serverUrl: "http://127.0.0.1:1" },
         {
@@ -1156,7 +1171,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       askHumanReview: () => Promise.resolve("abort"),
     }
 
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     try {
       await expect(
         runPhaseUntilResolved(
@@ -1196,7 +1211,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
         prepared,
         { head: "baseline" },
         noopProgress,
-        new RunShutdown(),
+        trackedShutdown(),
         createGitLock(),
         { serverUrl: "http://127.0.0.1:1" },
         {
@@ -1229,7 +1244,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
         prepared,
         undefined,
         progress,
-        new RunShutdown(),
+        trackedShutdown(),
         createGitLock(),
         { serverUrl: "http://127.0.0.1:1" },
         {
@@ -1275,7 +1290,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -1345,7 +1360,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -1407,7 +1422,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -1475,7 +1490,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
         prepared,
         { head: "baseline" },
         progress,
-        new RunShutdown(),
+        trackedShutdown(),
         createGitLock(),
         { serverUrl: "http://127.0.0.1:1" },
         {
@@ -1514,7 +1529,7 @@ ${JSON.stringify({ dimensions: { prd: 90, tests: 90, security: 90, maintainabili
       prepared,
       { head: "baseline" },
       progress,
-      new RunShutdown(),
+      trackedShutdown(),
       createGitLock(),
       { serverUrl: "http://127.0.0.1:1" },
       {
@@ -1628,7 +1643,7 @@ describe("RunShutdown multi-session tracking", () => {
   }
 
   test("tracks one active session per phase independently", () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     const aborted: string[] = []
     shutdown.setActiveSession(fakeSession("patterns", "ses_1", aborted))
     shutdown.setActiveSession(fakeSession("security", "ses_2", aborted))
@@ -1642,7 +1657,7 @@ describe("RunShutdown multi-session tracking", () => {
   })
 
   test("abortActiveSessions aborts every currently-tracked session", async () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     const aborted: string[] = []
     shutdown.setActiveSession(fakeSession("patterns", "ses_1", aborted))
     shutdown.setActiveSession(fakeSession("security", "ses_2", aborted))
@@ -1653,7 +1668,7 @@ describe("RunShutdown multi-session tracking", () => {
   })
 
   test("concurrent callers share the same in-flight abort", async () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     const aborted: string[] = []
     shutdown.setActiveSession(fakeSession("patterns", "ses_1", aborted))
 
@@ -2672,7 +2687,7 @@ describe("loopGuard seam regressions", () => {
       model: { providerID: "openai", modelID: "gpt-5.5" },
       attachments: [],
       progress: noopProgress,
-      shutdown: new RunShutdown(),
+      shutdown: trackedShutdown(),
       attempt: 1,
       loopGuardConfig: resolveLoopGuard({ maxPhaseCost: false }),
     })
@@ -2724,7 +2739,7 @@ describe("loopGuard seam regressions", () => {
       model: { providerID: "openai", modelID: "gpt-5.5" },
       attachments: [],
       progress: { ...noopProgress, phaseActivity: (_name, detail) => void activities.push(detail) },
-      shutdown: new RunShutdown(),
+      shutdown: trackedShutdown(),
       attempt: 1,
       loopGuardConfig: resolveLoopGuard({ maxSteps: 200 }),
     })
@@ -2787,7 +2802,7 @@ describe("loopGuard seam regressions", () => {
           activities.push(`${level}:${detail}`)
         },
       },
-      shutdown: new RunShutdown(),
+      shutdown: trackedShutdown(),
       attempt: 1,
       loopGuardConfig: resolveLoopGuard({ maxSteps: 200 }),
     })
@@ -2854,7 +2869,7 @@ describe("loopGuard seam regressions", () => {
           targetDir: "/repo",
           model: { providerID: "openai", modelID: "gpt-5.5" },
           progress: noopProgress,
-          shutdown: new RunShutdown(),
+          shutdown: trackedShutdown(),
           sessionID: "ses_1",
           loopGuard,
         },
@@ -2936,7 +2951,7 @@ describe("applyCompletionCheckpoint lastAssistantParts", () => {
     targetDir: "/repo",
     model: { providerID: "openai", modelID: "gpt-5.5" },
     progress: noopProgress,
-    shutdown: new RunShutdown(),
+    shutdown: trackedShutdown(),
     sessionID: "ses_1",
     loopGuard: new LoopGuard(resolveLoopGuard()),
   })
@@ -3071,7 +3086,7 @@ describe("applyReportCheckpoint", () => {
     targetDir: "/repo",
     model: { providerID: "openai", modelID: "gpt-5.5" },
     progress: noopProgress,
-    shutdown: new RunShutdown(),
+    shutdown: trackedShutdown(),
     sessionID: "ses_1",
     loopGuard: new LoopGuard(resolveLoopGuard()),
   })
@@ -3119,7 +3134,7 @@ describe("applyReportCheckpoint", () => {
         targetDir: "/repo",
         model: { providerID: "openai", modelID: "gpt-5.5" },
         progress: noopProgress,
-        shutdown: new RunShutdown(),
+        shutdown: trackedShutdown(),
         sessionID: "ses_1",
         loopGuard: new LoopGuard(resolveLoopGuard()),
       },
@@ -3169,7 +3184,7 @@ describe("applyReportCheckpoint", () => {
         reportPrepared,
         { head: "baseline" },
         progress,
-        new RunShutdown(),
+        trackedShutdown(),
         createGitLock(),
         { serverUrl: "http://127.0.0.1:1" },
         {
@@ -3281,27 +3296,27 @@ describe("isIgnorableRejection", () => {
 
 describe("RunShutdown methods", () => {
   test("signal returns an AbortSignal", () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     expect(shutdown.signal).toBeInstanceOf(Object)
     expect(shutdown.signal.aborted).toBe(false)
     shutdown.dispose()
   })
 
   test("aborted reflects the underlying controller state", () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     expect(shutdown.aborted).toBe(false)
     shutdown.dispose()
   })
 
   test("abortError returns UserAbortError when no reason is set", () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     const error = shutdown.abortError()
     expect(isUserAbortError(error)).toBe(true)
     shutdown.dispose()
   })
 
   test("abortError returns the signal reason when it is a UserAbortError", () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     const signal = shutdown.signal
     const err = new UserAbortError("test abort")
     // Manually abort the controller to set the reason
@@ -3312,7 +3327,7 @@ describe("RunShutdown methods", () => {
   })
 
   test("abortError falls back to fallback when available", () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     const fallback = new UserAbortError("fallback")
     const error = shutdown.abortError(fallback)
     expect(isUserAbortError(error)).toBe(true)
@@ -3321,13 +3336,13 @@ describe("RunShutdown methods", () => {
   })
 
   test("throwIfRequested does not throw before abort", () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     expect(() => shutdown.throwIfRequested()).not.toThrow()
     shutdown.dispose()
   })
 
   test("setActiveSession and clearActiveSession manage session map", async () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     const session = {
       client: {} as never,
       sessionID: "ses_1",
@@ -3345,7 +3360,7 @@ describe("RunShutdown methods", () => {
   })
 
   test("abortActiveSessions resolves when no sessions are tracked", async () => {
-    const shutdown = new RunShutdown()
+    const shutdown = trackedShutdown()
     await shutdown.abortActiveSessions()
     shutdown.dispose()
   })
