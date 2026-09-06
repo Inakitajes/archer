@@ -28,6 +28,14 @@ jobs:
       - name: Install locked dependencies
         run: bun install --frozen-lockfile --os='*' --cpu='*'
 
+      - name: Install OpenSpec CLI
+        # Convoy shells out to `openspec` (board reads, close's archive step),
+        # and the e2e ownership tests run a real archive against fixture
+        # repos. CI must carry the same tool a developer's environment has or
+        # those paths fail with a raw spawn ENOENT instead of serving. Pinned
+        # to the version the maintainers run locally.
+        run: bun add -g @fission-ai/openspec@1.10.0
+
       - name: Verify cross-platform native dependencies
         # OpenTUI resolves each target dynamically, so a missing package can
         # produce a binary that reports a version but cannot open the TUI.
