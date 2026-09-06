@@ -88,7 +88,7 @@ Work-scoped launches SHALL reuse the existing feature plan link and durable life
 - **THEN** its history remains readable and existing resume validation applies without forcing metadata conversion
 
 ### Requirement: Pre-proposal state uses shared lifecycle assessment
-The feature list, Home, detail, and action handlers SHALL consume the same lifecycle assessment. A feature with a verified checkout, no contracts, and no execution SHALL offer conversation and proposal without claiming implementation completion or close readiness. Contract assignment SHALL use the existing explicit association-revision workflow. Archived contracts, local integration, publication, and cleanup SHALL retain their separate existing evidence requirements.
+The feature list, Home, detail, and action handlers SHALL consume the same lifecycle assessment. A feature with a verified checkout, no contracts, and no execution SHALL offer conversation and proposal without claiming implementation completion or close readiness. Contract assignment SHALL use the existing explicit association-revision workflow. Verified archive evidence for a change SHALL remain authoritative over an unarchived copy of the same change ID that exists only on a branch behind the work's recorded base; the assessment SHALL disclose that stale-copy discrepancy instead of presenting the stale copy as current state. Archived contracts, local integration, publication, and cleanup SHALL retain their separate existing evidence requirements.
 
 #### Scenario: Empty contract set is awaiting proposal
 - **WHEN** a newly created feature has no selected contracts or execution
@@ -97,3 +97,7 @@ The feature list, Home, detail, and action handlers SHALL consume the same lifec
 #### Scenario: Several contracts share one feature
 - **WHEN** two contracts are explicitly associated with one checkout and the reader focuses one
 - **THEN** pipeline review preserves both contracts and close remains an operation on the entire feature, not a partial branch landing
+
+#### Scenario: Stale branch copy defers to verified archive evidence
+- **WHEN** an active copy of an associated change exists only on the feature branch behind its recorded base while verified archive evidence for that change ID exists in the base state
+- **THEN** the shared assessment reports the archived state with the stale-copy discrepancy disclosed, and neither Home nor the board presents the stale copy as awaiting proposal or implementation
