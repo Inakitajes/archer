@@ -3,17 +3,16 @@ import { createTestRenderer } from "@opentui/core/testing"
 
 import { browseSpecs } from "../src/specs"
 import {
-  createRippleSeeds,
+  breathAmplitude,
+  breathPeriodMs,
   defaultReducedMotion,
   envReducedMotion,
   intensityCell,
   isLoadingInterrupted,
   LoadingInterruptedError,
-  mulberry32,
   paintSpan,
-  rippleIntensities,
-  rippleRow,
-  seedCountFor,
+  seaIntensities,
+  seaRow,
   transitionGrid,
   withLoadingTransition,
 } from "../src/loading-transition"
@@ -194,6 +193,37 @@ describe("withLoadingTransition", () => {
     session.destroy()
   })
 
+  test("the status line floats centered over the sea on both axes", async () => {
+    const { testRenderer, session, opened } = await recordedSession(100, 30)
+    const route: TuiRoute = { session }
+    let resolveLoad!: (value: string) => void
+    const pending = withLoadingTransition(route, "specs", () => new Promise<string>((resolve) => (resolveLoad = resolve)), {
+      thresholdMs: 5,
+      reducedMotion: () => true,
+    })
+
+    await Bun.sleep(50)
+    await testRenderer.renderOnce()
+    expect(opened).toEqual(["convoy-loading-scene"])
+    const lines = testRenderer.captureCharFrame().split("\n")
+    const labelIndex = lines.findIndex((line) => line.includes("loading specs…"))
+    expect(labelIndex).toBeGreaterThanOrEqual(0)
+    // Vertically centered: the label lives in the middle band of the frame,
+    // not hugging the top edge or the old bottom status row.
+    expect(labelIndex).toBeGreaterThanOrEqual(Math.floor(lines.length / 3))
+    expect(labelIndex).toBeLessThanOrEqual(Math.ceil((2 * lines.length) / 3))
+    // Horizontally centered: the text starts well inside the row (a 100-col
+    // terminal leaves ~42 leading columns for the 15-char status), not flush
+    // left. The columns around it belong to the sea, so measure the offset.
+    const start = lines[labelIndex]!.indexOf("loading specs…")
+    expect(start).toBeGreaterThanOrEqual(20)
+    expect(start).toBeLessThanOrEqual(50)
+
+    resolveLoad("view")
+    await expect(pending).resolves.toBe("view")
+    session.destroy()
+  })
+
   test("a reduced-motion preference renders one static frame", async () => {
     const { testRenderer, session, opened, scenes } = await recordedSession()
     const route: TuiRoute = { session }
@@ -237,36 +267,45 @@ describe("the specs browser routes through the transition", () => {
   })
 })
 
-describe("ripple model", () => {
-  const seeds = createRippleSeeds(mulberry32(7), 3, 0)
-
-  test("seeds are deterministic and carry the staggering", () => {
-    const a = createRippleSeeds(mulberry32(7), 3, 0)
-    const b = createRippleSeeds(mulberry32(7), 3, 0)
-    expect(a).toEqual(b)
-    expect(seeds).toHaveLength(3)
-    // Staggered births keep even the first frame populated with waves.
-    expect(seeds.every((seed) => seed.born <= 0)).toBeTrue()
-    expect(seedCountFor(40, 23)).toBe(3)
-    expect(seedCountFor(110, 60)).toBe(7)
+describe("the breathing sea model", () => {
+  test("the breath envelope pulses between its floor and 1 over one period", () => {
+    // The envelope is a full sine over the period: rest at the phase origin,
+    // crest a quarter period later, back to rest at the trough.
+    expect(breathAmplitude(0)).toBeCloseTo(0.5 + (1 - 0.5) / 2, 10)
+    expect(breathAmplitude(breathPeriodMs / 4)).toBeCloseTo(1, 10)
+    expect(breathAmplitude((3 * breathPeriodMs) / 4)).toBeCloseTo(0.5, 10)
+    expect(breathAmplitude(breathPeriodMs)).toBeCloseTo(breathAmplitude(0), 10)
+    for (let ms = 0; ms <= breathPeriodMs; ms += 250) {
+      const value = breathAmplitude(ms)
+      expect(value).toBeGreaterThanOrEqual(0.5)
+      expect(value).toBeLessThanOrEqual(1)
+    }
   })
 
-  test("intensities describe expanding rings", () => {
-    const single = [{ x: 0.5, y: 0.5, born: 0, speed: 10, life: 10 }]
-    // Grid 41×21, center at (20,10); radius after 1s is 10 cells.
-    const at = rippleIntensities(41, 21, 1_000, single)
-    expect(at.length).toBe(41 * 21)
-    // The ring front is bright; the origin is dark; the far corner is untouched.
-    expect(at[10 * 41 + 30]!).toBeGreaterThan(0.5)
-    expect(at[10 * 41 + 20]!).toBeLessThan(0.05)
-    expect(at[0]!).toBeLessThan(0.02)
-    // The ring has moved on by the next second.
-    const later = rippleIntensities(41, 21, 2_000, single)
-    expect(later[10 * 41]!).toBeGreaterThan(0.5)
-    expect(later[10 * 41 + 30]!).toBeLessThan(at[10 * 41 + 30]!)
-    // Overlap sums but never saturates past 1.
-    for (const value of later) expect(value).toBeGreaterThanOrEqual(0)
-    for (const value of later) expect(value).toBeLessThanOrEqual(1)
+  test("intensities describe a coherent breathing sea, not expanding rings", () => {
+    const field = seaIntensities(41, 21, 1_000)
+    expect(field.length).toBe(41 * 21)
+    for (const value of field) {
+      expect(value).toBeGreaterThanOrEqual(0)
+      expect(value).toBeLessThanOrEqual(1)
+    }
+    // Deterministic: same position and time, same brightness — the field is a
+    // pure function, so a resize never strands hidden state.
+    expect(seaIntensities(41, 21, 1_000)).toEqual(field)
+    // The sea undulates: no frame is empty (the breath floor keeps swells
+    // visible) and crests reach the bright tones of the ramp.
+    expect(field.some((value) => value > 0.9)).toBeTrue()
+    // The sea breathes in place: at the trough of the envelope the whole
+    // surface dims together (no cell can exceed half brightness), and at the
+    // crest bright swells return — a global pulse, not rings going dark.
+    const crest = seaIntensities(41, 21, breathPeriodMs / 4)
+    const trough = seaIntensities(41, 21, (3 * breathPeriodMs) / 4)
+    for (const value of trough) expect(value).toBeLessThanOrEqual(0.5)
+    expect(crest.some((value) => value > 0.9)).toBeTrue()
+    // The swells travel: the field drifts as crests move across the surface.
+    const later = seaIntensities(41, 21, 1_500)
+    const drift = field.reduce((total, value, index) => total + Math.abs(value - later[index]!), 0)
+    expect(drift).toBeGreaterThan(0)
   })
 
   test("the brightness ramp quantizes onto the theme tones", () => {
@@ -317,13 +356,13 @@ describe("ripple model", () => {
 
   test("a painted row fills its width on typical, odd, and over-cap terminals", () => {
     const bright = (cols: number) => new Float64Array(cols).fill(0.9)
-    const textOf = (row: ReturnType<typeof rippleRow>) => row.chunks.map((chunk) => chunk.text).join("")
+    const textOf = (row: ReturnType<typeof seaRow>) => row.chunks.map((chunk) => chunk.text).join("")
     // Typical terminal: two columns per sampled cell, as before.
-    expect(textOf(rippleRow(40, bright(40), 0, 80))).toHaveLength(80)
+    expect(textOf(seaRow(40, bright(40), 0, 80))).toHaveLength(80)
     // Odd width: spans absorb the remainder without overflowing.
-    expect(textOf(rippleRow(41, bright(41), 0, 81))).toHaveLength(81)
+    expect(textOf(seaRow(41, bright(41), 0, 81))).toHaveLength(81)
     // Over-cap terminal: three-column spans cover what the clamped grid can't sample.
-    expect(textOf(rippleRow(110, bright(110), 0, 300))).toHaveLength(300)
+    expect(textOf(seaRow(110, bright(110), 0, 300))).toHaveLength(300)
   })
 
   test("a painted row carries the active theme palette on each tone", () => {
@@ -332,7 +371,7 @@ describe("ripple model", () => {
     // Bright → text, mid → dim (":"), low → faint, blank stays unstyled. Each
     // tone is distinct so no adjacent run merges, keeping one chunk per tone.
     const intensities = new Float64Array([0.9, 0.6, 0.1, 0.0])
-    const row = rippleRow(4, intensities, 0, 4)
+    const row = seaRow(4, intensities, 0, 4)
     const chunks = row.chunks
     // Every cell paints exactly one column at width 4.
     expect(chunks.map((chunk) => chunk.text).join("")).toHaveLength(4)

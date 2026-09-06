@@ -6,12 +6,12 @@ Relevant constraints from the existing architecture:
 - `TuiSession.openScene(id)` closes the current active scene and mounts a new one; the new scene paints over the previous frame with no blank frame and no alternate-screen toggle. This is the atomic-handoff primitive we already have.
 - `TuiScene` exposes `close()` and `requestInterrupt()`; the route's `onInterrupt` sets an `interrupted` flag the navigation loop checks.
 - Theme palette lives in `src/tui-theme.ts` (`theme.text`, `theme.dim`, `theme.faint`, etc.); `setTheme` swaps it.
-- Rendering is OpenTUI `BoxRenderable`/`TextRenderable`; backgrounds are transparent, so the field is drawn with fg-colored glyphs.
+- Rendering is OpenTUI `BoxRenderable`/`TextRenderable`; backgrounds are transparent (the terminal's own background shows through), so the field is drawn with fg-colored glyphs. The palette's single opaque color, `theme.overlay`, exists for floating elements that must mask what is underneath — the transition's status pill uses it.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- A reusable transition that mounts on the shared `TuiSession` while a destination loads, animates a character ripple field, and hands off atomically to the destination scene.
+- A reusable transition that mounts on the shared `TuiSession` while a destination loads, animates a breathing sea of characters, and hands off atomically to the destination scene.
 - Only show it for genuinely slow loads (threshold), never extend the load, and never flash on fast loads.
 - Keep the transition cheap enough to run on large terminals and over SSH; honor reduced motion; support `Ctrl+C` interrupt.
 
@@ -39,10 +39,13 @@ This is the single choke point that every destination's `browseSpecs`/`browseRun
 ### 2. The transition is a real `TuiScene`, so handoff stays atomic
 The helper opens `sceneForRoute(route, "convoy-loading-scene")` when it decides to show. When `load` settles, the helper closes the transition scene; the destination's own `sceneForRoute(route, "<dest>")` mount then closes whatever scene is active. Because both are scenes on the same session, the frame is replaced in place — no blank frame, no alternate-screen exit/re-entry (the existing contract in `src/tui-session.ts`).
 
-### 3. Ripple field drawn with glyphs and per-cell fg color
-A grid of cells covers the body area. Each cell's glyph and brightness is a function of a set of expanding ripples (origin point, radius growing over time, decaying strength), evaluated per frame. Brightness is quantized to a small ramp of the theme's text → dim → faint colors, so cells render as `StyledText` runs rather than true alpha. Ripples are seeded at random ambient points and expand outward; the effect reads as overlapping circular waves, not noise (mirrors Apollo's `FieldCanvas`, but cell-based).
+### 3. A breathing sea drawn with glyphs and per-cell fg color
+A grid of cells covers the terminal. Each cell's brightness is a pure function of position and time: two crossed plane-wave swells whose interference reads as an undulating sea surface, scaled by a slow global breathing envelope (≈4 s period) that brightens and dims the whole field in place. Brightness is quantized to a small ramp of the theme's text → dim → faint colors, so cells render as `StyledText` runs rather than true alpha. Waves travel; nothing expands outward from a point — the motion is swell and breath, not rings. The model is deterministic (no PRNG, no per-seed state), so a resize never strands hidden state and tests can pin the field exactly.
 
-**Alternatives considered:** true alpha/SGR-blend per cell — not supported well in terminal cells and much more expensive; a single rolling glyph column — visually reads as "Matrix" noise, not waves. The ramp + expanding-ripple model is the right tradeoff.
+**Alternatives considered:** true alpha/SGR-blend per cell — not supported well in terminal cells and much more expensive; a single rolling glyph column — visually reads as "Matrix" noise, not waves; expanding rings from ambient seed points (the first implementation) — read as sonar pings rather than the sea, and need seed bookkeeping. The ramp + breathing-swell model is the right tradeoff.
+
+### 3a. The status line floats centered over the sea
+The status label is a full-screen absolutely-positioned overlay using the repo's centered-modal pattern (`justifyContent`/`alignItems: "center"`, as in `config-tui.ts`), so the caption sits at the visual center on both axes while the sea fills the whole terminal behind it. The label paints a small solid pill in `theme.overlay` — the palette's one opaque backdrop color — because `theme.bg` is transparent by theme contract and the sea would otherwise bleed through the text's own spaces.
 
 ### 4. Bounded work for large terminals and SSH
 - Cap the animation at ≈30 fps (same cadence Apollo uses).
@@ -51,14 +54,14 @@ A grid of cells covers the body area. Each cell's glyph and brightness is a func
 - This keeps CPU and ANSI output bounded so it stays smooth over SSH or a slow link.
 
 ### 5. Reduced motion → static frame
-Detect a reduced-motion preference and, when set, render one static frame of the ripple field instead of animating (the spec requires a static frame, not absence). Detection is the open question below; the default path uses a config/flag with a terminal-capability probe when available.
+Detect a reduced-motion preference and, when set, render one static frame of the sea field instead of animating (the spec requires a static frame, not absence). Detection is the open question below; the default path uses a config/flag with a terminal-capability probe when available.
 
 ### 6. Interrupt through the existing route interrupt
 The transition registers the route's interrupt handler on its scene. When `Ctrl+C` fires, the helper rejects/aborts the pending `load` (an abort signal the destination load can observe) and closes the transition, so `runHomeNavigationLoop` sees `interrupted` and exits without a destination starting.
 
 ## Risks / Trade-offs
 
-- **[A static-looking field on very large terminals]** → Clamp the evaluated grid and keep the coarse sampling; the wave still reads as a field, just at lower resolution.
+- **[A static-looking field on very large terminals]** → Clamp the evaluated grid and keep the coarse sampling; the sea still reads as a field, just at lower resolution.
 - **[Animation cost on slow links]** → The 30 fps cap and coarse grid bound ANSI output; if needed, drop to a lower fps under a detected slow link.
 - **[Aborting a load is hard when the destination does I/O without a signal]** → The abort signal is best-effort: `Ctrl+C` at minimum stops the animation and returns control; the destination's `await` resolves or rejects naturally and the helper closes the transition either way. The spec's observable behavior (interrupt returns control, no destination started) holds.
 - **[Reduced-motion detection in a terminal]** → May not be directly observable. Mitigation: a config/flag default, and treat an unknown value as "no preference" so the animation is still available; documented in the open question.

@@ -1,6 +1,6 @@
 ## Purpose
 
-Defines the shared transition screen Convoy shows while a destination in the home session loads, animating a soft field of character ripples in the current theme and handing off to the destination atomically so an operator is never left staring at an unresponsive, frozen menu.
+Defines the shared transition screen Convoy shows while a destination in the home session loads, animating a breathing sea of characters in the current theme and handing off to the destination atomically so an operator is never left staring at an unresponsive, frozen menu.
 
 ## ADDED Requirements
 
@@ -20,17 +20,29 @@ When an operator opens a destination from the home launcher, Convoy SHALL begin 
 - **WHEN** the destination becomes ready while the transition is visible
 - **THEN** the destination replaces the transition immediately and the transition is not held for any animation to finish
 
-### Requirement: Transition animates character ripples in the current theme
+### Requirement: Transition animates a breathing sea in the current theme
 
-The loading transition SHALL render a field of characters whose brightness, density, or position undulates in expanding ripples, in the terminal's current foreground and background theme. The animation SHALL be a coherent wave effect, not random noise or a scrolling glyph column.
+The loading transition SHALL render a field of characters whose brightness undulates like a sea surface — swells that travel across the field while the whole surface brightens and dims in place under a slow global pulse — in the terminal's current foreground and background theme. The animation SHALL be a coherent wave effect; it SHALL NOT read as expanding rings, random noise, or a scrolling glyph column.
 
-#### Scenario: Ripples use the theme palette
+#### Scenario: The sea uses the theme palette
 - **WHEN** the transition renders in a light or dark terminal
 - **THEN** its characters are drawn in the matching theme palette and remain legible against the theme background
 
-#### Scenario: Ripples are animated
+#### Scenario: The sea breathes and undulates
 - **WHEN** the transition is visible for more than a single frame
-- **THEN** the character field changes over time in an expanding-wave pattern rather than remaining static or shuffling randomly
+- **THEN** the character field changes over time as swells travel and the whole surface's brightness pulses in place, rather than remaining static, shuffling randomly, or expanding rings outward from points
+
+### Requirement: The status line is centered over the field
+
+While the transition is visible, the loading status line SHALL be centered horizontally and vertically over the animated field, and SHALL remain legible above it.
+
+#### Scenario: The status line sits at the center
+- **WHEN** the transition renders on any terminal size
+- **THEN** the status line is positioned at the horizontal and vertical center of the terminal, floating above the field
+
+#### Scenario: The status line stays legible
+- **WHEN** the animated field passes beneath the status line
+- **THEN** the field does not bleed through the status text's own spacing, so the message reads as continuous words
 
 ### Requirement: Handoff to the destination is atomic
 
@@ -66,11 +78,11 @@ While the transition is visible, `Ctrl+C` SHALL interrupt the pending load, stop
 
 ### Requirement: Reduced motion renders a static frame
 
-When the operator has expressed a reduced-motion preference, the transition SHALL render a static frame of the ripple field instead of animating it, so the screen remains informative without motion.
+When the operator has expressed a reduced-motion preference, the transition SHALL render a static frame of the sea field instead of animating it, so the screen remains informative without motion.
 
 #### Scenario: Reduced motion is honored
 - **WHEN** the operator prefers reduced motion and a destination loads slowly
-- **THEN** a static ripple field renders in place of the animation and the destination replaces it when ready
+- **THEN** a static sea field renders in place of the animation and the destination replaces it when ready
 
 ### Requirement: Load failure degrades gracefully
 

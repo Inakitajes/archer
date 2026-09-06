@@ -4,7 +4,7 @@ When an operator enters a destination from the home launcher — most noticeably
 
 ## What Changes
 
-- Introduce a reusable loading-transition screen that animates a soft field of expanding character "ripples" (waves) in the current theme while a destination loads.
+- Introduce a reusable loading-transition screen that animates a breathing sea of characters (traveling swells under a slow global pulse) in the current theme while a destination loads, with the status line centered over the field.
 - Show the transition only for genuine load time, with a short threshold (≈150 ms) so fast loads do not flash it.
 - Replace the transition with the destination as soon as it is ready; never extend the load to finish an animation.
 - Paint the transition with OpenTUI renderables (no images, no canvas), sized to the terminal and bounded so large terminals and SSH sessions stay responsive.
@@ -15,7 +15,7 @@ When an operator enters a destination from the home launcher — most noticeably
 ## Capabilities
 
 ### New Capabilities
-- `loading-transition`: A shared transition screen shown while a destination within the home session loads, animating character-based waves in the current theme and handing off to the destination atomically.
+- `loading-transition`: A shared transition screen shown while a destination within the home session loads, animating a breathing sea of characters in the current theme and handing off to the destination atomically.
 
 ### Modified Capabilities
 - (none — the destination screens themselves do not change their requirements; only the handoff between them gains a transition.)

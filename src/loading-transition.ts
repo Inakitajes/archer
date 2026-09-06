@@ -1,4 +1,4 @@
-import { BoxRenderable, StyledText, TextRenderable, fg } from "@opentui/core"
+import { bg, BoxRenderable, StyledText, TextRenderable, fg } from "@opentui/core"
 
 import { joinLines, paletteForTerminal, raw, setTheme, terminalBackgroundHex, theme } from "./tui-theme"
 import { sceneForRoute, type TuiRoute, type TuiScene } from "./tui-session"
@@ -7,7 +7,7 @@ import type { CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 
 /**
  * The shared loading transition of the home session: while a destination load
- * outlasts a short threshold, a scene of expanding character ripples replaces
+ * outlasts a short threshold, a scene of a breathing sea of characters replaces
  * the frozen home frame, and the destination's own scene mount paints over it
  * atomically (the same contract every home-session screen already uses —
  * scenes close only when the next one mounts). Rejected or interrupted loads
@@ -53,7 +53,7 @@ export type LoadingTransitionOptions = {
 }
 
 /**
- * Runs `load`, showing the ripple transition on the route's session only when
+ * Runs `load`, showing the breathing-sea transition on the route's session only when
  * the load genuinely outlasts the threshold. Without a route (non-interactive
  * and piped invocations) the load runs unchanged. Every settlement path leaves
  * the session healthy: the transition stops animating as soon as the load
@@ -200,89 +200,60 @@ export function probeReducedMotion(): Promise<boolean> {
   return probePromise
 }
 
-// ── the ripple field (pure model, unit-testable without a renderer) ────────
+// ── the breathing sea (pure model, unit-testable without a renderer) ───────
 
-/** One expanding wave: a normalized origin, birth time, speed and lifespan. */
-export type RippleSeed = {
-  /** Origin in normalized grid coordinates, 0..1. */
-  x: number
-  y: number
-  /** Birth time in ms (the same clock the animator renders against). */
-  born: number
-  /** Expansion speed in grid cells per second. */
+/**
+ * One traveling swell of the sea: a plane wave with spatial frequencies
+ * `kx`/`ky` (radians per grid cell) that carries its crests at `speed` grid
+ * cells per second along its own wave vector, weighted within the combined sea.
+ */
+export type Swell = {
+  kx: number
+  ky: number
   speed: number
-  /** Lifespan in seconds, after which the seed respawns. */
-  life: number
+  weight: number
 }
 
-/** Small deterministic PRNG so tests can pin the field's geometry. */
-export function mulberry32(seed: number): () => number {
-  let a = seed >>> 0
-  return () => {
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
+/** Slow global pulse: the whole sea brightens and dims in place (breathing). */
+export const breathPeriodMs = 4_000
+/** Brightness floor of the breath, so the field never goes fully dark. */
+export const breathFloor = 0.5
 
-const waveSigmaCells = 1.4
-const waveFadeInMs = 500
-const seedMaxCount = 10
-const seedMinCount = 3
+/**
+ * The sea's swells: two crossed plane waves whose interference reads as an
+ * undulating surface, deliberately incommensurable wavelengths so the pattern
+ * never visibly repeats. Waves travel; nothing expands outward from a point —
+ * the motion is swell and breath, not rings.
+ */
+export const seaSwells: readonly Swell[] = [
+  { kx: (2 * Math.PI) / 16, ky: (2 * Math.PI) / 34, speed: 3.5, weight: 0.62 },
+  { kx: (2 * Math.PI) / 29, ky: -(2 * Math.PI) / 21, speed: 2.5, weight: 0.38 },
+]
 
-/** Staggered ambient seeds, so even the first frame already shows waves. */
-export function createRippleSeeds(random: () => number, count: number, now: number): RippleSeed[] {
-  return Array.from({ length: count }, () => {
-    const life = 3 + random() * 2
-    return {
-      x: random(),
-      y: random(),
-      born: now - random() * 1_800,
-      speed: 5 + random() * 4,
-      life,
-    }
-  })
-}
-
-/** Seeds live in normalized space so a resize never strands them off-grid. */
-export function respawnSeed(seed: RippleSeed, random: () => number, now: number): RippleSeed {
-  return {
-    x: random(),
-    y: random(),
-    born: now + random() * 300,
-    speed: 5 + random() * 4,
-    life: 3 + random() * 2,
-  }
-}
-
-export function seedCountFor(cols: number, rows: number): number {
-  return Math.max(seedMinCount, Math.min(seedMaxCount, Math.round((cols * rows) / 1_000)))
+/** The breath envelope in [breathFloor, 1]: a full sine over one period. */
+export function breathAmplitude(now: number): number {
+  return breathFloor + ((1 - breathFloor) / 2) * (1 + Math.sin((2 * Math.PI * now) / breathPeriodMs))
 }
 
 /**
- * Per-cell brightness in [0,1]: the sum of every seed's expanding gaussian
- * ring, faded in at birth and decaying over its lifespan, clamped at 1.
+ * Per-cell brightness in [0,1]: the combined swell of the sea, scaled by the
+ * breathing envelope. Pure and deterministic — a function of position and time
+ * alone, so tests can pin the field and a resize never strands state.
  */
-export function rippleIntensities(cols: number, rows: number, now: number, seeds: readonly RippleSeed[]): Float64Array {
+export function seaIntensities(cols: number, rows: number, now: number): Float64Array {
   const field = new Float64Array(cols * rows)
-  for (const seed of seeds) {
-    const age = (now - seed.born) / 1_000
-    if (age <= 0) continue
-    const decay = 1 - age / seed.life
-    if (decay <= 0) continue
-    const radius = seed.speed * age
-    const strength = decay * Math.min(1, age / (waveFadeInMs / 1_000))
-    const cx = seed.x * cols
-    const cy = seed.y * rows
-    for (let y = 0; y < rows; y++) {
-      const dy = y - cy
-      for (let x = 0; x < cols; x++) {
-        const dx = x - cx
-        const ring = Math.exp(-((Math.sqrt(dx * dx + dy * dy) - radius) ** 2) / (2 * waveSigmaCells * waveSigmaCells))
-        const index = y * cols + x
-        field[index] = Math.min(1, field[index]! + ring * strength)
+  const breath = breathAmplitude(now)
+  const tSec = now / 1_000
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      let wave = 0
+      for (const swell of seaSwells) {
+        // ω = |k|·speed keeps the crest speed honest along the wave vector.
+        const k = Math.hypot(swell.kx, swell.ky)
+        wave += swell.weight * Math.sin(swell.kx * x + swell.ky * y - k * swell.speed * tSec)
       }
+      const index = y * cols + x
+      field[index] = Math.min(1, Math.max(0, (0.5 + 0.5 * wave) * breath))
     }
   }
   return field
@@ -292,7 +263,7 @@ export type RampTone = "faint" | "dim" | "text"
 
 /**
  * Brightness quantized onto the theme's faint → dim → text ramp; undefined
- * cells stay blank. The wavefront reads bright, the tail fades out.
+ * cells stay blank. Swell crests read bright, troughs fade to faint.
  */
 export function intensityCell(intensity: number): { glyph: string; color: RampTone } | undefined {
   if (intensity >= 0.82) return { glyph: "·", color: "text" }
@@ -335,15 +306,14 @@ type LoadingSceneOptions = {
 }
 
 /**
- * The mounted transition: a full-body glyph field plus a one-row status label.
+ * The mounted transition: a full-screen breathing sea with the status line
+ * floating centered over it (both axes, like the repo's other overlays).
  * Follows the repo's screen lifecycle — the scene stays painted until the next
  * scene mounts; {@linkcode stop} only detaches listeners and timers.
  */
 class LoadingTransition {
   private finished = false
   private readonly t0 = performance.now()
-  private seeds: RippleSeed[] | undefined
-  private readonly random = mulberry32((Math.random() * 0xffffffff) >>> 0)
   private readonly ticker: ReturnType<typeof setInterval> | undefined
   private readonly fieldText: TextRenderable
 
@@ -359,17 +329,30 @@ class LoadingTransition {
       backgroundColor: theme.bg,
       flexDirection: "column",
     })
-    const fieldBox = new BoxRenderable(renderer, { id: "convoy-loading-field", width: "100%", flexGrow: 1 })
+    const fieldBox = new BoxRenderable(renderer, { id: "convoy-loading-field", width: "100%", height: "100%" })
     this.fieldText = new TextRenderable(renderer, { content: "", width: "100%", height: "100%" })
     fieldBox.add(this.fieldText)
-    const labelBox = new BoxRenderable(renderer, { id: "convoy-loading-label", width: "100%", height: 1, alignItems: "center" })
-    const labelText = new TextRenderable(renderer, {
-      content: `loading ${options.label ?? "destination"}…`,
-      fg: theme.dim,
+    // The status line floats over the sea, centered on both axes — the same
+    // centered-overlay pattern the config modal and notice screens use.
+    const labelOverlay = new BoxRenderable(renderer, {
+      id: "convoy-loading-label",
+      position: "absolute",
+      left: 0,
+      top: 0,
+      width: "100%",
+      height: "100%",
+      zIndex: 10,
+      alignItems: "center",
+      justifyContent: "center",
     })
-    labelBox.add(labelText)
+    const labelText = new TextRenderable(renderer, { content: "" })
+    // A solid pill in the palette's overlay color — the one opaque backdrop
+    // the theme provides — so the sea doesn't bleed through the text's own
+    // spaces and the status reads as words, not run-together glyphs.
+    labelText.content = new StyledText([bg(theme.overlay)(fg(theme.dim)(`loading ${options.label ?? "destination"}…`))])
+    labelOverlay.add(labelText)
     shell.add(fieldBox)
-    shell.add(labelBox)
+    shell.add(labelOverlay)
     scene.root.add(shell)
 
     renderer.keyInput.on("keypress", this.handleKeyPress)
@@ -403,7 +386,6 @@ class LoadingTransition {
       this.stop()
       return
     }
-    this.cullSeeds(now)
     this.render(now)
   }
 
@@ -416,18 +398,13 @@ class LoadingTransition {
     this.renderer.off("theme_mode", this.handleThemeMode)
   }
 
-  private cullSeeds(now: number): void {
-    if (!this.seeds) return
-    this.seeds = this.seeds.map((seed) => (now - seed.born > seed.life * 1_000 ? respawnSeed(seed, this.random, now) : seed))
-  }
-
   private render(now: number): void {
     if (this.finished || this.scene.isClosed || this.renderer.isDestroyed) return
     const width = this.renderer.width
-    const bodyHeight = Math.max(1, this.renderer.height - 1)
+    // The label floats as an overlay, so the sea fills the whole terminal.
+    const bodyHeight = Math.max(1, this.renderer.height)
     const { cols, rows } = transitionGrid(width, bodyHeight)
-    this.seeds ??= createRippleSeeds(this.random, seedCountFor(cols, rows), now)
-    this.fieldText.content = joinLines(this.fieldRows(cols, rows, rippleIntensities(cols, rows, now, this.seeds), width, bodyHeight))
+    this.fieldText.content = joinLines(this.fieldRows(cols, rows, seaIntensities(cols, rows, now), width, bodyHeight))
     this.renderer.requestRender()
   }
 
@@ -439,7 +416,7 @@ class LoadingTransition {
   private fieldRows(cols: number, rows: number, intensities: Float64Array, width: number, bodyHeight: number): StyledText[] {
     const lines: StyledText[] = []
     for (let y = 0; y < rows; y++) {
-      const line = rippleRow(cols, intensities, y * cols, width)
+      const line = seaRow(cols, intensities, y * cols, width)
       const span = paintSpan(y, rows, bodyHeight)
       for (let r = 0; r < span; r++) lines.push(line)
     }
@@ -450,9 +427,9 @@ class LoadingTransition {
 /**
  * One painted field row: the row's cells quantized onto the theme ramp, each
  * cell's glyph repeated across its proportional column span so the runs fill
- * exactly `width` columns. Pure and renderer-free, like the ripple model.
+ * exactly `width` columns. Pure and renderer-free, like the sea model.
  */
-export function rippleRow(cols: number, intensities: Float64Array, offset: number, width: number): StyledText {
+export function seaRow(cols: number, intensities: Float64Array, offset: number, width: number): StyledText {
   const chunks: TextChunk[] = []
   let run = ""
   let runColor: RampTone | undefined
